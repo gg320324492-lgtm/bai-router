@@ -176,7 +176,15 @@ const relay = http.createServer((req, res) => {
     for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
     try {
       const { Readable } = await import("node:stream");
-      const r = await fetch(cfg.upstream + req.url, { method: req.method, headers, body: body.length ? body : undefined });
+      // 探活级小请求（max_tokens≤8，桌面版健康检查/模型探测）遇 429 静默退避重试，
+      // 避免限速窗口抖动被放大成桌面端的 "Gateway returned an error" 卡片
+      let r;
+      const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();
+      for (let attempt = 0; ; attempt++) {
+        r = await fetch(cfg.upstream + req.url, { method: req.method, headers, body: body.length ? body : undefined });
+        if (!isProbe || r.status !== 429 || attempt >= 3) break;
+        await new Promise((res) => setTimeout(res, 400 * (attempt + 1)));
+      }
       const h = {};
       // fetch 已自动解压响应体，content-encoding 必须剥掉，否则客户端按 gzip 解明文会炸
       r.headers.forEach((v, k) => { if (!["content-length", "transfer-encoding", "connection", "content-encoding"].includes(k)) h[k] = v; });
