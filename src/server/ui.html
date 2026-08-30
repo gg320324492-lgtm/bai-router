@@ -176,6 +176,23 @@
     resize: vertical; line-height: 1.7;
   }
 
+  /* ---------- 内嵌通知横幅（替代系统弹窗/气泡） ---------- */
+  .banner-wrap { position: fixed; right: 18px; bottom: 18px; z-index: 50; display: flex; flex-direction: column; gap: 10px; max-width: 360px; }
+  .banner {
+    background: #23252d; border: 1px solid var(--line); border-left: 3px solid var(--amber);
+    border-radius: 9px; padding: 12px 14px; font-size: 13px; color: var(--ink);
+    box-shadow: 0 8px 28px rgba(0,0,0,.5); display: none; animation: rise .25s ease;
+  }
+  .banner.show { display: block; }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+  @media (prefers-reduced-motion: reduce) { .banner { animation: none; } }
+  .banner .t { font-weight: 600; margin-bottom: 4px; }
+  .banner .bar { height: 4px; background: var(--line); border-radius: 99px; margin: 8px 0 6px; overflow: hidden; }
+  .banner .bar i { display: block; height: 100%; background: var(--amber); width: 0%; transition: width .4s ease; }
+  .banner .row { display: flex; gap: 8px; margin-top: 8px; }
+  .banner button { font-size: 12px; padding: 5px 12px; border-radius: 6px; }
+  .banner .x { margin-left: auto; background: none; border: none; color: var(--dim); cursor: pointer; font-size: 14px; padding: 0 2px; }
+
   /* ---------- 测试结果 / 日志 ---------- */
   .result {
     display: none; margin-top: 14px; padding: 10px 14px; border-radius: 8px;
@@ -319,6 +336,24 @@
     <button class="btn-sm" id="updBtn" type="button" style="display:none">检查更新</button>
     <button class="btn-sm" id="stopBtn" type="button">停止服务</button>
   </footer>
+</div>
+
+<div class="banner-wrap">
+  <div class="banner" id="bnrUpdate">
+    <div class="t" id="bnrUpdTitle">更新</div>
+    <div class="bar" id="bnrUpdBarWrap"><i id="bnrUpdBar"></i></div>
+    <div id="bnrUpdMsg" style="font-size:12px;color:var(--dim)"></div>
+    <div class="row" id="bnrUpdRow" style="display:none">
+      <button class="btn-main" id="bnrUpdGo" type="button" style="padding:6px 14px;font-size:12px">重启安装</button>
+      <button class="btn-sm" id="bnrUpdLater" type="button">稍后</button>
+    </div>
+    <button class="x" id="bnrUpdX" type="button" title="关闭">✕</button>
+  </div>
+  <div class="banner" id="bnrInfo">
+    <div class="t" id="bnrInfoTitle"></div>
+    <div id="bnrInfoMsg" style="font-size:12px;color:var(--dim)"></div>
+    <button class="x" id="bnrInfoX" type="button" title="关闭">✕</button>
+  </div>
 </div>
 
 <script>
@@ -612,6 +647,44 @@ if (window.baiDesktop) {
   $("footPaths").textContent = "数据保存在 %APPDATA%\\bai-router · 切换前自动快照到 backups/";
   $("updBtn").style.display = "";
   api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
+
+  // ---- 内嵌通知：更新进度/就绪、部署结果、服务恢复，全部走这里，不再弹系统窗 ----
+  let infoTimer = null;
+  const showInfo = (title, msg, ms = 6000) => {
+    $("bnrInfoTitle").textContent = title;
+    $("bnrInfoMsg").textContent = msg;
+    $("bnrInfo").classList.add("show");
+    clearTimeout(infoTimer);
+    if (ms) infoTimer = setTimeout(() => $("bnrInfo").classList.remove("show"), ms);
+  };
+  $("bnrInfoX").onclick = () => $("bnrInfo").classList.remove("show");
+
+  const paintUpdate = (st) => {
+    const b = $("bnrUpdate");
+    if (!st || st.phase === "latest" || st.phase === "checking" || st.phase === "error") { b.classList.remove("show"); return; }
+    b.classList.add("show");
+    if (st.phase === "downloading") {
+      $("bnrUpdTitle").textContent = `正在下载 v${st.version}`;
+      $("bnrUpdBarWrap").style.display = "";
+      $("bnrUpdBar").style.width = (st.percent || 0) + "%";
+      $("bnrUpdMsg").textContent = (st.percent || 0) + "% · 完成后点「重启安装」即可，期间不影响使用";
+      $("bnrUpdRow").style.display = "none";
+    } else if (st.phase === "ready") {
+      $("bnrUpdTitle").textContent = `v${st.version} 已就绪`;
+      $("bnrUpdBarWrap").style.display = "none";
+      $("bnrUpdMsg").textContent = "重启安装约需 10 秒，中转会中断几秒；也可稍后退出时自动安装。";
+      $("bnrUpdRow").style.display = "";
+    }
+  };
+  $("bnrUpdGo").onclick = () => window.baiDesktop.installUpdate();
+  $("bnrUpdLater").onclick = () => $("bnrUpdate").classList.remove("show");
+  $("bnrUpdX").onclick = () => $("bnrUpdate").classList.remove("show");
+
+  window.baiDesktop.onAppEvent((ev) => {
+    if (ev.kind === "update") paintUpdate(ev.state);
+    else if (ev.kind === "deployed") showInfo("已自动部署", ev.text, 8000);
+    else if (ev.kind === "recovered") showInfo("服务恢复", ev.text);
+  });
 }
 $("updBtn").addEventListener("click", () => { if (window.baiDesktop) window.baiDesktop.checkUpdate(); });
 $("stopBtn").addEventListener("click", () => {

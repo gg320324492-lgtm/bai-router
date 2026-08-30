@@ -7,13 +7,24 @@ const fs = require("fs");
 // 打包后：主程序 resources/app；后端在 resources/server（extraResources，升级会被替换）
 //       用户数据（config.json/backups/server.log）在 %APPDATA%\bai-router —— 升级不会覆盖
 const APP_DIR = __dirname;
+// 数据目录固定为 %APPDATA%\bai-router —— 不跟 productName 走，跨机器/改名/重装都稳定
+try { app.setPath("userData", path.join(app.getPath("appData"), "bai-router")); } catch { }
+const DATA_DIR = app.getPath("userData");
 const SERVER_JS = app.isPackaged
   ? path.join(process.resourcesPath, "server", "server.mjs")
   : path.join(APP_DIR, "server", "server.mjs");
-const DATA_DIR = app.getPath("userData");
 const iconPath = app.isPackaged
   ? path.join(process.resourcesPath, "icon.ico")
   : path.join(APP_DIR, "..", "build", "icon.ico");
+// 一次性迁移：v1.0.1 曾把数据写到 productName 目录，存在旧数据且新目录没配置时搬过来
+try {
+  const oldDir = path.join(app.getPath("appData"), "B.AI Router");
+  if (fs.existsSync(path.join(oldDir, "config.json")) && !fs.existsSync(path.join(DATA_DIR, "config.json"))) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.copyFileSync(path.join(oldDir, "config.json"), path.join(DATA_DIR, "config.json"));
+    for (const f of ["backups"]) { try { fs.cpSync(path.join(oldDir, f), path.join(DATA_DIR, f), { recursive: true }); } catch { } }
+  }
+} catch { }
 
 let win = null;
 let tray = null;
@@ -105,7 +116,8 @@ function spawnServer() {
 async function respawnWithNotice() {
   spawnServer();
   await waitReady(20000);
-  if (tray) tray.displayBalloon({ title: "B.AI 路由台", content: "服务已自动恢复运行" });
+  // 静默恢复：只通知面板横幅，不再弹系统气泡
+  notifyWindow("app-event", { kind: "recovered", text: "服务已自动恢复运行" });
 }
 
 async function waitReady(timeoutMs) {
@@ -166,6 +178,12 @@ function showWindow() {
     webPreferences: { preload: path.join(APP_DIR, "preload.js"), contextIsolation: true, nodeIntegration: false },
   });
   win.loadURL(PANEL);
+  win.webContents.on("did-finish-load", () => {
+    // 补发当前更新状态，重开窗口横幅不丢
+    if (updateState && (updateState.phase === "downloading" || updateState.phase === "ready")) {
+      notifyWindow("app-event", { kind: "update", state: updateState });
+    }
+  });
   win.on("close", (e) => { if (!quitting) { e.preventDefault(); win.hide(); } });
   win.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action: "deny" }; });
 }
@@ -186,6 +204,7 @@ function createTray() {
   ]);
   tray.on("double-click", () => showWindow());
   tray.setContextMenu(menu);
+  trayMenuRef = menu;
 }
 
 async function deployLocal() {
@@ -245,25 +264,24 @@ async function runDeploy(autostart) {
   return { ok: true, messages: msgs };
 }
 
+// 面板内通知通道（替代系统弹窗/气泡）
+function notifyWindow(channel, payload) {
+  try { if (win && !win.isDestroyed()) win.webContents.send(channel, payload); } catch { }
+}
+
 function maybeFirstRunDeploy() {
   const marker = path.join(DATA_DIR, ".deployed");
   if (fs.existsSync(marker)) return;
-  dialog.showMessageBox(win && win.isVisible() ? win : undefined, {
-    type: "question", title: "欢迎使用 B.AI 路由台",
-    message: "首次运行：是否自动创建桌面快捷方式并开启开机自启？",
-    detail: "推荐「一键部署」——之后开机自动在托盘常驻。也可以稍后从托盘菜单手动部署。",
-    buttons: ["一键部署", "暂不"], defaultId: 0, cancelId: 1,
-  }).then(async ({ response }) => {
-    fs.writeFileSync(marker, new Date().toISOString());
-    if (response === 0) {
-      const j = await runDeploy(true);
-      if (tray) tray.displayBalloon({ title: "部署完成", content: (j.messages || [j.error || "完成"]).join("\n") });
-    }
+  // 首启静默部署（快捷方式+自启），结果走面板横幅，不打扰
+  fs.writeFileSync(marker, new Date().toISOString());
+  runDeploy(true).then((j) => {
+    notifyWindow("app-event", { kind: "deployed", text: "首次运行已完成自动部署：" + (j.messages || []).filter((m) => /快捷方式|自启|代理/.test(m)).join("；") });
   });
 }
 
-// ---------- 自动更新 ----------
+// ---------- 自动更新（全部静默化：状态进面板横幅 + 托盘提示，不弹系统窗） ----------
 let autoUpdater = null;
+let trayMenuRef = null;
 function setupUpdater() {
   if (!app.isPackaged) return; // 开发/绿色模式没有 app-update.yml，跳过
   try {
@@ -273,23 +291,22 @@ function setupUpdater() {
     au.autoInstallOnAppQuit = true;
     au.on("checking-for-update", () => { updateState = { phase: "checking" }; syncTray(); });
     au.on("update-available", (info) => {
-      updateState = { phase: "downloading", version: info.version };
+      updateState = { phase: "downloading", version: info.version, percent: 0 };
       syncTray();
-      if (tray) tray.displayBalloon({ title: "发现新版本 " + info.version, content: "正在后台下载更新…" });
+      notifyWindow("app-event", { kind: "update", state: updateState });
     });
     au.on("update-not-available", () => { updateState = { phase: "latest" }; syncTray(); });
-    au.on("download-progress", (p) => { updateState = updateState || {}; updateState.percent = Math.round(p.percent); syncTray(); });
+    let lastPct = -5;
+    au.on("download-progress", (p) => {
+      const pct = Math.round(p.percent);
+      updateState = { ...(updateState || { phase: "downloading" }), phase: "downloading", percent: pct };
+      if (pct - lastPct >= 5 || pct === 100) { lastPct = pct; notifyWindow("app-event", { kind: "update", state: updateState }); }
+      syncTray();
+    });
     au.on("update-downloaded", (info) => {
       updateState = { phase: "ready", version: info.version };
       syncTray();
-      dialog.showMessageBox({
-        type: "info", title: "更新已就绪",
-        message: `B.AI 路由台 ${info.version} 已下载完成`,
-        detail: "重启应用后生效。现在重启吗？（中转会中断约 5 秒）",
-        buttons: ["立即重启安装", "稍后（退出时自动装）"], defaultId: 0, cancelId: 1,
-      }).then(({ response }) => {
-        if (response === 0) { quitting = true; setImmediate(() => au.quitAndInstall(false, true)); }
-      });
+      notifyWindow("app-event", { kind: "update", state: updateState });
     });
     au.on("error", (e) => {
       updateState = { phase: "error", msg: String((e && e.message) || e).slice(0, 120) };
@@ -301,6 +318,18 @@ function setupUpdater() {
   } catch { autoUpdater = null; }
 }
 
+function installReadyUpdate() {
+  if (!autoUpdater || !updateState || updateState.phase !== "ready") return;
+  const { dialog: d } = require("electron");
+  d.showMessageBox({
+    type: "question", title: "安装更新",
+    message: `立即重启安装 v${updateState.version} 吗？`,
+    detail: "中转会中断约 5 秒。", buttons: ["重启安装", "稍后"], defaultId: 0, cancelId: 1,
+  }).then(({ response }) => {
+    if (response === 0) { quitting = true; setImmediate(() => autoUpdater.quitAndInstall(false, true)); }
+  });
+}
+
 function syncTray() {
   if (!tray) return;
   const u = updateState;
@@ -309,6 +338,17 @@ function syncTray() {
   else if (u && u.phase === "ready") tip += ` · 新版 ${u.version} 待安装`;
   else if (u && u.phase === "error") tip += " · 更新失败（可重试检查更新）";
   tray.setToolTip(tip);
+  // 更新就绪时：托盘菜单第一项变成「安装更新 vX」
+  if (trayMenuRef) {
+    const first = trayMenuRef.items[0];
+    if (u && u.phase === "ready") {
+      first.label = `安装更新 v${u.version}`;
+      first.click = installReadyUpdate;
+    } else {
+      first.label = "显示主界面";
+      first.click = () => showWindow();
+    }
+  }
 }
 
 async function manualCheckUpdate() {
@@ -316,13 +356,18 @@ async function manualCheckUpdate() {
     dialog.showMessageBox({ type: "info", title: "检查更新", message: "当前为绿色/开发模式，自动更新仅在安装版可用。" });
     return;
   }
+  // 已有就绪/进行中的更新 → 不再重复检查，直接给反馈
+  if (updateState && updateState.phase === "ready") { installReadyUpdate(); return; }
+  if (updateState && updateState.phase === "downloading") {
+    dialog.showMessageBox({ type: "info", title: "检查更新", message: `v${updateState.version} 正在下载（${updateState.percent || 0}%），完成后托盘菜单会出现「安装更新」。` });
+    return;
+  }
   try {
-    updateState = null;
     const r = await autoUpdater.checkForUpdates();
-    if (!r || !r.updateInfo) return;
-    if (r.isUpdateAvailable === false && !updateState?.version) {
+    if (r && r.isUpdateAvailable === false) {
       dialog.showMessageBox({ type: "info", title: "检查更新", message: "已是最新版本 v" + app.getVersion() });
     }
+    // 有更新时 update-available 事件会静默处理（面板横幅），无需弹窗
   } catch (e) {
     dialog.showMessageBox({ type: "error", title: "检查更新失败", message: String((e && e.message) || e), detail: "常见原因：网络/代理未就绪，或 GitHub 不可达。开 Clash 后重试。" });
   }
@@ -332,6 +377,7 @@ async function manualCheckUpdate() {
 ipcMain.handle("server-restart", async () => restartServer());
 ipcMain.handle("deploy-local", async () => { deployLocal(); return true; });
 ipcMain.handle("check-update", async () => { manualCheckUpdate(); return true; });
+ipcMain.handle("install-update", async () => { installReadyUpdate(); return true; });
 ipcMain.handle("app-version", () => ({ version: app.getVersion(), packaged: app.isPackaged }));
 ipcMain.on("app-quit", () => { quitting = true; app.quit(); });
 
