@@ -150,6 +150,16 @@ function spawnServer() {
     child = null;
     logMain(`服务子进程退出 code=${code} sig=${sig} 存活${Math.round((Date.now() - born) / 1000)}s 运行时=${runtimeSystem ? "system-node" : "electron-node"}`);
     if (quitting) return;
+    // 快速崩溃计数：连续 5 次秒退 → 熔断重试，切诊断页（防止无限拉起循环）
+    if (Date.now() - born < 5000) crashStreak++; else crashStreak = 0;
+    if (crashStreak >= 5) {
+      crashStreak = 0;
+      lastSpawnError = `服务连续崩溃 ${5} 次已停止自动重试。最近退出码=${code}（2=端口被占用）。详见诊断日志`;
+      serverHealthy = false;
+      logMain("崩溃熔断：停止自动重拉，界面切换诊断页");
+      showWindow(true);
+      return;
+    }
     // 崩溃循环保护：秒退说明该运行时不行 → 切到内置 Node 再试
     recentExits.push(Date.now() - born);
     if (recentExits.length > 6) recentExits.shift();
@@ -168,7 +178,8 @@ function logMain(msg) {
 
 async function respawnWithNotice() {
   spawnServer();
-  await waitReady(20000);
+  const ok = await waitReady(20000);
+  if (ok) crashStreak = 0;
   // 静默恢复：只通知面板横幅，不再弹系统气泡
   notifyWindow("app-event", { kind: "recovered", text: "服务已自动恢复运行" });
 }
@@ -182,7 +193,58 @@ async function waitReady(timeoutMs) {
   return false;
 }
 
+// ---------- 端口预检与回收（v1.0.10：根治"教程旧 relay 残留占 15722"导致的死循环） ----------
+const net = require("net");
+function portBusy(port) {
+  return new Promise((res) => {
+    const s = net.connect({ host: "127.0.0.1", port, timeout: 1200 }, () => { s.destroy(); res(true); });
+    s.on("error", () => res(false));
+    s.on("timeout", () => { s.destroy(); res(false); });
+  });
+}
+function execOut(cmd, args) {
+  return new Promise((res) => execFile(cmd, args, { windowsHide: true, timeout: 8000 }, (e, so) => res(e ? "" : String(so))));
+}
+async function occupantOf(port) {
+  const out = await execOut("netstat", ["-ano", "-p", "TCP"]);
+  for (const line of out.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t.startsWith("TCP") || !t.includes(`127.0.0.1:${port}`) || !/LISTENING/i.test(t)) continue;
+    const pid = (t.match(/(\d+)\s*$/) || [])[1];
+    if (!pid) continue;
+    const tl = await execOut("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"]);
+    const m = String(tl).match(/"([^"]+\.exe)"/i); // CSV: "node.exe","4996","Console",...
+    const name = m ? m[1] : "未知进程";
+    return { pid, name };
+  }
+  return null;
+}
+let portReport = null; // 展示给诊断页
+async function reclaimPort(port) {
+  if (!(await portBusy(port))) return null;
+  const o = await occupantOf(port);
+  if (!o) return { port, note: "占用者未知" };
+  // node.exe = 上一代服务；B.AI Router.exe = 旧实例/半死 Electron。都可以安全回收
+  if (/^(node(\.exe)?|B\.AI Router\.exe)$/i.test(o.name) && String(o.pid) !== String(process.pid)) {
+    await new Promise((r) => execFile("taskkill", ["/F", "/T", "/PID", String(o.pid)], { windowsHide: true }, r));
+    for (let i = 0; i < 10 && (await portBusy(port)); i++) await new Promise((r) => setTimeout(r, 300));
+    const still = await portBusy(port);
+    logMain(`端口:${port} 原被 ${o.name}(pid ${o.pid}) 占用 → 已${still ? "回收失败" : "回收"}`);
+    return { port, killed: `${o.name} pid ${o.pid}`, ok: !still };
+  }
+  return { port, occupant: `${o.name} pid ${o.pid}`, blocked: true };
+}
+
 async function ensureServer() {
+  // 预检：抢回被旧残留占用的端口
+  const r1 = await reclaimPort(relayPort);
+  const r2 = await reclaimPort(panelPort);
+  portReport = [r1, r2].filter(Boolean);
+  const blocked = portReport.find((p) => p.blocked);
+  if (blocked) {
+    lastSpawnError = `端口 ${blocked.port} 被非本软件进程占用: ${blocked.occupant}（请手动关闭该程序或改端口）`;
+    logMain(lastSpawnError);
+  }
   const st = await getStatus();
   if (st && st.service && st.service.up && st.service.pid && st.service.pid !== process.pid) {
     try { await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(st.service.pid)], { windowsHide: true }, r)); } catch { }
@@ -193,6 +255,8 @@ async function ensureServer() {
   if (!ok) logMain("服务 25 秒内未就绪，进入诊断模式");
   return ok;
 }
+
+let crashStreak = 0;
 
 // 服务未起来时不再黑屏：加载内置诊断页，实时监测，起来了自动切回面板
 let serverHealthy = true;
@@ -216,6 +280,10 @@ async function restartServer() {
   quitting = true;
   try { if (child) await killTree(child.pid); } catch { }
   quitting = false;
+  // 重试前重新回收端口（应对"外部残留占用"场景）
+  const r1 = await reclaimPort(relayPort);
+  const r2 = await reclaimPort(panelPort);
+  portReport = [r1, r2].filter(Boolean);
   const st = await getStatus();
   if (st && st.service && st.service.pid) {
     try { await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(st.service.pid)], { windowsHide: true }, r)); } catch { }
@@ -453,13 +521,25 @@ ipcMain.handle("app-version", () => ({ version: app.getVersion(), packaged: app.
 ipcMain.on("app-quit", () => { quitting = true; app.quit(); });
 
 // 诊断页支持
+function tailOf(p, n = 2400) {
+  try {
+    const s = fs.readFileSync(p, "utf8");
+    return s.length > n ? "…" + s.slice(-n) : s;
+  } catch { return ""; }
+}
 ipcMain.handle("diag-info", () => ({
   version: app.getVersion(),
   runtime: runtimeSystem ? `system-node (${runtimeNodePath})` : "electron 内置 node",
   lastSpawnError,
+  portReport,
   dataDir: DATA_DIR,
   childLog: path.join(DATA_DIR, "server-child.log"),
   appLog: path.join(DATA_DIR, "app.log"),
+  logs: {
+    server: tailOf(path.join(DATA_DIR, "server.log")),
+    child: tailOf(path.join(DATA_DIR, "server-child.log")),
+    app: tailOf(path.join(DATA_DIR, "app.log")),
+  },
   panel: PANEL,
   win: require("os").release(),
 }));

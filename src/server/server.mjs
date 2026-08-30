@@ -643,16 +643,9 @@ const panel = http.createServer(async (req, res) => {
 });
 
 // ---------- 起飞 ----------
-// EADDRINUSE 时先探活：若已有健康实例在跑（attached），静默退出 0——
-// Electron 端据此判断"已有服务"直接连上去，重复启动无害
-function portTakenThen(code) {
-  const probe = cfg0.panelPort;
-  fetch(`http://127.0.0.1:${probe}/api/ping`, { signal: AbortSignal.timeout(2000) })
-    .then((r) => r.json())
-    .then((j) => { if (j.ok) { log(`已有实例在 :${probe} (pid ${j.pid || "?"})，attached 退出`); process.exit(0); } process.exit(code); })
-    .catch(() => process.exit(code));
-}
-relay.on("error", (e) => { log("relay 端口错误:", e.message); if (e.code === "EADDRINUSE") portTakenThen(1); else process.exit(1); });
-panel.on("error", (e) => { log("panel 端口错误:", e.message); if (e.code === "EADDRINUSE") portTakenThen(1); else process.exit(1); });
+// 端口被占 = 本进程无法工作，硬退出（exit 2），由 Electron 壳负责回收旧占用并进诊断页。
+// 不再用"ping 面板端口判断已有实例"——那会被自己的面板骗到（自判 attached 死循环，v1.0.10 修复）
+relay.on("error", (e) => { log(`relay 端口错误: ${e.message} —— :${cfg0.relayPort} 被其他程序占用，进程退出`); process.exit(e.code === "EADDRINUSE" ? 2 : 1); });
+panel.on("error", (e) => { log(`panel 端口错误: ${e.message} —— :${cfg0.panelPort} 被其他程序占用，进程退出`); process.exit(e.code === "EADDRINUSE" ? 2 : 1); });
 relay.listen(cfg0.relayPort, "127.0.0.1", () => log(`中转就绪 http://127.0.0.1:${cfg0.relayPort}`));
 panel.listen(cfg0.panelPort, "127.0.0.1", () => log(`面板就绪 http://127.0.0.1:${cfg0.panelPort}`));

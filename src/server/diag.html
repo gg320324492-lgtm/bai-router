@@ -47,6 +47,11 @@
     <button id="openDir">打开数据文件夹</button>
   </div>
 
+  <div class="card" style="margin-top:16px">
+    <div class="row"><span class="k">最近日志</span><span class="v" id="portRpt">…</span></div>
+    <pre id="logBox" style="background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;font-family:var(--mono);font-size:11px;line-height:1.7;color:#a9adb8;white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto;margin-top:8px">加载中…</pre>
+  </div>
+
   <div class="tip">
     常见原因：<br>
     ① <b>杀毒软件拦截</b>——Windows Defender/火绒/360 把子进程杀了，请将安装目录加入白名单后点「立即重试」<br>
@@ -62,8 +67,13 @@ async function refresh() {
   $("ver").textContent = "v" + d.version;
   $("win").textContent = d.win;
   $("rt").textContent = d.runtime;
-  $("err").textContent = d.lastSpawnError || "无 spawn 错误（服务进程可能反复崩溃，见崩溃日志）";
+  $("err").textContent = d.lastSpawnError || "无 spawn 错误（服务进程可能反复崩溃，见下方日志）";
   $("panel").textContent = d.panel;
+  $("portRpt").textContent = (d.portReport && d.portReport.length)
+    ? d.portReport.map((p) => `:${p.port} ${p.killed ? "原被 " + p.killed + " 占用→" + (p.ok ? "已回收" : "回收失败") : p.blocked ? "被外部程序占用 " + p.occupant : "占用者未知"}`).join("；")
+    : "端口预检通过，15722/15723 空闲";
+  const lg = d.logs || {};
+  $("logBox").textContent = [lg.server && ("—— server.log ——\n" + lg.server), lg.child && ("\n—— server-child.log ——\n" + lg.child), lg.app && ("\n—— app.log ——\n" + lg.app)].filter(Boolean).join("\n") || "(暂无日志)";
   window.__d = d;
 }
 $("retry").onclick = async () => { $("retry").textContent = "重试中…"; const ok = await window.baiDesktop.diagRetry(); $("retry").textContent = ok ? "✔ 已启动" : "✘ 仍失败"; refresh(); };
