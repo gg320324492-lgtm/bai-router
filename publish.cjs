@@ -13,6 +13,18 @@ const exe = `BARRouter-Setup-${v}.exe`;
 
 const run = (cmd) => { console.log("»", cmd); execSync(cmd, { cwd: ROOT, stdio: "inherit", env: { ...process.env, ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/" } }); };
 
+// 发布前置：用发布机当前配置刷新随包默认快照（脱敏 apiKey）→ 新电脑开箱即得同款模型列表/映射
+try {
+  const userCfgPath = path.join(process.env.APPDATA, "bai-router", "config.json");
+  if (fs.existsSync(userCfgPath)) {
+    const local = JSON.parse(fs.readFileSync(userCfgPath, "utf8"));
+    const def = { ...local, apiKey: "" };
+    delete def._modelsSynced;
+    fs.writeFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), JSON.stringify(def, null, 2) + "\n");
+    console.log(`» 默认快照已同步发布机: ${def.availableModels.length} 个模型`);
+  } else console.log("» 未找到发布机配置，沿用仓库内 defaults 快照");
+} catch (e) { console.log("» 快照同步跳过:", e.message); }
+
 if (fs.existsSync(path.join(ROOT, "dist", exe))) console.log(`⚠ dist/${exe} 已存在——若确认重发请先删除或升版本号`);
 run("npx electron-builder --win nsis");
 run(`gh release create v${v} -R ${owner}/${repo} "dist/${exe}" "dist/latest.yml" --title "v${v}" --notes "${notes.replace(/"/g, "'")}"`);

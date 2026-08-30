@@ -8,12 +8,27 @@
   "availableModels": [
     "qwen3.8-flash",
     "glm-5.3-flash",
-    "deepseek-v4-flash"
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
+    "hy3",
+    "mimo-v2.5"
   ],
   "mapping": {
-    "claude-fable-5": { "target": "qwen3.8-flash", "label": "Qwen3.8-Flash" },
-    "claude-sonnet-5": { "target": "glm-5.3-flash", "label": "GLM-5.3-Flash" },
-    "claude-opus-5": { "target": "deepseek-v4-flash", "label": "DeepSeek-V4-Flash" },
-    "claude-haiku-4-5": { "target": "qwen3.8-flash", "label": "Qwen3.8-Flash" }
+    "claude-fable-5": {
+      "target": "qwen3.8-flash",
+      "label": "Qwen3.8-Flash"
+    },
+    "claude-sonnet-5": {
+      "target": "glm-5.3-flash",
+      "label": "GLM-5.3-Flash"
+    },
+    "claude-opus-5": {
+      "target": "deepseek-v4-flash-vision-exp",
+      "label": "deepseek-v4-flash-vision-exp"
+    },
+    "claude-haiku-4-5": {
+      "target": "mimo-v2.5",
+      "label": "mimo-v2.5"
+    }
   }
 }

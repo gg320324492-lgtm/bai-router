@@ -107,6 +107,22 @@ if (process.env.NODE_USE_ENV_PROXY !== "1") {
 log(`路由台启动 relay=:${cfg0.relayPort} panel=:${cfg0.panelPort} (pid ${process.pid})`);
 process.on("uncaughtException", (e) => log("uncaughtException:", e?.stack || String(e)));
 
+// 发布机模型同步（每版本一次性、只增不删）：把 config.defaults.json 里的可选模型并进本机列表
+try {
+  const defaultsPath = path.join(HERE, "config.defaults.json");
+  if (DATA_DIR !== HERE && existsSync(defaultsPath)) {
+    const cur = loadCfg();
+    if (cur._modelsSynced !== APP_VERSION) {
+      const def = JSON.parse(readFileSync(defaultsPath, "utf8"));
+      const merged = [...new Set([...(cur.availableModels || []), ...(def.availableModels || [])])];
+      cur.availableModels = merged;
+      cur._modelsSynced = APP_VERSION;
+      saveCfg(cur);
+      log(`可选模型已同步发布机（${merged.length} 个）`);
+    }
+  }
+} catch (e) { log("模型同步跳过: " + e.message); }
+
 // ---------- 中转服务 ----------
 function normalizeModel(name) {
   // Claude Code 会发送带上下文后缀的档位名（如 claude-opus-5[1m] / claude-fable-5[1M]），
