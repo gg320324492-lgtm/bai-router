@@ -443,20 +443,34 @@ function setupUpdater() {
     });
     au.on("update-not-available", () => { updateState = { phase: "latest" }; syncTray(); });
     let lastPct = -5;
+    let dlWatchdog = null;
     au.on("download-progress", (p) => {
       const pct = Math.round(p.percent);
       updateState = { ...(updateState || { phase: "downloading" }), phase: "downloading", percent: pct };
       if (pct - lastPct >= 5 || pct === 100) { lastPct = pct; notifyWindow("app-event", { kind: "update", state: updateState }); }
       syncTray();
+      // 看门狗：100% 后 25 秒仍未收到 ready → 主动再查一次（已下载文件会被秒判就绪）
+      if (pct >= 100 && !dlWatchdog) {
+        dlWatchdog = setTimeout(() => {
+          dlWatchdog = null;
+          if (updateState && updateState.phase === "downloading") {
+            logMain("下载100%后未见 ready 事件，主动重查");
+            au.checkForUpdates().catch(() => { });
+          }
+        }, 25000);
+      }
     });
     au.on("update-downloaded", (info) => {
+      if (dlWatchdog) { clearTimeout(dlWatchdog); dlWatchdog = null; }
+      lastPct = -5;
       updateState = { phase: "ready", version: info.version };
       syncTray();
       notifyWindow("app-event", { kind: "update", state: updateState });
     });
     au.on("error", (e) => {
-      updateState = { phase: "error", msg: String((e && e.message) || e).slice(0, 120) };
+      updateState = { phase: "error", msg: String((e && e.message) || e).slice(0, 160) };
       syncTray();
+      notifyWindow("app-event", { kind: "update", state: updateState }); // v1.0.11：错误也要上屏，不能只写托盘
     });
     // 启动 8 秒后检查一次，之后每 12 小时一次
     setTimeout(() => au.checkForUpdates().catch(() => { }), 8000);

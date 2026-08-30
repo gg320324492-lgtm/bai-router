@@ -671,20 +671,30 @@ if (window.baiDesktop) {
 
   const paintUpdate = (st) => {
     const b = $("bnrUpdate");
-    if (!st || st.phase === "latest" || st.phase === "checking" || st.phase === "error") { b.classList.remove("show"); return; }
+    if (!st || st.phase === "latest" || st.phase === "checking") { b.classList.remove("show"); return; }
     b.classList.add("show");
     if (st.phase === "downloading") {
-      $("bnrUpdTitle").textContent = `正在下载 v${st.version}`;
+      $("bnrUpdTitle").textContent = st.percent >= 100 ? "正在校验安装包…" : `正在下载 v${st.version}`;
       $("bnrUpdBarWrap").style.display = "";
       $("bnrUpdBar").style.width = (st.percent || 0) + "%";
-      $("bnrUpdMsg").textContent = (st.percent || 0) + "% · 完成后点「重启安装」即可，期间不影响使用";
+      $("bnrUpdMsg").textContent = (st.percent || 0) + "% · 完成后会自动切换为「重启安装」按钮";
       $("bnrUpdRow").style.display = "none";
     } else if (st.phase === "ready") {
       $("bnrUpdTitle").textContent = `v${st.version} 已就绪`;
       $("bnrUpdBarWrap").style.display = "none";
       $("bnrUpdMsg").textContent = "重启安装约需 10 秒，中转会中断几秒；也可稍后退出时自动安装。";
       $("bnrUpdRow").style.display = "";
+    } else if (st.phase === "error") {
+      $("bnrUpdTitle").textContent = "更新失败";
+      $("bnrUpdBarWrap").style.display = "none";
+      $("bnrUpdMsg").textContent = st.msg || "未知错误";
+      $("bnrUpdRow").style.display = "";
+      $("bnrUpdGo").textContent = "重试更新";
+      $("bnrUpdGo").onclick = () => window.baiDesktop.checkUpdate();
+      return;
     }
+    $("bnrUpdGo").textContent = "重启安装";
+    $("bnrUpdGo").onclick = () => window.baiDesktop.installUpdate();
   };
   $("bnrUpdGo").onclick = () => window.baiDesktop.installUpdate();
   $("bnrUpdLater").onclick = () => $("bnrUpdate").classList.remove("show");
