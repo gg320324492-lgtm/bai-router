@@ -584,6 +584,18 @@ ipcMain.handle("diag-info", () => ({
 }));
 ipcMain.handle("open-log", (_e, p) => shell.openPath(p || path.join(DATA_DIR, "server-child.log")));
 ipcMain.handle("diag-retry", async () => { const ok = await restartServer(); return ok; });
+// 一键信任自带证书（解决自签名更新校验：每台新电脑点一次即可，写当前用户信任库，免管理员）
+ipcMain.handle("trust-cert", async () => {
+  const cer = app.isPackaged
+    ? path.join(process.resourcesPath, "bai-router.cer")
+    : path.join(APP_DIR, "..", "cert", "bai-router.cer");
+  if (!fs.existsSync(cer)) return { ok: false, msg: "随包证书文件缺失" };
+  const run = (args) => new Promise((r) => execFile("certutil", args, { windowsHide: true, timeout: 20000 }, (e) => r(!e)));
+  const a = await run(["-addstore", "-user", "Root", cer]);
+  const b = await run(["-addstore", "-user", "TrustedPublisher", cer]);
+  logMain(`trust-cert 导入：Root=${a ? "OK" : "FAIL"} TrustedPublisher=${b ? "OK" : "FAIL"}`);
+  return { ok: a && b };
+});
 
 app.on("before-quit", () => {
   quitting = true;

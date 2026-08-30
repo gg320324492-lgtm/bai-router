@@ -722,12 +722,24 @@ if (window.baiDesktop) {
       $("bnrUpdMsg").textContent = "重启安装约需 10 秒，中转会中断几秒；也可稍后退出时自动安装。";
       $("bnrUpdRow").style.display = "";
     } else if (st.phase === "error") {
-      $("bnrUpdTitle").textContent = "更新失败";
+      const certIssue = /not signed by the application owner|publisherNames/i.test(st.msg || "");
+      $("bnrUpdTitle").textContent = certIssue ? "更新被证书校验拦下" : "更新失败";
       $("bnrUpdBarWrap").style.display = "none";
-      $("bnrUpdMsg").textContent = st.msg || "未知错误";
+      $("bnrUpdMsg").textContent = certIssue
+        ? "这台电脑还没信任软件证书（每台电脑只需一次）。点「信任并重试」即可自动完成。"
+        : (st.msg || "未知错误");
       $("bnrUpdRow").style.display = "";
-      $("bnrUpdGo").textContent = "重试更新";
-      $("bnrUpdGo").onclick = () => window.baiDesktop.checkUpdate();
+      $("bnrUpdGo").textContent = certIssue ? "信任并重试" : "重试更新";
+      $("bnrUpdGo").onclick = async () => {
+        if (certIssue) {
+          $("bnrUpdGo").disabled = true;
+          $("bnrUpdMsg").textContent = "正在导入证书…";
+          const r = await window.baiDesktop.trustCert();
+          $("bnrUpdGo").disabled = false;
+          $("bnrUpdMsg").textContent = r.ok ? "证书已信任，重新检查更新…" : ("证书导入失败：" + (r.msg || "未知") + "，重试或手动运行 trust-cert.cmd");
+        }
+        window.baiDesktop.checkUpdate();
+      };
       return;
     }
     $("bnrUpdGo").textContent = "重启安装";

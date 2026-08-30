@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld("baiDesktop", {
   appVersion: () => ipcRenderer.invoke("app-version"),
   diagInfo: () => ipcRenderer.invoke("diag-info"),
   diagRetry: () => ipcRenderer.invoke("diag-retry"),
+  trustCert: () => ipcRenderer.invoke("trust-cert"),
   openLog: (p) => ipcRenderer.invoke("open-log", p),
   onAppEvent: (cb) => ipcRenderer.on("app-event", (_e, payload) => cb(payload)),
 });
