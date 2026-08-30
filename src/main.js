@@ -308,11 +308,36 @@ function showWindow(diagMode) {
     return;
   }
   win = new BrowserWindow({
-    width: 940, height: 780, minWidth: 720, minHeight: 560,
+    width: 1120, height: 800, minWidth: 720, minHeight: 560,
     title: "B.AI 路由台", backgroundColor: "#16171b", autoHideMenuBar: true,
     icon: iconPath,
     webPreferences: { preload: path.join(APP_DIR, "preload.js"), contextIsolation: true, nodeIntegration: false },
   });
+  // 恢复上次窗口尺寸/位置（越界保护：显示器变了就居中）
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "window-state.json"), "utf8"));
+    const { screen } = require("electron");
+    const inScreen = st && screen.getAllDisplays().some((d) =>
+      st.x !== undefined && d.workArea.x - 60 <= st.x && st.x <= d.workArea.x + d.workArea.width - 60 &&
+      d.workArea.y - 20 <= st.y && st.y <= d.workArea.y + d.workArea.height - 60);
+    if (st && inScreen) win.setBounds({ x: st.x, y: st.y, width: st.width, height: st.height });
+    if (st && st.maximized) win.maximize();
+  } catch { }
+  let wsTimer = null;
+  const saveWindowState = () => {
+    clearTimeout(wsTimer);
+    wsTimer = setTimeout(() => {
+      try {
+        if (!win || win.isDestroyed()) return;
+        const b = win.getBounds();
+        fs.writeFileSync(path.join(DATA_DIR, "window-state.json"), JSON.stringify({ ...b, maximized: win.isMaximized() }));
+      } catch { }
+    }, 400);
+  };
+  win.on("resize", saveWindowState);
+  win.on("move", saveWindowState);
+  win.on("maximize", saveWindowState);
+  win.on("unmaximize", saveWindowState);
   if (diagMode) win.loadFile(path.join(path.dirname(SERVER_JS), "diag.html")).catch(() => { });
   else win.loadURL(PANEL).catch(() => { });
   // 服务尚未就绪导致加载失败 → 自动重试（黑屏保险）
