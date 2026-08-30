@@ -89,7 +89,7 @@ if (process.env.NODE_USE_ENV_PROXY !== "1") {
     [fileURLToPath(import.meta.url)],
     {
       detached: true,
-      stdio: "ignore",
+      stdio: "ignore", windowsHide: true,
       cwd: HERE,
       env: {
         ...process.env,
@@ -562,7 +562,7 @@ const panel = http.createServer(async (req, res) => {
       // Electron 托管时子进程退出会被主进程自动重拉，这里同样安全。
       const cfg = loadCfg();
       const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
-        detached: true, stdio: "ignore", cwd: HERE,
+        detached: true, stdio: "ignore", windowsHide: true, cwd: HERE,
         env: { ...process.env, NODE_USE_ENV_PROXY: "1", HTTPS_PROXY: cfg.proxy, HTTP_PROXY: cfg.proxy, NO_PROXY: "127.0.0.1,localhost" },
       });
       child.unref();
@@ -578,7 +578,7 @@ const panel = http.createServer(async (req, res) => {
       const msgs = [];
       const exe = process.env.BAI_ROUTER_EXE || ""; // 由 Electron 主进程注入
       const here = HERE.replace(/\//g, "\\");
-      const execFileAsync = (cmd, args) => new Promise((res2, rej) => execFile(cmd, args, { timeout: 30000 }, (e, so) => e ? rej(e) : res2(String(so))));
+      const execFileAsync = (cmd, args) => new Promise((res2, rej) => execFile(cmd, args, { timeout: 30000, windowsHide: true }, (e, so) => e ? rej(e) : res2(String(so))));
 
       // ① 代理端口探测（候选常见 Clash/V2ray 混合端口，谁通用谁）
       if (b.probeProxy !== false) {

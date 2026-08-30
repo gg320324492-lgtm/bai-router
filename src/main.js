@@ -133,8 +133,8 @@ function spawnServer() {
   try { fd = fs.openSync(path.join(DATA_DIR, "server-child.log"), "a"); } catch { }
   const born = Date.now();
   try {
-    if (runtimeSystem && runtimeNodePath) child = spawn(runtimeNodePath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: ["ignore", fd, fd] });
-    else { env.ELECTRON_RUN_AS_NODE = "1"; child = spawn(process.execPath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: ["ignore", fd, fd] }); }
+    if (runtimeSystem && runtimeNodePath) child = spawn(runtimeNodePath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: ["ignore", fd, fd], windowsHide: true });
+    else { env.ELECTRON_RUN_AS_NODE = "1"; child = spawn(process.execPath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: ["ignore", fd, fd], windowsHide: true }); }
   } catch (e) {
     lastSpawnError = "spawn 抛异常: " + String((e && e.message) || e);
     logMain(lastSpawnError);
@@ -185,7 +185,7 @@ async function waitReady(timeoutMs) {
 async function ensureServer() {
   const st = await getStatus();
   if (st && st.service && st.service.up && st.service.pid && st.service.pid !== process.pid) {
-    try { await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(st.service.pid)], r)); } catch { }
+    try { await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(st.service.pid)], { windowsHide: true }, r)); } catch { }
     for (let i = 0; i < 20 && (await ping()); i++) await new Promise((r) => setTimeout(r, 300));
   }
   spawnServer();
@@ -218,7 +218,7 @@ async function restartServer() {
   quitting = false;
   const st = await getStatus();
   if (st && st.service && st.service.pid) {
-    try { await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(st.service.pid)], r)); } catch { }
+    try { await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(st.service.pid)], { windowsHide: true }, r)); } catch { }
   }
   for (let i = 0; i < 20 && (await ping()); i++) await new Promise((r) => setTimeout(r, 300));
   spawnServer();
