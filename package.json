@@ -1,0 +1,78 @@
+{
+  "name": "bai-router",
+  "productName": "B.AI Router",
+  "version": "1.0.1",
+  "private": true,
+  "description": "B.AI 模型路由台：Claude Code / Claude 桌面版 外接模型的一键切换与中转",
+  "author": "pc",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis",
+    "publish": "node publish.cjs"
+  },
+  "build": {
+    "appId": "local.bai.router",
+    "productName": "B.AI Router",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/main.js",
+      "src/preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "src/server",
+        "to": "server",
+        "filter": [
+          "server.mjs",
+          "ui.html",
+          "config.defaults.json"
+        ]
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "BARRouter-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false,
+      "shortcutName": "B.AI 路由台",
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "gg320324492-lgtm",
+        "repo": "bai-router"
+      }
+    ]
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.0"
+  },
+  "devDependencies": {
+    "electron": "44.0.0",
+    "electron-builder": "^26.0.0"
+  }
+}

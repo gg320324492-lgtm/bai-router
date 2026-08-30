@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B.AI 路由台</title>
+<style>
+  :root {
+    --bg: #16171b;
+    --panel: #1d1f25;
+    --panel2: #22242c;
+    --line: #2c2f39;
+    --amber: #e8a33d;
+    --amber-soft: rgba(232, 163, 61, .14);
+    --ok: #57b878;
+    --err: #e05d5d;
+    --blue: #6b9bd8;
+    --ink: #e8e6df;
+    --dim: #8b8e9a;
+    --mono: "Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+    --sans: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { background: var(--bg); }
+  body {
+    font-family: var(--sans);
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.6;
+    padding: 28px 16px 60px;
+    background:
+      radial-gradient(1100px 500px at 50% -220px, rgba(232,163,61,.07), transparent 60%),
+      var(--bg);
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+
+  /* ---------- 头部 ---------- */
+  header {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding-bottom: 18px; border-bottom: 1px solid var(--line); margin-bottom: 18px;
+  }
+  .logo-dot {
+    width: 11px; height: 11px; border-radius: 50%;
+    background: var(--amber); align-self: center;
+    box-shadow: 0 0 10px rgba(232,163,61,.8);
+  }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: 1px; }
+  h1 small { font-family: var(--mono); font-size: 11px; color: var(--dim); letter-spacing: 3px; margin-left: 10px; font-weight: 400; }
+  .svc {
+    margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--dim);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .svc b { color: var(--ok); font-weight: 600; }
+  .svc b.off { color: var(--err); }
+
+  /* ---------- 卡片 ---------- */
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    margin-bottom: 18px;
+    overflow: hidden;
+  }
+  .card > .head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 18px; border-bottom: 1px solid var(--line);
+    background: var(--panel2);
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 3px;
+    color: var(--amber); text-transform: uppercase;
+  }
+  .card > .head .title { font-size: 14px; font-weight: 600; }
+  .card > .head .aux { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .card .body { padding: 16px 18px; }
+
+  /* ---------- 信号灯 ---------- */
+  .lamps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  @media (max-width: 640px) { .lamps { grid-template-columns: repeat(2, 1fr); } }
+  .lamp {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .lamp .name { font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--dim); text-transform: uppercase; }
+  .lamp .val { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; }
+  .led { width: 9px; height: 9px; border-radius: 50%; background: #3a3d47; flex: none; }
+  .led.g { background: var(--ok); box-shadow: 0 0 8px rgba(87,184,120,.7); }
+  .led.r { background: var(--err); box-shadow: 0 0 8px rgba(224,93,93,.7); }
+  .led.a { background: var(--amber); box-shadow: 0 0 8px rgba(232,163,61,.7); }
+  .led.pulse { animation: pulse 2.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .45; } }
+  @media (prefers-reduced-motion: reduce) { .led.pulse { animation: none; } }
+  .lamp .sub { font-family: var(--mono); font-size: 10px; color: var(--dim); margin-top: 2px; min-height: 14px; }
+
+  /* ---------- 接线区 ---------- */
+  .patch { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px dashed var(--line); }
+  .patch:last-of-type { border-bottom: none; }
+  .patch .who { width: 118px; flex: none; }
+  .patch .who .n { font-weight: 600; }
+  .patch .who .d { font-family: var(--mono); font-size: 10px; color: var(--dim); }
+  .patch .wire { flex: 1; display: flex; align-items: center; min-width: 60px; }
+  .patch .wire svg { width: 100%; height: 12px; display: block; }
+  .badge {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 1px;
+    padding: 3px 9px; border-radius: 99px; border: 1px solid; white-space: nowrap;
+  }
+  .badge.bai { color: var(--amber); border-color: rgba(232,163,61,.45); background: var(--amber-soft); }
+  .badge.cc { color: var(--blue); border-color: rgba(107,155,216,.4); background: rgba(107,155,216,.1); }
+  .badge.unk { color: var(--dim); border-color: var(--line); background: transparent; }
+
+  .notice {
+    display: none; margin: 12px 0 2px; padding: 10px 14px; border-radius: 8px;
+    font-size: 13px; border: 1px solid rgba(232,163,61,.4); background: var(--amber-soft);
+  }
+  .notice.show { display: block; }
+  .notice.err { border-color: rgba(224,93,93,.45); background: rgba(224,93,93,.09); }
+
+  .actions { display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap; align-items: center; }
+  button { font-family: var(--sans); cursor: pointer; border-radius: 8px; border: 1px solid transparent; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  button[disabled] { opacity: .45; cursor: wait; }
+  .btn-main {
+    background: var(--amber); color: #241a08; font-weight: 700; font-size: 14px;
+    padding: 10px 22px; letter-spacing: 1px;
+  }
+  .btn-main:hover:not([disabled]) { filter: brightness(1.1); }
+  .btn-ghost {
+    background: transparent; color: var(--ink); border-color: var(--line);
+    padding: 10px 18px; font-size: 13px;
+  }
+  .btn-ghost:hover:not([disabled]) { border-color: var(--dim); }
+  .btn-sm { background: transparent; color: var(--dim); border-color: var(--line); padding: 6px 14px; font-size: 12px; }
+  .btn-sm:hover:not([disabled]) { color: var(--ink); border-color: var(--dim); }
+  .checks { display: flex; gap: 16px; font-size: 13px; color: var(--dim); user-select: none; }
+  .checks label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .checks input { accent-color: var(--amber); }
+
+  /* ---------- 路由表 ---------- */
+  table.route { width: 100%; border-collapse: collapse; }
+  table.route th {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--dim);
+    text-transform: uppercase; text-align: left; font-weight: 400;
+    padding: 2px 8px 10px; border-bottom: 1px solid var(--line);
+  }
+  table.route td { padding: 9px 8px; border-bottom: 1px dashed var(--line); vertical-align: middle; }
+  table.route tr:last-child td { border-bottom: none; }
+  td .tier { font-family: var(--mono); font-size: 12.5px; }
+  td .zh { font-size: 11px; color: var(--dim); }
+  td .arrow { color: var(--amber); font-family: var(--mono); }
+  select, input[type=text], input[type=password] {
+    background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 10px; font-size: 13px; font-family: var(--mono);
+  }
+  select { cursor: pointer; }
+  input[type=text].lbl, input[type=text].custom { width: 150px; }
+  @media (max-width: 700px) {
+    table.route, table.route tbody, table.route tr, table.route td { display: block; width: 100%; }
+    table.route thead { display: none; }
+    table.route td { border-bottom: none; padding: 4px 0; }
+    table.route tr { display: block; padding: 10px 0; border-bottom: 1px dashed var(--line); }
+  }
+  .keyrow { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+  .keyrow .k { font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--dim); text-transform: uppercase; }
+  .keyrow input { width: 280px; max-width: 100%; }
+  .saverow { display: flex; gap: 12px; margin-top: 16px; align-items: center; flex-wrap: wrap; }
+
+  /* ---------- 本机设置 ---------- */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; }
+  @media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
+  .fld { display: flex; flex-direction: column; gap: 4px; }
+  .fld > label { font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--dim); text-transform: uppercase; }
+  .fld input[type=text], .fld textarea { width: 100%; }
+  textarea {
+    background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px 10px; font-size: 12.5px; font-family: var(--mono);
+    resize: vertical; line-height: 1.7;
+  }
+
+  /* ---------- 测试结果 / 日志 ---------- */
+  .result {
+    display: none; margin-top: 14px; padding: 10px 14px; border-radius: 8px;
+    font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); background: var(--bg);
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .result.show { display: block; }
+  .result.good { border-color: rgba(87,184,120,.4); color: #a9dcb9; }
+  .result.bad { border-color: rgba(224,93,93,.45); color: #e8a7a7; }
+
+  footer {
+    display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 10.5px; color: var(--dim); margin-top: 8px;
+  }
+  footer .paths { flex: 1; min-width: 260px; }
+  #stopBtn { color: #b06a6a; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <span class="logo-dot"></span>
+    <h1>B.AI 路由台<small>MODEL ROUTER</small></h1>
+    <span class="svc" id="svc">服务 <b>●</b> :15722 / :15723</span>
+  </header>
+
+  <!-- 信号灯 -->
+  <div class="lamps" style="margin-bottom:18px">
+    <div class="lamp">
+      <div class="name">Clash 代理</div>
+      <div class="val"><span class="led" id="ledClash"></span><span id="txtClash">检测中…</span></div>
+      <div class="sub" id="subClash">:7890 → 外网</div>
+    </div>
+    <div class="lamp">
+      <div class="name">本地中转</div>
+      <div class="val"><span class="led" id="ledRelay"></span><span id="txtRelay">—</span></div>
+      <div class="sub">:15722 → api.b.ai</div>
+    </div>
+    <div class="lamp">
+      <div class="name">B.AI 上游</div>
+      <div class="val"><span class="led" id="ledUp"></span><span id="txtUp">未测试</span></div>
+      <div class="sub" id="subUp">点「测试连通」检查</div>
+    </div>
+    <div class="lamp">
+      <div class="name">CC Switch</div>
+      <div class="val"><span class="led" id="ledCc"></span><span id="txtCc">—</span></div>
+      <div class="sub">运行时会改写配置</div>
+    </div>
+  </div>
+
+  <!-- 接线 -->
+  <div class="card">
+    <div class="head">
+      <span class="eyebrow">01</span><span class="title">当前接线</span>
+      <span class="aux" id="patchTime"></span>
+    </div>
+    <div class="body">
+      <div class="patch">
+        <div class="who"><div class="n">终端 CLI</div><div class="d">settings.json</div></div>
+        <div class="wire"><svg preserveAspectRatio="none" viewBox="0 0 100 12"><path d="M0 6 H96" stroke="#3a3d47" stroke-width="1.5"/><path d="M93 2 L99 6 L93 10 Z" fill="#3a3d47"/></svg></div>
+        <span class="badge unk" id="cliBadge">…</span>
+      </div>
+      <div class="patch">
+        <div class="who"><div class="n">桌面版 Claude</div><div class="d">configLibrary</div></div>
+        <div class="wire"><svg preserveAspectRatio="none" viewBox="0 0 100 12"><path d="M0 6 H96" stroke="#3a3d47" stroke-width="1.5"/><path d="M93 2 L99 6 L93 10 Z" fill="#3a3d47"/></svg></div>
+        <span class="badge unk" id="deskBadge">…</span>
+      </div>
+
+      <div class="notice" id="notice"></div>
+
+      <div class="actions">
+        <button class="btn-main" id="btnBai">接通 B.AI</button>
+        <button class="btn-ghost" id="btnRestore">接回 CC Switch</button>
+        <div class="checks">
+          <label><input type="checkbox" id="ckCli" checked>终端 CLI</label>
+          <label><input type="checkbox" id="ckDesk" checked>桌面版</label>
+        </div>
+      </div>
+      <div class="result" id="applyResult"></div>
+    </div>
+  </div>
+
+  <!-- 路由表 -->
+  <div class="card">
+    <div class="head">
+      <span class="eyebrow">02</span><span class="title">路由表 · 模型映射</span>
+      <span class="aux">改完保存即生效，无需重启</span>
+    </div>
+    <div class="body">
+      <table class="route">
+        <thead>
+          <tr><th style="width:32%">Claude 档位</th><th style="width:34%">→ B.AI 模型</th><th>界面显示名</th></tr>
+        </thead>
+        <tbody id="routeBody"></tbody>
+      </table>
+
+      <div class="keyrow">
+        <span class="k">API Key</span>
+        <input type="password" id="apiKey" autocomplete="off">
+        <button class="btn-sm" id="keyToggle" type="button">显示</button>
+      </div>
+
+      <div class="saverow">
+        <button class="btn-main" id="btnSave" style="padding:8px 20px">保存映射</button>
+        <button class="btn-ghost" id="btnTest" style="padding:8px 16px">测试连通</button>
+        <label class="checks" style="font-size:12px"><input type="checkbox" id="ckAllTiers">测全部四档</label>
+      </div>
+      <div class="result" id="testResult"></div>
+    </div>
+  </div>
+
+  <!-- 本机设置 -->
+  <div class="card">
+    <div class="head">
+      <span class="eyebrow">03</span><span class="title">本机设置</span>
+      <span class="aux">换电脑 / 换代理时改这里</span>
+    </div>
+    <div class="body">
+      <div class="grid2">
+        <div class="fld"><label for="fUpstream">上游地址（Anthropic 兼容）</label><input type="text" id="fUpstream" placeholder="https://api.b.ai"></div>
+        <div class="fld"><label for="fProxy">本地代理（出海通道）</label><input type="text" id="fProxy" placeholder="http://127.0.0.1:7890"></div>
+        <div class="fld"><label for="fRelayPort">中转端口</label><input type="text" id="fRelayPort" placeholder="15722"></div>
+        <div class="fld"><label for="fPanelPort">面板端口</label><input type="text" id="fPanelPort" placeholder="15723"></div>
+      </div>
+      <div class="fld" style="margin-top:12px">
+        <label>可选模型列表（下拉框内容，一行一个）</label>
+        <textarea id="fModels" rows="5" spellcheck="false"></textarea>
+      </div>
+      <div class="saverow">
+        <button class="btn-main" id="btnSaveSys" style="padding:8px 20px">保存设置</button>
+        <button class="btn-ghost" id="btnDeploy" style="padding:8px 16px">部署到本机…</button>
+      </div>
+      <div class="result" id="sysResult"></div>
+    </div>
+  </div>
+
+  <footer>
+    <span class="paths" id="footPaths"></span>
+    <span id="verTxt" style="font-family:var(--mono)"></span>
+    <button class="btn-sm" id="updBtn" type="button" style="display:none">检查更新</button>
+    <button class="btn-sm" id="stopBtn" type="button">停止服务</button>
+  </footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const TIERS = [
+  { key: "claude-fable-5",   zh: "Fable · 最强" },
+  { key: "claude-sonnet-5",  zh: "Sonnet · 均衡" },
+  { key: "claude-opus-5",    zh: "Opus · 重型" },
+  { key: "claude-haiku-4-5", zh: "Haiku · 快速" },
+];
+const MODE_TXT = { bai: "B.AI", ccswitch: "CC SWITCH", other: "其他", unknown: "未知" };
+const BRANDS = { qwen: "Qwen", glm: "GLM", deepseek: "DeepSeek", hy: "HY", mimo: "MiMo", kimi: "Kimi", minimax: "MiniMax" };
+function prettyName(id) {
+  return String(id).split("-").map((seg) => {
+    const low = seg.toLowerCase();
+    if (BRANDS[low]) return BRANDS[low];
+    if (/^[0-9]/.test(seg)) return seg;              // 版本号段原样
+    const ver = low.match(/^([a-z]+)([0-9].*)$/);    // vision2 / v4 之类拆分 capitalize 前缀
+    if (ver && BRANDS[ver[1]]) return BRANDS[ver[1]] + ver[2];
+    return seg.charAt(0).toUpperCase() + seg.slice(1);
+  }).join("-");
+}
+let cfg = null, busy = false;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+function setLed(el, state, pulse) {
+  el.className = "led " + state + (pulse ? " pulse" : "");
+}
+
+function renderStatus(s) {
+  // 服务
+  $("svc").innerHTML = `服务 <b class="${s.service.up ? "" : "off"}">●</b> :${s.relay.port} / :${s.panel.port}`;
+  setLed($("ledRelay"), s.relay.up ? "g pulse" : "r");
+  $("txtRelay").textContent = s.relay.up ? "运行中" : "已停止";
+  // Clash
+  setLed($("ledClash"), s.clash.alive ? "g" : "r");
+  $("txtClash").textContent = s.clash.alive ? "正常" : "不可用";
+  $("subClash").textContent = s.clash.alive ? `:7890 · ${s.clash.ms}ms` : "Clash 没开或节点挂了";
+  // 上游（常显当前使用中的模型名；测试结果补充状态）
+  if (s.recent) {
+    const fresh = s.recent.observedAt && (Date.now() - new Date(s.recent.observedAt).getTime() < 30 * 60000);
+    if (s.upstream.tested === true) {
+      setLed($("ledUp"), "g");
+      $("txtUp").textContent = `${s.upstream.model} ${s.upstream.ms}ms`;
+    } else if (s.upstream.tested === false) {
+      setLed($("ledUp"), "r");
+      $("txtUp").textContent = "测试失败";
+    } else {
+      setLed($("ledUp"), fresh ? "g" : "a");
+      $("txtUp").textContent = fresh ? "正常" : "待测试";
+    }
+    $("subUp").textContent = fresh ? `使用中: ${s.recent.label} 1M` : (s.upstream.error || "尚未观察到 Claude Code 调用");
+  } else {
+    setLed($("ledUp"), s.upstream.tested === true ? "g" : s.upstream.tested === false ? "r" : "a");
+    $("txtUp").textContent = s.upstream.tested === true ? `正常 ${s.upstream.ms}ms` : s.upstream.tested === false ? "失败" : "未测试";
+    $("subUp").textContent = s.upstream.tested === true ? (s.upstream.model || "") : (s.upstream.error || "点「测试连通」检查");
+  }
+  // CC Switch
+  setLed($("ledCc"), s.ccswitch.running ? "a" : "g");
+  $("txtCc").textContent = s.ccswitch.running ? "运行中" : "未运行";
+
+  // 接线徽章
+  const setBadge = (el, m) => {
+    const cls = m.mode === "bai" ? "bai" : m.mode === "ccswitch" ? "cc" : "unk";
+    el.className = "badge " + cls;
+    el.textContent = MODE_TXT[m.mode] || m.mode;
+    el.title = m.baseUrl || "";
+  };
+  setBadge($("cliBadge"), s.cli);
+  setBadge($("deskBadge"), s.desktop);
+  $("patchTime").textContent = "检查于 " + new Date(s.now).toLocaleTimeString("zh-CN", { hour12: false });
+
+  // 提示条
+  const n = $("notice");
+  n.classList.remove("show", "err");
+  if (s.ccswitch.running) {
+    n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 B.AI 突然失效，回到这里点「接通 B.AI」一键恢复即可。";
+    n.classList.add("show");
+  }
+  if (s.cli.mode === "ccswitch" && s.desktop.mode === "ccswitch") {
+    n.textContent = "检测到配置在 CC Switch 手里。点「接通 B.AI」切换；想用 CC Switch 就保持现状。";
+    n.classList.add("show");
+  }
+}
+
+function renderRoute() {
+  const tb = $("routeBody");
+  tb.innerHTML = "";  TIERS.forEach((t) => {
+    const m = cfg.mapping[t.key] || { target: "", label: t.zh };
+    const opts = [...cfg.availableModels, "__custom__"];
+    const isCustom = !cfg.availableModels.includes(m.target);
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><div class="tier">${t.key}</div><div class="zh">${t.zh}</div></td>
+      <td><span class="arrow">─►&nbsp;</span></td>
+      <td></td>`;
+    // select 插到第二格
+    const sel = document.createElement("select");
+    sel.dataset.tier = t.key;
+    sel.dataset.role = "target";
+    sel.className = "selTarget";
+    opts.forEach((o) => {
+      const op = document.createElement("option");
+      if (o === "__custom__") { op.value = "__custom__"; op.textContent = "自定义…"; }
+      else { op.value = o; op.textContent = o; }
+      sel.appendChild(op);
+    });
+    sel.value = isCustom ? "__custom__" : m.target;
+    // label 输入
+    const lbl = document.createElement("input");
+    lbl.type = "text"; lbl.className = "lbl"; lbl.dataset.tier = t.key; lbl.dataset.role = "label";
+    lbl.value = m.label; lbl.placeholder = "显示名";
+    // 自定义输入
+    const cus = document.createElement("input");
+    cus.type = "text"; cus.className = "custom"; cus.dataset.tier = t.key; cus.dataset.role = "custom";
+    cus.value = isCustom ? m.target : ""; cus.placeholder = "输入模型名"; cus.style.display = isCustom ? "" : "none";
+    cus.style.marginTop = "4px";
+    sel.addEventListener("change", () => {
+      tr.querySelector('[data-role="custom"]').style.display = sel.value === "__custom__" ? "" : "none";
+      // 选定目标模型后，自动把「界面显示名」填成对应的漂亮名字
+      const target = sel.value === "__custom__" ? (cus.value || "") : sel.value;
+      if (target) lbl.value = prettyName(target);
+    });
+    cus.addEventListener("input", () => {
+      if (sel.value === "__custom__" && cus.value) lbl.value = prettyName(cus.value);
+    });
+    tr.children[1].appendChild(sel);
+    tr.children[1].appendChild(cus);
+    tr.children[2].appendChild(lbl);
+    tb.appendChild(tr);
+  });
+  $("apiKey").value = cfg.apiKey || "";
+}
+
+async function refreshConfig() {
+  cfg = await api("/api/config");
+  renderRoute();
+  renderSys();
+}
+
+async function poll() {
+  if (busy) return;
+  try {
+    const s = await api("/api/status");
+    renderStatus(s);
+  } catch {
+    $("svc").innerHTML = `服务 <b class="off">○</b> 已停止`;
+    setLed($("ledRelay"), "r");
+    $("txtRelay").textContent = "已停止";
+  }
+}
+
+function showResult(el, text, good) {
+  el.textContent = text;
+  el.className = "result show " + (good ? "good" : "bad");
+}
+
+async function withBusy(btn, fn) {
+  busy = true;
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "处理中…";
+  try { await fn(); } catch (e) { showResult($("applyResult"), "出错了：" + e.message, false); }
+  finally {
+    btn.disabled = false;
+    btn.textContent = old;
+    busy = false;
+    poll();
+  }
+}
+
+$("btnBai").addEventListener("click", () => withBusy($("btnBai"), async () => {
+  const r = await api("/api/apply", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cli: $("ckCli").checked, desktop: $("ckDesk").checked }),
+  });
+  showResult($("applyResult"),
+    "✔ 已接通 B.AI（切换前配置已自动快照，可一键恢复）\n" + r.warnings.map((w) => "· " + w).join("\n"), true);
+}));
+
+$("btnRestore").addEventListener("click", () => withBusy($("btnRestore"), async () => {
+  const r = await api("/api/restore", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cli: $("ckCli").checked, desktop: $("ckDesk").checked }),
+  });
+  showResult($("applyResult"),
+    "✔ 已接回 CC Switch\n" + r.messages.map((m) => "· " + m).concat(r.hints.map((h) => "· " + h)).join("\n"), true);
+}));
+
+$("btnSave").addEventListener("click", () => withBusy($("btnSave"), async () => {
+  const mapping = {};
+  for (const t of TIERS) {
+    const sel = document.querySelector(`select[data-tier="${t.key}"]`);
+    const cus = document.querySelector(`input[data-role="custom"][data-tier="${t.key}"]`);
+    const lbl = document.querySelector(`input[data-role="label"][data-tier="${t.key}"]`);
+    const target = sel.value === "__custom__" ? cus.value : sel.value;
+    mapping[t.key] = { target: (target || "").trim().toLowerCase(), label: lbl.value };
+  }
+  const r = await api("/api/config", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mapping, apiKey: $("apiKey").value }),
+  });
+  showResult($("testResult"),
+    "✔ 映射已保存并生效\n" + r.hints.map((h) => "· " + h).join("\n"), true);
+  await refreshConfig();
+}));
+
+$("btnTest").addEventListener("click", () => withBusy($("btnTest"), async () => {
+  const all = $("ckAllTiers").checked;
+  const r = await api("/api/test", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(all ? { all: true } : {}),
+  });
+  const lines = (r.tiers || []).map((t) => {
+    const name = t.label + " 1M"; // 与 Claude Code 显示对齐（它会给 1M 档加此后缀）
+    return t.ok
+      ? `✔ ${all ? "" : "当前使用："}${name} · ${t.ms}ms`
+      : `✘ ${name} · 失败：${t.error}`;
+  });
+  showResult($("testResult"),
+    lines.join("\n") + (all ? "" : "\n（测试的就是你 Claude Code 里显示的那个模型，名字完全一致）"),
+    !!r.ok);
+}));
+
+$("keyToggle").addEventListener("click", () => {
+  const k = $("apiKey");
+  const show = k.type === "password";
+  k.type = show ? "text" : "password";
+  $("keyToggle").textContent = show ? "隐藏" : "显示";
+});
+
+/* ---------- 03 本机设置 ---------- */
+function renderSys() {
+  $("fUpstream").value = cfg.upstream || "";
+  $("fProxy").value = cfg.proxy || "";
+  $("fRelayPort").value = cfg.relayPort || "";
+  $("fPanelPort").value = cfg.panelPort || "";
+  $("fModels").value = (cfg.availableModels || []).join("\n");
+}
+
+$("btnSaveSys").addEventListener("click", () => withBusy($("btnSaveSys"), async () => {
+  const body = {
+    upstream: $("fUpstream").value,
+    proxy: $("fProxy").value,
+    relayPort: $("fRelayPort").value,
+    panelPort: $("fPanelPort").value,
+    availableModels: $("fModels").value.split(/[\n,]/).map((x) => x.trim()).filter(Boolean),
+  };
+  const r = await api("/api/config", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  const lines = ["✔ 设置已保存", ...(r.messages || []), ...(r.hints || [])];
+  if (r.needRestart) {
+    showResult($("sysResult"), lines.join("\n") + "\n\n点「保存并重启」让代理/端口改动生效", true);
+    $("sysResult").append(" ");
+    const rb = document.createElement("button");
+    rb.className = "btn-main"; rb.type = "button"; rb.textContent = "保存并重启服务";
+    rb.style.cssText = "margin-top:8px;padding:6px 16px";
+    rb.onclick = () => withBusy(rb, async () => {
+      if (window.baiDesktop) { await window.baiDesktop.restartServer(); showResult($("sysResult"), "✔ 服务已重启（面板将自动刷新）", true); poll(); }
+      else { await api("/api/service/restart", { method: "POST" }); showResult($("sysResult"), "✔ 服务正在重启，5 秒后自动回到面板", true); setTimeout(() => location.reload(), 5000); }
+    });
+    $("sysResult").appendChild(rb);
+  } else {
+    showResult($("sysResult"), lines.join("\n"), true);
+  }
+  await refreshConfig();
+}));
+
+$("btnDeploy").addEventListener("click", () => withBusy($("btnDeploy"), async () => {
+  if (window.baiDesktop) { await window.baiDesktop.deployLocal(); return; }
+  const r = await api("/api/deploy-local", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ shortcuts: true, autostart: true, probeProxy: true }),
+  });
+  showResult($("sysResult"), "✔ 部署完成\n" + (r.messages || [r.error || ""]).join("\n"), !!r.ok);
+}));
+
+/* 桌面壳 / 浏览器 的页脚差异 */
+if (window.baiDesktop) {
+  $("stopBtn").textContent = "退出软件";
+  $("footPaths").textContent = "数据保存在 %APPDATA%\\bai-router · 切换前自动快照到 backups/";
+  $("updBtn").style.display = "";
+  api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
+}
+$("updBtn").addEventListener("click", () => { if (window.baiDesktop) window.baiDesktop.checkUpdate(); });
+$("stopBtn").addEventListener("click", () => {
+  if (window.baiDesktop) {
+    if (confirm("退出软件？退出后中转停止，B.AI 模式下的桌面版 Claude 会断线。")) window.baiDesktop.quit();
+    return;
+  }
+  if (!confirm("停止服务后中转 15722 也会停止，桌面版/CLI 若在 B.AI 模式会立即断线。确定停止？")) return;
+  api("/api/service/stop", { method: "POST" }).finally(() => {
+    document.body.innerHTML = '<div style="font-family:sans-serif;color:#8b8e9a;padding:40px;text-align:center">服务已停止。重新双击「B.AI 路由台」图标即可恢复。</div>';
+  });
+});
+
+poll();
+refreshConfig().catch((e) => showResult($("applyResult"), "配置加载失败：" + e.message, false));
+setInterval(poll, 5000);
+</script>
+</body>
+</html>

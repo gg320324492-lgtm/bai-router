@@ -1,0 +1,19 @@
+{
+  "apiKey": "",
+  "upstream": "https://api.b.ai",
+  "proxy": "http://127.0.0.1:7890",
+  "relayPort": 15722,
+  "panelPort": 15723,
+  "defaultModel": "qwen3.8-flash",
+  "availableModels": [
+    "qwen3.8-flash",
+    "glm-5.3-flash",
+    "deepseek-v4-flash"
+  ],
+  "mapping": {
+    "claude-fable-5": { "target": "qwen3.8-flash", "label": "Qwen3.8-Flash" },
+    "claude-sonnet-5": { "target": "glm-5.3-flash", "label": "GLM-5.3-Flash" },
+    "claude-opus-5": { "target": "deepseek-v4-flash", "label": "DeepSeek-V4-Flash" },
+    "claude-haiku-4-5": { "target": "qwen3.8-flash", "label": "Qwen3.8-Flash" }
+  }
+}
