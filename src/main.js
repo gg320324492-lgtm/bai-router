@@ -3,6 +3,12 @@ const { spawn, execFile } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 
+// ---------- 兼容性：老机器/核显/远程桌面下 Electron 窗口黑屏的根治开关 ----------
+// 路由台界面极轻，软件渲染没有任何可感知性能损失
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch("disable-gpu");
+app.commandLine.appendSwitch("disable-gpu-compositing");
+
 // ---------- 路径布局 ----------
 // 打包后：主程序 resources/app；后端在 resources/server（extraResources，升级会被替换）
 //       用户数据（config.json/backups/server.log）在 %APPDATA%\bai-router —— 升级不会覆盖
@@ -61,6 +67,7 @@ if (!app.requestSingleInstanceLock()) {
 async function main() {
   await app.whenReady();
   app.setAppUserModelId("local.bai.router");
+  await detectRuntime();
   await ensureServer();
   createTray();
   setupUpdater();
@@ -91,9 +98,24 @@ function findSystemNode() {
   return null;
 }
 
+// 运行时选择：系统 Node 需 ≥18（AbortSignal 等 API），否则用 Electron 内置 Node
+let runtimeSystem = false;
+let runtimeNodePath = null;
+const recentExits = [];
+async function detectRuntime() {
+  const node = findSystemNode();
+  if (node) {
+    try {
+      const out = await new Promise((res, rej) => execFile(node, ["-v"], { timeout: 8000 }, (e, so) => (e ? rej(e) : res(so))));
+      const major = parseInt(String(out).trim().replace(/^v/, ""), 10);
+      if (major >= 18) { runtimeSystem = true; runtimeNodePath = node; return; }
+    } catch { }
+  }
+  runtimeSystem = false;
+}
+
 function spawnServer() {
   const cfg = readCfgSafe();
-  const node = findSystemNode();
   const env = {
     ...process.env,
     NODE_USE_ENV_PROXY: "1",
@@ -104,11 +126,19 @@ function spawnServer() {
     BAI_DATA_DIR: DATA_DIR,
     APP_VERSION: app.getVersion(),
   };
-  if (node) child = spawn(node, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: "ignore" });
+  const born = Date.now();
+  if (runtimeSystem && runtimeNodePath) child = spawn(runtimeNodePath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: "ignore" });
   else { env.ELECTRON_RUN_AS_NODE = "1"; child = spawn(process.execPath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: "ignore" }); }
   child.on("exit", () => {
     child = null;
     if (quitting) return;
+    // 崩溃循环保护：秒退说明该运行时不行 → 切到内置 Node 再试
+    recentExits.push(Date.now() - born);
+    if (recentExits.length > 6) recentExits.shift();
+    if (Date.now() - born < 3000 && recentExits.filter((x) => x < 3000).length >= 3 && runtimeSystem) {
+      runtimeSystem = false;
+      notifyWindow("app-event", { kind: "check", text: "检测到系统 Node 不兼容，已切换为内置运行时", sticky: true });
+    }
     setTimeout(() => { if (!quitting && !child) respawnWithNotice(); }, 500);
   });
 }
@@ -177,7 +207,12 @@ function showWindow() {
     icon: iconPath,
     webPreferences: { preload: path.join(APP_DIR, "preload.js"), contextIsolation: true, nodeIntegration: false },
   });
-  win.loadURL(PANEL);
+  win.loadURL(PANEL).catch(() => { });
+  // 服务尚未就绪导致加载失败 → 自动重试（黑屏保险）
+  win.webContents.on("did-fail-load", (_e, code, _d, _u, isMain) => {
+    if (!isMain || !win || win.isDestroyed()) return;
+    setTimeout(() => { if (win && !win.isDestroyed()) win.loadURL(PANEL).catch(() => { }); }, 1500);
+  });
   win.webContents.on("did-finish-load", () => {
     // 补发缓存的事件（含当前更新状态），重开窗口横幅不丢
     if (updateState && (updateState.phase === "downloading" || updateState.phase === "ready")) {
