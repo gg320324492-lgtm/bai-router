@@ -68,11 +68,13 @@ async function main() {
   await app.whenReady();
   app.setAppUserModelId("local.bai.router");
   await detectRuntime();
-  await ensureServer();
+  const ok = await ensureServer();
+  serverHealthy = ok;
   createTray();
   setupUpdater();
   maybeFirstRunDeploy();
-  if (!startMin) showWindow();
+  startHealthWatcher();
+  if (!startMin) showWindow(!ok);
 }
 
 // ---------- 服务生命周期 ----------
@@ -126,11 +128,27 @@ function spawnServer() {
     BAI_DATA_DIR: DATA_DIR,
     APP_VERSION: app.getVersion(),
   };
+  // 子进程 stdout/stderr 落盘（server-child.log）——崩溃原因不再丢失
+  let fd = null;
+  try { fd = fs.openSync(path.join(DATA_DIR, "server-child.log"), "a"); } catch { }
   const born = Date.now();
-  if (runtimeSystem && runtimeNodePath) child = spawn(runtimeNodePath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: "ignore" });
-  else { env.ELECTRON_RUN_AS_NODE = "1"; child = spawn(process.execPath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: "ignore" }); }
-  child.on("exit", () => {
+  try {
+    if (runtimeSystem && runtimeNodePath) child = spawn(runtimeNodePath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: ["ignore", fd, fd] });
+    else { env.ELECTRON_RUN_AS_NODE = "1"; child = spawn(process.execPath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: ["ignore", fd, fd] }); }
+  } catch (e) {
+    lastSpawnError = "spawn 抛异常: " + String((e && e.message) || e);
+    logMain(lastSpawnError);
+    if (fd != null) try { fs.closeSync(fd); } catch { }
+    return;
+  }
+  if (fd != null) try { fs.closeSync(fd); } catch { }
+  child.on("error", (e) => {
+    lastSpawnError = "子进程错误: " + String((e && e.message) || e);
+    logMain(lastSpawnError);
+  });
+  child.on("exit", (code, sig) => {
     child = null;
+    logMain(`服务子进程退出 code=${code} sig=${sig} 存活${Math.round((Date.now() - born) / 1000)}s 运行时=${runtimeSystem ? "system-node" : "electron-node"}`);
     if (quitting) return;
     // 崩溃循环保护：秒退说明该运行时不行 → 切到内置 Node 再试
     recentExits.push(Date.now() - born);
@@ -141,6 +159,11 @@ function spawnServer() {
     }
     setTimeout(() => { if (!quitting && !child) respawnWithNotice(); }, 500);
   });
+}
+
+let lastSpawnError = null;
+function logMain(msg) {
+  try { fs.appendFileSync(path.join(DATA_DIR, "app.log"), `[${new Date().toISOString()}] ${msg}\n`); } catch { }
 }
 
 async function respawnWithNotice() {
@@ -167,8 +190,22 @@ async function ensureServer() {
   }
   spawnServer();
   const ok = await waitReady(25000);
-  if (!ok && tray) tray.displayBalloon({ title: "B.AI 路由台", content: "服务启动失败，请查看日志 " + path.join(DATA_DIR, "server.log"), iconType: "error" });
+  if (!ok) logMain("服务 25 秒内未就绪，进入诊断模式");
   return ok;
+}
+
+// 服务未起来时不再黑屏：加载内置诊断页，实时监测，起来了自动切回面板
+let serverHealthy = true;
+function startHealthWatcher() {
+  setInterval(async () => {
+    const up = await ping();
+    if (up && !serverHealthy) {
+      serverHealthy = true;
+      if (win && !win.isDestroyed()) win.loadURL(PANEL).catch(() => { });
+    } else if (!up && serverHealthy && child === null && !quitting) {
+      serverHealthy = false;
+    }
+  }, 3000);
 }
 
 function readCfgSafe() {
@@ -195,8 +232,9 @@ function killTree(pid) {
 }
 
 // ---------- 窗口 ----------
-function showWindow() {
+function showWindow(diagMode) {
   if (win && !win.isDestroyed()) {
+    if (diagMode) win.loadFile(path.join(path.dirname(SERVER_JS), "diag.html")).catch(() => { });
     if (!win.isVisible()) win.show();
     win.focus();
     return;
@@ -207,7 +245,8 @@ function showWindow() {
     icon: iconPath,
     webPreferences: { preload: path.join(APP_DIR, "preload.js"), contextIsolation: true, nodeIntegration: false },
   });
-  win.loadURL(PANEL).catch(() => { });
+  if (diagMode) win.loadFile(path.join(path.dirname(SERVER_JS), "diag.html")).catch(() => { });
+  else win.loadURL(PANEL).catch(() => { });
   // 服务尚未就绪导致加载失败 → 自动重试（黑屏保险）
   win.webContents.on("did-fail-load", (_e, code, _d, _u, isMain) => {
     if (!isMain || !win || win.isDestroyed()) return;
@@ -412,6 +451,20 @@ ipcMain.handle("check-update", async () => { manualCheckUpdate(); return true; }
 ipcMain.handle("install-update", async () => { installReadyUpdate(); return true; });
 ipcMain.handle("app-version", () => ({ version: app.getVersion(), packaged: app.isPackaged }));
 ipcMain.on("app-quit", () => { quitting = true; app.quit(); });
+
+// 诊断页支持
+ipcMain.handle("diag-info", () => ({
+  version: app.getVersion(),
+  runtime: runtimeSystem ? `system-node (${runtimeNodePath})` : "electron 内置 node",
+  lastSpawnError,
+  dataDir: DATA_DIR,
+  childLog: path.join(DATA_DIR, "server-child.log"),
+  appLog: path.join(DATA_DIR, "app.log"),
+  panel: PANEL,
+  win: require("os").release(),
+}));
+ipcMain.handle("open-log", (_e, p) => shell.openPath(p || path.join(DATA_DIR, "server-child.log")));
+ipcMain.handle("diag-retry", async () => { const ok = await restartServer(); return ok; });
 
 app.on("before-quit", () => {
   quitting = true;
