@@ -682,6 +682,7 @@ if (window.baiDesktop) {
 
   window.baiDesktop.onAppEvent((ev) => {
     if (ev.kind === "update") paintUpdate(ev.state);
+    else if (ev.kind === "check") showInfo("检查更新 / 部署", ev.text, ev.sticky ? 0 : 6000);
     else if (ev.kind === "deployed") showInfo("已自动部署", ev.text, 8000);
     else if (ev.kind === "recovered") showInfo("服务恢复", ev.text);
   });

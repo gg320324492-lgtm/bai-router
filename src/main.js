@@ -179,9 +179,12 @@ function showWindow() {
   });
   win.loadURL(PANEL);
   win.webContents.on("did-finish-load", () => {
-    // 补发当前更新状态，重开窗口横幅不丢
+    // 补发缓存的事件（含当前更新状态），重开窗口横幅不丢
     if (updateState && (updateState.phase === "downloading" || updateState.phase === "ready")) {
       notifyWindow("app-event", { kind: "update", state: updateState });
+    }
+    for (const ev of pendingEvents.splice(0)) {
+      try { win.webContents.send("app-event", ev); } catch { }
     }
   });
   win.on("close", (e) => { if (!quitting) { e.preventDefault(); win.hide(); } });
@@ -208,15 +211,11 @@ function createTray() {
 }
 
 async function deployLocal() {
-  const { response } = await dialog.showMessageBox(win && win.isVisible() ? win : undefined, {
-    type: "question", title: "部署到本机",
-    message: "将创建桌面/开始菜单快捷方式，并注册开机自启（登录后台运行）。",
-    detail: "· 快捷方式 → 本软件\n· 开机自启：当前用户启动文件夹（不写注册表）\n· 自动探测本机代理端口\n重复执行无害。",
-    buttons: ["部署（含开机自启）", "只创建快捷方式", "取消"],
-    defaultId: 0, cancelId: 2,
-  });
-  if (response === 2) return;
-  await runDeploy(response === 0);
+  // 静默部署（含开机自启），结果走面板横幅——不再弹系统对话框
+  showWindow();
+  notifyWindow("app-event", { kind: "check", text: "正在部署到本机…" });
+  const j = await runDeploy(true);
+  notifyWindow("app-event", { kind: "check", text: "部署完成：" + (j.messages || ["完成"]).join("；"), sticky: true });
 }
 
 async function runDeploy(autostart) {
@@ -264,9 +263,14 @@ async function runDeploy(autostart) {
   return { ok: true, messages: msgs };
 }
 
-// 面板内通知通道（替代系统弹窗/气泡）
+// 面板内通知通道（替代系统弹窗/气泡）；窗口未就绪时先缓存，加载完补发
+const pendingEvents = [];
 function notifyWindow(channel, payload) {
-  try { if (win && !win.isDestroyed()) win.webContents.send(channel, payload); } catch { }
+  try {
+    if (win && !win.isDestroyed() && !win.webContents.isLoading()) { win.webContents.send(channel, payload); return; }
+  } catch { }
+  pendingEvents.push(payload);
+  if (pendingEvents.length > 20) pendingEvents.shift();
 }
 
 function maybeFirstRunDeploy() {
@@ -320,14 +324,9 @@ function setupUpdater() {
 
 function installReadyUpdate() {
   if (!autoUpdater || !updateState || updateState.phase !== "ready") return;
-  const { dialog: d } = require("electron");
-  d.showMessageBox({
-    type: "question", title: "安装更新",
-    message: `立即重启安装 v${updateState.version} 吗？`,
-    detail: "中转会中断约 5 秒。", buttons: ["重启安装", "稍后"], defaultId: 0, cancelId: 1,
-  }).then(({ response }) => {
-    if (response === 0) { quitting = true; setImmediate(() => autoUpdater.quitAndInstall(false, true)); }
-  });
+  // 面板横幅/托盘菜单点「安装更新」即直接执行，不再二次确认
+  quitting = true;
+  setImmediate(() => autoUpdater.quitAndInstall(false, true));
 }
 
 function syncTray() {
@@ -352,24 +351,22 @@ function syncTray() {
 }
 
 async function manualCheckUpdate() {
+  showWindow();
   if (!autoUpdater) {
-    dialog.showMessageBox({ type: "info", title: "检查更新", message: "当前为绿色/开发模式，自动更新仅在安装版可用。" });
+    notifyWindow("app-event", { kind: "check", text: "绿色/开发模式不支持自动更新，仅安装版可用", sticky: true });
     return;
   }
-  // 已有就绪/进行中的更新 → 不再重复检查，直接给反馈
-  if (updateState && updateState.phase === "ready") { installReadyUpdate(); return; }
-  if (updateState && updateState.phase === "downloading") {
-    dialog.showMessageBox({ type: "info", title: "检查更新", message: `v${updateState.version} 正在下载（${updateState.percent || 0}%），完成后托盘菜单会出现「安装更新」。` });
-    return;
-  }
+  if (updateState && updateState.phase === "ready") { notifyWindow("app-event", { kind: "update", state: updateState }); return; }
+  if (updateState && updateState.phase === "downloading") { notifyWindow("app-event", { kind: "update", state: updateState }); return; }
   try {
+    notifyWindow("app-event", { kind: "check", text: "正在检查更新…" });
     const r = await autoUpdater.checkForUpdates();
     if (r && r.isUpdateAvailable === false) {
-      dialog.showMessageBox({ type: "info", title: "检查更新", message: "已是最新版本 v" + app.getVersion() });
+      notifyWindow("app-event", { kind: "check", text: "已是最新版本 v" + app.getVersion() });
     }
-    // 有更新时 update-available 事件会静默处理（面板横幅），无需弹窗
+    // 有更新：update-available 事件自动切到下载横幅，无需弹窗
   } catch (e) {
-    dialog.showMessageBox({ type: "error", title: "检查更新失败", message: String((e && e.message) || e), detail: "常见原因：网络/代理未就绪，或 GitHub 不可达。开 Clash 后重试。" });
+    notifyWindow("app-event", { kind: "check", text: "检查更新失败：" + String((e && e.message) || e).slice(0, 100) + "（多为网络/代理未就绪，开 Clash 后重试）", sticky: true });
   }
 }
 
