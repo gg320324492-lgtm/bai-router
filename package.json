@@ -1,7 +1,7 @@
 {
   "name": "bai-router",
   "productName": "B.AI Router",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": true,
   "description": "B.AI 模型路由台：Claude Code / Claude 桌面版 外接模型的一键切换与中转",
   "author": "pc",
@@ -48,7 +48,12 @@
         }
       ],
       "icon": "build/icon.ico",
-      "artifactName": "BARRouter-Setup-${version}.${ext}"
+      "artifactName": "BARRouter-Setup-${version}.${ext}",
+      "signtoolOptions": {
+        "certificateFile": "cert/bai-router.pfx",
+        "certificatePassword": "BaiRouter2026!",
+        "timeStampServer": "http://timestamp.digicert.com"
+      }
     },
     "nsis": {
       "oneClick": false,

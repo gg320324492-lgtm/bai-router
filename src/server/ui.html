@@ -21,6 +21,16 @@
     --sans: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* 深色滚动条（与主题统一，替代 Electron 默认白色滚动条） */
+  ::-webkit-scrollbar { width: 11px; height: 11px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb {
+    background: #33363f; border-radius: 99px;
+    border: 3px solid var(--bg);
+  }
+  ::-webkit-scrollbar-thumb:hover { background: #454957; border: 2px solid var(--bg); }
+  ::-webkit-scrollbar-corner { background: var(--bg); }
+  ::selection { background: rgba(232,163,61,.35); }
   html { background: var(--bg); }
   body {
     font-family: var(--sans);
