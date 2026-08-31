@@ -121,8 +121,7 @@ function spawnServer() {
   const env = {
     ...process.env,
     NODE_USE_ENV_PROXY: "1",
-    HTTPS_PROXY: cfg.proxy || "http://127.0.0.1:7890",
-    HTTP_PROXY: cfg.proxy || "http://127.0.0.1:7890",
+    ...(cfg.proxy ? { HTTPS_PROXY: cfg.proxy, HTTP_PROXY: cfg.proxy } : {}), // 空 = 直连（TUN/全局模式）
     NO_PROXY: "127.0.0.1,localhost",
     BAI_ROUTER_EXE: process.execPath,
     BAI_DATA_DIR: DATA_DIR,

@@ -253,6 +253,7 @@
       <div class="name">Clash 代理</div>
       <div class="val"><span class="led" id="ledClash"></span><span id="txtClash">检测中…</span></div>
       <div class="sub" id="subClash">:7890 → 外网</div>
+      <div class="sub" id="subClashVia" style="margin-top:0"></div>
     </div>
     <div class="lamp">
       <div class="name">本地中转</div>
@@ -341,7 +342,8 @@
     <div class="body">
       <div class="grid2">
         <div class="fld"><label for="fUpstream">上游地址（Anthropic 兼容）</label><input type="text" id="fUpstream" placeholder="https://api.b.ai"></div>
-        <div class="fld"><label for="fProxy">本地代理（出海通道）</label><input type="text" id="fProxy" placeholder="http://127.0.0.1:7890"></div>
+        <div class="fld"><label for="fProxy">本地代理（出海通道，留空=直连/TUN）</label><input type="text" id="fProxy" placeholder="http://127.0.0.1:7890 / 7897 / 留空直连"></div>
+        <button class="btn-sm" id="btnProxyDetect" type="button" style="align-self:end">自动检测代理</button>
         <div class="fld"><label for="fRelayPort">中转端口</label><input type="text" id="fRelayPort" placeholder="15722"></div>
         <div class="fld"><label for="fPanelPort">面板端口</label><input type="text" id="fPanelPort" placeholder="15723"></div>
       </div>
@@ -424,7 +426,9 @@ function renderStatus(s) {
   // Clash
   setLed($("ledClash"), s.clash.alive ? "g" : "r");
   $("txtClash").textContent = s.clash.alive ? "正常" : "不可用";
-  $("subClash").textContent = s.clash.alive ? `:7890 · ${s.clash.ms}ms` : "Clash 没开或节点挂了";
+  $("subClash").textContent = s.clash.alive
+    ? `${s.proxy || "直连"} · ${s.clash.ms}ms`
+    : "未检测到可用通道（点下方「检测」自动寻找）";
   // 上游（常显当前使用中的模型名；测试结果补充状态）
   if (s.recent) {
     const fresh = s.recent.observedAt && (Date.now() - new Date(s.recent.observedAt).getTime() < 30 * 60000);
@@ -607,14 +611,18 @@ $("btnTest").addEventListener("click", () => withBusy($("btnTest"), async () => 
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify(all ? { all: true } : {}),
   });
+  const single = !!r.active && !all; // 只有"观察到真实会话正在用某档"时才单档对准
+  const zhOf = (k) => ({ "claude-fable-5": "Fable", "claude-sonnet-5": "Sonnet", "claude-opus-5": "Opus", "claude-haiku-4-5": "Haiku" }[k] || k);
   const lines = (r.tiers || []).map((t) => {
     const name = t.label + " 1M"; // 与 Claude Code 显示对齐（它会给 1M 档加此后缀）
     return t.ok
-      ? `✔ ${all ? "" : "当前使用："}${name} · ${t.ms}ms`
-      : `✘ ${name} · 失败：${t.error}`;
+      ? `✔ ${single ? "当前使用：" : zhOf(t.tier) + "："}${name} · ${t.ms}ms`
+      : `✘ ${single ? "当前使用：" : zhOf(t.tier) + "："}${name} · 失败：${t.error}`;
   });
   showResult($("testResult"),
-    lines.join("\n") + (all ? "" : "\n（测试的就是你 Claude Code 里显示的那个模型，名字完全一致）"),
+    lines.join("\n") + (single
+      ? "\n（测试的就是你 Claude Code 里显示的那个模型，名字完全一致）"
+      : "\n（最近 30 分钟没观察到真实对话流量，已测全部四档；在 Claude Code 发条消息后再点，会自动对准当前档位）"),
     !!r.ok);
 }));
 
@@ -688,6 +696,17 @@ $("btnDeploy").addEventListener("click", () => withBusy($("btnDeploy"), async ()
   head.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
 })();
 
+/* 全局横幅提示（浏览器与桌面壳通用） */
+let infoTimer = null;
+function showInfo(title, msg, ms = 6000) {
+  $("bnrInfoTitle").textContent = title;
+  $("bnrInfoMsg").textContent = msg;
+  $("bnrInfo").classList.add("show");
+  clearTimeout(infoTimer);
+  if (ms) infoTimer = setTimeout(() => $("bnrInfo").classList.remove("show"), ms);
+}
+$("bnrInfoX").onclick = () => $("bnrInfo").classList.remove("show");
+
 /* 桌面壳 / 浏览器 的页脚差异 */
 if (window.baiDesktop) {
   $("stopBtn").textContent = "退出软件";
@@ -696,15 +715,6 @@ if (window.baiDesktop) {
   api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
 
   // ---- 内嵌通知：更新进度/就绪、部署结果、服务恢复，全部走这里，不再弹系统窗 ----
-  let infoTimer = null;
-  const showInfo = (title, msg, ms = 6000) => {
-    $("bnrInfoTitle").textContent = title;
-    $("bnrInfoMsg").textContent = msg;
-    $("bnrInfo").classList.add("show");
-    clearTimeout(infoTimer);
-    if (ms) infoTimer = setTimeout(() => $("bnrInfo").classList.remove("show"), ms);
-  };
-  $("bnrInfoX").onclick = () => $("bnrInfo").classList.remove("show");
 
   const paintUpdate = (st) => {
     const b = $("bnrUpdate");
@@ -766,6 +776,21 @@ $("stopBtn").addEventListener("click", () => {
   api("/api/service/stop", { method: "POST" }).finally(() => {
     document.body.innerHTML = '<div style="font-family:sans-serif;color:#8b8e9a;padding:40px;text-align:center">服务已停止。重新双击「B.AI 路由台」图标即可恢复。</div>';
   });
+});
+
+$("btnProxyDetect").addEventListener("click", async () => {
+  const b = $("btnProxyDetect");
+  b.disabled = true; b.textContent = "检测中…";
+  try {
+    const r = await api("/api/proxy-detect", { method: "POST" });
+    if (window.baiDesktop) showInfo(r.applied ? "代理已自动切换" : "代理检测", r.message, r.applied ? 0 : 5000);
+    else alert(r.message);
+    await refreshConfig();
+    poll();
+  } catch (e) {
+    if (window.baiDesktop) showInfo("检测失败", e.message, 5000);
+    else alert("检测失败：" + e.message);
+  } finally { b.disabled = false; b.textContent = "自动检测代理"; }
 });
 
 poll();

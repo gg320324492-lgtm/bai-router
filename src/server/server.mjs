@@ -94,8 +94,7 @@ if (process.env.NODE_USE_ENV_PROXY !== "1") {
       env: {
         ...process.env,
         NODE_USE_ENV_PROXY: "1",
-        HTTPS_PROXY: cfg0.proxy,
-        HTTP_PROXY: cfg0.proxy,
+        ...(cfg0.proxy ? { HTTPS_PROXY: cfg0.proxy, HTTP_PROXY: cfg0.proxy } : {}), // 空代理 = 直连(TUN/全局模式)
         NO_PROXY: "127.0.0.1,localhost",
       },
     }
@@ -104,8 +103,64 @@ if (process.env.NODE_USE_ENV_PROXY !== "1") {
   log(`缺 NODE_USE_ENV_PROXY，已以正确环境重启自己 -> pid ${child.pid}`);
   process.exit(0);
 }
-log(`路由台启动 relay=:${cfg0.relayPort} panel=:${cfg0.panelPort} (pid ${process.pid})`);
+log(`路由台启动 relay=:${cfg0.relayPort} panel=:${cfg0.panelPort} (pid ${process.pid}) 代理=${cfg0.proxy || "直连"}`);
 process.on("uncaughtException", (e) => log("uncaughtException:", e?.stack || String(e)));
+
+// ---------- 本地代理自适应（v1.0.17）：自动探测所有常见 Clash/V2ray 端口，支持直连(TUN) ----------
+const PROXY_CANDIDATES = [
+  "http://127.0.0.1:7890",  // Clash for Windows / Mihomo Party
+  "http://127.0.0.1:7897",  // Clash Verge Rev
+  "http://127.0.0.1:7891",
+  "http://127.0.0.1:10809", // v2rayN HTTP
+  "http://127.0.0.1:2080",  // sing-box 常见
+];
+function probeVia(proxy) {
+  // proxy === "DIRECT" 表示不走代理直连
+  const args = ["-s", "--ssl-no-revoke", "-m", "4", "-o", "NUL", "-w", "%{http_code}", "https://www.gstatic.com/generate_204"];
+  if (proxy !== "DIRECT") args.splice(1, 0, "-x", proxy);
+  return new Promise((res) => execFile("curl", args, { windowsHide: true, timeout: 8000 }, (e, so) => res(!e && /^(204|200|302)/.test(String(so).trim()))));
+}
+let proxySwitching = false;
+function applyProxy(found, reason) {
+  const cfg = loadCfg();
+  const norm = found === "DIRECT" ? "" : found;
+  if ((cfg.proxy || "") === norm) return false;
+  cfg.proxy = norm;
+  saveCfg(cfg);
+  log(`代理已自动切换（${reason}）→ ${norm || "直连"}`);
+  if (!proxySwitching) {
+    proxySwitching = true;
+    setTimeout(() => {
+      const c = loadCfg();
+      const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+        detached: true, stdio: "ignore", windowsHide: true, cwd: HERE,
+        env: { ...process.env, NODE_USE_ENV_PROXY: "1", ...(c.proxy ? { HTTPS_PROXY: c.proxy, HTTP_PROXY: c.proxy } : {}), NO_PROXY: "127.0.0.1,localhost" },
+      });
+      child.unref();
+      log("代理变更，服务自重启以应用新通道");
+      setTimeout(() => process.exit(0), 400);
+    }, 1200);
+  }
+  return true;
+}
+async function detectWorkingProxy() {
+  const cfg = loadCfg();
+  const cands = [...new Set([cfg.proxy, process.env.HTTPS_PROXY, ...PROXY_CANDIDATES].filter(Boolean))];
+  cands.push("DIRECT"); // 兜底：TUN/全局模式无需本地端口
+  for (const c of cands) if (await probeVia(c)) return c;
+  return null;
+}
+let proxyCheckTimer = null;
+function scheduleProxyCheck(delay = 3000, reason = "周期探测") {
+  clearTimeout(proxyCheckTimer);
+  proxyCheckTimer = setTimeout(async () => {
+    const found = await detectWorkingProxy();
+    if (found) applyProxy(found, reason);
+  }, delay);
+}
+// 启动后探测一次；此后周期性自检；上游 fetch 失败时立刻触发
+setTimeout(() => scheduleProxyCheck(0, "启动探测"), 2500);
+setInterval(() => scheduleProxyCheck(0, "周期探测"), 10 * 60 * 1000);
 
 // 发布机模型同步（每版本一次性、只增不删）：把 config.defaults.json 里的可选模型并进本机列表
 try {
@@ -148,9 +203,9 @@ function recordCall(tier, served) {
   if (recentCalls.length > 30) recentCalls.pop();
 }
 function activeTier() {
-  // 最近 30 分钟内被 Claude Code 用过的档位；没有观察记录则回退 Haiku
+  // 最近 30 分钟内被"真实会话"用过的档位；没有观察则返回 null（不再默认猜 Haiku）
   if (recentCalls.length && Date.now() - recentCalls[0].at < 30 * 60000) return recentCalls[0].tier;
-  return "claude-haiku-4-5";
+  return null;
 }
 
 const relay = http.createServer((req, res) => {
@@ -167,7 +222,9 @@ const relay = http.createServer((req, res) => {
         if (typeof j.model === "string") {
           const tier = normalizeModel(j.model);
           j.model = resolveModel(j.model, cfg);
-          if (req.method === "POST" && req.url.startsWith("/v1/messages")) recordCall(tier, j.model);
+          // 只观察"真实会话"流量：max_tokens≥512 的对话请求。
+          // 桌面版后台小请求(健康探测/起标题/摘要, max_tokens 通常 ≤128)不算"用户正在用的档位"
+          if (req.method === "POST" && req.url.startsWith("/v1/messages") && typeof j.max_tokens === "number" && j.max_tokens >= 512) recordCall(tier, j.model);
         }
         body = Buffer.from(JSON.stringify(j));
       } catch { /* 非 JSON 原样透传 */ }
@@ -195,6 +252,7 @@ const relay = http.createServer((req, res) => {
         stream.on("error", () => res.end());
       } else res.end();
     } catch (e) {
+      if (String((e && e.message) || e).includes("fetch failed")) scheduleProxyCheck(0, "上游连接失败触发"); // 代理可能换了端口/挂了 → 自动探测
       if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { type: "relay_error", message: String((e && e.message) || e) } }));
     }
@@ -384,12 +442,8 @@ function checkCcSwitch() {
 }
 async function checkClash(cfg) {
   const t0 = Date.now();
-  try {
-    const r = await fetch("https://www.gstatic.com/generate_204", { signal: AbortSignal.timeout(6000) });
-    return { alive: r.ok || r.status === 204, ms: Date.now() - t0 };
-  } catch {
-    return { alive: false, ms: Date.now() - t0 };
-  }
+  const ok = await probeVia(cfg.proxy || "DIRECT");
+  return { alive: ok, ms: Date.now() - t0, via: cfg.proxy || "直连" };
 }
 
 // ---------- 面板 API ----------
@@ -414,10 +468,12 @@ async function statusPayload() {
     relay: { port: cfg.relayPort, up: true },
     panel: { port: cfg.panelPort, up: true },
     clash,
+    proxy: cfg.proxy || "直连",
     ccswitch: { running: ccswitch },
     upstream: { host: cfg.upstream, tested: lastTest.ok, ok: lastTest.ok, model: lastTest.model || null, ms: lastTest.ms || null, error: lastTest.error || null, at: lastTest.at || null },
     recent: (() => {
       const t = activeTier();
+      if (!t) return { tier: null };
       const m = cfg.mapping?.[t] || {};
       const obs = recentCalls.find((x) => x.tier === t);
       return { tier: t, label: m.label || t, target: m.target || cfg.defaultModel, observedAt: obs ? obs.at : null };
@@ -442,6 +498,19 @@ const panel = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && u.pathname === "/api/status") return json(res, 200, await statusPayload());
 
+    if (req.method === "POST" && u.pathname === "/api/proxy-detect") {
+      const found = await detectWorkingProxy();
+      let applied = false;
+      if (found) applied = applyProxy(found, "手动检测");
+      return json(res, 200, {
+        found: found || null,
+        applied,
+        message: found
+          ? (applied ? `检测到可用通道 ${found === "DIRECT" ? "直连(TUN/全局)" : found}，已切换并重启服务` : `当前配置已是可用通道 ${found === "DIRECT" ? "直连" : found}`)
+          : "未检测到可用代理/直连——请确认 Clash 已开启（系统代理或 TUN 均可）后重试",
+      });
+    }
+
     if (req.method === "GET" && u.pathname === "/api/config") return json(res, 200, loadCfg());
 
     if (req.method === "POST" && u.pathname === "/api/config") {
@@ -451,6 +520,11 @@ const panel = http.createServer(async (req, res) => {
         const k = b.apiKey.trim();
         if (!k.startsWith("sk-")) return json(res, 400, { error: "API Key 应以 sk- 开头" });
         cfg.apiKey = k;
+      }
+      if (typeof b.proxy === "string") {
+        const p = b.proxy.trim();
+        if (p && !/^https?:\/\/127\.0\.0\.1:\d+$/.test(p)) return json(res, 400, { error: "代理格式应为 http://127.0.0.1:端口，留空表示直连" });
+        cfg.proxy = p; // 留空 = 直连（TUN/全局模式）
       }
       if (b.mapping && typeof b.mapping === "object") {
         for (const t of TIERS) {
@@ -535,9 +609,8 @@ const panel = http.createServer(async (req, res) => {
       // 默认只测 Claude Code 当前真实使用的档位（与用户看到的名字对齐）；body.all=true 测全部
       const cfg = loadCfg();
       const b = await readBody(req).catch(() => ({}));
-      const targets = b.all
-        ? TIERS.map((t) => t.key)
-        : [activeTier()];
+      const active = b.all ? null : activeTier();
+      const targets = active ? [active] : TIERS.map((t) => t.key);
       const tierInfo = (key) => {
         const m = cfg.mapping[key] || {};
         return { label: m.label || key, target: m.target || cfg.defaultModel };
@@ -571,7 +644,7 @@ const panel = http.createServer(async (req, res) => {
         error: pass === tiers.length ? null : tiers.filter((x) => !x.ok).map((x) => `${x.label}: ${x.error}`).join("；"),
         at: new Date().toISOString(),
       });
-      return json(res, 200, { ok: pass === tiers.length, tiers, pass, total: tiers.length, active: b.all ? null : targets[0] });
+      return json(res, 200, { ok: pass === tiers.length, tiers, pass, total: tiers.length, active });
     }
 
     if (req.method === "POST" && u.pathname === "/api/service/stop") {
