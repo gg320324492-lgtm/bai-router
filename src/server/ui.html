@@ -258,7 +258,7 @@
     <div class="lamp">
       <div class="name">本地中转</div>
       <div class="val"><span class="led" id="ledRelay"></span><span id="txtRelay">—</span></div>
-      <div class="sub">:15722 → api.b.ai</div>
+      <div class="sub" id="subRelay" title="">:15722 → 上游</div>
     </div>
     <div class="lamp">
       <div class="name">B.AI 上游</div>
@@ -327,6 +327,7 @@
       <div class="saverow">
         <button class="btn-main" id="btnSave" style="padding:8px 20px">保存映射</button>
         <button class="btn-ghost" id="btnTest" style="padding:8px 16px">测试连通</button>
+        <button class="btn-ghost" id="btnModels" style="padding:8px 16px" title="从上游 /v1/models 拉取当前真实模型目录，更新下拉框">刷新模型列表</button>
         <label class="checks" style="font-size:12px"><input type="checkbox" id="ckAllTiers">测全部四档</label>
       </div>
       <div class="result" id="testResult"></div>
@@ -423,6 +424,11 @@ function renderStatus(s) {
   $("svc").innerHTML = `服务 <b class="${s.service.up ? "" : "off"}">●</b> :${s.relay.port} / :${s.panel.port}`;
   setLed($("ledRelay"), s.relay.up ? "g pulse" : "r");
   $("txtRelay").textContent = s.relay.up ? "运行中" : "已停止";
+  // v1.0.19: 中转灯副行显示最近链路错误归因（30 分钟内有效），悬停看全文
+  const rl = s.relayLast || {};
+  const rlFresh = rl.at && Date.now() - new Date(rl.at).getTime() < 30 * 60000;
+  $("subRelay").textContent = rlFresh ? `最近错误·${rl.kind}: ${rl.message}` : `:${s.relay.port} → 上游`;
+  $("subRelay").title = rlFresh ? `${rl.at}\n${rl.message}` : "";
   // Clash
   setLed($("ledClash"), s.clash.alive ? "g" : "r");
   $("txtClash").textContent = s.clash.alive ? "正常" : "不可用";
@@ -767,6 +773,20 @@ if (window.baiDesktop) {
   });
 }
 $("updBtn").addEventListener("click", () => { if (window.baiDesktop) window.baiDesktop.checkUpdate(); });
+
+// v1.0.19: 从上游拉取真实模型目录，并入可选列表（映射目标强制保留，防止目录刷新后映射悬空）
+$("btnModels").addEventListener("click", () => withBusy($("btnModels"), async () => {
+  const r = await api("/api/models");
+  const fetched = r.models || [];
+  const curTargets = TIERS.map((t) => String((cfg.mapping[t.key] || {}).target || "").toLowerCase()).filter(Boolean);
+  const merged = [...new Set([...fetched, ...curTargets])];
+  await api("/api/config", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ availableModels: merged }),
+  });
+  await refreshConfig();
+  showResult($("testResult"), `✔ 已拉取上游模型目录 ${r.count} 个\n已更新可选模型列表（四个映射目标强制保留）`, true);
+}));
 $("stopBtn").addEventListener("click", () => {
   if (window.baiDesktop) {
     if (confirm("退出软件？退出后中转停止，B.AI 模式下的桌面版 Claude 会断线。")) window.baiDesktop.quit();

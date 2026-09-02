@@ -208,6 +208,64 @@ function activeTier() {
   return null;
 }
 
+function isApiResponseType(contentType) {
+  const type = String(contentType || "").toLowerCase();
+  return type.includes("application/json") || type.includes("text/event-stream");
+}
+
+// v1.0.19: 最近一次中转链路错误（供面板"本地中转"灯做归因：proxy/timeout/rate_limit/upstream_4xx/network）
+const lastRelayError = { kind: null, message: null, at: null };
+function noteRelayError(kind, message) {
+  lastRelayError.kind = kind;
+  lastRelayError.message = String(message).slice(0, 180);
+  lastRelayError.at = new Date().toISOString();
+}
+
+function sendRateLimitError(res, upstream) {
+  const retryAfter = upstream.headers.get("retry-after");
+  const headers = {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  };
+  if (retryAfter) headers["retry-after"] = retryAfter;
+  res.writeHead(429, headers);
+  res.end(JSON.stringify({
+    type: "error",
+    error: {
+      type: "rate_limit_error",
+      message: `上游 API 暂时限流（HTTP 429）${retryAfter ? `，请在 ${retryAfter} 秒后重试` : "，请稍后重试"}。这不是代理或配置错误。`,
+    },
+  }));
+}
+
+function sendUnexpectedUpstreamResponse(res, upstream) {
+  // 代理、网关或登录页偶尔会返回 HTML。不能把 HTML 原样交给 Claude/
+  // 测试面板，否则客户端会只显示 "Unexpected token '<'"，看不到真正的链路问题。
+  const status = upstream.status >= 400 ? upstream.status : 502;
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end(JSON.stringify({
+    type: "error",
+    error: {
+      type: "unexpected_upstream_response",
+      message: `上游返回了非 API 响应（HTTP ${upstream.status}，Content-Type: ${upstream.headers.get("content-type") || "未知"}）。请检查代理或上游地址。`,
+    },
+  }));
+}
+
+async function readProbeJson(response) {
+  const raw = await response.text();
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const type = response.headers.get("content-type") || "未知";
+    const kind = /^\s*</.test(raw) ? "HTML 页面" : "非 JSON 内容";
+    throw new Error(`上游返回${kind}（HTTP ${response.status}，Content-Type: ${type}）`);
+  }
+}
+
 const relay = http.createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
@@ -231,17 +289,37 @@ const relay = http.createServer((req, res) => {
     }
     const headers = {};
     for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
+    // 探活级小请求（max_tokens≤8，桌面版健康检查/模型探测）：遇 429 静默退避重试 + 更短超时。
+    // 放在 try 外声明——catch 里的超时归因也要用到
+    const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();
+    const headerTimeoutMs = isProbe ? 10000 : 30000;
     try {
       const { Readable } = await import("node:stream");
-      // 探活级小请求（max_tokens≤8，桌面版健康检查/模型探测）遇 429 静默退避重试，
-      // 避免限速窗口抖动被放大成桌面端的 "Gateway returned an error" 卡片
       let r;
-      const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();
+      // v1.0.19: 上游超时只限"连接+响应头"——头一到就 clearTimeout 放行（SSE 流式正文不限时）。
+      // 之前无超时，上游挂起时请求会无限吊住，桌面端表现为永远转圈。
       for (let attempt = 0; ; attempt++) {
-        r = await fetch(cfg.upstream + req.url, { method: req.method, headers, body: body.length ? body : undefined });
+        const ac = new AbortController();
+        const tid = setTimeout(() => ac.abort(), headerTimeoutMs);
+        try {
+          r = await fetch(cfg.upstream + req.url, { method: req.method, headers, body: body.length ? body : undefined, signal: ac.signal });
+        } finally {
+          clearTimeout(tid);
+        }
         if (!isProbe || r.status !== 429 || attempt >= 3) break;
         await new Promise((res) => setTimeout(res, 400 * (attempt + 1)));
       }
+      // 429 可能是不带 Content-Type 的空响应；先单独处理，不能误判为代理 HTML。
+      if (r.status === 429) {
+        noteRelayError("rate_limit", "上游 429 限流（免费渠道并发敏感）");
+        return sendRateLimitError(res, r);
+      }
+      // Anthropic API 端点只应返回 JSON 或 SSE；其余类型通常是代理/WAF
+      // 的 HTML 页面。转换为标准 JSON 错误，避免调用端误报 JSON 解析异常。
+      if (req.url.startsWith("/v1/") && !isApiResponseType(r.headers.get("content-type"))) {
+        return sendUnexpectedUpstreamResponse(res, r);
+      }
+      if (r.status >= 400) noteRelayError(`upstream_${r.status}`, `上游 HTTP ${r.status}（${req.url}）`);
       const h = {};
       // fetch 已自动解压响应体，content-encoding 必须剥掉，否则客户端按 gzip 解明文会炸
       r.headers.forEach((v, k) => { if (!["content-length", "transfer-encoding", "connection", "content-encoding"].includes(k)) h[k] = v; });
@@ -252,9 +330,18 @@ const relay = http.createServer((req, res) => {
         stream.on("error", () => res.end());
       } else res.end();
     } catch (e) {
-      if (String((e && e.message) || e).includes("fetch failed")) scheduleProxyCheck(0, "上游连接失败触发"); // 代理可能换了端口/挂了 → 自动探测
+      const msg = String((e && e.message) || e);
+      if (msg.includes("fetch failed")) scheduleProxyCheck(0, "上游连接失败触发"); // 代理可能换了端口/挂了 → 自动探测
+      // v1.0.19: 超时/网络错误给出人话归因，并记录到面板"本地中转"灯
+      const friendly = e?.name === "AbortError" || msg.toLowerCase().includes("abort")
+        ? `上游 ${cfg.upstream} 在 ${isProbe ? 10 : 30}s 内未返回响应头（节点慢或被墙），已中断本次请求`
+        : msg;
+      noteRelayError(
+        e?.name === "AbortError" || msg.toLowerCase().includes("abort") ? "timeout" : msg.includes("fetch failed") ? "proxy" : "network",
+        friendly
+      );
       if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { type: "relay_error", message: String((e && e.message) || e) } }));
+      res.end(JSON.stringify({ error: { type: "relay_error", message: friendly } }));
     }
   });
 });
@@ -466,6 +553,7 @@ async function statusPayload() {
     now: new Date().toISOString(),
     service: { up: true, uptimeSec: Math.floor((Date.now() - BOOT) / 1000), pid: process.pid },
     relay: { port: cfg.relayPort, up: true },
+    relayLast: { ...lastRelayError },
     panel: { port: cfg.panelPort, up: true },
     clash,
     proxy: cfg.proxy || "直连",
@@ -488,6 +576,16 @@ const lastTest = { ok: null, model: null, ms: null, error: null, at: null };
 const panel = http.createServer(async (req, res) => {
   res.setHeader("access-control-allow-origin", "http://127.0.0.1:" + loadCfg().panelPort);
   const u = new URL(req.url, "http://127.0.0.1");
+  // v1.0.19: 面板加固——Host 必须是回环地址；带 Origin 头时必须是面板自身。
+  // 防 DNS rebinding（外网页面把域名解析到 127.0.0.1 后调面板 API 改写 Claude 配置）。
+  // curl/本机程序不带 Origin 不受影响；面板页面同源 fetch 的 Origin 就是 selfOrigin，也不受影响。
+  {
+    const pp = cfg0.panelPort;
+    const hostOk = req.headers.host === `127.0.0.1:${pp}` || req.headers.host === `localhost:${pp}`;
+    const selfOrigin = `http://127.0.0.1:${pp}`;
+    const originOk = !req.headers.origin || req.headers.origin === selfOrigin || req.headers.origin === `http://localhost:${pp}`;
+    if (!hostOk || !originOk) return json(res, 403, { error: "forbidden: 面板只接受本机回环访问" });
+  }
   try {
     if (req.method === "GET" && (u.pathname === "/" || u.pathname === "/index.html")) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
@@ -495,6 +593,20 @@ const panel = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && u.pathname === "/api/ping") return json(res, 200, { ok: true });
     if (req.method === "GET" && u.pathname === "/api/version") return json(res, 200, { version: APP_VERSION });
+
+    // v1.0.19: 拉取上游真实模型目录。模型会腐烂/新增（实测 mimo-v2.5 目录里有但实际 503），
+    // 下拉框不能只靠发布机默认列表；UI 的「刷新模型列表」按钮走这里。
+    if (req.method === "GET" && u.pathname === "/api/models") {
+      const c2 = loadCfg();
+      const r = await fetch(c2.upstream + "/v1/models", {
+        headers: { authorization: `Bearer ${c2.apiKey}`, "anthropic-version": "2023-06-01" },
+        signal: AbortSignal.timeout(15000),
+      });
+      const j = await readProbeJson(r);
+      if (!r.ok) throw new Error(j?.error?.message || `HTTP ${r.status}`);
+      const models = [...new Set((j.data || []).map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))].sort();
+      return json(res, 200, { ok: true, count: models.length, models });
+    }
 
     if (req.method === "GET" && u.pathname === "/api/status") return json(res, 200, await statusPayload());
 
@@ -627,7 +739,7 @@ const panel = http.createServer(async (req, res) => {
               body: JSON.stringify({ model: tier + "[1M]", max_tokens: 8, messages: [{ role: "user", content: "ok" }] }),
               signal: AbortSignal.timeout(45000),
             });
-            const j = await r.json();
+            const j = await readProbeJson(r);
             const ms = Date.now() - t0;
             if (!r.ok) throw new Error(j?.error?.message || `HTTP ${r.status}`);
             return { tier, label: info.label, target: info.target, served: j.model, ok: true, ms, error: null };
@@ -635,7 +747,13 @@ const panel = http.createServer(async (req, res) => {
         }
         return { tier, label: info.label, target: info.target, served: null, ok: false, ms: null, error: lastErr || "unknown" };
       };
-      const tiers = await Promise.all(targets.map(probe));
+      // 免费渠道对短时间并发探测很敏感。串行并留出间隔，避免四个档位
+      // 同时命中 429；这不会影响真实对话的吞吐。
+      const tiers = [];
+      for (let i = 0; i < targets.length; i++) {
+        tiers.push(await probe(targets[i]));
+        if (i < targets.length - 1) await new Promise((res) => setTimeout(res, 1500));
+      }
       const pass = tiers.filter((x) => x.ok).length;
       Object.assign(lastTest, {
         ok: pass === tiers.length,
@@ -655,8 +773,16 @@ const panel = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && u.pathname === "/api/service/restart") {
-      // 浏览器模式下"保存并重启"用：以最新 config 起一个新实例然后自我退出。
-      // Electron 托管时子进程退出会被主进程自动重拉，这里同样安全。
+      // v1.0.19: Electron 托管模式下直接退出，由壳自动重拉——不再自产继任者进程。
+      // 之前"自己 spawn 继任者 + 壳又重拉一个"会让两个新实例互撞（胜者绑定端口，
+      // 败者反复被壳拉起又让位，形成 ~2 秒一轮的重启循环）。
+      if (process.env.BAI_ROUTER_EXE) {
+        json(res, 200, { ok: true, message: "服务正在重启（桌面壳托管：退出后由壳重拉）" });
+        log("收到重启指令（Electron 托管），直接退出交由壳重拉");
+        setTimeout(() => process.exit(0), 300);
+        return;
+      }
+      // 浏览器/绿色模式：无壳托管，保留"以最新 config 起继任者再自我退出"的老路。
       const cfg = loadCfg();
       const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
         detached: true, stdio: "ignore", windowsHide: true, cwd: HERE,
@@ -740,9 +866,50 @@ const panel = http.createServer(async (req, res) => {
 });
 
 // ---------- 起飞 ----------
-// 端口被占 = 本进程无法工作，硬退出（exit 2），由 Electron 壳负责回收旧占用并进诊断页。
-// 不再用"ping 面板端口判断已有实例"——那会被自己的面板骗到（自判 attached 死循环，v1.0.10 修复）
-relay.on("error", (e) => { log(`relay 端口错误: ${e.message} —— :${cfg0.relayPort} 被其他程序占用，进程退出`); process.exit(e.code === "EADDRINUSE" ? 2 : 1); });
-panel.on("error", (e) => { log(`panel 端口错误: ${e.message} —— :${cfg0.panelPort} 被其他程序占用，进程退出`); process.exit(e.code === "EADDRINUSE" ? 2 : 1); });
-relay.listen(cfg0.relayPort, "127.0.0.1", () => log(`中转就绪 http://127.0.0.1:${cfg0.relayPort}`));
-panel.listen(cfg0.panelPort, "127.0.0.1", () => log(`面板就绪 http://127.0.0.1:${cfg0.panelPort}`));
+// v1.0.19: 端口被占不再立刻硬退出。重启交接窗口（旧进程尚未释放端口）按 600ms 退避重试；
+// 若对面是"健康的本套实例"（面板可 ping 且自己两端都没绑上）→ 转待命而不是退出：
+// 退出会被 Electron 壳再拉起，形成"拉起→让位→再拉起"的死循环。待命实例每 5 秒探测，
+// 对方一退出立即接管端口，壳全程无感。对非本套的外来占用，持续 15 秒才 exit 2 交壳回收。
+function listenWithRetry(srv, port, name) {
+  const started = Date.now();
+  let attempts = 0;
+  let standby = false;
+  const start = () => {
+    attempts++;
+    srv.once("error", onErr);
+    srv.listen(port, "127.0.0.1", () => {
+      srv.removeListener("error", onErr);
+      log(`${name}就绪 http://127.0.0.1:${port}` + (standby ? "（待命接管成功）" : attempts > 1 ? `（重试 ${attempts - 1} 次后绑定成功）` : ""));
+      standby = false;
+    });
+  };
+  const onErr = async (e) => {
+    if (srv.listening) return;
+    if (e.code !== "EADDRINUSE") { log(`${name} 端口错误: ${e.message}`); process.exit(1); }
+    if (attempts === 1) log(`${name} 端口 :${port} 暂被占用（多为重启交接），每 600ms 重试，最多 15 秒`);
+    let peerHealthy = false;
+    if (!relay.listening && !panel.listening) {
+      try {
+        const pr = await fetch(`http://127.0.0.1:${cfg0.panelPort}/api/ping`, { signal: AbortSignal.timeout(1200) });
+        peerHealthy = pr.ok;
+      } catch { /* 探活失败，按无健康实例处理 */ }
+    }
+    if (peerHealthy) {
+      if (!standby) {
+        standby = true;
+        log(`已有健康实例在跑，本实例转入待命（每 5 秒探测，对方退出即自动接管）`);
+      }
+      // 不重置 standby：绑定成功后由成功回调统一清零，避免每轮探测重复打"转入待命"日志
+      setTimeout(() => start(), 5000);
+      return;
+    }
+    if (Date.now() - started > 15000) {
+      log(`${name} 端口 :${port} 持续被占用超过 15 秒，放弃（exit 2 交由壳进程回收）`);
+      process.exit(2);
+    }
+    setTimeout(start, 600);
+  };
+  start();
+}
+listenWithRetry(relay, cfg0.relayPort, "中转");
+listenWithRetry(panel, cfg0.panelPort, "面板");
