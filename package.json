@@ -58,7 +58,7 @@
       "signtoolOptions": {
         "certificateFile": "cert/bai-router.pfx",
         "certificatePassword": "BaiRouter2026!",
-        "timeStampServer": "http://timestamp.digicert.com"
+        "timeStampServer": "http://timestamp.sectigo.com"
       }
     },
     "nsis": {
