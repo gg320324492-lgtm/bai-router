@@ -1,7 +1,7 @@
 {
   "name": "bai-router",
   "productName": "B.AI Router",
-  "version": "1.0.19",
+  "version": "1.0.20",
   "private": true,
   "description": "B.AI 模型路由台：Claude Code / Claude 桌面版 外接模型的一键切换与中转",
   "author": "pc",
@@ -9,7 +9,8 @@
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win nsis",
-    "publish": "node publish.cjs"
+    "publish": "node publish.cjs",
+    "postinstall": "node scripts/patch-updater.cjs"
   },
   "build": {
     "appId": "local.bai.router",

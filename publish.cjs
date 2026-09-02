@@ -27,6 +27,6 @@ try {
 
 if (fs.existsSync(path.join(ROOT, "dist", exe))) console.log(`⚠ dist/${exe} 已存在——若确认重发请先删除或升版本号`);
 run("npx electron-builder --win nsis");
-run(`gh release create v${v} -R ${owner}/${repo} "dist/${exe}" "dist/latest.yml" --title "v${v}" --notes "${notes.replace(/"/g, "'")}"`);
+run(`gh release create v${v} -R ${owner}/${repo} "dist/${exe}" "dist/${exe}.blockmap" "dist/latest.yml" --title "v${v}" --notes "${notes.replace(/"/g, "'")}"`);
 console.log(`\n✔ 已发布 v${v} → https://github.com/${owner}/${repo}/releases/tag/v${v}`);
 console.log("  各电脑上的软件将在启动 8 秒内或点「检查更新」时自动收到新版。");
