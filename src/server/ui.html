@@ -109,6 +109,7 @@
   .patch .who { width: 118px; flex: none; }
   .patch .who .n { font-weight: 600; }
   .patch .who .d { font-family: var(--mono); font-size: 10px; color: var(--dim); }
+  .patch .who .keyfp { display: block; font-family: var(--mono); font-size: 10px; margin-top: 2px; cursor: help; }
   .patch .wire { flex: 1; display: flex; align-items: center; min-width: 60px; }
   .patch .wire svg { width: 100%; height: 12px; display: block; overflow: visible; }
   .patch .wire .ln { stroke: var(--wire, #3a3d47); stroke-width: 1.5; }
@@ -470,6 +471,16 @@ function renderStatus(s) {
     const patch = el === $("cliBadge") ? $("patchCli") : $("patchDesk");
     patch.classList.toggle("state-bai", m.mode === "bai");
     patch.classList.toggle("state-cc", m.mode === "ccswitch");
+    // 实际生效的密钥指纹：与面板不一致时标红（中转是透传客户端 key，不是面板 key）
+    let kf = patch.querySelector(".keyfp");
+    if (m.keyFp) {
+      if (!kf) { kf = document.createElement("span"); kf.className = "keyfp"; patch.querySelector(".who").appendChild(kf); }
+      const ok = m.keyMatch !== false;
+      kf.textContent = (ok ? "🔑" : "⚠️") + m.keyFp;
+      kf.style.color = ok ? "var(--dim)" : "var(--err)";
+      kf.title = ok ? `此端实际使用的密钥：${m.keyFp}（与面板一致）` : `此端密钥(${m.keyFp}) 与面板当前密钥不一致！请求将用这把 key 计费，非面板显示的那把。`;
+      kf.style.display = "";
+    } else if (kf) kf.style.display = "none";
   };
   setBadge($("cliBadge"), s.cli);
   setBadge($("deskBadge"), s.desktop);
@@ -478,7 +489,11 @@ function renderStatus(s) {
   // 提示条
   const n = $("notice");
   n.classList.remove("show", "err");
-  if (s.ccswitch.running) {
+  const keyMismatch = (s.cli.mode === "bai" && s.cli.keyMatch === false) || (s.desktop.mode === "bai" && s.desktop.keyMatch === false);
+  if (keyMismatch) {
+    n.textContent = "⚠ 有客户端正在用的密钥和面板里填的不一致——中转是按请求自带 key 计费的，面板改了 key 不会自动更新已接线的客户端。请重开对应终端/桌面版，或重新点「接通 B.AI」把新 key 写进去。";
+    n.classList.add("show", "err");
+  } else if (s.ccswitch.running) {
     n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 B.AI 突然失效，回到这里点「接通 B.AI」一键恢复即可。";
     n.classList.add("show");
   }

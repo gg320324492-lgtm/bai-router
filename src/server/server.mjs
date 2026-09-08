@@ -465,6 +465,12 @@ const relay = http.createServer((req, res) => {
 function readJson(file) {
   return JSON.parse(readFileSync(file, "utf8"));
 }
+// 密钥指纹（面板用于对比各端实际生效的 key，不显示全文）
+function keyFp(k) {
+  const s = String(k || "");
+  if (!s) return "(空)";
+  return s.length <= 12 ? "***" : s.slice(0, 7) + "…" + s.slice(-2) + "(" + s.length + ")";
+}
 function desktopConfigFile() {
   try {
     const meta = readJson(META_FILE);
@@ -472,24 +478,32 @@ function desktopConfigFile() {
   } catch {}
   return null;
 }
-function cliMode() {
+function cliMode(cfgKey) {
   try {
-    const u = readJson(SETTINGS)?.env?.ANTHROPIC_BASE_URL || "";
-    if (u.includes("api.b.ai")) return { mode: "bai", baseUrl: u };
-    if (u.includes(":15721")) return { mode: "ccswitch", baseUrl: u };
-    return { mode: "other", baseUrl: u };
+    const s = readJson(SETTINGS);
+    const u = s?.env?.ANTHROPIC_BASE_URL || "";
+    const key = s?.env?.ANTHROPIC_AUTH_TOKEN || "";
+    const r = { baseUrl: u, keyFp: key ? keyFp(key) : null };
+    if (cfgKey) r.keyMatch = key === cfgKey;
+    if (u.includes("api.b.ai")) return { mode: "bai", ...r };
+    if (u.includes(":15721")) return { mode: "ccswitch", ...r };
+    return { mode: "other", ...r };
   } catch {
     return { mode: "unknown", baseUrl: "" };
   }
 }
-function desktopMode() {
+function desktopMode(cfgKey) {
   try {
     const f = desktopConfigFile();
     if (!f || !existsSync(f)) return { mode: "unknown", baseUrl: "" };
-    const u = readJson(f)?.inferenceGatewayBaseUrl || "";
-    if (u.includes(":15722")) return { mode: "bai", baseUrl: u };
-    if (u.includes(":15721")) return { mode: "ccswitch", baseUrl: u };
-    return { mode: "other", baseUrl: u };
+    const d = readJson(f);
+    const u = d?.inferenceGatewayBaseUrl || "";
+    const key = d?.inferenceGatewayApiKey || "";
+    const r = { baseUrl: u, keyFp: key ? keyFp(key) : null };
+    if (cfgKey) r.keyMatch = key === cfgKey;
+    if (u.includes(":15722")) return { mode: "bai", ...r };
+    if (u.includes(":15721")) return { mode: "ccswitch", ...r };
+    return { mode: "other", ...r };
   } catch {
     return { mode: "unknown", baseUrl: "" };
   }
@@ -681,8 +695,8 @@ async function statusPayload() {
       const obs = recentCalls.find((x) => x.tier === t);
       return { tier: t, label: m.label || t, target: m.target || cfg.defaultModel, observedAt: obs ? obs.at : null };
     })(),
-    cli: cliMode(),
-    desktop: desktopMode(),
+    cli: cliMode(cfg.apiKey),
+    desktop: desktopMode(cfg.apiKey),
   };
 }
 
