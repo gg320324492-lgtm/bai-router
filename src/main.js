@@ -451,6 +451,8 @@ function maybeFirstRunDeploy() {
 
 // ---------- 自动更新（全部静默化：状态进面板横幅 + 托盘提示，不弹系统窗） ----------
 let autoUpdater = null;
+let manualCheckAt = 0;   // 用户主动点「检查更新」的时刻（区分 自动/手动 失败的提示方式）
+let autoFailRetried = false; // 本会话内自动检查失败后的静默重试只做一次
 let trayMenuRef = null;
 function setupUpdater() {
   if (!app.isPackaged) return; // 开发/绿色模式没有 app-update.yml，跳过
@@ -494,7 +496,18 @@ function setupUpdater() {
     au.on("error", (e) => {
       updateState = { phase: "error", msg: String((e && e.message) || e).slice(0, 160) };
       syncTray();
-      notifyWindow("app-event", { kind: "update", state: updateState }); // v1.0.11：错误也要上屏，不能只写托盘
+      // 只有用户主动点「检查更新」后才弹错误横幅；后台自动检查失败保持静默
+      // （GitHub 网络抖动是常态，自动失败就弹窗会把用户吓跑）——记日志 + 托盘提示，
+      // 5 分钟后本会话内悄悄重试一次。
+      if (Date.now() - manualCheckAt < 3 * 60 * 1000) {
+        notifyWindow("app-event", { kind: "update", state: updateState });
+      } else {
+        logMain("自动检查更新失败（已静默）: " + updateState.msg);
+        if (!autoFailRetried) {
+          autoFailRetried = true;
+          setTimeout(() => { au.checkForUpdates().catch(() => { }); }, 5 * 60 * 1000);
+        }
+      }
     });
     // 启动 8 秒后检查一次，之后每 12 小时一次
     setTimeout(() => au.checkForUpdates().catch(() => { }), 8000);
@@ -540,13 +553,18 @@ async function manualCheckUpdate() {
   if (updateState && updateState.phase === "downloading") { notifyWindow("app-event", { kind: "update", state: updateState }); return; }
   try {
     notifyWindow("app-event", { kind: "check", text: "正在检查更新…" });
+    manualCheckAt = Date.now();
     const r = await autoUpdater.checkForUpdates();
     if (r && r.isUpdateAvailable === false) {
       notifyWindow("app-event", { kind: "check", text: "已是最新版本 v" + app.getVersion() });
     }
     // 有更新：update-available 事件自动切到下载横幅，无需弹窗
   } catch (e) {
-    notifyWindow("app-event", { kind: "check", text: "检查更新失败：" + String((e && e.message) || e).slice(0, 100) + "（多为网络/代理未就绪，开 Clash 后重试）", sticky: true });
+    // 失败详情已由 au.on("error") 弹「更新失败」横幅（含重试/备用升级按钮），
+    // 这里不再补发第二条，避免一次失败双横幅轰炸
+    if (!updateState || updateState.phase !== "error") {
+      notifyWindow("app-event", { kind: "check", text: "检查更新失败：" + String((e && e.message) || e).slice(0, 100) + "（多为网络/代理未就绪，开 Clash 后重试）", sticky: true });
+    }
   }
 }
 

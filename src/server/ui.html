@@ -746,9 +746,9 @@ if (window.baiDesktop) {
       const certIssue = /not signed by the application owner|publisherNames/i.test(st.msg || "");
       $("bnrUpdTitle").textContent = certIssue ? "更新被证书校验拦下" : "更新失败";
       $("bnrUpdBarWrap").style.display = "none";
-      $("bnrUpdMsg").textContent = certIssue
+      $("bnrUpdMsg").textContent = (certIssue
         ? "这台电脑还没信任软件证书（每台电脑只需一次）。点「信任并重试」即可自动完成。"
-        : (st.msg || "未知错误");
+        : ((st.msg || "未知错误") + " —— 多为 Clash 节点抖动：开/换节点后点「重试」，或直接点「备用升级」（走路由台下载通道，通常更稳）。"));
       $("bnrUpdRow").style.display = "";
       $("bnrUpdSelf").style.display = "";
       $("bnrUpdGo").textContent = certIssue ? "信任并重试" : "重试更新";

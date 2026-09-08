@@ -62,12 +62,12 @@
       "label": "GLM-5.3-Flash"
     },
     "claude-opus-5": {
-      "target": "deepseek-v4-flash-vision-exp",
-      "label": "DeepSeek-V4-Flash-Vision"
+      "target": "hy3",
+      "label": "HY3"
     },
     "claude-haiku-4-5": {
-      "target": "deepseek-v4-flash",
-      "label": "DeepSeek-V4-Flash"
+      "target": "mimo-v2.5",
+      "label": "MiMo-V2.5"
     }
   }
 }
