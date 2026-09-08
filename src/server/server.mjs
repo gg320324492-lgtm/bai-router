@@ -159,6 +159,9 @@ function launchApplyScript() {
     "  taskkill /F /PID %%b >nul 2>&1",
     ")",
     'taskkill /F /IM "B.AI Router.exe" >nul 2>&1',
+    // 扫残留：历次升级可能遗留"待命孤儿"的 node.exe 服务进程（端口不在手但活着）。
+    // 按命令行精确匹配本应用的 server.mjs，不误伤其他 node 程序。
+    'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq \'node.exe\' -and $_.CommandLine -match \'bai-router.+server[\\\\/]+server[.]mjs\' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1',
     "ping -n 3 127.0.0.1 >nul",
     `"${SU_EXE}" /S`,
     "ping -n 2 127.0.0.1 >nul",
@@ -1034,6 +1037,12 @@ function listenWithRetry(srv, port, name) {
       if (!standby) {
         standby = true;
         log(`已有健康实例在跑，本实例转入待命（每 5 秒探测，对方退出即自动接管）`);
+      }
+      // 孤儿防护：待命实例若父进程（桌面壳）已消失，说明自己是历次升级/重启的遗留物，
+      // 直接退出，不再无限待命堆积（实测发现过存活 1 小时+ 的孤儿待命进程）。
+      if (process.ppid) {
+        const parentAlive = await new Promise((r) => execFile("tasklist", ["/FI", `PID eq ${process.ppid}`, "/NH"], { windowsHide: true, timeout: 5000 }, (e, so) => r(!e && String(so).includes(String(process.ppid)))));
+        if (!parentAlive) { log(`父进程（pid ${process.ppid}）已消失，孤儿待命实例退出`); process.exit(0); }
       }
       // 不重置 standby：绑定成功后由成功回调统一清零，避免每轮探测重复打"转入待命"日志
       setTimeout(() => start(), 5000);
