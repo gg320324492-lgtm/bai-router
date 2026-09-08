@@ -116,9 +116,17 @@ const PROXY_CANDIDATES = [
 ];
 function probeVia(proxy) {
   // proxy === "DIRECT" 表示不走代理直连
-  const args = ["-s", "--ssl-no-revoke", "-m", "4", "-o", "NUL", "-w", "%{http_code}", "https://www.gstatic.com/generate_204"];
+  // 探测真实上游 origin（未带 key 会返回 401/403）——只要能拿到 HTTP 响应，
+  // 就证明"代理隧道 + 到 B.AI 的路由"这条链路真的通，比只探 Google 更准确。
+  // curl 连不上时 http_code 返回 000，据此判定不可用。
+  let origin;
+  try { origin = new URL(loadCfg().upstream).origin + "/v1/models"; } catch { origin = "https://api.b.ai/v1/models"; }
+  const args = ["-s", "--ssl-no-revoke", "-m", "6", "-o", "NUL", "-w", "%{http_code}", origin];
   if (proxy !== "DIRECT") args.splice(1, 0, "-x", proxy);
-  return new Promise((res) => execFile("curl", args, { windowsHide: true, timeout: 8000 }, (e, so) => res(!e && /^(204|200|302)/.test(String(so).trim()))));
+  return new Promise((res) => execFile("curl", args, { windowsHide: true, timeout: 9000 }, (_e, so) => {
+    const code = String(so).trim();
+    res(/^[1-5]\d\d$/.test(code)); // 任何真实 HTTP 状态码（非 000）= 链路可达
+  }));
 }
 let proxySwitching = false;
 function applyProxy(found, reason) {
@@ -633,10 +641,13 @@ const panel = http.createServer(async (req, res) => {
         if (!k.startsWith("sk-")) return json(res, 400, { error: "API Key 应以 sk- 开头" });
         cfg.apiKey = k;
       }
+      let needRestart = false;
+      const prevProxy = cfg.proxy || "";
       if (typeof b.proxy === "string") {
         const p = b.proxy.trim();
         if (p && !/^https?:\/\/127\.0\.0\.1:\d+$/.test(p)) return json(res, 400, { error: "代理格式应为 http://127.0.0.1:端口，留空表示直连" });
-        cfg.proxy = p; // 留空 = 直连（TUN/全局模式）
+        // 只有新旧值确实不同才置重启标志：换端口、以及"改成留空=直连"都要重启才生效
+        if (prevProxy !== p) { cfg.proxy = p; needRestart = true; }
       }
       if (b.mapping && typeof b.mapping === "object") {
         for (const t of TIERS) {
@@ -653,16 +664,11 @@ const panel = http.createServer(async (req, res) => {
         if (arr.length) cfg.availableModels = [...new Set(arr)];
       }
       // ---- 可移植设置（跨机器编辑）----
-      let needRestart = false;
-      if (typeof b.proxy === "string" && b.proxy.trim()) {
-        const p = b.proxy.trim();
-        if (!/^https?:\/\/.+:\d+$/.test(p)) return json(res, 400, { error: "代理地址格式应为 http://127.0.0.1:端口" });
-        if (p !== cfg.proxy) { cfg.proxy = p; needRestart = true; }
-      }
+      // 注：代理已在上面统一处理（含换端口/切直连的重启判定），此处不再重复
       if (typeof b.upstream === "string" && b.upstream.trim()) {
         const up = b.upstream.trim().replace(/\/+$/, "");
         if (!/^https?:\/\//.test(up)) return json(res, 400, { error: "上游地址需以 http(s):// 开头" });
-        if (up !== cfg.upstream) { cfg.upstream = up; needRestart = false; /* 中转每请求读取，无需重启 */ }
+        if (up !== cfg.upstream) { cfg.upstream = up; /* 中转每请求实时读，无需重启；切勿重置 needRestart，否则会抹掉代理/端口的重启标志 */ }
       }
       for (const portKey of ["relayPort", "panelPort"]) {
         if (b[portKey] != null && b[portKey] !== "") {
