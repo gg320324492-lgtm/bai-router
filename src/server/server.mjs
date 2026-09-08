@@ -139,6 +139,13 @@ function applyProxy(found, reason) {
   if (!proxySwitching) {
     proxySwitching = true;
     setTimeout(() => {
+      // Electron 托管：只退出，让壳用新配置重拉（壳的 spawnServer 每次都读最新 cfg.proxy）。
+      // 若这里也 spawn 继任者，壳检测到子进程退出后还会再拉一个 → 双实例（一个绑端口、
+      // 一个永久待命）。待命实例不服务但白耗资源，历史上还造成过配置多写竞态。
+      if (process.env.BAI_ROUTER_EXE) {
+        log("代理变更，退出交由桌面壳以新配置重拉");
+        process.exit(0);
+      }
       const c = loadCfg();
       const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
         detached: true, stdio: "ignore", windowsHide: true, cwd: HERE,
@@ -162,29 +169,37 @@ let proxyCheckTimer = null;
 function scheduleProxyCheck(delay = 3000, reason = "周期探测") {
   clearTimeout(proxyCheckTimer);
   proxyCheckTimer = setTimeout(async () => {
+    if (!serverActivated) return; // 待命/未激活实例不探测（也就绝不触发写配置与自重启）
     const found = await detectWorkingProxy();
     if (found) applyProxy(found, reason);
   }, delay);
 }
-// 启动后探测一次；此后周期性自检；上游 fetch 失败时立刻触发
-setTimeout(() => scheduleProxyCheck(0, "启动探测"), 2500);
-setInterval(() => scheduleProxyCheck(0, "周期探测"), 10 * 60 * 1000);
-
-// 发布机模型同步（每版本一次性、只增不删）：把 config.defaults.json 里的可选模型并进本机列表
-try {
-  const defaultsPath = path.join(HERE, "config.defaults.json");
-  if (DATA_DIR !== HERE && existsSync(defaultsPath)) {
-    const cur = loadCfg();
-    if (cur._modelsSynced !== APP_VERSION) {
-      const def = JSON.parse(readFileSync(defaultsPath, "utf8"));
-      const merged = [...new Set([...(cur.availableModels || []), ...(def.availableModels || [])])];
-      cur.availableModels = merged;
-      cur._modelsSynced = APP_VERSION;
-      saveCfg(cur);
-      log(`可选模型已同步发布机（${merged.length} 个）`);
+// ---------- "激活"门控：只有真正绑上端口、在对外服务的实例才允许写配置/跑探测 ----------
+// 背景：v1.0.19 的待命接管会允许第二个实例长期存在（对方挂了随时接管）。若待命实例
+// 也跑模型合并(saveCfg)+周期代理探测，多实例并发读写同一份 config.json 会互相覆盖。
+let serverActivated = false;
+function onActivated() {
+  if (serverActivated) return;
+  serverActivated = true;
+  // 发布机模型同步（每版本一次性、只增不删）：把 config.defaults.json 里的可选模型并进本机列表
+  try {
+    const defaultsPath = path.join(HERE, "config.defaults.json");
+    if (DATA_DIR !== HERE && existsSync(defaultsPath)) {
+      const cur = loadCfg();
+      if (cur._modelsSynced !== APP_VERSION) {
+        const def = JSON.parse(readFileSync(defaultsPath, "utf8"));
+        const merged = [...new Set([...(cur.availableModels || []), ...(def.availableModels || [])])];
+        cur.availableModels = merged;
+        cur._modelsSynced = APP_VERSION;
+        saveCfg(cur);
+        log(`可选模型已同步发布机（${merged.length} 个）`);
+      }
     }
-  }
-} catch (e) { log("模型同步跳过: " + e.message); }
+  } catch (e) { log("模型同步跳过: " + e.message); }
+  // 激活后探测一次；此后周期性自检；上游 fetch 失败时由请求处理路径立刻触发
+  scheduleProxyCheck(0, "启动探测");
+  setInterval(() => scheduleProxyCheck(0, "周期探测"), 10 * 60 * 1000);
+}
 
 // ---------- 中转服务 ----------
 function normalizeModel(name) {
@@ -919,3 +934,5 @@ function listenWithRetry(srv, port, name) {
 }
 listenWithRetry(relay, cfg0.relayPort, "中转");
 listenWithRetry(panel, cfg0.panelPort, "面板");
+// 成功绑定中转端口 = 本实例成为唯一的活跃服务者，此时才允许合并配置/跑周期探测
+relay.once("listening", () => setTimeout(onActivated, 300));
