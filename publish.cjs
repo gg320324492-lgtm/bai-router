@@ -27,6 +27,10 @@ try {
 
 if (fs.existsSync(path.join(ROOT, "dist", exe))) console.log(`⚠ dist/${exe} 已存在——若确认重发请先删除或升版本号`);
 run("npx electron-builder --win nsis");
-run(`gh release create v${v} -R ${owner}/${repo} "dist/${exe}" "dist/${exe}.blockmap" "dist/latest.yml" --title "v${v}" --notes "${notes.replace(/"/g, "'")}"`);
+// upgrade.ps1：救砖/一键升级脚本，作为 release 资产随每个版本发布（旧版更新器损坏的用户无需打开网页）
+if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {
+  fs.copyFileSync(path.join(ROOT, "scripts", "upgrade.ps1"), path.join(ROOT, "dist", "upgrade.ps1"));
+}
+run(`gh release create v${v} -R ${owner}/${repo} "dist/${exe}" "dist/${exe}.blockmap" "dist/upgrade.ps1" "dist/latest.yml" --title "v${v}" --notes "${notes.replace(/"/g, "'")}"`);
 console.log(`\n✔ 已发布 v${v} → https://github.com/${owner}/${repo}/releases/tag/v${v}`);
 console.log("  各电脑上的软件将在启动 8 秒内或点「检查更新」时自动收到新版。");

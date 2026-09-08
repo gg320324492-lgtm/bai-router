@@ -3,7 +3,7 @@
 //   :panelPort  管理面板（UI + API：一键切换 / 一键恢复 / 映射编辑 / 状态体检）
 // 启动方式任意：若缺 NODE_USE_ENV_PROXY 环境变量会自动以正确环境重启自己。
 import http from "node:http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync, createWriteStream } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
@@ -79,6 +79,95 @@ function writeAtomic(file, data) {
   const tmp = file + ".tmp";
   writeFileSync(tmp, data);
   renameSync(tmp, file);
+}
+
+// ---------- 备用自升级通道（v1.0.24）：完全不依赖 electron-updater ----------
+// 动机：更新器是打包进客户端的代码，一旦上游出 bug（v1.0.19 前实测 PowerShell 验签必炸）
+// 存量客户端就被永久锁死在旧版。NSIS 安装器本身不受更新器影响且天然支持跨版本原地升级
+// （配置在 %APPDATA%，卸载不清理）。本通道用普通下载 + latest.yml sha512 + Authenticode
+// Subject 校验拉取最新安装器，再由一个脱离本进程树的 apply.cmd 完成：杀应用→静默安装→重拉。
+const SU_REPO = "gg320324492-lgtm/bai-router";
+const SU_DIR = path.join(DATA_DIR, "selfupdate");
+const SU_STATE = path.join(SU_DIR, "state.json");
+const SU_EXE = path.join(SU_DIR, "setup.exe");
+function suState(o) {
+  try { mkdirSync(SU_DIR, { recursive: true }); writeAtomic(SU_STATE, JSON.stringify({ ...o, at: new Date().toISOString() }, null, 2)); } catch { }
+}
+function readSuState() { try { return JSON.parse(readFileSync(SU_STATE, "utf8")); } catch { return null; } }
+async function downloadLatestInstaller() {
+  suState({ phase: "resolving" });
+  const rel = await (await fetch(`https://api.github.com/repos/${SU_REPO}/releases/latest`, {
+    headers: { accept: "application/vnd.github+json", "user-agent": "bai-router-selfupdate" },
+    signal: AbortSignal.timeout(20000),
+  })).json();
+  if (!rel || !rel.tag_name) throw new Error("查询最新 release 失败（多为 GitHub 不可达，开代理后重试）");
+  const asset = (rel.assets || []).find((a) => /^BARRouter-Setup-.+\.exe$/.test(a.name));
+  if (!asset) throw new Error("release 里没有安装包资产");
+  suState({ phase: "downloading", version: rel.tag_name, file: asset.name, got: 0, total: asset.size || 0, percent: 0 });
+  const fr = await fetch(asset.browser_download_url, {
+    headers: { "user-agent": "bai-router-selfupdate" },
+    signal: AbortSignal.timeout(15 * 60 * 1000),
+  });
+  if (!fr.ok || !fr.body) throw new Error("下载失败 HTTP " + fr.status);
+  const { Readable } = await import("node:stream");
+  const { createHash } = await import("node:crypto");
+  const hash = createHash("sha512");
+  const total = Number(fr.headers.get("content-length") || asset.size || 0);
+  let got = 0, lastTick = 0;
+  const ws = createWriteStream(SU_EXE);
+  try {
+    for await (const chunk of Readable.fromWeb(fr.body)) {
+      if (!ws.write(chunk)) await new Promise((r) => ws.once("drain", r));
+      hash.update(chunk);
+      got += chunk.length;
+      if (Date.now() - lastTick > 500) {
+        lastTick = Date.now();
+        suState({ phase: "downloading", version: rel.tag_name, file: asset.name, got, total, percent: total ? Math.floor((got / total) * 100) : 0 });
+      }
+    }
+  } finally {
+    ws.end();
+  }
+  await new Promise((r) => ws.once("close", r));
+  suState({ phase: "verifying", version: rel.tag_name, percent: 100, got, total });
+  // ① sha512 与 release feed（latest.yml）比对
+  const yml = await (await fetch(`https://github.com/${SU_REPO}/releases/latest/download/latest.yml`, { signal: AbortSignal.timeout(20000) })).text();
+  const mm = String(yml).match(/^sha512:\s*(.+)$/m);
+  const digest = hash.digest("base64");
+  if (mm && digest !== mm[1].trim()) throw new Error("安装包 sha512 校验不匹配");
+  // ② Authenticode 发布者校验（只取 Subject 字符串，不走 JSON——避开 electron-updater 同款深度截断坑）
+  const subject = await new Promise((r) => execFile("powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", `(Get-AuthenticodeSignature -LiteralPath '${SU_EXE.replace(/'/g, "''")}').SignerCertificate.Subject`],
+    { windowsHide: true, timeout: 25000 }, (e, so) => r(e ? "" : String(so).trim())));
+  if (!/B\.AI Router Personal/.test(subject)) throw new Error("安装包签名者校验失败：" + (subject || "无有效签名"));
+  suState({ phase: "ready", version: rel.tag_name, percent: 100 });
+  log(`备用升级：${rel.tag_name} 已下载并校验通过（${Math.round(got / 1048576)}MB）`);
+  return rel.tag_name;
+}
+function launchApplyScript() {
+  // apply.cmd 由 cmd.exe detached 起：不在服务进程树里，能安全杀掉 node+Electron 主进程。
+  // 路径全部用引号包裹；安装器 /S 为 electron-builder NSIS 静默模式，原地升级保留 %APPDATA% 配置。
+  const pids = path.join(SU_DIR, "pids.txt");
+  try { writeFileSync(pids, `${process.pid} ${process.ppid || 0}\n`); } catch { }
+  const appExe = process.env.BAI_ROUTER_EXE || "";
+  const helper = path.join(SU_DIR, "apply.cmd");
+  const lines = [
+    "@echo off",
+    "ping -n 3 127.0.0.1 >nul",
+    `for /f "tokens=1,2" %%a in ('type "${pids}"') do (`,
+    "  taskkill /F /PID %%a >nul 2>&1",
+    "  taskkill /F /PID %%b >nul 2>&1",
+    ")",
+    'taskkill /F /IM "B.AI Router.exe" >nul 2>&1',
+    "ping -n 3 127.0.0.1 >nul",
+    `"${SU_EXE}" /S`,
+    "ping -n 2 127.0.0.1 >nul",
+  ];
+  if (appExe) lines.push(`start "" "${appExe}" --min`);
+  lines.push(`del "${pids}" >nul 2>&1`, `del "%~f0" >nul 2>&1`);
+  writeFileSync(helper, lines.join("\r\n") + "\r\n");
+  const child = spawn("cmd.exe", ["/d", "/c", helper], { detached: true, stdio: "ignore", windowsHide: true, cwd: SU_DIR });
+  child.unref();
 }
 
 // ---------- 启动环境自检：缺代理环境变量则以正确环境重启自己 ----------
@@ -784,6 +873,32 @@ const panel = http.createServer(async (req, res) => {
         at: new Date().toISOString(),
       });
       return json(res, 200, { ok: pass === tiers.length, tiers, pass, total: tiers.length, active });
+    }
+
+    // ---------- 备用自升级 API ----------
+    if (req.method === "POST" && u.pathname === "/api/selfupdate") {
+      const cur = readSuState();
+      if (cur && (cur.phase === "downloading" || cur.phase === "verifying" || cur.phase === "resolving")) {
+        return json(res, 200, { ok: true, message: "升级已在进行中", phase: cur.phase });
+      }
+      downloadLatestInstaller().catch((e) => {
+        const msg = String((e && e.message) || e);
+        log("备用升级失败: " + msg);
+        suState({ phase: "error", error: msg.slice(0, 200) });
+      });
+      return json(res, 200, { ok: true, message: "开始下载最新版（走本机代理）" });
+    }
+    if (req.method === "GET" && u.pathname === "/api/selfupdate/status") {
+      return json(res, 200, readSuState() || { phase: "idle" });
+    }
+    if (req.method === "POST" && u.pathname === "/api/selfupdate/install") {
+      const st = readSuState();
+      if (!st || st.phase !== "ready") return json(res, 400, { error: "还没有校验通过的升级包（先点「开始升级」）" });
+      json(res, 200, { ok: true, message: `即将退出并安装 ${st.version}，约 15 秒后自动重开` });
+      log(`备用升级：启动安装 ${st.version}（本进程即将被 apply.cmd 收掉）`);
+      launchApplyScript();
+      setTimeout(() => process.exit(0), 400);
+      return;
     }
 
     if (req.method === "POST" && u.pathname === "/api/service/stop") {

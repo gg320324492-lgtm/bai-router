@@ -364,6 +364,7 @@
     <span class="paths" id="footPaths"></span>
     <span id="verTxt" style="font-family:var(--mono)"></span>
     <button class="btn-sm" id="updBtn" type="button" style="display:none">检查更新</button>
+    <button class="btn-sm" id="btnSelfUpd" type="button" style="display:none" title="不依赖内置更新器，直接从 GitHub 下载最新安装包并升级">备用升级</button>
     <button class="btn-sm" id="stopBtn" type="button">停止服务</button>
   </footer>
 </div>
@@ -375,6 +376,7 @@
     <div id="bnrUpdMsg" style="font-size:12px;color:var(--dim)"></div>
     <div class="row" id="bnrUpdRow" style="display:none">
       <button class="btn-main" id="bnrUpdGo" type="button" style="padding:6px 14px;font-size:12px">重启安装</button>
+      <button class="btn-sm" id="bnrUpdSelf" type="button" style="display:none">备用升级</button>
       <button class="btn-sm" id="bnrUpdLater" type="button">稍后</button>
     </div>
     <button class="x" id="bnrUpdX" type="button" title="关闭">✕</button>
@@ -720,6 +722,9 @@ if (window.baiDesktop) {
   $("updBtn").style.display = "";
   api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
 
+  $("btnSelfUpd").style.display = "";
+  $("btnSelfUpd").addEventListener("click", startSelfUpdate);
+
   // ---- 内嵌通知：更新进度/就绪、部署结果、服务恢复，全部走这里，不再弹系统窗 ----
 
   const paintUpdate = (st) => {
@@ -745,6 +750,7 @@ if (window.baiDesktop) {
         ? "这台电脑还没信任软件证书（每台电脑只需一次）。点「信任并重试」即可自动完成。"
         : (st.msg || "未知错误");
       $("bnrUpdRow").style.display = "";
+      $("bnrUpdSelf").style.display = "";
       $("bnrUpdGo").textContent = certIssue ? "信任并重试" : "重试更新";
       $("bnrUpdGo").onclick = async () => {
         if (certIssue) {
@@ -773,6 +779,63 @@ if (window.baiDesktop) {
   });
 }
 $("updBtn").addEventListener("click", () => { if (window.baiDesktop) window.baiDesktop.checkUpdate(); });
+
+/* ---------- 备用升级：独立于 electron-updater 的自救援通道（服务端执行下载/校验/安装） ---------- */
+let suTimer = null;
+function paintSelf(st) {
+  const b = $("bnrUpdate");
+  b.classList.add("show");
+  $("bnrUpdSelf").style.display = "none";
+  $("bnrUpdGo").style.display = "none";
+  $("bnrUpdLater").style.display = "none";
+  $("bnrUpdRow").style.display = "";
+  if (st.phase === "resolving") {
+    $("bnrUpdTitle").textContent = "备用升级：查询最新版…";
+    $("bnrUpdBarWrap").style.display = "none";
+  } else if (st.phase === "downloading") {
+    $("bnrUpdTitle").textContent = `备用升级：下载 ${st.version || ""}`;
+    $("bnrUpdBarWrap").style.display = "";
+    $("bnrUpdBar").style.width = (st.percent || 0) + "%";
+    $("bnrUpdMsg").textContent = `${st.percent || 0}% · ${((st.got || 0) / 1048576).toFixed(0)} / ${((st.total || 0) / 1048576).toFixed(0)} MB`;
+    $("bnrUpdLater").style.display = "";
+  } else if (st.phase === "verifying") {
+    $("bnrUpdTitle").textContent = "备用升级：校验安装包（sha512 + 数字签名）…";
+    $("bnrUpdBarWrap").style.display = "none";
+  } else if (st.phase === "ready") {
+    if (suTimer) { clearInterval(suTimer); suTimer = null; }
+    $("bnrUpdTitle").textContent = `${st.version} 已下载并校验通过`;
+    $("bnrUpdBarWrap").style.display = "none";
+    $("bnrUpdMsg").textContent = "点「立即重启安装」后应用会自动退出、静默升级并重新拉起（约 15 秒）。";
+    $("bnrUpdGo").style.display = "";
+    $("bnrUpdGo").textContent = "立即重启安装";
+    $("bnrUpdGo").disabled = false;
+    $("bnrUpdGo").onclick = async () => {
+      $("bnrUpdGo").disabled = true;
+      try {
+        const r = await api("/api/selfupdate/install", { method: "POST" });
+        $("bnrUpdMsg").textContent = r.message || "正在退出并安装…";
+      } catch (e) {
+        $("bnrUpdGo").disabled = false;
+        $("bnrUpdMsg").textContent = "启动安装失败：" + e.message;
+      }
+    };
+    $("bnrUpdLater").style.display = "";
+  } else if (st.phase === "error") {
+    if (suTimer) { clearInterval(suTimer); suTimer = null; }
+    b.classList.remove("show");
+    showInfo("备用升级失败", st.error || "未知错误", 0);
+  }
+}
+async function startSelfUpdate() {
+  if (!confirm("备用升级不依赖内置更新器：由路由台自己从 GitHub 下载最新版、校验签名后静默安装（期间应用会退出并自动重开，配置保留）。继续？")) return;
+  try { await api("/api/selfupdate", { method: "POST" }); } catch (e) { showInfo("备用升级", "启动失败：" + e.message, 0); return; }
+  if (suTimer) clearInterval(suTimer);
+  paintSelf({ phase: "resolving" });
+  suTimer = setInterval(async () => {
+    try { paintSelf(await api("/api/selfupdate/status")); } catch { /* 安装阶段服务退出，轮询自然停止 */ }
+  }, 1200);
+}
+$("bnrUpdSelf").addEventListener("click", startSelfUpdate);
 
 // v1.0.19: 从上游拉取真实模型目录，并入可选列表（映射目标强制保留，防止目录刷新后映射悬空）
 $("btnModels").addEventListener("click", () => withBusy($("btnModels"), async () => {
