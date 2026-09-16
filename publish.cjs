@@ -33,6 +33,16 @@ try {
 
 if (fs.existsSync(path.join(ROOT, "dist", exe))) console.log(`⚠ dist/${exe} 已存在——若确认重发请先删除或升版本号`);
 run("npx electron-builder --win nsis");
+// 发布闸门：打包产物必须模块齐全（v1.0.29 曾漏打包 install-consistency.js 导致启动即崩）
+{
+  const asar = path.join(ROOT, "dist", "win-unpacked", "resources", "app.asar");
+  const list = execSync(`npx --yes @electron/asar l "${asar}"`, { cwd: ROOT }).toString().replace(/\\/g, "/");
+  const need = ["src/main.js", "src/preload.js", "src/install-consistency.js"];
+  const miss = need.filter((f) => !list.includes(f));
+  const snOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "sn.html"));
+  if (miss.length || !snOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html"));
+  console.log("» 发布闸门通过：asar 模块齐全，sn.html 已随包");
+}
 // upgrade.ps1：救砖/一键升级脚本，作为 release 资产随每个版本发布（旧版更新器损坏的用户无需打开网页）
 if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {
   fs.copyFileSync(path.join(ROOT, "scripts", "upgrade.ps1"), path.join(ROOT, "dist", "upgrade.ps1"));
