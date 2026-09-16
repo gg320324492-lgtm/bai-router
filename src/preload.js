@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("baiDesktop", {
   deployLocal: () => ipcRenderer.invoke("deploy-local"),
   checkUpdate: () => ipcRenderer.invoke("check-update"),
   installUpdate: () => ipcRenderer.invoke("install-update"),
+  switchInstalled: () => ipcRenderer.invoke("switch-installed"),
   appVersion: () => ipcRenderer.invoke("app-version"),
   diagInfo: () => ipcRenderer.invoke("diag-info"),
   diagRetry: () => ipcRenderer.invoke("diag-retry"),

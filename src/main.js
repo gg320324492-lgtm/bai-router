@@ -2,6 +2,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, dialog } = 
 const { spawn, execFile } = require("child_process");
 const path = require("path");
 const fs = require("fs");
+const instCheck = require("./install-consistency");
 
 // ---------- 兼容性：老机器/核显/远程桌面下 Electron 窗口黑屏的根治开关 ----------
 // 路由台界面极轻，软件渲染没有任何可感知性能损失
@@ -60,11 +61,23 @@ const PANEL = `http://127.0.0.1:${panelPort}`;
 const startMin = process.argv.includes("--min");
 
 // ---------- 单实例 ----------
-if (!app.requestSingleInstanceLock()) {
-  app.quit();
-} else {
+// BAI_SELFHEAL=1 的子进程（从旧副本一键切到正式版）会等旧实例退出后再拿锁
+function startApp() {
   app.on("second-instance", () => showWindow());
   main().catch((e) => { dialog.showErrorBox("B.AI 路由台启动失败", String((e && e.stack) || e)); app.quit(); });
+}
+if (!app.requestSingleInstanceLock()) {
+  if (process.env.BAI_SELFHEAL) {
+    let lockTries = 0;
+    const lockTimer = setInterval(() => {
+      if (app.requestSingleInstanceLock()) { clearInterval(lockTimer); startApp(); }
+      else if (++lockTries >= 40) { clearInterval(lockTimer); app.quit(); }
+    }, 500);
+  } else {
+    app.quit();
+  }
+} else {
+  startApp();
 }
 
 async function main() {
@@ -75,6 +88,14 @@ async function main() {
   serverHealthy = ok;
   createTray();
   setupUpdater();
+  instCheck.init({
+    app, spawn, logMain,
+    getUpdateState: () => updateState,
+    setUpdateState: (s) => { updateState = s; },
+    notifyWindow, syncTray,
+    requestQuit: () => { quitting = true; setTimeout(() => app.quit(), 600); },
+  });
+  instCheck.check().catch(() => { });
   maybeFirstRunDeploy();
   startHealthWatcher();
   if (!startMin) showWindow(!ok);
@@ -354,6 +375,9 @@ function showWindow(diagMode) {
     if (updateState && (updateState.phase === "downloading" || updateState.phase === "ready")) {
       notifyWindow("app-event", { kind: "update", state: updateState });
     }
+    if (updateState && updateState.phase === "stale") {
+      notifyWindow("app-event", { kind: "stale", state: updateState });
+    }
     for (const ev of pendingEvents.splice(0)) {
       try { win.webContents.send("app-event", ev); } catch { }
     }
@@ -534,6 +558,7 @@ function syncTray() {
   if (u && u.phase === "downloading") tip += ` · 下载新版 ${u.version || ""} ${u.percent || 0}%`;
   else if (u && u.phase === "ready") tip += ` · 新版 ${u.version} 待安装`;
   else if (u && u.phase === "error") tip += " · 更新失败（可重试检查更新）";
+  else if (u && u.phase === "stale") tip += ` · 正在运行旧副本（正式版 v${u.version} 装在 ${u.regPath || "别处"}）`;
   tray.setToolTip(tip);
   // 更新就绪时：托盘菜单第一项变成「安装更新 vX」
   if (trayMenuRef) {
@@ -541,6 +566,9 @@ function syncTray() {
     if (u && u.phase === "ready") {
       first.label = `安装更新 v${u.version}`;
       first.click = installReadyUpdate;
+    } else if (u && u.phase === "stale" && u.canSwitch) {
+      first.label = `切换到正式版 v${u.version}`;
+      first.click = () => instCheck.switchToInstalled();
     } else {
       first.label = "显示主界面";
       first.click = () => showWindow();
@@ -578,6 +606,7 @@ ipcMain.handle("server-restart", async () => restartServer());
 ipcMain.handle("deploy-local", async () => { deployLocal(); return true; });
 ipcMain.handle("check-update", async () => { manualCheckUpdate(); return true; });
 ipcMain.handle("install-update", async () => { installReadyUpdate(); return true; });
+ipcMain.handle("switch-installed", () => instCheck.switchToInstalled());
 ipcMain.handle("app-version", () => ({ version: app.getVersion(), packaged: app.isPackaged }));
 ipcMain.on("app-quit", () => { quitting = true; app.quit(); });
 

@@ -761,6 +761,36 @@ if (window.baiDesktop) {
 
   // ---- 内嵌通知：更新进度/就绪、部署结果、服务恢复，全部走这里，不再弹系统窗 ----
 
+  // 旧副本提示（v1.0.29）：正从手工副本运行、正式版在别处且更新
+  const paintStale = (st) => {
+    const b = $("bnrUpdate");
+    b.classList.add("show");
+    $("bnrUpdBarWrap").style.display = "none";
+    $("bnrUpdSelf").style.display = "none";
+    $("bnrUpdLater").style.display = "none";
+    $("bnrUpdRow").style.display = "";
+    $("bnrUpdTitle").textContent = `检测到正在运行旧副本（正式版 v${st.version} 安装在别处）`;
+    const go = $("bnrUpdGo");
+    go.style.display = "";
+    if (st.canSwitch) {
+      $("bnrUpdMsg").textContent = "自动更新只会安装到正式目录，你打开的这份副本永远不会被更新。点「切换到正式版」立即改用最新安装（界面会自动重开），快捷方式也将一并校正。";
+      go.textContent = "切换到正式版 v" + st.version;
+      go.onclick = async () => {
+        go.disabled = true;
+        const r = await window.baiDesktop.switchInstalled();
+        go.disabled = false;
+        if (!r || !r.ok) {
+          $("bnrUpdTitle").textContent = "切换失败";
+          $("bnrUpdMsg").textContent = (r && r.msg) || "未知错误，可退出后从桌面图标重新打开";
+        }
+      };
+    } else {
+      $("bnrUpdMsg").textContent = "正式版主程序似乎已被删除或移动（" + (st.regPath || "") + "）。请重新安装最新版：退出本程序后运行安装包。";
+      go.textContent = "知道了";
+      go.onclick = () => b.classList.remove("show");
+    }
+  };
+
   const paintUpdate = (st) => {
     const b = $("bnrUpdate");
     if (!st || st.phase === "latest" || st.phase === "checking") { b.classList.remove("show"); return; }
@@ -807,6 +837,7 @@ if (window.baiDesktop) {
 
   window.baiDesktop.onAppEvent((ev) => {
     if (ev.kind === "update") paintUpdate(ev.state);
+    else if (ev.kind === "stale") paintStale(ev.state);
     else if (ev.kind === "check") showInfo("检查更新 / 部署", ev.text, ev.sticky ? 0 : 6000);
     else if (ev.kind === "deployed") showInfo("已自动部署", ev.text, 8000);
     else if (ev.kind === "recovered") showInfo("服务恢复", ev.text);
