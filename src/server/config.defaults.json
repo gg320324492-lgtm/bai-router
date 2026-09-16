@@ -7,6 +7,7 @@
   "defaultModel": "qwen3.8-flash",
   "availableModels": [
     "claude-fable-5",
+    "claude-fable-5.1",
     "claude-haiku-4.5",
     "claude-opus-4.5",
     "claude-opus-4.6",
@@ -16,14 +17,14 @@
     "claude-sonnet-4.5",
     "claude-sonnet-4.6",
     "claude-sonnet-5",
-    "deepseek-v4-flash",
-    "deepseek-v4-flash-vision-exp",
     "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
     "gemini-3-flash",
     "gemini-3.1-pro",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
+    "gemini-3.8-flash",
     "glm-5.1",
     "glm-5.2",
     "glm-5.3",
@@ -40,6 +41,7 @@
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-6-astra",
     "hy3",
     "hy4-preview",
     "kimi-k2.6",
@@ -58,8 +60,8 @@
       "label": "Qwen3.8-Flash"
     },
     "claude-sonnet-5": {
-      "target": "glm-5.3-flash",
-      "label": "GLM-5.3-Flash"
+      "target": "hy3",
+      "label": "HY3"
     },
     "claude-opus-5": {
       "target": "hy3",
@@ -68,6 +70,37 @@
     "claude-haiku-4-5": {
       "target": "mimo-v2.5",
       "label": "MiMo-V2.5"
+    }
+  },
+  "sn": {
+    "apiKey": "",
+    "upstream": "https://token.sensenova.cn",
+    "relayPort": 15732,
+    "defaultModel": "sensenova-6.8-flash-lite",
+    "availableModels": [
+      "sensenova-6.8-flash-lite",
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+      "glm-5.2",
+      "kimi-k3"
+    ],
+    "mapping": {
+      "claude-fable-5": {
+        "target": "sensenova-6.8-flash-lite",
+        "label": "SenseNova 6.8 Flash-Lite"
+      },
+      "claude-sonnet-5": {
+        "target": "sensenova-6.8-flash-lite",
+        "label": "SenseNova 6.8 Flash-Lite"
+      },
+      "claude-opus-5": {
+        "target": "sensenova-6.8-flash-lite",
+        "label": "SenseNova 6.8 Flash-Lite"
+      },
+      "claude-haiku-4-5": {
+        "target": "sensenova-6.8-flash-lite",
+        "label": "SenseNova 6.8 Flash-Lite"
+      }
     }
   }
 }

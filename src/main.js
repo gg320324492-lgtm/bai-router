@@ -38,6 +38,7 @@ let child = null;
 let quitting = false;
 let panelPort = 15723;
 let relayPort = 15722;
+let snRelayPort = 15732; // v1.0.28: SenseNova 独立中转端口（同样纳入启动预检回收）
 let updateState = null; // {version, downloaded}
 
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch { }
@@ -45,11 +46,13 @@ try {
   const c = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "config.json"), "utf8"));
   panelPort = c.panelPort || panelPort;
   relayPort = c.relayPort || relayPort;
+  snRelayPort = (c.sn && c.sn.relayPort) || snRelayPort;
 } catch {
   try {
     const c = JSON.parse(fs.readFileSync(path.join(path.dirname(SERVER_JS), "config.defaults.json"), "utf8"));
     panelPort = c.panelPort || panelPort;
     relayPort = c.relayPort || relayPort;
+    snRelayPort = (c.sn && c.sn.relayPort) || snRelayPort;
   } catch { }
 }
 
@@ -235,10 +238,11 @@ async function reclaimPort(port) {
 }
 
 async function ensureServer() {
-  // 预检：抢回被旧残留占用的端口
+  // 预检：抢回被旧残留占用的端口（含 SenseNova 中转 :15732）
   const r1 = await reclaimPort(relayPort);
   const r2 = await reclaimPort(panelPort);
-  portReport = [r1, r2].filter(Boolean);
+  const r3 = await reclaimPort(snRelayPort);
+  portReport = [r1, r2, r3].filter(Boolean);
   const blocked = portReport.find((p) => p.blocked);
   if (blocked) {
     lastSpawnError = `端口 ${blocked.port} 被非本软件进程占用: ${blocked.occupant}（请手动关闭该程序或改端口）`;
@@ -282,7 +286,8 @@ async function restartServer() {
   // 重试前重新回收端口（应对"外部残留占用"场景）
   const r1 = await reclaimPort(relayPort);
   const r2 = await reclaimPort(panelPort);
-  portReport = [r1, r2].filter(Boolean);
+  const r3 = await reclaimPort(snRelayPort);
+  portReport = [r1, r2, r3].filter(Boolean);
   const st = await getStatus();
   if (st && st.service && st.service.pid) {
     try { await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(st.service.pid)], { windowsHide: true }, r)); } catch { }
