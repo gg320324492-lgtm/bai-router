@@ -3,7 +3,6 @@
 //   :panelPort  管理面板（UI + API：一键切换 / 一键恢复 / 映射编辑 / 状态体检）
 // 启动方式任意：若缺 NODE_USE_ENV_PROXY 环境变量会自动以正确环境重启自己。
 import http from "node:http";
-import https from "node:https";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync, createWriteStream } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,10 +53,6 @@ function log(...a) {
 }
 
 // ---------- 配置 ----------
-// Claude 档位 → 目标模型 的默认映射（每个提供方各一份，互不影响）
-function defaultMapping(target, label) {
-  return Object.fromEntries(TIERS.map((t) => [t.key, { target, label }]));
-}
 const DEFAULTS = {
   apiKey: "",
   upstream: "https://api.b.ai",
@@ -66,33 +61,15 @@ const DEFAULTS = {
   panelPort: 15723,
   defaultModel: "qwen3.8-flash",
   availableModels: ["qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash"],
-  mapping: defaultMapping("qwen3.8-flash", "Qwen3.8-Flash"),
-  // SenseNova（商汤日日新）—— 第二个可路由提供方，独立密钥/上游/端口/映射，UI 单独一页
-  sn: {
-    apiKey: "",
-    upstream: "https://token.sensenova.cn", // 中转按 upstream + req.url 拼接，客户端请求 /v1/messages
-    relayPort: 15732,
-    defaultModel: "sensenova-6.8-flash-lite",
-    // 均为 /v1/models 实测可对话（output_modalities=text）的模型；图像模型(u1-fast/u1.5-lite)不列
-    availableModels: ["sensenova-6.8-flash-lite", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.2", "kimi-k3"],
-    mapping: defaultMapping("sensenova-6.8-flash-lite", "SenseNova 6.8 Flash-Lite"),
-  },
+  mapping: Object.fromEntries(TIERS.map((t) => [t.key, { target: "qwen3.8-flash", label: t.zh }])),
 };
 function loadCfg() {
   try {
     const c = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
-    const merged = { ...DEFAULTS, ...c, mapping: { ...DEFAULTS.mapping, ...(c.mapping || {}) } };
-    // sn 深合并：旧 config.json 没有 sn 时也能拿到完整默认，缺字段时逐个补
-    const snIn = c.sn || {};
-    merged.sn = {
-      ...DEFAULTS.sn, ...snIn,
-      mapping: { ...DEFAULTS.sn.mapping, ...(snIn.mapping || {}) },
-      availableModels: Array.isArray(snIn.availableModels) && snIn.availableModels.length ? snIn.availableModels : [...DEFAULTS.sn.availableModels],
-    };
-    return merged;
+    return { ...DEFAULTS, ...c, mapping: { ...DEFAULTS.mapping, ...(c.mapping || {}) } };
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
-    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] } };
+    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping } };
   }
 }
 function saveCfg(cfg) {
@@ -305,13 +282,9 @@ function onActivated() {
         const def = JSON.parse(readFileSync(defaultsPath, "utf8"));
         const merged = [...new Set([...(cur.availableModels || []), ...(def.availableModels || [])])];
         cur.availableModels = merged;
-        // SenseNova 侧同样并入（每版本一次性、只增不删）
-        if (def.sn && Array.isArray(def.sn.availableModels) && def.sn.availableModels.length) {
-          cur.sn.availableModels = [...new Set([...(cur.sn.availableModels || []), ...def.sn.availableModels])];
-        }
         cur._modelsSynced = APP_VERSION;
         saveCfg(cur);
-        log(`可选模型已同步发布机（${merged.length} 个 + SenseNova ${cur.sn.availableModels.length} 个）`);
+        log(`可选模型已同步发布机（${merged.length} 个）`);
       }
     }
   } catch (e) { log("模型同步跳过: " + e.message); }
@@ -335,12 +308,18 @@ function resolveModel(name, cfg) {
 }
 
 // 最近真实调用观察（Claude Code 每次请求都会经过中转，天然全知）
-// 每个提供方一份：B.AI 侧观察不能依赖 sn 侧流量，反之亦然。记录逻辑内联在 makeRelay 里。
-const recentCallsBai = [];  // {tier, served, at}
-const recentCallsSn = [];
-function activeTier(store) {
+const recentCalls = []; // {tier, served, at}
+function recordCall(tier, served) {
+  if (recentCalls[0] && recentCalls[0].tier === tier && Date.now() - recentCalls[0].at < 2000) {
+    recentCalls[0].at = Date.now(); // 密集请求合并，只刷新时间
+    return;
+  }
+  recentCalls.unshift({ tier, served, at: Date.now() });
+  if (recentCalls.length > 30) recentCalls.pop();
+}
+function activeTier() {
   // 最近 30 分钟内被"真实会话"用过的档位；没有观察则返回 null（不再默认猜 Haiku）
-  if (store.length && Date.now() - store[0].at < 30 * 60000) return store[0].tier;
+  if (recentCalls.length && Date.now() - recentCalls[0].at < 30 * 60000) return recentCalls[0].tier;
   return null;
 }
 
@@ -350,16 +329,11 @@ function isApiResponseType(contentType) {
 }
 
 // v1.0.19: 最近一次中转链路错误（供面板"本地中转"灯做归因：proxy/timeout/rate_limit/upstream_4xx/network）
-// v1.0.28: 按提供方各记一份（B.AI 与 SenseNova 的中转互不干扰）
-const relayErrors = {
-  bai: { kind: null, message: null, at: null },
-  sn: { kind: null, message: null, at: null },
-};
-function noteRelayError(p, kind, message) {
-  const slot = relayErrors[p] || relayErrors.bai;
-  slot.kind = kind;
-  slot.message = String(message).slice(0, 180);
-  slot.at = new Date().toISOString();
+const lastRelayError = { kind: null, message: null, at: null };
+function noteRelayError(kind, message) {
+  lastRelayError.kind = kind;
+  lastRelayError.message = String(message).slice(0, 180);
+  lastRelayError.at = new Date().toISOString();
 }
 
 function sendRateLimitError(res, upstream) {
@@ -407,128 +381,85 @@ async function readProbeJson(response) {
   }
 }
 
-// 直连上游（不经 HTTPS_PROXY 环境变量）：SenseNova 是境内服务，走 Clash 出海节点反而多一跳、
-// 且 Clash 没开时不该被带崩。用 node http/https 手工发请求，返回一个与 fetch 响应形状兼容的对象
-// （status / headers.get / headers.forEach / body 为 node stream），让 relayHandler 两套传输共用处理逻辑。
-function directHttp(target, { method, headers, body, timeoutMs }) {
-  return new Promise((resolve, reject) => {
-    let u;
-    try { u = new URL(target); } catch { reject(new Error("upstream 地址非法: " + target)); return; }
-    const mod = u.protocol === "http:" ? http : https;
-    const r = mod.request(u, { method, headers }, (res) => {
-      // 与 fetch 路径语义对齐：超时只限"连接+响应头"。头已到达，解除不活动计时——
-      // 否则深度思考模型在两个 SSE 块之间静默 >30s 会被掐（fetch 路径的 signal 此时已了结）。
-      if (timeoutMs) r.setTimeout(0);
-      const h = res.headers || {};
-      resolve({
-        status: res.statusCode,
-        headers: {
-          get: (k) => { const v = h[String(k).toLowerCase()]; return Array.isArray(v) ? v.join(", ") : v; },
-          forEach: (fn) => { for (const k in h) fn(h[k], k, h); },
-        },
-        body: res,
-        _nodeStream: true,
-      });
-    });
-    r.on("error", reject);
-    if (timeoutMs) r.setTimeout(timeoutMs, () => { const e = new Error("aborted (header timeout)"); e.name = "AbortError"; r.destroy(e); });
-    if (body) r.write(body);
-    r.end();
-  });
-}
-
-// 中转核心工厂：B.AI(:relayPort) 与 SenseNova(:sn.relayPort) 复用同一套逻辑，只是
-// 取哪份配置(slice)、是否走代理(useProxy)、把流量记到哪个 recentCalls(store) 不同。
-function makeRelay(p, store, getSlice, useProxy) {
-  return http.createServer((req, res) => {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", async () => {
-      const cfg = loadCfg(); // 每请求实时读：映射改完立即生效，无需重启
-      const S = getSlice(cfg); // {upstream, mapping, defaultModel, availableModels}
-      const sliceCfg = { mapping: S.mapping, availableModels: S.availableModels, defaultModel: S.defaultModel };
-      let body = Buffer.concat(chunks);
-      const ct = (req.headers["content-type"] || "").toLowerCase();
-      if (body.length && ct.includes("json")) {
-        try {
-          const j = JSON.parse(body.toString("utf8"));
-          if (typeof j.max_tokens === "number" && j.max_tokens < 3) j.max_tokens = 3; // 桌面版健康探测兼容
-          if (typeof j.model === "string") {
-            const tier = normalizeModel(j.model);
-            j.model = resolveModel(j.model, sliceCfg);
-            // 只观察"真实会话"流量：max_tokens≥512 的对话请求。
-            // 桌面版后台小请求(健康探测/起标题/摘要, max_tokens 通常 ≤128)不算"用户正在用的档位"
-            if (req.method === "POST" && req.url.startsWith("/v1/messages") && typeof j.max_tokens === "number" && j.max_tokens >= 512) {
-              if (store[0] && store[0].tier === tier && Date.now() - store[0].at < 2000) store[0].at = Date.now();
-              else { store.unshift({ tier, served: j.model, at: Date.now() }); if (store.length > 30) store.pop(); }
-            }
-          }
-          body = Buffer.from(JSON.stringify(j));
-        } catch { /* 非 JSON 原样透传 */ }
-      }
-      const headers = {};
-      for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
-      // 探活级小请求（max_tokens≤8，桌面版健康检查/模型探测）：遇 429 静默退避重试 + 更短超时。
-      // 放在 try 外声明——catch 里的超时归因也要用到
-      const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();
-      const headerTimeoutMs = isProbe ? 10000 : 30000;
-      const UP = S.upstream + req.url;
-      const doCall = () => useProxy(cfg)
-        ? fetch(UP, { method: req.method, headers, body: body.length ? body : undefined, signal: AbortSignal.timeout(headerTimeoutMs) })
-        : directHttp(UP, { method: req.method, headers, body: body.length ? body : undefined, timeoutMs: headerTimeoutMs });
+const relay = http.createServer((req, res) => {
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", async () => {
+    const cfg = loadCfg(); // 每请求实时读：映射改完立即生效，无需重启
+    let body = Buffer.concat(chunks);
+    const ct = (req.headers["content-type"] || "").toLowerCase();
+    if (body.length && ct.includes("json")) {
       try {
-        const { Readable } = await import("node:stream");
-        let r;
-        // v1.0.19: 上游超时只限"连接+响应头"——头一到就放行（SSE 流式正文不限时）。
-        for (let attempt = 0; ; attempt++) {
-          r = await doCall();
-          if (!isProbe || r.status !== 429 || attempt >= 3) break;
-          if (r.body && r.body.resume) r.body.resume(); // 丢弃 429 响应体（node stream 需 resume 否则挂起）
-          await new Promise((rr) => setTimeout(rr, 400 * (attempt + 1)));
+        const j = JSON.parse(body.toString("utf8"));
+        if (typeof j.max_tokens === "number" && j.max_tokens < 3) j.max_tokens = 3; // 桌面版健康探测兼容
+        if (typeof j.model === "string") {
+          const tier = normalizeModel(j.model);
+          j.model = resolveModel(j.model, cfg);
+          // 只观察"真实会话"流量：max_tokens≥512 的对话请求。
+          // 桌面版后台小请求(健康探测/起标题/摘要, max_tokens 通常 ≤128)不算"用户正在用的档位"
+          if (req.method === "POST" && req.url.startsWith("/v1/messages") && typeof j.max_tokens === "number" && j.max_tokens >= 512) recordCall(tier, j.model);
         }
-        // 429 可能是不带 Content-Type 的空响应；先单独处理，不能误判为代理 HTML。
-        if (r.status === 429) {
-          noteRelayError(p, "rate_limit", "上游 429 限流（免费渠道并发敏感）");
-          return sendRateLimitError(res, r);
+        body = Buffer.from(JSON.stringify(j));
+      } catch { /* 非 JSON 原样透传 */ }
+    }
+    const headers = {};
+    for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
+    // 探活级小请求（max_tokens≤8，桌面版健康检查/模型探测）：遇 429 静默退避重试 + 更短超时。
+    // 放在 try 外声明——catch 里的超时归因也要用到
+    const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();
+    const headerTimeoutMs = isProbe ? 10000 : 30000;
+    try {
+      const { Readable } = await import("node:stream");
+      let r;
+      // v1.0.19: 上游超时只限"连接+响应头"——头一到就 clearTimeout 放行（SSE 流式正文不限时）。
+      // 之前无超时，上游挂起时请求会无限吊住，桌面端表现为永远转圈。
+      for (let attempt = 0; ; attempt++) {
+        const ac = new AbortController();
+        const tid = setTimeout(() => ac.abort(), headerTimeoutMs);
+        try {
+          r = await fetch(cfg.upstream + req.url, { method: req.method, headers, body: body.length ? body : undefined, signal: ac.signal });
+        } finally {
+          clearTimeout(tid);
         }
-        // Anthropic API 端点只应返回 JSON 或 SSE；其余类型通常是代理/WAF
-        // 的 HTML 页面。转换为标准 JSON 错误，避免调用端误报 JSON 解析异常。
-        if (req.url.startsWith("/v1/") && !isApiResponseType(r.headers.get("content-type"))) {
-          return sendUnexpectedUpstreamResponse(res, r);
-        }
-        if (r.status >= 400) noteRelayError(p, `upstream_${r.status}`, `上游 HTTP ${r.status}（${req.url}）`);
-        const h = {};
-        // fetch 已自动解压响应体，content-encoding 必须剥掉，否则客户端按 gzip 解明文会炸。
-        // node 直连不解压：对 sn 保留 content-encoding，交给客户端解压。
-        const strip = r._nodeStream
-          ? ["content-length", "transfer-encoding", "connection"]
-          : ["content-length", "transfer-encoding", "connection", "content-encoding"];
-        r.headers.forEach((v, k) => { if (!strip.includes(k)) h[k] = v; });
-        res.writeHead(r.status, h);
-        if (r.body) {
-          const stream = r._nodeStream ? r.body : Readable.fromWeb(r.body);
-          stream.pipe(res);
-          stream.on("error", () => res.end());
-        } else res.end();
-      } catch (e) {
-        const msg = String((e && e.message) || e);
-        if (useProxy(cfg) && msg.includes("fetch failed")) scheduleProxyCheck(0, "上游连接失败触发"); // 代理可能换了端口/挂了 → 自动探测
-        // v1.0.19: 超时/网络错误给出人话归因，并记录到面板"本地中转"灯
-        const timedOut = e?.name === "AbortError" || msg.toLowerCase().includes("abort");
-        const friendly = timedOut
-          ? `上游 ${S.upstream} 在 ${isProbe ? 10 : 30}s 内未返回响应头（节点慢或被墙），已中断本次请求`
-          : msg;
-        noteRelayError(p, timedOut ? "timeout" : msg.includes("fetch failed") ? "proxy" : "network", friendly);
-        if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { type: "relay_error", message: friendly } }));
+        if (!isProbe || r.status !== 429 || attempt >= 3) break;
+        await new Promise((res) => setTimeout(res, 400 * (attempt + 1)));
       }
-    });
+      // 429 可能是不带 Content-Type 的空响应；先单独处理，不能误判为代理 HTML。
+      if (r.status === 429) {
+        noteRelayError("rate_limit", "上游 429 限流（免费渠道并发敏感）");
+        return sendRateLimitError(res, r);
+      }
+      // Anthropic API 端点只应返回 JSON 或 SSE；其余类型通常是代理/WAF
+      // 的 HTML 页面。转换为标准 JSON 错误，避免调用端误报 JSON 解析异常。
+      if (req.url.startsWith("/v1/") && !isApiResponseType(r.headers.get("content-type"))) {
+        return sendUnexpectedUpstreamResponse(res, r);
+      }
+      if (r.status >= 400) noteRelayError(`upstream_${r.status}`, `上游 HTTP ${r.status}（${req.url}）`);
+      const h = {};
+      // fetch 已自动解压响应体，content-encoding 必须剥掉，否则客户端按 gzip 解明文会炸
+      r.headers.forEach((v, k) => { if (!["content-length", "transfer-encoding", "connection", "content-encoding"].includes(k)) h[k] = v; });
+      res.writeHead(r.status, h);
+      if (r.body) {
+        const stream = Readable.fromWeb(r.body);
+        stream.pipe(res);
+        stream.on("error", () => res.end());
+      } else res.end();
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (msg.includes("fetch failed")) scheduleProxyCheck(0, "上游连接失败触发"); // 代理可能换了端口/挂了 → 自动探测
+      // v1.0.19: 超时/网络错误给出人话归因，并记录到面板"本地中转"灯
+      const friendly = e?.name === "AbortError" || msg.toLowerCase().includes("abort")
+        ? `上游 ${cfg.upstream} 在 ${isProbe ? 10 : 30}s 内未返回响应头（节点慢或被墙），已中断本次请求`
+        : msg;
+      noteRelayError(
+        e?.name === "AbortError" || msg.toLowerCase().includes("abort") ? "timeout" : msg.includes("fetch failed") ? "proxy" : "network",
+        friendly
+      );
+      if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "relay_error", message: friendly } }));
+    }
   });
-}
-
-// 两个中转：B.AI 走代理（出海）、SenseNova 走直连（境内，可被 sn.useProxy 覆盖）
-const relay = makeRelay("bai", recentCallsBai, (cfg) => ({ upstream: cfg.upstream, mapping: cfg.mapping, defaultModel: cfg.defaultModel, availableModels: cfg.availableModels }), () => true);
-const snRelay = makeRelay("sn", recentCallsSn, (cfg) => ({ upstream: cfg.sn.upstream, mapping: cfg.sn.mapping, defaultModel: cfg.sn.defaultModel, availableModels: cfg.sn.availableModels }), (cfg) => cfg.sn.useProxy === true);
+});
 
 // ---------- 文件级操作 ----------
 function readJson(file) {
@@ -547,50 +478,21 @@ function desktopConfigFile() {
   } catch {}
   return null;
 }
-// ---------- 提供方（provider）切片：B.AI 与 SenseNova 归一化成同一形状，逻辑复用 ----------
-// p="bai"（顶层字段）或 p="sn"（cfg.sn 子对象）。返回统一形状供中转/面板/接线共用。
-function sliceOf(cfg, p) {
-  if (p === "sn") {
-    const s = cfg.sn || {};
-    return {
-      p: "sn", zh: "SenseNova", key: s.apiKey || "", upstream: s.upstream || DEFAULTS.sn.upstream,
-      relayPort: s.relayPort || DEFAULTS.sn.relayPort, defaultModel: s.defaultModel || DEFAULTS.sn.defaultModel,
-      availableModels: s.availableModels || [...DEFAULTS.sn.availableModels], mapping: s.mapping || { ...DEFAULTS.sn.mapping },
-      useProxy: s.useProxy === true,
-    };
-  }
-  return {
-    p: "bai", zh: "B.AI", key: cfg.apiKey || "", upstream: cfg.upstream || DEFAULTS.upstream,
-    relayPort: cfg.relayPort || DEFAULTS.relayPort, defaultModel: cfg.defaultModel || DEFAULTS.defaultModel,
-    availableModels: cfg.availableModels || [...DEFAULTS.availableModels], mapping: cfg.mapping || { ...DEFAULTS.mapping },
-    useProxy: true,
-  };
-}
-const PROVIDERS = { bai: "B.AI", sn: "SenseNova" };
-const isOurs = (mode) => mode === "bai" || mode === "sn";
-function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
-
-// CLI 的 ANTHROPIC_BASE_URL 恒为提供方上游本体（B.AI=api.b.ai、sn=token.sensenova.cn），不经本地中转；
-// 只有桌面版走 127.0.0.1:<relay>。故两者用不同的判据。
-function cliMode(cfg, cfgKey, snKey) {
+function cliMode(cfgKey) {
   try {
     const s = readJson(SETTINGS);
     const u = s?.env?.ANTHROPIC_BASE_URL || "";
     const key = s?.env?.ANTHROPIC_AUTH_TOKEN || "";
     const r = { baseUrl: u, keyFp: key ? keyFp(key) : null };
-    const c = cfg || loadCfg();
     if (cfgKey) r.keyMatch = key === cfgKey;
-    if (snKey != null) r.keyMatchSn = key === snKey;
-    const bh = hostOf(c.upstream || DEFAULTS.upstream), sh = hostOf(c.sn?.upstream || DEFAULTS.sn.upstream);
-    if (bh && u.includes(bh)) return { mode: "bai", ...r };
-    if (sh && u.includes(sh)) return { mode: "sn", ...r };
+    if (u.includes("api.b.ai")) return { mode: "bai", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
     return { mode: "unknown", baseUrl: "" };
   }
 }
-function desktopMode(cfg, cfgKey, snKey) {
+function desktopMode(cfgKey) {
   try {
     const f = desktopConfigFile();
     if (!f || !existsSync(f)) return { mode: "unknown", baseUrl: "" };
@@ -598,67 +500,55 @@ function desktopMode(cfg, cfgKey, snKey) {
     const u = d?.inferenceGatewayBaseUrl || "";
     const key = d?.inferenceGatewayApiKey || "";
     const r = { baseUrl: u, keyFp: key ? keyFp(key) : null };
-    const c = cfg || loadCfg();
     if (cfgKey) r.keyMatch = key === cfgKey;
-    if (snKey != null) r.keyMatchSn = key === snKey;
-    if (u.includes(`:${c.relayPort || DEFAULTS.relayPort}`)) return { mode: "bai", ...r };
-    if (u.includes(`:${c.sn?.relayPort || DEFAULTS.sn.relayPort}`)) return { mode: "sn", ...r };
+    if (u.includes(":15722")) return { mode: "bai", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
     return { mode: "unknown", baseUrl: "" };
   }
 }
-// 把「当前非本软件（CC Switch/其他）的配置」快照下来，作为将来一键恢复的还原点。
-// 只有当前不属于任何本软件提供方时才覆盖快照——避免把 bai 配置误存成"外部基线"。
+// 把「当前非 B.AI 的配置」快照下来，作为将来一键恢复的还原点
 function snapshotExternal() {
   mkdirSync(BACKUP_DIR, { recursive: true });
-  const c = loadCfg();
   const warns = [];
-  const cm = cliMode(c);
-  if (!isOurs(cm.mode) && existsSync(SETTINGS)) {
+  const cm = cliMode();
+  if (cm.mode !== "bai" && existsSync(SETTINGS)) {
     copyFileSync(SETTINGS, path.join(BACKUP_DIR, "external-cli.json"));
-  } else if (isOurs(cm.mode) && !existsSync(path.join(BACKUP_DIR, "external-cli.json"))) {
-    warns.push("CLI 没有可恢复的 CC Switch 快照（当前已是本软件接管且从未快照过）");
+  } else if (cm.mode === "bai" && !existsSync(path.join(BACKUP_DIR, "external-cli.json"))) {
+    warns.push("CLI 没有可恢复的 CC Switch 快照（当前已是 B.AI 且从未快照过）");
   }
-  const dm = desktopMode(c);
+  const dm = desktopMode();
   const df = desktopConfigFile();
-  if (!isOurs(dm.mode) && df && existsSync(df)) {
+  if (dm.mode !== "bai" && df && existsSync(df)) {
     copyFileSync(df, path.join(BACKUP_DIR, "external-desktop.json"));
-  } else if (isOurs(dm.mode) && !existsSync(path.join(BACKUP_DIR, "external-desktop.json"))) {
+  } else if (dm.mode === "bai" && !existsSync(path.join(BACKUP_DIR, "external-desktop.json"))) {
     warns.push("桌面版没有可恢复的 CC Switch 快照");
   }
   return warns;
 }
 
-// 通用：把一个提供方的映射写进 CLI settings.json
-function applyToCli(S) {
+function applyBaiToCli(cfg) {
   let s = {};
   try { s = readJson(SETTINGS); } catch { s = {}; }
   s.env = s.env || {};
   const e = s.env;
-  e.ANTHROPIC_AUTH_TOKEN = S.key;
-  // B.AI 的 CLI 直连上游（靠 proxy env 出海）；SenseNova 是境内服务，CLI 直连、清空代理
-  e.ANTHROPIC_BASE_URL = S.p === "sn" ? S.upstream : S.upstream;
-  e.ANTHROPIC_MODEL = S.mapping["claude-haiku-4-5"]?.target || S.defaultModel;
+  e.ANTHROPIC_AUTH_TOKEN = cfg.apiKey;
+  e.ANTHROPIC_BASE_URL = cfg.upstream;
+  e.ANTHROPIC_MODEL = cfg.mapping["claude-haiku-4-5"]?.target || cfg.defaultModel;
   for (const t of TIERS) {
-    e[t.envKey] = S.mapping[t.key]?.target || S.defaultModel;
+    e[t.envKey] = cfg.mapping[t.key]?.target || cfg.defaultModel;
     delete e[t.envKey + "_NAME"];
   }
   e.API_TIMEOUT_MS = e.API_TIMEOUT_MS || "3000000";
   e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
   e.NODE_USE_ENV_PROXY = "1";
-  if (S.p === "sn") {
-    delete e.HTTPS_PROXY; delete e.HTTP_PROXY; // 境内直连，无需 Clash
-  } else {
-    e.HTTPS_PROXY = loadCfg().proxy;
-    e.HTTP_PROXY = loadCfg().proxy;
-  }
+  e.HTTPS_PROXY = cfg.proxy;
+  e.HTTP_PROXY = cfg.proxy;
   e.NO_PROXY = "127.0.0.1,localhost";
   writeAtomic(SETTINGS, JSON.stringify(s, null, 2) + "\n");
 }
-// 通用：把一个提供方写进桌面版 configLibrary（都经由本地中转，桌面版不感知上游差异）
-function applyToDesktop(S) {
+function applyBaiToDesktop(cfg) {
   const f = desktopConfigFile();
   if (!f) throw new Error("找不到桌面版配置文件（configLibrary/_meta.json）");
   writeAtomic(
@@ -667,11 +557,11 @@ function applyToDesktop(S) {
       {
         coworkEgressAllowedHosts: ["*"],
         disableDeploymentModeChooser: true,
-        inferenceGatewayApiKey: S.key,
+        inferenceGatewayApiKey: cfg.apiKey,
         inferenceGatewayAuthScheme: "bearer",
-        inferenceGatewayBaseUrl: `http://127.0.0.1:${S.relayPort}`,
+        inferenceGatewayBaseUrl: `http://127.0.0.1:${cfg.relayPort}`,
         inferenceModels: TIERS.map((t) => ({
-          labelOverride: S.mapping[t.key]?.label || t.zh,
+          labelOverride: cfg.mapping[t.key]?.label || t.zh,
           name: t.key,
           supports1m: true,
         })),
@@ -682,9 +572,6 @@ function applyToDesktop(S) {
     ) + "\n"
   );
 }
-// 兼容旧调用名
-function applyBaiToCli(cfg) { applyToCli(sliceOf(cfg, "bai")); }
-function applyBaiToDesktop(cfg) { applyToDesktop(sliceOf(cfg, "bai")); }
 
 // CC Switch 方案的兜底还原数据（取自用户机器上真实生效过的配置）
 const FALLBACK_CC_CLI = {
@@ -724,18 +611,17 @@ const FALLBACK_CC_DESK = {
 };
 
 function restoreExternal(target, cfg) {
-  const c = cfg || loadCfg();
   if (target === "cli") {
     const bak = path.join(BACKUP_DIR, "external-cli.json");
     if (existsSync(bak)) {
       copyFileSync(bak, SETTINGS);
       return "已从快照恢复 CLI";
     }
-    if (isOurs(cliMode(c).mode)) {
+    if (cliMode().mode === "bai") {
       writeAtomic(SETTINGS, JSON.stringify(FALLBACK_CC_CLI, null, 2) + "\n");
       return "CLI 无快照，已写入内置 CC Switch 兜底配置";
     }
-    return "CLI 当前不是本软件接管，无需恢复";
+    return "CLI 当前不是 B.AI 模式，无需恢复";
   }
   if (target === "desktop") {
     const bak = path.join(BACKUP_DIR, "external-desktop.json");
@@ -744,11 +630,11 @@ function restoreExternal(target, cfg) {
       copyFileSync(bak, f);
       return "已从快照恢复桌面版";
     }
-    if (f && isOurs(desktopMode(c).mode)) {
+    if (f && desktopMode().mode === "bai") {
       writeAtomic(f, JSON.stringify(FALLBACK_CC_DESK, null, 2) + "\n");
       return "桌面版无快照，已写入内置 CC Switch 兜底配置";
     }
-    return "桌面版当前不是本软件接管，无需恢复";
+    return "桌面版当前不是 B.AI 模式，无需恢复";
   }
   throw new Error("未知恢复目标 " + target);
 }
@@ -789,49 +675,32 @@ async function readBody(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-function providerStatus(cfg, p, store) {
-  const S = sliceOf(cfg, p);
-  const t = activeTier(store);
-  return {
-    relay: { port: S.relayPort, up: true },
-    relayLast: { ...(relayErrors[p] || {}) },
-    upstream: {
-      host: S.upstream,
-      tested: lastTest[p]?.ok, ok: lastTest[p]?.ok, model: lastTest[p]?.model || null,
-      ms: lastTest[p]?.ms || null, error: lastTest[p]?.error || null, at: lastTest[p]?.at || null,
-    },
-    recent: (() => {
-      if (!t) return { tier: null };
-      const m = S.mapping?.[t] || {};
-      const obs = store.find((x) => x.tier === t);
-      return { tier: t, label: m.label || t, target: m.target || S.defaultModel, observedAt: obs ? obs.at : null };
-    })(),
-  };
-}
-
 async function statusPayload() {
   const cfg = loadCfg();
   const [clash, ccswitch] = await Promise.all([checkClash(cfg), checkCcSwitch()]);
-  const bai = providerStatus(cfg, "bai", recentCallsBai);
-  const sn = providerStatus(cfg, "sn", recentCallsSn);
   return {
     now: new Date().toISOString(),
     service: { up: true, uptimeSec: Math.floor((Date.now() - BOOT) / 1000), pid: process.pid },
+    relay: { port: cfg.relayPort, up: true },
+    relayLast: { ...lastRelayError },
     panel: { port: cfg.panelPort, up: true },
     clash,
     proxy: cfg.proxy || "直连",
     ccswitch: { running: ccswitch },
-    // 接线状态（两端各自归属哪个提供方）。keyMatch=对 B.AI key 的匹配，
-    // keyMatchSn=对 SenseNova key 的匹配——两页各取各的对比对象，指纹本身是实际生效值。
-    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey),
-    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey),
-    // B.AI 灯/接线沿用旧字段名，SenseNova 灯挂 sn 下
-    relay: bai.relay, relayLast: bai.relayLast, upstream: bai.upstream, recent: bai.recent,
-    sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, useProxy: cfg.sn?.useProxy === true },
+    upstream: { host: cfg.upstream, tested: lastTest.ok, ok: lastTest.ok, model: lastTest.model || null, ms: lastTest.ms || null, error: lastTest.error || null, at: lastTest.at || null },
+    recent: (() => {
+      const t = activeTier();
+      if (!t) return { tier: null };
+      const m = cfg.mapping?.[t] || {};
+      const obs = recentCalls.find((x) => x.tier === t);
+      return { tier: t, label: m.label || t, target: m.target || cfg.defaultModel, observedAt: obs ? obs.at : null };
+    })(),
+    cli: cliMode(cfg.apiKey),
+    desktop: desktopMode(cfg.apiKey),
   };
 }
 
-const lastTest = { bai: { ok: null, model: null, ms: null, error: null, at: null }, sn: { ok: null, model: null, ms: null, error: null, at: null } };
+const lastTest = { ok: null, model: null, ms: null, error: null, at: null };
 
 const panel = http.createServer(async (req, res) => {
   res.setHeader("access-control-allow-origin", "http://127.0.0.1:" + loadCfg().panelPort);
@@ -851,41 +720,18 @@ const panel = http.createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "ui.html")));
     }
-    // v1.0.28: SenseNova 独立页面（与 B.AI 页并列，经 header 导航互跳）
-    if (req.method === "GET" && (u.pathname === "/sn" || u.pathname === "/sensenova" || u.pathname === "/sn.html")) {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      return res.end(readFileSync(path.join(HERE, "sn.html")));
-    }
     if (req.method === "GET" && u.pathname === "/api/ping") return json(res, 200, { ok: true });
     if (req.method === "GET" && u.pathname === "/api/version") return json(res, 200, { version: APP_VERSION });
 
     // v1.0.19: 拉取上游真实模型目录。模型会腐烂/新增（实测 mimo-v2.5 目录里有但实际 503），
     // 下拉框不能只靠发布机默认列表；UI 的「刷新模型列表」按钮走这里。
-    // v1.0.28: ?p=sn 时从 SenseNova 拉（境内直连，不走代理）；只保留可对话模型（output 含 text）。
     if (req.method === "GET" && u.pathname === "/api/models") {
-      const p = u.searchParams.get("p") === "sn" ? "sn" : "bai";
       const c2 = loadCfg();
-      const S = sliceOf(c2, p);
-      let j;
-      if (p === "sn") {
-        const r = await directHttp(S.upstream + "/v1/models", {
-          method: "GET", headers: { authorization: `Bearer ${S.key}`, "anthropic-version": "2023-06-01" }, timeoutMs: 15000,
-        });
-        j = await readProbeJson({ status: r.status, headers: r.headers, text: async () => {
-          const { Readable } = await import("node:stream");
-          return await Readable.from(r.body).reduce((s, c) => s + c, "");
-        } });
-        if (r.status >= 400) throw new Error(j?.error?.message || `HTTP ${r.status}`);
-        // SenseNova 目录带 modalities：只把能输出文本的模型作为可路由目标
-        const chat = (j.data || []).filter((m) => (m.output_modalities || ["text"]).includes("text"));
-        const models = [...new Set(chat.map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))].sort();
-        return json(res, 200, { ok: true, count: models.length, models });
-      }
-      const r = await fetch(S.upstream + "/v1/models", {
-        headers: { authorization: `Bearer ${S.key}`, "anthropic-version": "2023-06-01" },
+      const r = await fetch(c2.upstream + "/v1/models", {
+        headers: { authorization: `Bearer ${c2.apiKey}`, "anthropic-version": "2023-06-01" },
         signal: AbortSignal.timeout(15000),
       });
-      j = await readProbeJson(r);
+      const j = await readProbeJson(r);
       if (!r.ok) throw new Error(j?.error?.message || `HTTP ${r.status}`);
       const models = [...new Set((j.data || []).map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))].sort();
       return json(res, 200, { ok: true, count: models.length, models });
@@ -908,77 +754,59 @@ const panel = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && u.pathname === "/api/config") return json(res, 200, loadCfg());
 
-    // v1.0.28: 配置编辑按提供方分流。body.provider="sn" 时读写 cfg.sn 子对象，
-    // 否则维持 B.AI 顶层字段（apiKey/mapping/upstream/relayPort/panelPort…），两边互不影响。
     if (req.method === "POST" && u.pathname === "/api/config") {
       const b = await readBody(req);
       const cfg = loadCfg();
-      const P = b.provider === "sn" ? "sn" : "bai";
-      const sn = cfg.sn;
-      // —— API Key ——
       if (typeof b.apiKey === "string" && b.apiKey.trim()) {
         const k = b.apiKey.trim();
         if (!k.startsWith("sk-")) return json(res, 400, { error: "API Key 应以 sk- 开头" });
-        if (P === "sn") sn.apiKey = k; else cfg.apiKey = k;
+        cfg.apiKey = k;
       }
       let needRestart = false;
-      // —— 代理：B.AI 走顶层 proxy（决定进程重启），SenseNova 走 useProxy 开关（每请求实时读，无需重启）——
-      if (P === "bai" && typeof b.proxy === "string") {
+      const prevProxy = cfg.proxy || "";
+      if (typeof b.proxy === "string") {
         const p = b.proxy.trim();
         if (p && !/^https?:\/\/127\.0\.0\.1:\d+$/.test(p)) return json(res, 400, { error: "代理格式应为 http://127.0.0.1:端口，留空表示直连" });
-        if ((cfg.proxy || "") !== p) { cfg.proxy = p; needRestart = true; }
+        // 只有新旧值确实不同才置重启标志：换端口、以及"改成留空=直连"都要重启才生效
+        if (prevProxy !== p) { cfg.proxy = p; needRestart = true; }
       }
-      if (P === "sn" && typeof b.useProxy === "boolean") sn.useProxy = b.useProxy;
-      // —— 映射表 ——
       if (b.mapping && typeof b.mapping === "object") {
-        const dst = P === "sn" ? sn.mapping : cfg.mapping;
         for (const t of TIERS) {
           const m = b.mapping[t.key];
           if (!m) continue;
           const target = String(m.target || "").trim().toLowerCase();
           const label = String(m.label || "").trim() || t.zh;
           if (!target) return json(res, 400, { error: `${t.key} 的目标模型不能为空` });
-          dst[t.key] = { target, label };
+          cfg.mapping[t.key] = { target, label };
         }
       }
-      // —— 可选模型列表 ——
       if (Array.isArray(b.availableModels)) {
         const arr = b.availableModels.map((x) => String(x).trim().toLowerCase()).filter(Boolean);
-        if (arr.length) { if (P === "sn") sn.availableModels = [...new Set(arr)]; else cfg.availableModels = [...new Set(arr)]; }
+        if (arr.length) cfg.availableModels = [...new Set(arr)];
       }
-      // —— 上游地址（中转每请求实时读，无需重启）——
+      // ---- 可移植设置（跨机器编辑）----
+      // 注：代理已在上面统一处理（含换端口/切直连的重启判定），此处不再重复
       if (typeof b.upstream === "string" && b.upstream.trim()) {
         const up = b.upstream.trim().replace(/\/+$/, "");
         if (!/^https?:\/\//.test(up)) return json(res, 400, { error: "上游地址需以 http(s):// 开头" });
-        if (P === "sn") sn.upstream = up; else cfg.upstream = up;
+        if (up !== cfg.upstream) { cfg.upstream = up; /* 中转每请求实时读，无需重启；切勿重置 needRestart，否则会抹掉代理/端口的重启标志 */ }
       }
-      // —— 端口 ——
-      if (b.panelPort != null && b.panelPort !== "") {
-        const n = Number(b.panelPort);
-        if (!Number.isInteger(n) || n < 1024 || n > 65535) return json(res, 400, { error: `panelPort 需为 1024-65535 的整数` });
-        if (n !== cfg.panelPort) { cfg.panelPort = n; needRestart = true; }
+      for (const portKey of ["relayPort", "panelPort"]) {
+        if (b[portKey] != null && b[portKey] !== "") {
+          const n = Number(b[portKey]);
+          if (!Number.isInteger(n) || n < 1024 || n > 65535) return json(res, 400, { error: `${portKey} 需为 1024-65535 的整数` });
+          if (n !== cfg[portKey]) { cfg[portKey] = n; needRestart = true; }
+        }
       }
-      const rpKey = P === "sn" ? "relayPort" : "relayPort";
-      if (b.relayPort != null && b.relayPort !== "") {
-        const n = Number(b.relayPort);
-        if (!Number.isInteger(n) || n < 1024 || n > 65535) return json(res, 400, { error: `${rpKey} 需为 1024-65535 的整数` });
-        const cur = P === "sn" ? sn.relayPort : cfg.relayPort;
-        if (n !== cur) { if (P === "sn") sn.relayPort = n; else cfg.relayPort = n; needRestart = true; }
-      }
-      if (typeof b.defaultModel === "string" && b.defaultModel.trim()) {
-        const dm = b.defaultModel.trim().toLowerCase();
-        if (P === "sn") sn.defaultModel = dm; else cfg.defaultModel = dm;
-      }
+      if (typeof b.defaultModel === "string" && b.defaultModel.trim()) cfg.defaultModel = b.defaultModel.trim().toLowerCase();
       saveCfg(cfg);
-      // 端上已接到该提供方的话，立即同步新映射
+      // 已处于 B.AI 模式的端立即同步新映射
       const applied = [];
-      const curCli = cliMode(cfg).mode, curDesk = desktopMode(cfg).mode;
-      if (curCli === P) { applyToCli(sliceOf(cfg, P)); applied.push("cli"); }
-      if (curDesk === P) { applyToDesktop(sliceOf(cfg, P)); applied.push("desktop"); }
-      log(`配置已保存(${P})，重应用到:`, applied.join(",") || "无", needRestart ? "(需重启)" : "");
+      if (cliMode().mode === "bai") { applyBaiToCli(cfg); applied.push("cli"); }
+      if (desktopMode().mode === "bai") { applyBaiToDesktop(cfg); applied.push("desktop"); }
+      log("配置已保存，重应用到:", applied.join(",") || "无", needRestart ? "(需重启)" : "");
       return json(res, 200, {
         ok: true,
-        provider: P,
         applied,
         needRestart,
         hints: [
@@ -990,27 +818,21 @@ const panel = http.createServer(async (req, res) => {
       });
     }
 
-    // v1.0.28: 一键接线按提供方分流；恢复（接回 CC Switch）在 /api/restore 里保持原样
     if (req.method === "POST" && u.pathname === "/api/apply") {
       const b = await readBody(req);
-      const P = b.provider === "sn" ? "sn" : "bai";
       const cfg = loadCfg();
-      const S = sliceOf(cfg, P);
-      const name = PROVIDERS[P];
-      if (!S.key) return json(res, 400, { error: `请先在「${name}」路由表里填写 API Key` });
+      if (!cfg.apiKey) return json(res, 400, { error: "请先在路由表里填写 API Key" });
       const doCli = b.cli !== false;
       const doDesk = b.desktop !== false;
       const warns = [];
       if (doCli) { const w = snapshotExternal(); warns.push(...w.filter((x) => x.startsWith("桌面"))); }
       if (doDesk) { const w = snapshotExternal(); warns.push(...w.filter((x) => x.startsWith("CLI"))); }
-      if (doCli) applyToCli(S);
-      if (doDesk) applyToDesktop(S);
-      const ccRunning = await checkCcSwitch();
-      if (ccRunning) warns.push("CC Switch 正在运行，它可能随时把配置改回去；切换前建议先退出它");
+      if (doCli) applyBaiToCli(cfg);
+      if (doDesk) applyBaiToDesktop(cfg);
+      if (cfg.ccswitch?.running) warns.push("CC Switch 正在运行，它可能随时把配置改回去；切换前建议先退出它");
       warns.push("桌面版需完全退出并重开 Claude 才生效；CLI 新开终端生效");
-      if (P === "sn") warns.push("SenseNova 有 TPM/RPM 限流，探测到 429 属正常，稍候即恢复；图像模型不参与对话路由");
-      log(`一键切到 ${name}: cli=${doCli} desktop=${doDesk}`);
-      return json(res, 200, { ok: true, provider: P, warnings: warns, snapshot: "已自动快照切换前的配置（可用于一键恢复）" });
+      log(`一键切到 B.AI: cli=${doCli} desktop=${doDesk}`);
+      return json(res, 200, { ok: true, warnings: warns, snapshot: "已自动快照切换前的配置（可用于一键恢复）" });
     }
 
     if (req.method === "POST" && u.pathname === "/api/restore") {
@@ -1022,18 +844,15 @@ const panel = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, messages: msgs, hints: ["桌面版需完全退出并重开 Claude 才生效；CLI 新开终端生效"] });
     }
 
-    // v1.0.28: 测连通按 provider 分流，各测各的中转端口/映射/密钥
     if (req.method === "POST" && u.pathname === "/api/test") {
+      // 默认只测 Claude Code 当前真实使用的档位（与用户看到的名字对齐）；body.all=true 测全部
       const cfg = loadCfg();
       const b = await readBody(req).catch(() => ({}));
-      const P = b.provider === "sn" ? "sn" : "bai";
-      const S = sliceOf(cfg, P);
-      const store = P === "sn" ? recentCallsSn : recentCallsBai;
-      const active = b.all ? null : activeTier(store);
+      const active = b.all ? null : activeTier();
       const targets = active ? [active] : TIERS.map((t) => t.key);
       const tierInfo = (key) => {
-        const m = S.mapping[key] || {};
-        return { label: m.label || key, target: m.target || S.defaultModel };
+        const m = cfg.mapping[key] || {};
+        return { label: m.label || key, target: m.target || cfg.defaultModel };
       };
       const probe = async (tier) => {
         const info = tierInfo(tier);
@@ -1041,9 +860,9 @@ const panel = http.createServer(async (req, res) => {
         for (let attempt = 0; attempt < 3; attempt++) { // 上游偶发截断/挂起，测活流量重试两次
           const t0 = Date.now();
           try {
-            const r = await fetch(`http://127.0.0.1:${S.relayPort}/v1/messages`, {
+            const r = await fetch(`http://127.0.0.1:${cfg.relayPort}/v1/messages`, {
               method: "POST",
-              headers: { authorization: `Bearer ${S.key}`, "content-type": "application/json", "anthropic-version": "2023-06-01" },
+              headers: { authorization: `Bearer ${cfg.apiKey}`, "content-type": "application/json", "anthropic-version": "2023-06-01" },
               body: JSON.stringify({ model: tier + "[1M]", max_tokens: 8, messages: [{ role: "user", content: "ok" }] }),
               signal: AbortSignal.timeout(45000),
             });
@@ -1063,14 +882,14 @@ const panel = http.createServer(async (req, res) => {
         if (i < targets.length - 1) await new Promise((res) => setTimeout(res, 1500));
       }
       const pass = tiers.filter((x) => x.ok).length;
-      Object.assign(lastTest[P], {
+      Object.assign(lastTest, {
         ok: pass === tiers.length,
         model: tiers[0]?.label || null,
         ms: tiers[0]?.ms || null,
         error: pass === tiers.length ? null : tiers.filter((x) => !x.ok).map((x) => `${x.label}: ${x.error}`).join("；"),
         at: new Date().toISOString(),
       });
-      return json(res, 200, { ok: pass === tiers.length, provider: P, tiers, pass, total: tiers.length, active });
+      return json(res, 200, { ok: pass === tiers.length, tiers, pass, total: tiers.length, active });
     }
 
     // ---------- 备用自升级 API ----------
@@ -1100,7 +919,7 @@ const panel = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && u.pathname === "/api/service/stop") {
-      json(res, 200, { ok: true, message: "服务即将停止（B.AI 中转与 SenseNova 中转一并停止）" });
+      json(res, 200, { ok: true, message: "服务即将停止（中转 15722 一并停止）" });
       log("收到停止指令，进程退出");
       setTimeout(() => process.exit(0), 300);
       return;
@@ -1222,7 +1041,7 @@ function listenWithRetry(srv, port, name) {
     if (e.code !== "EADDRINUSE") { log(`${name} 端口错误: ${e.message}`); process.exit(1); }
     if (attempts === 1) log(`${name} 端口 :${port} 暂被占用（多为重启交接），每 600ms 重试，最多 15 秒`);
     let peerHealthy = false;
-    if (!relay.listening && !snRelay.listening && !panel.listening) {
+    if (!relay.listening && !panel.listening) {
       try {
         const pr = await fetch(`http://127.0.0.1:${cfg0.panelPort}/api/ping`, { signal: AbortSignal.timeout(1200) });
         peerHealthy = pr.ok;
@@ -1252,7 +1071,6 @@ function listenWithRetry(srv, port, name) {
   start();
 }
 listenWithRetry(relay, cfg0.relayPort, "中转");
-listenWithRetry(snRelay, cfg0.sn.relayPort, "SenseNova中转");
 listenWithRetry(panel, cfg0.panelPort, "面板");
 // 成功绑定中转端口 = 本实例成为唯一的活跃服务者，此时才允许合并配置/跑周期探测
 relay.once("listening", () => setTimeout(onActivated, 300));

@@ -20,8 +20,14 @@ try {
     const local = JSON.parse(fs.readFileSync(userCfgPath, "utf8"));
     const def = { ...local, apiKey: "" };
     delete def._modelsSynced;
+    // sn（SenseNova）块：发布机 config 可能还没有（旧版未写入）或残留密钥——一律以代码默认+脱敏为准
+    if (def.sn) { def.sn = { ...def.sn, apiKey: "" }; }
+    else {
+      const cur = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
+      if (cur.sn) def.sn = { ...cur.sn, apiKey: "" };
+    }
     fs.writeFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), JSON.stringify(def, null, 2) + "\n");
-    console.log(`» 默认快照已同步发布机: ${def.availableModels.length} 个模型`);
+    console.log(`» 默认快照已同步发布机: ${def.availableModels.length} 个模型${def.sn ? " + SenseNova " + def.sn.availableModels.length + " 个" : ""}`);
   } else console.log("» 未找到发布机配置，沿用仓库内 defaults 快照");
 } catch (e) { console.log("» 快照同步跳过:", e.message); }
 
