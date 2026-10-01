@@ -1734,6 +1734,12 @@ const panel = http.createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "qd.html")));
     }
+
+    // v1.0.40: 五个提供方页面共用的底栏/更新控件（单一来源，避免各页复制后漂移）
+    if (req.method === "GET" && u.pathname === "/panel-common.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
+      return res.end(readFileSync(path.join(HERE, "panel-common.js")));
+    }
     if (req.method === "GET" && u.pathname === "/api/ping") return json(res, 200, { ok: true });
     if (req.method === "GET" && u.pathname === "/api/version") return json(res, 200, { version: APP_VERSION });
 
