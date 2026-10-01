@@ -258,7 +258,6 @@
     <nav class="prov-nav">
       <a href="/" class="prov-tab active">B.AI</a>
       <a href="/sn" class="prov-tab">SenseNova</a>
-      <a href="/wb" class="prov-tab">WorkBuddy</a>
     </nav>
     <span class="svc" id="svc">服务 <b>●</b> :15722 / :15723</span>
   </header>
@@ -412,7 +411,7 @@ const TIERS = [
   { key: "claude-opus-5",    zh: "Opus · 重型" },
   { key: "claude-haiku-4-5", zh: "Haiku · 快速" },
 ];
-const MODE_TXT = { bai: "B.AI", sn: "SENSENOVA", wb: "WORKBUDDY", ccswitch: "CC SWITCH", other: "其他", unknown: "未知" };
+const MODE_TXT = { bai: "B.AI", sn: "SENSENOVA", ccswitch: "CC SWITCH", other: "其他", unknown: "未知" };
 const BRANDS = { qwen: "Qwen", glm: "GLM", deepseek: "DeepSeek", hy: "HY", mimo: "MiMo", kimi: "Kimi", minimax: "MiniMax" };
 function prettyName(id) {
   return String(id).split("-").map((seg) => {
@@ -478,7 +477,7 @@ function renderStatus(s) {
 
   // 接线徽章
   const setBadge = (el, m) => {
-    const cls = m.mode === "bai" ? "bai" : m.mode === "ccswitch" ? "cc" : m.mode === "sn" ? "sn" : m.mode === "wb" ? "cc" : "unk";
+    const cls = m.mode === "bai" ? "bai" : m.mode === "ccswitch" ? "cc" : m.mode === "sn" ? "sn" : "unk";
     el.className = "badge " + cls;
     el.textContent = MODE_TXT[m.mode] || m.mode;
     el.title = m.baseUrl || "";
@@ -491,10 +490,10 @@ function renderStatus(s) {
     if (m.keyFp) {
       if (!kf) { kf = document.createElement("span"); kf.className = "keyfp"; patch.querySelector(".who").appendChild(kf); }
       // 该端若已接在 SenseNova 上，用的是 sn 的 key，本页不据此判 B.AI key 不匹配
-      const ok = (m.mode === "sn" || m.mode === "wb") ? true : m.keyMatch !== false;
+      const ok = m.mode === "sn" ? true : m.keyMatch !== false;
       kf.textContent = (ok ? "🔑" : "⚠️") + m.keyFp;
       kf.style.color = ok ? "var(--dim)" : "var(--err)";
-      kf.title = m.mode === "sn" ? `此端已接 SenseNova，密钥：${m.keyFp}（B.AI 页不比对这把 key）` : m.mode === "wb" ? `此端已接 WorkBuddy，凭据：${m.keyFp}（B.AI 页不比对）` : (ok ? `此端实际使用的密钥：${m.keyFp}（与面板一致）` : `此端密钥(${m.keyFp}) 与面板当前密钥不一致！请求将用这把 key 计费，非面板显示的那把。`);
+      kf.title = m.mode === "sn" ? `此端已接 SenseNova，密钥：${m.keyFp}（B.AI 页不比对这把 key）` : (ok ? `此端实际使用的密钥：${m.keyFp}（与面板一致）` : `此端密钥(${m.keyFp}) 与面板当前密钥不一致！请求将用这把 key 计费，非面板显示的那把。`);
       kf.style.display = "";
     } else if (kf) kf.style.display = "none";
   };
@@ -507,15 +506,11 @@ function renderStatus(s) {
   n.classList.remove("show", "err");
   const keyMismatch = (s.cli.mode === "bai" && s.cli.keyMatch === false) || (s.desktop.mode === "bai" && s.desktop.keyMatch === false);
   const onSn = (s.cli.mode === "sn") || (s.desktop.mode === "sn");
-  const onWb = (s.cli.mode === "wb") || (s.desktop.mode === "wb");
   if (keyMismatch) {
     n.textContent = "⚠ 有客户端正在用的密钥和面板里填的不一致——中转是按请求自带 key 计费的，面板改了 key 不会自动更新已接线的客户端。请重开对应终端/桌面版，或重新点「接通 B.AI」把新 key 写进去。";
     n.classList.add("show", "err");
   } else if (onSn) {
     n.textContent = "有一端当前接在 SenseNova 上（见顶部「SenseNova」页）。点本页「接通 B.AI」可把它换回来；两方映射互相独立，切换只动接线不动对方配置。";
-    n.classList.add("show");
-  } else if (onWb) {
-    n.textContent = "有一端当前接在 WorkBuddy 上（见顶部「WorkBuddy」页）。点本页「接通 B.AI」可把它换回来；各提供方映射互相独立，切换只动接线不动对方配置。";
     n.classList.add("show");
   } else if (s.ccswitch.running) {
     n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 B.AI 突然失效，回到这里点「接通 B.AI」一键恢复即可。";
