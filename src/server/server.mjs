@@ -5,6 +5,7 @@
 import http from "node:http";
 import https from "node:https";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync, createWriteStream } from "node:fs";
+import { promises as fsPromises } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
@@ -560,6 +561,185 @@ async function wbEnsureToken(cfg) {
     wbRefreshLock = wbRefreshToken(cfg).finally(() => { wbRefreshLock = null; });
   }
   return wbRefreshLock;
+}
+
+// ---------- 一键捕获 WorkBuddy 令牌（v1.0.33）----------
+// 背景：WorkBuddy 客户端登录后，令牌只存在内存、不落盘，无法直接读取。
+// 做法：临时给它的 CLI 启动脚本（cli/bin/codebuddy，纯文本 JS、无签名）注入一小段采集钩子，
+//       钩子把令牌写进中转目录；捕到（或超时）后立刻还原原文件——不留任何常驻修改。
+// 安全性：注入前备份、finally 里必还原、进程异常退出由下次启动时自愈清理。
+// 抓取时机：WorkBuddy 每次真正跑会话都会拉起该脚本，用户随便发条消息即可触发。
+const WB_CLI_REL = path.join("resources", "app.asar.unpacked", "cli", "bin", "codebuddy");
+// 候选安装目录：常见位置 + 各盘符根目录（WorkBuddy 可装在任意盘/任意用户目录）
+function wbCandidateBases() {
+  const out = [];
+  const push = (p) => { if (p && !out.includes(p)) out.push(p); };
+  const userLocal = process.env.LOCALAPPDATA || "";
+  // ① 当前用户（最常见：%LOCALAPPDATA%\Programs\WorkBuddyAI）
+  push(path.join(userLocal, "Programs", "WorkBuddyAI"));
+  push(path.join(userLocal, "Programs", "workbuddy"));
+  push(path.join(userLocal, "WorkBuddyAI"));
+  // ② Program Files 系
+  for (const k of ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]) {
+    if (process.env[k]) { push(path.join(process.env[k], "WorkBuddyAI")); push(path.join(process.env[k], "WorkBuddy AI")); }
+  }
+  // ③ 所有盘符（含 D:/E:/F:…）：\Users\<用户>\AppData\Local\Programs\WorkBuddyAI 及 \Program Files\WorkBuddyAI
+  //    安装程序把 LOCALAPPDATA 重定向到别的盘时，实际路径就落在这些位置
+  const user = process.env.USERNAME || "";
+  const drives = [];
+  for (let c = 67; c <= 90; c++) drives.push(String.fromCharCode(c) + ":"); // C: ~ Z:
+  for (const d of drives) {
+    if (user) push(path.join(d, "Users", user, "AppData", "Local", "Programs", "WorkBuddyAI"));
+    push(path.join(d, "Program Files", "WorkBuddyAI"));
+  }
+  return out;
+}
+const WB_CAPTURE_HOOK = `
+// === BAI-CAPTURE-HOOK (temporary, auto-removed) ===
+try {
+  const __fs = require("fs");
+  const __out = __path_capture;
+  const __grab = (txt) => { try { __fs.appendFileSync(__out, String(txt) + String.fromCharCode(10)); } catch (e) {} };
+  const __pick = (h) => {
+    try {
+      const g = (k) => { const v = h && (h[k] || h[String(k).toLowerCase()]); return typeof v === "string" ? v : ""; };
+      const tok = (g("authorization") || g("Authorization")).replace(/^Bearer\\s+/i, "");
+      const ref = g("x-refresh-token") || g("X-Refresh-Token");
+      const dev = g("X-Device-Token") || g("x-device-token");
+      const uid = g("X-User-Id") || g("x-user-id");
+      if (tok && tok.indexOf(".") > 0 && ref) __grab(JSON.stringify({ accessToken: tok, refreshToken: ref, deviceToken: dev, userId: uid }));
+    } catch (e) {}
+  };
+  for (const m of ["https", "http"]) {
+    const mod = require(m);
+    const orig = mod.request;
+    mod.request = function () {
+      try {
+        const a = arguments[0];
+        if (typeof a === "string" || a instanceof URL) __pick(arguments[1] && arguments[1].headers);
+        else if (a && typeof a === "object") __pick(a.headers);
+      } catch (e) {}
+      return orig.apply(this, arguments);
+    };
+  }
+  const __of = globalThis.fetch;
+  if (typeof __of === "function") {
+    globalThis.fetch = function (input, init) {
+      try { __pick((init && init.headers) || (input && input.headers) || {}); } catch (e) {}
+      return __of.apply(this, arguments);
+    };
+  }
+} catch (e) {}
+// === /BAI-CAPTURE-HOOK ===
+`;
+let wbCapState = { active: false, startedAt: null, error: null };
+
+// 定位 WorkBuddy 的 CLI 启动脚本：① 注册表安装信息（最准，任意盘）→ ② 候选目录 → ③ 同级目录扫描
+function findWbCliScript() {
+  const tryPath = async (base, rel) => {
+    if (!base) return null;
+    const p = path.join(base, rel);
+    try { await fsPromises.access(p); return p; } catch { return null; }
+  };
+  const fromRegistry = () => new Promise((resolve) => {
+    // 查 HKCU/HKLM 卸载项里 DisplayName 含 WorkBuddy 的 InstallLocation
+    const ps = "$ErrorActionPreference='SilentlyContinue';"
+      + "$r=@();"
+      + "foreach($root in @('HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall')){"
+      + "  Get-ChildItem $root | ForEach-Object { $p=Get-ItemProperty $_.PSPath; if($p.DisplayName -match 'WorkBuddy'){ "
+      + "    if($p.InstallLocation){$r+=$p.InstallLocation}; if($p.DisplayIcon){$r+=($p.DisplayIcon -replace ',.*$','')} } } };"
+      + "$r | Select-Object -Unique";
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true, timeout: 15000 },
+      (e, so) => resolve(e ? [] : String(so).split(/\r?\n/).map((s) => s.trim()).filter(Boolean)));
+  });
+  return (async () => {
+    // ① 注册表
+    for (const hit of await fromRegistry()) {
+      const asDir = await tryPath(hit, WB_CLI_REL);
+      if (asDir) return asDir;
+      const asExeDir = await tryPath(path.dirname(hit), WB_CLI_REL); // DisplayIcon 给的是 exe 路径
+      if (asExeDir) return asExeDir;
+    }
+    // ② 候选目录
+    for (const base of wbCandidateBases()) {
+      const hit = await tryPath(base, WB_CLI_REL);
+      if (hit) return hit;
+    }
+    // ③ 扫 \Programs 下含 workbuddy 的同级目录
+    for (const d of ["C", "D", "E", "F"]) {
+      const root = path.join(d + ":", "Users", process.env.USERNAME || "", "AppData", "Local", "Programs");
+      try {
+        for (const name of await fsPromises.readdir(root)) {
+          if (!/workbuddy/i.test(name)) continue;
+          const hit = await tryPath(path.join(root, name), WB_CLI_REL);
+          if (hit) return hit;
+        }
+      } catch { }
+    }
+    return null;
+  })();
+}
+
+// 还原：只要备份在，就把原文件写回去（幂等，可重复调用）
+async function wbCaptureRestore() {
+  const st = wbCapState;
+  if (!st.script || !st.backup) return;
+  try {
+    if (st.wrote) {
+      const cur = await fsPromises.readFile(st.script, "utf8").catch(() => "");
+      if (cur.includes("BAI-CAPTURE-HOOK")) await fsPromises.writeFile(st.script, st.backup, "utf8");
+    }
+  } catch (e) { log("WorkBuddy 令牌捕获：还原失败 " + e.message); }
+  st.wrote = false;
+}
+
+async function wbCaptureToken(timeoutMs = 150000) {
+  if (wbCapState.active) throw new Error("已有一次捕获正在进行，请稍候");
+  const script = await findWbCliScript();
+  if (!script) throw new Error("未找到 WorkBuddy 程序（请确认本机已安装 WorkBuddy AI 客户端）");
+  const outFile = path.join(DATA_DIR, "wb-captured-token.json");
+  await fsPromises.rm(outFile, { force: true }).catch(() => { });
+  const original = await fsPromises.readFile(script, "utf8");
+  if (original.includes("BAI-CAPTURE-HOOK")) {
+    // 上次异常残留：先清掉钩子再重来
+    await fsPromises.writeFile(script, original.replace(/[\s\S]*?BAI-CAPTURE-HOOK[\s\S]*?\/BAI-CAPTURE-HOOK ===[\r\n]*/, ""), "utf8");
+  }
+  const backup = await fsPromises.readFile(script, "utf8");
+  const hook = WB_CAPTURE_HOOK.replace("__path_capture", JSON.stringify(outFile));
+  // 注入到 shebang 之后（保留首行 #!，Node 才能正常执行）
+  const lines = backup.split("\n");
+  const patched = lines[0] + "\n" + hook + "\n" + lines.slice(1).join("\n");
+  wbCapState = { active: true, startedAt: Date.now(), error: null, script, backup, wrote: false };
+  await fsPromises.writeFile(script, patched, "utf8");
+  wbCapState.wrote = true;
+  log(`WorkBuddy 令牌捕获：已注入临时钩子（${script}），等待客户端触发…`);
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        const raw = (await fsPromises.readFile(outFile, "utf8")).trim().split("\n").filter(Boolean).pop();
+        if (raw) {
+          const obj = JSON.parse(raw);
+          if (obj.accessToken && obj.refreshToken) {
+            const cfg = loadCfg();
+            cfg.wb.accessToken = obj.accessToken;
+            cfg.wb.refreshToken = obj.refreshToken;
+            if (obj.deviceToken) cfg.wb.deviceToken = obj.deviceToken;
+            if (obj.userId) cfg.wb.userId = obj.userId;
+            saveCfg(cfg);
+            log("WorkBuddy 令牌捕获：成功");
+            return { ok: true, masked: keyFp(obj.accessToken) };
+          }
+        }
+      } catch { /* 文件还没生成/还没写完整，继续等 */ }
+    }
+    throw new Error("等待超时：请在 WorkBuddy 客户端里随便发一条消息（它会拉起内部 CLI，钩子即可捕获），然后重试");
+  } finally {
+    await wbCaptureRestore();
+    await fsPromises.rm(outFile, { force: true }).catch(() => { });
+    wbCapState.active = false;
+  }
 }
 
 // WorkBuddy 网关对 Claude Code 的客户端指纹拦截（"Illegal API invocation from an unapproved
@@ -1370,6 +1550,19 @@ const panel = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && u.pathname === "/api/ping") return json(res, 200, { ok: true });
     if (req.method === "GET" && u.pathname === "/api/version") return json(res, 200, { version: APP_VERSION });
+
+    // v1.0.33: 一键捕获 WorkBuddy 令牌（临时注入客户端 CLI 脚本 → 抓取 → 立即还原）
+    if (req.method === "POST" && u.pathname === "/api/wb/capture") {
+      try {
+        const r = await wbCaptureToken(150000);
+        return json(res, 200, { ok: true, ...r, message: "令牌已自动填入并保存" });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: String((e && e.message) || e) });
+      }
+    }
+    if (req.method === "GET" && u.pathname === "/api/wb/capture/status") {
+      return json(res, 200, { active: wbCapState.active, startedAt: wbCapState.startedAt, elapsedMs: wbCapState.active ? Date.now() - wbCapState.startedAt : 0 });
+    }
 
     // v1.0.19: 拉取上游真实模型目录。模型会腐烂/新增（实测 mimo-v2.5 目录里有但实际 503），
     // 下拉框不能只靠发布机默认列表；UI 的「刷新模型列表」按钮走这里。
