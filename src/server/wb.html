@@ -63,7 +63,33 @@
     background: radial-gradient(1100px 500px at 50% -220px, rgba(155,127,240,.08), transparent 60%), var(--bg);
   }
   .wrap { max-width: 860px; margin: 0 auto; }
-  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; padding-bottom: 18px; border-bottom: 1px solid var(--line); margin-bottom: 18px; }
+  /* v1.0.34 自绘标题栏：与内容区同一底色，取消分隔线，整体成为一整块 */
+  body.app-frame { padding-top: 0; }
+  header {
+    -webkit-app-region: drag;
+    padding: 14px 0 16px;                 /* 顶部留出拖动与窗口按钮的高度 */
+    margin: 0 -28px 18px;                  /* 负边距贴到窗口两侧 */
+    padding-left: 28px; padding-right: 8px;
+    border-bottom: none;
+    background: var(--bg);                 /* 与页面同色，消除断层 */
+    transition: background .18s ease;
+  }
+  header * { -webkit-app-region: no-drag; }
+  header .logo-dot, header h1, header .prov-nav, header .svc { -webkit-app-region: drag; }
+  /* Windows 窗口按钮（macOS 用系统红绿灯，由 titleBarOverlay/trafficLight 处理） */
+  .winCtrls { position: absolute; top: 0; right: 0; display: flex; -webkit-app-region: no-drag; }
+  .winCtrls button {
+    width: 46px; height: 34px; border: 0; background: transparent; color: var(--dim);
+    display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0;
+  }
+  .winCtrls button:hover { background: var(--panel2); color: var(--ink); }
+  .winCtrls button.close:hover { background: #c42b1c; color: #fff; }
+  .winCtrls svg { width: 10px; height: 10px; stroke: currentColor; stroke-width: 1; fill: none; }
+  .winCtrls button svg { fill: currentColor; stroke: none; }
+  /* 非 Electron 环境（浏览器直开面板）不显示窗口按钮 */
+  body.no-frame header { padding-top: 28px; }
+  body.no-frame .winCtrls { display: none; }
+  header h1 { padding-left: 4px; }
   .logo-dot { width: 11px; height: 11px; border-radius: 50%; background: var(--accent); align-self: center; box-shadow: 0 0 10px rgba(155,127,240,.8); }
   h1 { font-size: 20px; font-weight: 600; letter-spacing: 1px; }
   h1 small { font-family: var(--mono); font-size: 11px; color: var(--dim); letter-spacing: 3px; margin-left: 10px; font-weight: 400; }
@@ -221,7 +247,12 @@
       <a href="/wb" class="prov-tab active">WorkBuddy</a>
     </nav>
     <span class="svc" id="svc">服务 <b>●</b> —</span>
-  </header>
+  <span class="winCtrls" id="winCtrls" aria-hidden="true">
+  <button id="winMin" title="最小化" aria-label="最小化"><svg viewBox="0 0 10 10"><rect x="1" y="4.5" width="8" height="1"/></svg></button>
+  <button id="winMax" title="最大化" aria-label="最大化"><svg viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1"/></svg></button>
+  <button id="winClose" class="close" title="关闭" aria-label="关闭"><svg viewBox="0 0 10 10"><path d="M1 1 L9 9 M9 1 L1 9" stroke="currentColor" stroke-width="1.2" fill="none"/></svg></button>
+</span>
+</header>
 
   <!-- 信号灯 -->
   <div class="lamps" style="margin-bottom:18px">
@@ -917,6 +948,24 @@ setInterval(poll, 5000);
   });
   // 跨页同步（同源其它标签页切换时跟随）
   window.addEventListener("storage", (e) => { if (e.key === KEY && e.newValue) apply(e.newValue); });
+})();
+
+/* v1.0.34 自绘标题栏：窗口控制 + 拖动区 */
+(() => {
+  const D = window.baiDesktop;
+  const hasFrame = !!(D && D.winMinimize);
+  document.body.classList.toggle("app-frame", hasFrame);
+  document.body.classList.toggle("no-frame", !hasFrame);
+  if (!hasFrame) return;
+  const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", (e) => { e.stopPropagation(); fn(); }); };
+  on("winMin", () => D.winMinimize());
+  on("winMax", () => D.winToggleMaximize());
+  on("winClose", () => D.winClose());
+  const syncMax = (s) => { const b = document.getElementById("winMax"); if (b && s) b.title = s.maximized ? "向下还原" : "最大化"; };
+  if (D.onWindowState) D.onWindowState(syncMax);
+  // 双击标题栏空白处 = 最大化/还原
+  const hd = document.querySelector("header");
+  if (hd) hd.addEventListener("dblclick", (e) => { if (e.target.closest(".winCtrls") || e.target.closest(".prov-tab") || e.target.closest("button")) return; D.winToggleMaximize(); });
 })();
 </script>
 </body>

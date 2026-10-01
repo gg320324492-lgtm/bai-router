@@ -346,6 +346,10 @@ function showWindow(diagMode) {
     width: 1120, height: 800, minWidth: 720, minHeight: 560,
     title: "B.AI 路由台", backgroundColor: "#16171b", autoHideMenuBar: true,
     icon: iconPath,
+    // v1.0.34：自绘标题栏——原生标题栏是系统浅色，与面板深色割裂；隐藏后由页面 header 接管拖动/最小化/关闭，
+    // 整个窗口成为一整块主题色（浅色主题同理，页面会把窗口底色一起切过去）。
+    titleBarStyle: "hidden",
+    ...(process.platform === "darwin" ? { trafficLightPosition: { x: 12, y: 14 } } : {}),
     webPreferences: { preload: path.join(APP_DIR, "preload.js"), contextIsolation: true, nodeIntegration: false },
   });
   // 恢复上次窗口尺寸/位置（越界保护：显示器变了就居中）
@@ -619,6 +623,19 @@ ipcMain.handle("install-update", async () => { installReadyUpdate(); return true
 ipcMain.handle("switch-installed", () => instCheck.switchToInstalled());
 ipcMain.handle("app-version", () => ({ version: app.getVersion(), packaged: app.isPackaged }));
 ipcMain.on("app-quit", () => { quitting = true; app.quit(); });
+
+// v1.0.34：自绘标题栏的窗口控制
+const pushWinState = () => { if (win && !win.isDestroyed()) win.webContents.send("win-state", { maximized: win.isMaximized() }); };
+ipcMain.handle("win-minimize", () => { if (win && !win.isDestroyed()) win.minimize(); });
+ipcMain.handle("win-toggle-maximize", () => {
+  if (!win || win.isDestroyed()) return false;
+  if (win.isMaximized()) win.unmaximize(); else win.maximize();
+  return win.isMaximized();
+});
+ipcMain.handle("win-close", () => { if (win && !win.isDestroyed()) { quitting = true; win.close(); } });
+for (const ev of ["maximize", "unmaximize"]) {
+  try { win && win.on(ev, pushWinState); } catch { }
+}
 
 // 诊断页支持
 function tailOf(p, n = 2400) {
