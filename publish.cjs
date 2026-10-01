@@ -62,8 +62,10 @@ run("npx electron-builder --win nsis");
   const wbOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "wb.html"));
   const zenOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "zen.html"));
   const qdOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "qd.html"));
-  if (miss.length || !snOk || !wbOk || !zenOk || !qdOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html") + (zenOk ? "" : " + resources/server/zen.html") + (qdOk ? "" : " + resources/server/qd.html"));
-  console.log("» 发布闸门通过：asar 模块齐全，sn.html / wb.html / zen.html / qd.html 已随包");
+  // 五个页面都 <script src="/panel-common.js">，缺了它所有页面的底栏与更新控件都会消失
+  const pcOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "panel-common.js"));
+  if (miss.length || !snOk || !wbOk || !zenOk || !qdOk || !pcOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html") + (zenOk ? "" : " + resources/server/zen.html") + (qdOk ? "" : " + resources/server/qd.html") + (pcOk ? "" : " + resources/server/panel-common.js"));
+  console.log("» 发布闸门通过：asar 模块齐全，sn/wb/zen/qd.html 与 panel-common.js 已随包");
 }
 // upgrade.ps1：救砖/一键升级脚本，作为 release 资产随每个版本发布（旧版更新器损坏的用户无需打开网页）
 if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {

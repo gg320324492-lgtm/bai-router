@@ -1,7 +1,7 @@
 {
   "name": "bai-router",
   "productName": "B.AI Router",
-  "version": "1.0.39",
+  "version": "1.0.40",
   "private": true,
   "description": "B.AI 模型路由台：Claude Code / Claude 桌面版 外接模型的一键切换与中转",
   "author": "pc",
@@ -36,6 +36,7 @@
           "wb.html",
           "zen.html",
           "qd.html",
+          "panel-common.js",
           "diag.html",
           "config.defaults.json"
         ]
