@@ -142,9 +142,10 @@ async function detectRuntime() {
 
 function spawnServer() {
   const cfg = readCfgSafe();
-  // NO_PROXY：回环 + useProxy=false 的上游域名（与 server.mjs computeNoProxy 同逻辑；
-  // 旧配置没有 sn/wb 块时按默认上游兜底）。Node 启动时缓存 env 代理配置，
-  // 这里不一致的话 server 自检会再修正重启一次——两处逻辑保持同步可省掉那一下。
+  // NO_PROXY：回环 + 每个 useProxy=false 的上游域名（必须与 server.mjs 的 computeNoProxy 逐项一致）。
+  // Node 启动时缓存 env 代理配置，两边不一致时 server 会自检重启一次——而那次 exit(0) 会被下面的
+  // 看门狗当成崩溃再拉起，形成"服务已自动恢复运行"弹窗风暴 + 端口互抢的死循环。
+  // 新增提供方时**这里必须同步加一行**（v1.0.37 加 zen 漏加就是一次真实故障）。
   const noProxyList = ["127.0.0.1", "localhost"];
   const addNoProxyHost = (upstream, useProxy) => {
     if (useProxy === true) return;
@@ -152,9 +153,14 @@ function spawnServer() {
   };
   addNoProxyHost(cfg.wb?.upstream || "https://www.workbuddy.ai", cfg.wb?.useProxy);
   addNoProxyHost(cfg.sn?.upstream || "https://token.sensenova.cn", cfg.sn?.useProxy);
+  addNoProxyHost(cfg.zen?.upstream || "https://opencode.ai/zen/v1", cfg.zen?.useProxy);
+  addNoProxyHost(cfg.qd?.upstream || "https://api2-v2.qoder.sh/model/v1", cfg.qd?.useProxy);
   const env = {
     ...process.env,
     NODE_USE_ENV_PROXY: "1",
+    // 本进程已按上表备好代理环境：告诉 server.mjs 不要自检重启。
+    // 少了这一行，每个子进程都会重启一次自己，而那次正常退出会被看门狗计成崩溃 → 无限重启。
+    BAI_ENV_FIXED: "1",
     ...(cfg.proxy ? { HTTPS_PROXY: cfg.proxy, HTTP_PROXY: cfg.proxy } : {}), // 空 = 直连（TUN/全局模式）
     NO_PROXY: noProxyList.join(","),
     BAI_ROUTER_EXE: process.execPath,
@@ -205,6 +211,7 @@ function spawnServer() {
 }
 
 let lastSpawnError = null;
+let lastRecoverNoticeAt = 0;
 function logMain(msg) {
   try { fs.appendFileSync(path.join(DATA_DIR, "app.log"), `[${new Date().toISOString()}] ${msg}\n`); } catch { }
 }
@@ -213,7 +220,11 @@ async function respawnWithNotice() {
   spawnServer();
   const ok = await waitReady(20000);
   if (ok) crashStreak = 0;
-  // 静默恢复：只通知面板横幅，不再弹系统气泡
+  // 静默恢复：只通知面板横幅。限流 60s 一次——若真出现重启循环（NO_PROXY 漂移等），
+  // 逐次弹出的横幅会盖住整个界面且关不掉，而根因在日志里，60s 一次足够定位。
+  const now = Date.now();
+  if (now - lastRecoverNoticeAt < 60000) return;
+  lastRecoverNoticeAt = now;
   notifyWindow("app-event", { kind: "recovered", text: "服务已自动恢复运行" });
 }
 
@@ -539,10 +550,10 @@ function setupUpdater() {
     au.on("error", (e) => {
       updateState = { phase: "error", msg: String((e && e.message) || e).slice(0, 160) };
       syncTray();
-      // 只有用户主动点「检查更新」后才弹错误横幅；后台自动检查失败保持静默
-      // （GitHub 网络抖动是常态，自动失败就弹窗会把用户吓跑）——记日志 + 托盘提示，
-      // 5 分钟后本会话内悄悄重试一次。
+      // 两种情况都落日志：自动失败记"已静默"，手动失败记明文——
+      // 否则"点了检查更新没反应"在 app.log 里查无实据，无法区分是没找到还是根本没发出去。
       if (Date.now() - manualCheckAt < 3 * 60 * 1000) {
+        logMain("手动检查更新失败: " + updateState.msg);
         notifyWindow("app-event", { kind: "update", state: updateState });
       } else {
         logMain("自动检查更新失败（已静默）: " + updateState.msg);
@@ -602,6 +613,7 @@ async function manualCheckUpdate() {
     notifyWindow("app-event", { kind: "check", text: "正在检查更新…" });
     manualCheckAt = Date.now();
     const r = await autoUpdater.checkForUpdates();
+    logMain("手动检查更新完成: " + (r ? (r.updateInfo ? `远端最新 v${r.updateInfo.version}` : JSON.stringify(r).slice(0, 120)) : "无返回值"));
     if (r && r.isUpdateAvailable === false) {
       notifyWindow("app-event", { kind: "check", text: "已是最新版本 v" + app.getVersion() });
     }

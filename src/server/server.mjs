@@ -284,9 +284,11 @@ function computeNoProxy(cfg) {
 }
 const cfg0 = loadCfg();
 const wantNoProxy = computeNoProxy(cfg0);
+const envNoProxy = process.env.NO_PROXY || "";
+const noProxyMismatch = envNoProxy !== wantNoProxy;
 const needEnvRestart =
   process.env.NODE_USE_ENV_PROXY !== "1" ||
-  (process.env.BAI_ENV_FIXED !== "1" && (process.env.NO_PROXY || "") !== wantNoProxy);
+  (process.env.BAI_ENV_FIXED !== "1" && noProxyMismatch);
 if (needEnvRestart) {
   const child = spawn(
     process.execPath,
@@ -309,6 +311,13 @@ if (needEnvRestart) {
   process.exit(0);
 }
 log(`路由台启动 relay=:${cfg0.relayPort} panel=:${cfg0.panelPort} (pid ${process.pid}) 代理=${cfg0.proxy || "直连"}`);
+// 壳进程已声明 env 就位（BAI_ENV_FIXED=1）却发现 NO_PROXY 对不上：只告警、绝不自动重启。
+// 自动重启在这里是有害的——每次自重启都会 exit(0)，壳进程的看门狗把它计成崩溃并再拉起一个，
+// 于是端口互抢 + "服务已自动恢复运行"弹窗反复弹出，形成死循环（v1.0.37 真实发生过）。
+// 真要对齐，改 src/main.js 的 noProxyList 补上漏掉的提供方即可。
+if (process.env.BAI_ENV_FIXED === "1" && noProxyMismatch) {
+  log(`⚠ NO_PROXY 与本进程计算结果不一致：壳进程传入=${envNoProxy || "(空)"} / 应为=${wantNoProxy}。已跳过自动纠正以避免重启循环——请检查 src/main.js 的 noProxyList 是否漏了提供方。`);
+}
 process.on("uncaughtException", (e) => log("uncaughtException:", e?.stack || String(e)));
 
 // ---------- 本地代理自适应（v1.0.17）：自动探测所有常见 Clash/V2ray 端口，支持直连(TUN) ----------
