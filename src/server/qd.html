@@ -563,7 +563,8 @@ function renderCatalog(j) {
     s.style.cssText = "font-family:var(--mono);font-size:11px;padding:3px 8px;border-radius:6px;"
       + (m.external ? "border:1px solid var(--line);color:var(--ink)" : "border:1px dashed var(--line);color:var(--dim)")
       + (m.free ? ";border-color:var(--ok);color:var(--ok)" : "");
-    s.textContent = m.name + (m.free ? " · 免费" : "") + (m.external ? "" : " · 仅客户端内");
+    s.textContent = (m.external && qdLabels && qdLabels[m.key]) || m.name
+      + (m.free ? " · 免费" : "") + (m.external ? "" : " · 仅客户端内");
     s.title = m.key + (m.price != null ? "　price_factor=" + m.price : "");
     return s;
   };
@@ -573,10 +574,11 @@ function renderCatalog(j) {
   $("catBox").style.display = "";
   $("catMore").textContent = "已读取 " + j.all.length + " 个";
   $("catHint").innerHTML = j.note + " 下拉里只列能从本中转真正调用的那些。";
-  // 顺带刷新下拉的可选项（外部可用的那批）
-  try { qdCfg.qd.availableModels = j.models; renderRoute(); } catch (e) { }
+  // 顺带刷新下拉的可选项与显示名
+  try { qdCfg.qd.availableModels = j.models; qdLabels = j.labels || null; renderRoute(); } catch (e) { }
 }
 
+let qdLabels = null;   // key -> 显示名，来自 /api/models?p=qd
 function renderRoute() {
   const qdc = qdSlice(qdCfg);
   const models = qdc.availableModels || [];
@@ -596,7 +598,9 @@ function renderRoute() {
     opts.forEach((o) => {
       const op = document.createElement("option");
       if (o === "__custom__") { op.value = "__custom__"; op.textContent = "自定义…"; }
-      else { op.value = o; op.textContent = o; }
+      // 显示名来自 /api/models?p=qd 返回的 labels（如 lite → "Qwen3.8-Flash · 免费档"），
+      // value 仍是原始 key —— 发给上游的必须是 key，显示什么只是给人看的。
+      else { op.value = o; op.textContent = (qdLabels && qdLabels[o]) || o; op.title = o; }
       sel.appendChild(op);
     });
     sel.value = isCustom ? "__custom__" : m.target;

@@ -367,7 +367,11 @@
         <tbody id="routeBody"></tbody>
       </table>
 
-      <div class="hint" style="margin-top:10px">Zen 侧目前只有 <b>space-bunny-free</b> 一个免费模型可外部调用，四档默认都映射到它；日后若开通 Go 订阅或 Zen 放开更多模型，这里可直接在下拉里切换。</div>
+      <div class="hint" style="margin-top:10px" id="zenCatHint">下拉里只列<b>能从本中转真正调用</b>的模型。Zen 的公开目录共八十多个，但绝大多数被上游按产品策略锁住——<span id="zenCatMore">点下方「刷新模型列表」读取</span>。</div>
+      <div id="zenCatBox" style="display:none;margin-top:10px">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:6px">Zen 公开模型目录（<span style="color:var(--ok)">绿框=可外部调用</span>，虚线=上游锁定）：</div>
+        <div id="zenCatList" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+      </div>
 
       <div class="saverow">
         <button class="btn-main" id="btnSave" style="padding:8px 20px">保存映射</button>
@@ -565,6 +569,30 @@ function renderStatus(s) {
   }
 }
 
+// Zen 公开目录：全部列出并标注可用性。下拉只放真能调通的，其余照实展示，
+// 免得用户以为"上游没有这个模型"，其实是产品级封锁（FreeTierError）。
+function renderZenCatalog(j) {
+  if (!j || !j.all || !j.all.length) {
+    if (j && j.note) $("zenCatHint").textContent = j.note;
+    return;
+  }
+  const box = $("zenCatList");
+  box.innerHTML = "";
+  for (const m of j.all) {
+    const s = document.createElement("span");
+    s.style.cssText = "font-family:var(--mono);font-size:11px;padding:3px 8px;border-radius:6px;"
+      + (m.external ? "border:1px solid var(--ok);color:var(--ok)"
+                    : (m.free ? "border:1px dashed var(--line);color:var(--dim)"
+                              : "border:1px solid var(--line);color:var(--dim)"));
+    s.textContent = m.key + (m.external ? " · 可用" : (m.free ? " · 免费档限客户端内" : " · 需付费额度"));
+    box.appendChild(s);
+  }
+  $("zenCatBox").style.display = "";
+  $("zenCatMore").textContent = "已读取 " + j.all.length + " 个";
+  $("zenCatHint").textContent = j.note;
+  try { zenCfg.zen.availableModels = j.models; renderRoute(); } catch (e) { }
+}
+
 function renderRoute() {
   const zen = zenSlice(zenCfg);
   const models = zen.availableModels || [];
@@ -617,9 +645,7 @@ function renderKeyInfo() {
   stat.innerHTML = has
     ? '<span>API Key：<b>已配置</b></span><span>上游：<b>' + (z.upstream || "") + '</b></span><span>可用模型：<b>' + ((z.availableModels || []).length) + ' 个</b></span>'
     : '<span>API Key：<b class="warn">未配置</b></span>　去 opencode.ai/console 生成后填入下方「Zen 设置」';
-  fetch("/api/models?p=zen").then(r => r.json()).then(j => {
-    if (j && j.note) stat.innerHTML += '<br><span>' + j.note + '</span>';
-  }).catch(() => { });
+  fetch("/api/models?p=zen").then((r) => r.json()).then(renderZenCatalog).catch(() => { });
 }
 
 function renderSys() {

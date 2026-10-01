@@ -629,6 +629,29 @@ async function wbEnsureToken(cfg) {
   return wbRefreshLock;
 }
 
+// ---------- OpenCode Zen 模型目录（v1.0.42）----------
+// 公开接口，无需鉴权也不需要任何补丁——这点与 Qoder 正好相反（Qoder 的目录要靠 worker
+// 钩子导出明文）。但公开目录只给 id，没有价格/免费标记，可用性只能按实测结论标注。
+//
+// 实测（2026-10，用户 Free key）：84 个模型里 11 个标 -free，其中只有 space-bunny-free
+// 能外部调用；其余 -free 一律返回 FreeTierError「only be used from within OpenCode」——
+// 这是产品级封锁，没有服务端别名可绕，不像 Qoder 的 lite 恰好落在免费档上。
+// 付费模型则需 key 有余额（当前为 0，一律 402 Insufficient account funds）。
+const ZEN_EXTERNAL_OK = new Set(["space-bunny-free"]);
+let zenCatCache = { at: 0, list: [] };
+async function zenReadCatalog() {
+  if (Date.now() - zenCatCache.at < 30 * 60 * 1000 && zenCatCache.list.length) return zenCatCache.list;
+  try {
+    const fr = await fetch("https://opencode.ai/zen/v1/models", { signal: AbortSignal.timeout(15000) });
+    const jj = await fr.json();
+    const list = (jj.data || []).map((m) => String(m.id || "").trim()).filter(Boolean);
+    if (list.length) zenCatCache = { at: Date.now(), list };
+    return zenCatCache.list;
+  } catch {
+    return zenCatCache.list;
+  }
+}
+
 // ---------- Qoder 模型目录（v1.0.41）----------
 // worker 拉回 /algo/api/v2/model/list 后在本地解密再 parse，补丁把那份**明文**目录写到
 // qoderModelsFile；这里直接读，无需复刻 Cosy 签名或解磁盘上的加密缓存。
@@ -665,13 +688,30 @@ function qdReadCatalog(cfg) {
     }));
     // `lite` 不在客户端目录里（是服务端别名），单独补进去并注明它就是免费那档
     if (!all.some((m) => m.key === "lite")) {
-      all.unshift({ key: "lite", name: "Qwen3.8-Flash（服务端别名）", free: true, price: 0,
+      all.unshift({ key: "lite", name: "Qwen3.8-Flash", free: true, price: 0,
         isDefault: true, reasoning: false, maxInput: null, external: true, alias: true });
     }
+    // 下拉框用 key（lite/qmodel/…）对用户毫无意义，换成看得懂的名字。
+    // 目录里有的取 display_name；lite/auto/ultimate/performance 这类档位名补一句说明。
+    const TIER_DESC = {
+      lite: "免费档",
+      auto: "自动选路",
+      ultimate: "最强档",
+      performance: "均衡档",
+      efficient: "高效档",
+    };
+    const labels = {};
+    for (const m of all) {
+      if (!m.external) continue;
+      const base = m.name || m.key;
+      labels[m.key] = TIER_DESC[m.key] ? `${base} · ${TIER_DESC[m.key]}` : base;
+    }
+    labels.lite = "Qwen3.8-Flash · 免费档";
     const val = {
       ok: true,
       count: all.length,
       models: all.filter((m) => m.external).map((m) => m.key),
+      labels,
       all,
       note: `目录共 ${all.length} 个，其中 ${all.filter((m) => m.external).length} 个可从本中转调用；`
         + `其余仅限 Qoder 客户端内使用（走 Cosy 签名通道，外部无法调用）。`,
@@ -1000,13 +1040,17 @@ function wbToOpenAI(j) {
 }
 
 // Anthropic 风格错误（Claude Code 按 type 分类重试/提示）
+// 这段桥被 wb / zen / qd 三个提供方共用（makeRelay 的 openai:true），前缀不能写死
+// WorkBuddy——否则 Zen/Qoder 的报错会顶着 "[WorkBuddy]" 出现在用户面前。
+let wbErrPrefix = "WorkBuddy";
+function setErrProvider(name) { wbErrPrefix = name; }
 function wbAnthroError(res, status, msg) {
   if (res.headersSent || res.writableEnded) { try { res.end(); } catch { } return; }
   const s = Number(status) >= 400 && Number(status) < 600 ? Number(status) : 502;
   const typeMap = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 500: "api_error", 503: "overloaded_error", 529: "overloaded_error" };
   const type = typeMap[s] || (s >= 500 ? "api_error" : "invalid_request_error");
   res.writeHead(s, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-  res.end(JSON.stringify({ type: "error", error: { type, message: `[WorkBuddy] ${String(msg).slice(0, 400)}` } }));
+  res.end(JSON.stringify({ type: "error", error: { type, message: `[${wbErrPrefix}] ${String(msg).slice(0, 400)}` } }));
 }
 
 async function* sseLines(body) {
@@ -1054,16 +1098,49 @@ async function wbPipe(r, res, { model, clientStream, inputJson }) {
     emit("ping", { type: "ping" });
   }
 
+  let sseEvent = "";   // 上游 SSE 的 event: 名字（error 等错误就靠它带出来）
+  const bail = (msg, kind) => {
+    noteRelayError(wbErrPrefix === "WorkBuddy" ? "wb" : "wb", "upstream_sse_error", msg.slice(0, 180));
+    if (clientStream) {
+      emit("error", { type: "error", error: { type: kind || "api_error", message: `[${wbErrPrefix}] ${msg}` } });
+      try { res.end(); } catch { }
+      return true;
+    }
+    wbAnthroError(res, 502, msg);
+    return true;
+  };
   try {
     for await (const raw of sseLines(r.body)) {
       const line = raw.trimEnd();
       if (!line) continue;
       if (line.startsWith(":")) { emit("ping", { type: "ping" }); continue; } // 心跳
+      if (line.startsWith("event:")) { sseEvent = line.slice(6).trim(); continue; }
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
       if (payload === "[DONE]") break;
       let d;
       try { d = JSON.parse(payload); } catch { continue; }
+      // OpenAI 兼容网关常把错误塞进 200 的 SSE 里（实测 Qoder model server 对不支持的
+      // 模型就是 `event: error` + {"code":"invalid_model_error"}，HTTP 仍是 200）。
+      // 不识别的话下面的 `if (!ch) continue` 会把它当成"没有内容"，静默产出一个空回复——
+      // 用户只看到模型不吭声，完全不知道是模型名不被支持。这里必须显式转成 Anthropic 错误。
+      {
+        const evName = String(sseEvent || "").toLowerCase();
+        const errObj = d && d.error;
+        const hasErr = evName === "error" || (errObj && typeof errObj === "object")
+          || (d && typeof d.code === "string" && /error/i.test(d.code));
+        if (hasErr) {
+          const em = (errObj && typeof errObj === "object")
+            ? (errObj.message || JSON.stringify(errObj))
+            : (d.message || String(errObj || d.code || "上游返回错误"));
+          const code = String((errObj && errObj.type) || d.code || "");
+          const kind = /invalid_model|model.*not|not.*support/i.test(code + em) ? "invalid_request_error"
+            : /auth|permission|forbidden/i.test(code + em) ? "permission_error"
+            : /rate|quota|too_many/i.test(code + em) ? "rate_limit_error" : "api_error";
+          if (bail(String(em).slice(0, 300), kind)) { try { await r.body.cancel(); } catch { } return; }
+        }
+        sseEvent = "";
+      }
       if (d.usage) usage = d.usage;
       const ch = Array.isArray(d.choices) && d.choices[0];
       if (!ch) continue;
@@ -1143,6 +1220,7 @@ async function wbPipe(r, res, { model, clientStream, inputJson }) {
 // p="zen"（OpenCode Zen，Bearer API Key + 标准头）。请求翻译与响应回译完全共用。
 async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : "WorkBuddy";
+  setErrProvider(NAME);
   let token;
   if (p === "zen") {
     token = (cfg.zen && cfg.zen.apiKey) || "";
@@ -1216,9 +1294,21 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
       await new Promise((rr) => setTimeout(rr, 400 * (a + 1)));
       r = await doCall(token);
     }
+    // Zen 限流很凶，且用 500 "Internal server error" 表达而不是 429——实测连发 11 个请求
+    // 全部被顶掉，间隔 7s 不够、需 25s 以上。探测时退避重试一次，别让「测试连通」假失败。
+    if (p === "zen" && r.status === 500 && isProbe) {
+      const peek = await readAllBody(r).catch(() => "");
+      if (/internal server error/i.test(peek)) {
+        await new Promise((rr) => setTimeout(rr, 3000));
+        r = await doCall(token);
+      } else {
+        consumedBodyHint = peek;
+      }
+    }
     // "unapproved channel" 偶发抖动：重试一次（确定性指纹已由 wbSanitizeSystem 剥除）。
     // 注意 400 响应体已被读走，若最终仍是错误，错误文案从 consumed400 兜底。
     let consumed400 = "";
+    let consumedBodyHint = "";
     if (r.status === 400) {
       consumed400 = await readAllBody(r).catch(() => "");
       if (consumed400.includes("unapproved channel")) {
@@ -1238,16 +1328,40 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   }
 
   if (r.status !== 200) {
-    const txt = (await readAllBody(r).catch(() => "")) || consumed400;
-    noteRelayError(p, r.status === 429 ? "rate_limit" : `upstream_${r.status}`, `${NAME} 上游 HTTP ${r.status}`);
+    const txt = (await readAllBody(r).catch(() => "")) || consumed400 || consumedBodyHint;
     let msg = txt;
     try { const jj = JSON.parse(txt); msg = jj.msg || jj.message || (jj.error && jj.error.message) || txt; } catch { }
+
+    // 归因：Zen 的几种典型拒绝各有明确含义，直接翻译成人话，别让用户对着裸错误码猜。
+    let why = "";
+    if (p === "zen") {
+      if (r.status === 429 || (r.status === 500 && /internal server error/i.test(txt))) {
+        why = " —— OpenCode Zen 限流很严（连发几次探测就会被顶掉）。等 30 秒左右再试，或只测当前档位别勾「测全部四档」。";
+        noteRelayError(p, "rate_limit", `${NAME} 触发上游限流`);
+      } else if (r.status === 403 && /FreeTierError|only be used from within/i.test(txt)) {
+        why = " —— 这是 Zen 的免费档，官方限定只能在 OpenCode 客户端内用（服务端返回 FreeTierError），外部无法调用。换 space-bunny-free，或用付费额度。";
+        noteRelayError(p, "upstream_403", `${NAME} 免费档限客户端内使用`);
+      } else if (r.status === 402 || /insufficient account funds/i.test(txt)) {
+        why = " —— API Key 余额为 0，付费模型需要先充值；免费档里只有 space-bunny-free 能外部调用。";
+        noteRelayError(p, "upstream_402", `${NAME} 余额不足`);
+      } else if (r.status === 400 && /Model is unavailable/i.test(txt)) {
+        why = " —— 该模型后端当前不可用（Zen 侧临时下线或未对免费档开放）。";
+        noteRelayError(p, "upstream_400", `${NAME} 模型不可用`);
+      } else if (r.status === 403 && /Model access is disabled/i.test(txt)) {
+        why = " —— 该模型未对你的 Key 开放。";
+        noteRelayError(p, "upstream_403", `${NAME} 模型未授权`);
+      } else {
+        noteRelayError(p, r.status === 429 ? "rate_limit" : `upstream_${r.status}`, `${NAME} 上游 HTTP ${r.status}`);
+      }
+    } else {
+      noteRelayError(p, r.status === 429 ? "rate_limit" : `upstream_${r.status}`, `${NAME} 上游 HTTP ${r.status}`);
+    }
     // 4xx 诊断：把被拒的翻译后请求体落一份，便于定位上游新增的校验/指纹规则
     if (r.status >= 400 && r.status < 500) {
       try { writeFileSync(path.join(DATA_DIR, "wb-last-4xx.json"), bodyStr); } catch { }
       log(`${NAME} 上游 ${r.status} 拒绝了请求，翻译后请求体已存 wb-last-4xx.json：${String(msg).slice(0, 160)}｜system 首行：${String((ob.messages && ob.messages[0] && ob.messages[0].content) || "").split("\n")[0].slice(0, 120)}`);
     }
-    return wbAnthroError(res, r.status, msg);
+    return wbAnthroError(res, r.status, String(msg).slice(0, 300) + why);
   }
   const ct = r.headers.get("content-type") || "";
   if (!ct.includes("text/event-stream")) {
@@ -1837,20 +1951,27 @@ const panel = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true });
       }
       if (p === "zen") {
-        // Zen 提供公开模型目录（无需鉴权）；带 -free 的多数被服务端限客户端内使用，
-        // 这里如实返回并标注，供 UI 提示——不把不可用模型塞进下拉框。
-        let live = [];
-        try {
-          const fr = await fetch("https://opencode.ai/zen/v1/models", { signal: AbortSignal.timeout(15000) });
-          const jj = await fr.json();
-          live = (jj.data || []).map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean);
-        } catch { }
-        const free = live.filter((id) => id.includes("free"));
-        const knownOk = S.availableModels.filter((id) => live.includes(id) || !live.length);
+        // Zen 提供公开模型目录（无需鉴权），但只给 id、没有价格与免费标记。
+        // 全部列出来并按实测结论标注可用性——让用户看得见"上游有什么、为什么用不了"，
+        // 而不是下拉框里只有孤零零一个模型。不可用的**不进下拉**，免得选了必然报错。
+        const cat = await zenReadCatalog();
+        const all = cat.map((id) => ({
+          key: id,
+          name: id,
+          free: id.includes("free"),
+          external: ZEN_EXTERNAL_OK.has(id),
+        }));
+        const freeN = all.filter((m) => m.free).length;
+        const okN = all.filter((m) => m.external).length;
         return json(res, 200, {
-          ok: true, count: live.length, models: [...S.availableModels],
-          freeCount: free.length,
-          note: `Zen 目录共 ${live.length} 个模型，其中 ${free.length} 个标 free；实测仅 space-bunny-free 可从外部调用，其余限 OpenCode 客户端内使用`,
+          ok: true, count: all.length,
+          models: all.filter((m) => m.external).map((m) => m.key),
+          all,
+          freeCount: freeN,
+          note: cat.length
+            ? `Zen 公开目录共 ${all.length} 个模型，其中 ${freeN} 个标 free；实测只有 ${okN} 个能从中转调用。`
+              + `其余 -free 会被服务端拒为 FreeTierError（"can only be used from within OpenCode"，产品级限制，非本机可绕），付费模型则需 API Key 有余额。`
+            : "未读到 Zen 公开目录（网络或上游暂时不可达），当前显示内置列表",
         });
       }
       let j;
