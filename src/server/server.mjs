@@ -563,19 +563,23 @@ async function wbEnsureToken(cfg) {
 }
 
 // WorkBuddy 网关对 Claude Code 的客户端指纹拦截（"Illegal API invocation from an unapproved
-// channel"）——实测两处确定性规则，均在 system 提示词内，中转侧剥除/改写（对模型行为无实质影响）：
-//   (1) 行首 "x-anthropic-billing-header:" 计费指纹行（Claude Code 写进 system 开头）；
-//   (2) "- To give feedback ... github.com/anthropics/claude-code/issues" 反馈指引行（措辞+链接组合）；
-//   (3) 旧版 Claude Code 开场句（前缀匹配）。
-// 若上游未来新增指纹规则，会以 400 显式报错并落盘 wb-last-4xx.json，届时在对应位置补充即可。
-const WB_CC_FINGERPRINT = "You are Claude Code, Anthropic's official CLI for Claude.";
+// channel"）——实测为"系统提示词整行/前缀"级规则。网关只认字符串内容，因此这里在把 system
+// 交给模型前剥除/改写这几处客户端指纹（均为纯标识文本，对模型行为无实质影响）。
+// 规则表形式便于上游新增指纹时单点补充；命中会以 400 显式报错，
+// 并把翻译后请求体落盘 wb-last-4xx.json + server.log 首行诊断。
+const WB_CC_REWRITE_HEAD = "You are a highly capable coding assistant operating in a developer's terminal.";
+const WB_SYSTEM_RULES = [
+  // ① Claude Code 写进 system 开头的计费指纹行（"x-anthropic-billing-header: cc_version=…"）
+  { re: /^x-anthropic-billing-header:[^\n]*\n?/gm },
+  // ② "To give feedback … github.com/anthropics/claude-code/issues" 反馈指引行（措辞+链接组合触发）
+  { re: /^.*github\.com\/anthropics\/claude-code.*(?:\n|$)/gm },
+  // ③ 开场句前缀——CLI 版（"…official CLI for Claude."）与 SDK 版
+  // （"…official CLI for Claude, running within the Claude Agent SDK."）等变体均命中，整行改写
+  { re: /^You are Claude Code, Anthropic's official CLI for Claude[^\n]*/, rewrite: WB_CC_REWRITE_HEAD },
+];
 function wbSanitizeSystem(sys) {
   let t = String(sys || "");
-  t = t.replace(/^x-anthropic-billing-header:[^\n]*\n?/gm, "");
-  t = t.replace(/^.*github\.com\/anthropics\/claude-code.*(?:\n|$)/gm, "");
-  if (t.startsWith(WB_CC_FINGERPRINT)) {
-    t = "You are a highly capable coding assistant operating in a developer's terminal." + t.slice(WB_CC_FINGERPRINT.length);
-  }
+  for (const r of WB_SYSTEM_RULES) t = r.rewrite ? t.replace(r.re, r.rewrite) : t.replace(r.re, "");
   return t;
 }
 function wbToOpenAI(j) {
@@ -874,7 +878,7 @@ async function wbExchange({ cfg, S, j, isProbe, res, useProxy }) {
     // 4xx 诊断：把被拒的翻译后请求体落一份，便于定位上游新增的校验/指纹规则
     if (r.status >= 400 && r.status < 500) {
       try { writeFileSync(path.join(DATA_DIR, "wb-last-4xx.json"), bodyStr); } catch { }
-      log(`WorkBuddy 上游 ${r.status} 拒绝了请求，翻译后请求体已存 wb-last-4xx.json：${String(msg).slice(0, 160)}`);
+      log(`WorkBuddy 上游 ${r.status} 拒绝了请求，翻译后请求体已存 wb-last-4xx.json：${String(msg).slice(0, 160)}｜system 首行：${String((ob.messages && ob.messages[0] && ob.messages[0].content) || "").split("\n")[0].slice(0, 120)}`);
     }
     return wbAnthroError(res, r.status, msg);
   }
