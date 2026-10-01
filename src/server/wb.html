@@ -234,14 +234,17 @@
   .tokstat b.warn { color: var(--err); }
 
   /* 主题切换按钮 */
-  .themeBtn { position: fixed; top: 14px; right: 152px; z-index: 60; display: flex; align-items: center; gap: 6px;
+  .themeBtn { -webkit-app-region: no-drag; display: flex; align-items: center; gap: 6px; margin-left: 14px; margin-right: 146px;
     font-family: var(--mono); font-size: 11px; letter-spacing: 1px; color: var(--dim); background: var(--panel);
-    border: 1px solid var(--line); border-radius: 99px; padding: 6px 12px; cursor: pointer; }
+    border: 1px solid var(--line); border-radius: 99px; padding: 5px 12px; cursor: pointer; }
   .themeBtn:hover { color: var(--ink); border-color: var(--dim); }
+  .themeBtn:active { transform: scale(.96); }
+  body.no-frame .themeBtn { margin-right: 8px; }
+  .themeBtn:hover { color: var(--ink); border-color: var(--dim); }
+  .themeBtn:active { transform: scale(.96); }
 </style>
 </head>
 <body>
-<button class="themeBtn" id="themeBtn" type="button" title="切换亮色 / 暗色主题"><span id="themeIcon">☾</span><span id="themeText">暗色</span></button>
 
 <div class="wrap">
 
@@ -254,6 +257,7 @@
       <a href="/wb" class="prov-tab active">WorkBuddy</a>
     </nav>
     <span class="svc" id="svc">服务 <b>●</b> —</span>
+    <button class="themeBtn" id="themeBtn" type="button" title="切换亮色 / 暗色主题"><span id="themeIcon">☾</span><span id="themeText">暗色</span></button>
   <span class="winCtrls" id="winCtrls" aria-hidden="true">
   <button id="winMin" title="最小化" aria-label="最小化"><svg viewBox="0 0 10 10"><rect x="1" y="4.5" width="8" height="1"/></svg></button>
   <button id="winMax" title="最大化" aria-label="最大化"><svg viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1"/></svg></button>
