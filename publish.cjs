@@ -38,6 +38,13 @@ try {
       const cur3 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
       if (cur3.zen) def.zen = { ...cur3.zen, apiKey: "" };
     }
+    // qd（Qoder）块：token 是手动兜底用的 jt- jobToken，绝不进快照
+    // （正常路径下它恒为空——真实令牌由 worker 补丁写在 %TEMP%\qoder-token.json，不落 config）
+    if (def.qd) { def.qd = { ...def.qd, token: "" }; }
+    else {
+      const cur4 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
+      if (cur4.qd) def.qd = { ...cur4.qd, token: "" };
+    }
     fs.writeFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), JSON.stringify(def, null, 2) + "\n");
     console.log(`» 默认快照已同步发布机: ${def.availableModels.length} 个模型${def.sn ? " + SenseNova " + def.sn.availableModels.length + " 个" : ""}`);
   } else console.log("» 未找到发布机配置，沿用仓库内 defaults 快照");
@@ -54,8 +61,9 @@ run("npx electron-builder --win nsis");
   const snOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "sn.html"));
   const wbOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "wb.html"));
   const zenOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "zen.html"));
-  if (miss.length || !snOk || !wbOk || !zenOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html") + (zenOk ? "" : " + resources/server/zen.html"));
-  console.log("» 发布闸门通过：asar 模块齐全，sn.html / wb.html / zen.html 已随包");
+  const qdOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "qd.html"));
+  if (miss.length || !snOk || !wbOk || !zenOk || !qdOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html") + (zenOk ? "" : " + resources/server/zen.html") + (qdOk ? "" : " + resources/server/qd.html"));
+  console.log("» 发布闸门通过：asar 模块齐全，sn.html / wb.html / zen.html / qd.html 已随包");
 }
 // upgrade.ps1：救砖/一键升级脚本，作为 release 资产随每个版本发布（旧版更新器损坏的用户无需打开网页）
 if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {

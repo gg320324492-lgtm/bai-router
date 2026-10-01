@@ -90,6 +90,22 @@ const DEFAULTS = {
     mapping: defaultMapping("space-bunny-free", "Space-Bunny-Free"),
     useProxy: false,
   },
+  // Qoder（qoder.com 桌面端附带的 Free 套餐）—— 第五个可路由提供方。
+  // 上游只讲 OpenAI 协议（/model/v1/chat/completions），复用通用协议桥。
+  // 认证不是 sk- 密钥，而是 jt- 开头的 jobToken，且**每次 Qoder 启动都会轮换**——
+  // 所以不落 config，由 worker 补丁（qoder-patch/patch_worker.py）实时写入 tokenFile，
+  // 中转每次请求现读；token 字段只作手动粘贴兜底。
+  // 服务端只认两个模型别名：普通用户走 lite，auto 为自动选路。
+  qd: {
+    upstream: "https://api2-v2.qoder.sh/model/v1",
+    relayPort: 15762,
+    defaultModel: "lite",
+    availableModels: ["lite", "auto"],
+    mapping: defaultMapping("lite", "Qoder Lite"),
+    token: "",
+    tokenFile: path.join(os.tmpdir(), "qoder-token.json"),
+    useProxy: false,
+  },
   // WorkBuddy（腾讯 WorkBuddy AI 客户端附带的免费模型）—— 第三个可路由提供方。
   // 上游只讲 OpenAI Chat Completions（且仅流式），中转内置 Anthropic↔OpenAI 协议桥；
   // 认证不是 sk- 密钥，而是从 WorkBuddy 客户端捕获的 JWT 三件套（访问/刷新/设备令牌），
@@ -139,10 +155,17 @@ function loadCfg() {
       mapping: { ...DEFAULTS.wb.mapping, ...(wbIn.mapping || {}) },
       availableModels: Array.isArray(wbIn.availableModels) && wbIn.availableModels.length ? wbIn.availableModels : [...DEFAULTS.wb.availableModels],
     };
+    // qd 深合并（同上）
+    const qdIn = c.qd || {};
+    merged.qd = {
+      ...DEFAULTS.qd, ...qdIn,
+      mapping: { ...DEFAULTS.qd.mapping, ...(qdIn.mapping || {}) },
+      availableModels: Array.isArray(qdIn.availableModels) && qdIn.availableModels.length ? qdIn.availableModels : [...DEFAULTS.qd.availableModels],
+    };
     return merged;
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
-    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] } };
+    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] } };
   }
 }
 function saveCfg(cfg) {
@@ -256,6 +279,7 @@ function computeNoProxy(cfg) {
   add(hostOf(cfg.wb?.upstream || DEFAULTS.wb.upstream), cfg.wb?.useProxy === true);
   add(hostOf(cfg.sn?.upstream || DEFAULTS.sn.upstream), cfg.sn?.useProxy === true);
   add(hostOf(cfg.zen?.upstream || DEFAULTS.zen.upstream), cfg.zen?.useProxy === true);
+  add(hostOf(cfg.qd?.upstream || DEFAULTS.qd.upstream), cfg.qd?.useProxy === true);
   return list.join(",");
 }
 const cfg0 = loadCfg();
@@ -382,9 +406,12 @@ function onActivated() {
         if (def.zen && Array.isArray(def.zen.availableModels) && def.zen.availableModels.length) {
           cur.zen.availableModels = [...new Set([...(cur.zen.availableModels || []), ...def.zen.availableModels])];
         }
+        if (def.qd && Array.isArray(def.qd.availableModels) && def.qd.availableModels.length) {
+          cur.qd.availableModels = [...new Set([...(cur.qd.availableModels || []), ...def.qd.availableModels])];
+        }
         cur._modelsSynced = APP_VERSION;
         saveCfg(cur);
-        log(`可选模型已同步发布机（${merged.length} 个 + SenseNova ${cur.sn.availableModels.length} 个 + WorkBuddy ${cur.wb.availableModels.length} 个）`);
+        log(`可选模型已同步发布机（${merged.length} 个 + SenseNova ${cur.sn.availableModels.length} 个 + WorkBuddy ${cur.wb.availableModels.length} 个 + Qoder ${cur.qd.availableModels.length} 个）`);
       }
     }
   } catch (e) { log("模型同步跳过: " + e.message); }
@@ -413,6 +440,7 @@ const recentCallsBai = [];  // {tier, served, at}
 const recentCallsSn = [];
 const recentCallsWb = [];
 const recentCallsZen = [];
+const recentCallsQd = [];
 function activeTier(store) {
   // 最近 30 分钟内被"真实会话"用过的档位；没有观察则返回 null（不再默认猜 Haiku）
   if (store.length && Date.now() - store[0].at < 30 * 60000) return store[0].tier;
@@ -431,6 +459,7 @@ const relayErrors = {
   sn: { kind: null, message: null, at: null },
   wb: { kind: null, message: null, at: null },
   zen: { kind: null, message: null, at: null },
+  qd: { kind: null, message: null, at: null },
 };
 function noteRelayError(p, kind, message) {
   const slot = relayErrors[p] || relayErrors.bai;
@@ -586,6 +615,33 @@ async function wbEnsureToken(cfg) {
     wbRefreshLock = wbRefreshToken(cfg).finally(() => { wbRefreshLock = null; });
   }
   return wbRefreshLock;
+}
+
+// ---------- Qoder 令牌（v1.0.38）----------
+// Qoder 的 jt- jobToken **每次客户端启动都会轮换**，缓存到 config 里必然失效。
+// 取法：worker 补丁（qoder-patch/patch_worker.py）在每次带鉴权的出站请求上把最新令牌
+// 覆盖写入 tokenFile，中转按 mtime 缓存几秒现读——Qoder 换令牌后无需重启中转即自动跟随。
+// 令牌失效时上游回 401，此时强制绕过缓存重读一次（Qoder 可能刚刷新过）。
+let qdTokCache = { token: "", mtimeMs: -1, at: 0 };
+function qdEnsureToken(cfg, force) {
+  const manual = (cfg.qd && cfg.qd.token) || "";
+  if (manual.trim()) return manual.trim();
+  const file = (cfg.qd && cfg.qd.tokenFile) || DEFAULTS.qd.tokenFile;
+  const fresh = Date.now() - qdTokCache.at < 5000;
+  if (!force && fresh && qdTokCache.token) return qdTokCache.token;
+  try {
+    const st = statSync(file);
+    if (force || st.mtimeMs !== qdTokCache.mtimeMs) {
+      const j = JSON.parse(readFileSync(file, "utf8"));
+      if (j && typeof j.token === "string" && j.token.trim()) {
+        qdTokCache = { token: j.token.trim(), mtimeMs: st.mtimeMs, at: Date.now() };
+      }
+    }
+  } catch {
+    if (!qdTokCache.token) throw new Error("未找到 Qoder 令牌——请先启动 Qoder 桌面端（补丁会把令牌写到 " + file + "）");
+  }
+  if (!qdTokCache.token) throw new Error("Qoder 令牌文件为空——请启动 Qoder 桌面端后重试");
+  return qdTokCache.token;
 }
 
 // ---------- 一键捕获 WorkBuddy 令牌（v1.0.33）----------
@@ -1020,23 +1076,35 @@ async function wbPipe(r, res, { model, clientStream, inputJson }) {
 // 通用 OpenAI 上游桥：p="wb"（WorkBuddy，需 JWT + WorkBuddy 专头 + 令牌续期）、
 // p="zen"（OpenCode Zen，Bearer API Key + 标准头）。请求翻译与响应回译完全共用。
 async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
-  const NAME = p === "zen" ? "OpenCode Zen" : "WorkBuddy";
+  const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : "WorkBuddy";
   let token;
   if (p === "zen") {
     token = (cfg.zen && cfg.zen.apiKey) || "";
     if (!token) { noteRelayError(p, "auth", "未配置 OpenCode Zen API Key"); return wbAnthroError(res, 401, "未配置 OpenCode Zen API Key——请到「OpenCode Zen」页填写"); }
+  } else if (p === "qd") {
+    try { token = qdEnsureToken(cfg); }
+    catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
   } else {
     try { token = await wbEnsureToken(cfg); }
     catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
   }
 
   const ob = wbToOpenAI(j);
-  const base = (S.upstream || (p === "zen" ? DEFAULTS.zen.upstream : DEFAULTS.wb.upstream)).replace(/\/+$/, "");
-  const url = p === "zen" ? base + "/chat/completions" : base + "/v2/chat/completions";
+  const base = (S.upstream || (p === "zen" ? DEFAULTS.zen.upstream : p === "qd" ? DEFAULTS.qd.upstream : DEFAULTS.wb.upstream)).replace(/\/+$/, "");
+  const url = p === "wb" ? base + "/v2/chat/completions" : base + "/chat/completions";
   const mkHeaders = (tok) => {
     if (p === "zen") {
       return {
         "content-type": "application/json",
+        authorization: `Bearer ${tok}`,
+        "user-agent": `B.AI-Router/${APP_VERSION}`,
+      };
+    }
+    if (p === "qd") {
+      // Qoder model server：普通 Bearer 即可，X-Request-ID / X-Session-ID 实测非必需
+      return {
+        "content-type": "application/json",
+        accept: "text/event-stream",
         authorization: `Bearer ${tok}`,
         "user-agent": `B.AI-Router/${APP_VERSION}`,
       };
@@ -1062,11 +1130,19 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   let r;
   try {
     r = await doCall(token);
-    // 令牌失效（401/403）→ WorkBuddy 侧可续期并重试一次；Zen 侧 key 失效直接报错
+    // 令牌失效（401/403）→ WorkBuddy 侧可续期并重试一次；Zen 侧 key 失效直接报错；
+    // Qoder 侧强制绕过 mtime 缓存重读令牌文件再试一次（Qoder 可能刚轮换过令牌）
     if ((r.status === 401 || r.status === 403) && p === "wb" && cfg.wb.refreshToken) {
       await readAllBody(r).catch(() => "");
       try { token = await wbRefreshToken(cfg); r = await doCall(token); }
       catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
+    }
+    if ((r.status === 401 || r.status === 403) && p === "qd") {
+      await readAllBody(r).catch(() => "");
+      try {
+        const again = qdEnsureToken(cfg, true);
+        if (again && again !== token) { token = again; r = await doCall(token); }
+      } catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
     }
     // 探测级小请求遇 429：静默退避重试（与 B.AI/SenseNova 行为一致）
     for (let a = 0; r.status === 429 && isProbe && a < 3; a++) {
@@ -1229,6 +1305,8 @@ const snRelay = makeRelay("sn", recentCallsSn, (cfg) => ({ upstream: cfg.sn.upst
 const wbRelay = makeRelay("wb", recentCallsWb, (cfg) => ({ upstream: cfg.wb.upstream, mapping: cfg.wb.mapping, defaultModel: cfg.wb.defaultModel, availableModels: cfg.wb.availableModels }), (cfg) => cfg.wb.useProxy === true, { openai: true });
 // OpenCode Zen：OpenAI 协议，复用同一套桥（apiKey 认证，无令牌续期）
 const zenRelay = makeRelay("zen", recentCallsZen, (cfg) => ({ upstream: cfg.zen.upstream, mapping: cfg.zen.mapping, defaultModel: cfg.zen.defaultModel, availableModels: cfg.zen.availableModels }), (cfg) => cfg.zen.useProxy === true, { openai: true });
+// Qoder：OpenAI 协议，复用同一套桥。认证是轮换的 jt- jobToken（每次请求现读令牌文件），无静态密钥
+const qdRelay = makeRelay("qd", recentCallsQd, (cfg) => ({ upstream: cfg.qd.upstream, mapping: cfg.qd.mapping, defaultModel: cfg.qd.defaultModel, availableModels: cfg.qd.availableModels }), (cfg) => cfg.qd.useProxy === true, { openai: true });
 
 // ---------- 文件级操作 ----------
 function readJson(file) {
@@ -1268,6 +1346,18 @@ function sliceOf(cfg, p) {
       useProxy: z.useProxy === true,
     };
   }
+  if (p === "qd") {
+    const q = cfg.qd || {};
+    return {
+      // Qoder 的 jobToken 每次客户端启动都轮换，**绝不能写进 config / settings.json**：
+      // 这里给一个稳定占位符当接线用（桥本身不校验入站 key），真实令牌由中转每次请求
+      // 经 qdEnsureToken() 现读令牌文件。令牌是否就绪由 /api/status 的 qd.token 汇报。
+      p: "qd", zh: "Qoder", key: "qd-local", upstream: q.upstream || DEFAULTS.qd.upstream,
+      relayPort: q.relayPort || DEFAULTS.qd.relayPort, defaultModel: q.defaultModel || DEFAULTS.qd.defaultModel,
+      availableModels: q.availableModels || [...DEFAULTS.qd.availableModels], mapping: q.mapping || { ...DEFAULTS.qd.mapping },
+      useProxy: q.useProxy === true,
+    };
+  }
   if (p === "wb") {
     const w = cfg.wb || {};
     return {
@@ -1285,8 +1375,8 @@ function sliceOf(cfg, p) {
     useProxy: true,
   };
 }
-const PROVIDERS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen" };
-const isOurs = (mode) => mode === "bai" || mode === "sn" || mode === "wb" || mode === "zen";
+const PROVIDERS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen", qd: "Qoder" };
+const isOurs = (mode) => mode === "bai" || mode === "sn" || mode === "wb" || mode === "zen" || mode === "qd";
 function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
 
 // CLI 的 ANTHROPIC_BASE_URL 恒为提供方上游本体（B.AI=api.b.ai、sn=token.sensenova.cn），不经本地中转；
@@ -1308,6 +1398,8 @@ function cliMode(cfg, cfgKey, snKey, wbKey, zenKey) {
     // WorkBuddy 的 CLI 直接指向本地协议桥（CLI 讲 Anthropic，上游讲 OpenAI，必须过桥）
     if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
     if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
+    // Qoder 同理走本地协议桥；令牌会轮换，故只按端口判据，不做 key 匹配
+    if (u.includes(`:${c.qd?.relayPort || DEFAULTS.qd.relayPort}`)) return { mode: "qd", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
@@ -1331,6 +1423,8 @@ function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey) {
     if (u.includes(`:${c.sn?.relayPort || DEFAULTS.sn.relayPort}`)) return { mode: "sn", ...r };
     if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
     if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
+    // Qoder 同理走本地协议桥；令牌会轮换，故只按端口判据，不做 key 匹配
+    if (u.includes(`:${c.qd?.relayPort || DEFAULTS.qd.relayPort}`)) return { mode: "qd", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
@@ -1367,8 +1461,8 @@ function applyToCli(S) {
   const e = s.env;
   e.ANTHROPIC_AUTH_TOKEN = S.key || "wb-local";
   // B.AI 的 CLI 直连上游（靠 proxy env 出海）；SenseNova 境内直连；
-  // WorkBuddy 必须走本地协议桥（CLI 是 Anthropic 协议，上游只讲 OpenAI）
-  e.ANTHROPIC_BASE_URL = S.p === "wb" ? `http://127.0.0.1:${S.relayPort}` : S.upstream;
+  // WorkBuddy / Qoder 必须走本地协议桥（CLI 是 Anthropic 协议，上游只讲 OpenAI）
+  e.ANTHROPIC_BASE_URL = (S.p === "wb" || S.p === "qd") ? `http://127.0.0.1:${S.relayPort}` : S.upstream;
   e.ANTHROPIC_MODEL = S.mapping["claude-haiku-4-5"]?.target || S.defaultModel;
   for (const t of TIERS) {
     e[t.envKey] = S.mapping[t.key]?.target || S.defaultModel;
@@ -1546,6 +1640,9 @@ async function statusPayload() {
   const sn = providerStatus(cfg, "sn", recentCallsSn);
   const wb = providerStatus(cfg, "wb", recentCallsWb);
   const zen = providerStatus(cfg, "zen", recentCallsZen);
+  const qd = providerStatus(cfg, "qd", recentCallsQd);
+  let qdTok = null;
+  try { qdTok = qdEnsureToken(cfg); } catch { }
   const wbExp = wbTokenExp(cfg.wb?.accessToken);
   return {
     now: new Date().toISOString(),
@@ -1562,6 +1659,12 @@ async function statusPayload() {
     relay: bai.relay, relayLast: bai.relayLast, upstream: bai.upstream, recent: bai.recent,
     sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, useProxy: cfg.sn?.useProxy === true },
     zen: { relay: zen.relay, relayLast: zen.relayLast, upstream: zen.upstream, recent: zen.recent, useProxy: cfg.zen?.useProxy === true, keyConfigured: !!cfg.zen?.apiKey },
+    qd: {
+      relay: qd.relay, relayLast: qd.relayLast, upstream: qd.upstream, recent: qd.recent,
+      useProxy: cfg.qd?.useProxy === true,
+      // 令牌是轮换的 jobToken，只有"当前有没有读到"这一态有意义（无到期时间可报）
+      token: { configured: !!qdTok, tokenFile: cfg.qd?.tokenFile || DEFAULTS.qd.tokenFile },
+    },
     wb: {
       relay: wb.relay, relayLast: wb.relayLast, upstream: wb.upstream, recent: wb.recent,
       useProxy: cfg.wb?.useProxy === true,
@@ -1581,6 +1684,7 @@ const lastTest = {
   sn: { ok: null, model: null, ms: null, error: null, at: null },
   wb: { ok: null, model: null, ms: null, error: null, at: null },
   zen: { ok: null, model: null, ms: null, error: null, at: null },
+  qd: { ok: null, model: null, ms: null, error: null, at: null },
 };
 
 const panel = http.createServer(async (req, res) => {
@@ -1616,6 +1720,11 @@ const panel = http.createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "zen.html")));
     }
+    // v1.0.38: Qoder 独立页面
+    if (req.method === "GET" && (u.pathname === "/qd" || u.pathname === "/qoder" || u.pathname === "/qd.html")) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      return res.end(readFileSync(path.join(HERE, "qd.html")));
+    }
     if (req.method === "GET" && u.pathname === "/api/ping") return json(res, 200, { ok: true });
     if (req.method === "GET" && u.pathname === "/api/version") return json(res, 200, { version: APP_VERSION });
 
@@ -1637,12 +1746,14 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.28: ?p=sn 时从 SenseNova 拉（境内直连，不走代理）；只保留可对话模型（output 含 text）。
     if (req.method === "GET" && u.pathname === "/api/models") {
       const pRaw = u.searchParams.get("p");
-      const p = pRaw === "sn" ? "sn" : pRaw === "wb" ? "wb" : pRaw === "zen" ? "zen" : "bai";
+      const p = pRaw === "sn" ? "sn" : pRaw === "wb" ? "wb" : pRaw === "zen" ? "zen" : pRaw === "qd" ? "qd" : "bai";
       const c2 = loadCfg();
       const S = sliceOf(c2, p);
       // WorkBuddy 没有公开的模型目录接口（模型清单随客户端 product config 下发），
       // 返回当前可选列表即可——三款免费模型由发布机默认随版本推送
-      if (p === "wb") {
+      if (p === "wb" || p === "qd") {
+        // Qoder 同样没有公开的模型目录接口：服务端只认 lite / auto 两个别名，
+        // 由客户端内部按账号套餐决定实际落到哪个后端模型
         return json(res, 200, { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true });
       }
       if (p === "zen") {
@@ -1710,8 +1821,8 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/config") {
       const b = await readBody(req);
       const cfg = loadCfg();
-      const P = ["sn", "zen"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
-      const sub = P === "sn" ? cfg.sn : P === "wb" ? cfg.wb : P === "zen" ? cfg.zen : cfg; // 共用字段（mapping/upstream/…）落点
+      const P = ["sn", "zen", "qd"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
+      const sub = P === "sn" ? cfg.sn : P === "wb" ? cfg.wb : P === "zen" ? cfg.zen : P === "qd" ? cfg.qd : cfg; // 共用字段（mapping/upstream/…）落点
       // —— API Key（仅 B.AI / SenseNova）——
       if (typeof b.apiKey === "string" && b.apiKey.trim()) {
         const k = b.apiKey.trim();
@@ -1721,6 +1832,10 @@ const panel = http.createServer(async (req, res) => {
           if (!k.startsWith("sk-")) return json(res, 400, { error: "API Key 应以 sk- 开头" });
           if (P === "sn") cfg.sn.apiKey = k; else if (P === "bai") cfg.apiKey = k;
         }
+      }
+      // —— Qoder 令牌（一般不用填：正常由 worker 补丁写入 tokenFile，此处仅手动兜底）——
+      if (P === "qd" && typeof b.token === "string") {
+        cfg.qd.token = b.token.trim();
       }
       // —— WorkBuddy 令牌（出现字段即写入；空串=清除）——
       if (P === "wb") {
@@ -1803,7 +1918,7 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.28: 一键接线按提供方分流；恢复（接回 CC Switch）在 /api/restore 里保持原样
     if (req.method === "POST" && u.pathname === "/api/apply") {
       const b = await readBody(req);
-      const P = ["sn", "zen"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
+      const P = ["sn", "zen", "qd"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
       const cfg = loadCfg();
       const S = sliceOf(cfg, P);
       const name = PROVIDERS[P];
@@ -1813,6 +1928,13 @@ const panel = http.createServer(async (req, res) => {
             ? "请先在「WorkBuddy」页粘贴访问令牌（JWT）——捕获方法见该页说明"
             : `请先在「${name}」路由表里填写 API Key`,
         });
+      }
+      // Qoder 的 key 是稳定占位符（令牌会轮换、不落 config），故单独校验令牌是否真的读得到
+      if (P === "qd") {
+        try { qdEnsureToken(cfg, true); }
+        catch {
+          return json(res, 400, { error: "未读到 Qoder 令牌——请先启动 Qoder 桌面端（补丁会把令牌写到 %TEMP%/qoder-token.json），无需手动填写" });
+        }
       }
       const doCli = b.cli !== false;
       const doDesk = b.desktop !== false;
@@ -1827,6 +1949,7 @@ const panel = http.createServer(async (req, res) => {
       if (P === "sn") warns.push("SenseNova 有 TPM/RPM 限流，探测到 429 属正常，稍候即恢复；图像模型不参与对话路由");
       if (P === "wb") warns.push("WorkBuddy 三款免费模型由 WorkBuddy 客户端账号提供（0 积分不限量）；令牌过期会自动用刷新令牌续期，无需重新接线");
       if (P === "zen") warns.push("OpenCode Zen 的免费额度多数限客户端内使用，实测仅 space-bunny-free 可外部调用；购买 Go 订阅后可解锁 Go 通道的 30 个模型");
+      if (P === "qd") warns.push("Qoder 走账号的 Free 套餐额度；令牌每次 Qoder 启动会轮换，中转会自动跟随——但 Qoder 客户端必须保持运行，否则中转读不到令牌");
       log(`一键切到 ${name}: cli=${doCli} desktop=${doDesk}`);
       return json(res, 200, { ok: true, provider: P, warnings: warns, snapshot: "已自动快照切换前的配置（可用于一键恢复）" });
     }
@@ -1844,9 +1967,9 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/test") {
       const cfg = loadCfg();
       const b = await readBody(req).catch(() => ({}));
-      const P = ["sn", "zen"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
+      const P = ["sn", "zen", "qd"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
       const S = sliceOf(cfg, P);
-      const store = P === "sn" ? recentCallsSn : P === "wb" ? recentCallsWb : P === "zen" ? recentCallsZen : recentCallsBai;
+      const store = P === "sn" ? recentCallsSn : P === "wb" ? recentCallsWb : P === "zen" ? recentCallsZen : P === "qd" ? recentCallsQd : recentCallsBai;
       const active = b.all ? null : activeTier(store);
       const targets = active ? [active] : TIERS.map((t) => t.key);
       const tierInfo = (key) => {
@@ -1918,7 +2041,7 @@ const panel = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && u.pathname === "/api/service/stop") {
-      json(res, 200, { ok: true, message: "服务即将停止（B.AI / SenseNova / WorkBuddy / OpenCode Zen 中转一并停止）" });
+      json(res, 200, { ok: true, message: "服务即将停止（B.AI / SenseNova / WorkBuddy / OpenCode Zen / Qoder 中转一并停止）" });
       log("收到停止指令，进程退出");
       setTimeout(() => process.exit(0), 300);
       return;
@@ -2040,7 +2163,7 @@ function listenWithRetry(srv, port, name) {
     if (e.code !== "EADDRINUSE") { log(`${name} 端口错误: ${e.message}`); process.exit(1); }
     if (attempts === 1) log(`${name} 端口 :${port} 暂被占用（多为重启交接），每 600ms 重试，最多 15 秒`);
     let peerHealthy = false;
-    if (!relay.listening && !snRelay.listening && !wbRelay.listening && !zenRelay.listening && !panel.listening) {
+    if (!relay.listening && !snRelay.listening && !wbRelay.listening && !zenRelay.listening && !qdRelay.listening && !panel.listening) {
       try {
         const pr = await fetch(`http://127.0.0.1:${cfg0.panelPort}/api/ping`, { signal: AbortSignal.timeout(1200) });
         peerHealthy = pr.ok;
@@ -2073,6 +2196,7 @@ listenWithRetry(relay, cfg0.relayPort, "中转");
 listenWithRetry(snRelay, cfg0.sn.relayPort, "SenseNova中转");
 listenWithRetry(wbRelay, cfg0.wb.relayPort, "WorkBuddy中转");
 listenWithRetry(zenRelay, cfg0.zen.relayPort, "OpenCodeZen中转");
+listenWithRetry(qdRelay, cfg0.qd.relayPort, "Qoder中转");
 listenWithRetry(panel, cfg0.panelPort, "面板");
 // 成功绑定中转端口 = 本实例成为唯一的活跃服务者，此时才允许合并配置/跑周期探测
 relay.once("listening", () => setTimeout(onActivated, 300));
