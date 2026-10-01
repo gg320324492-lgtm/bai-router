@@ -100,10 +100,13 @@ const DEFAULTS = {
     upstream: "https://api2-v2.qoder.sh/model/v1",
     relayPort: 15762,
     defaultModel: "lite",
-    availableModels: ["lite", "auto"],
+    // 实测（2026-10，Free 套餐）能被外部 model server 调用的全集。
+    // lite 是服务端别名，实际落到客户端目录里的免费档 qfmodel = Qwen3.8-Flash。
+    availableModels: ["lite", "auto", "performance", "ultimate", "qmodel", "kmodel", "dmodel", "mmodel"],
     mapping: defaultMapping("lite", "Qoder Lite"),
     token: "",
     tokenFile: path.join(os.tmpdir(), "qoder-token.json"),
+    modelsFile: path.join(os.tmpdir(), "qoder-models.json"),
     useProxy: false,
   },
   // WorkBuddy（腾讯 WorkBuddy AI 客户端附带的免费模型）—— 第三个可路由提供方。
@@ -624,6 +627,60 @@ async function wbEnsureToken(cfg) {
     wbRefreshLock = wbRefreshToken(cfg).finally(() => { wbRefreshLock = null; });
   }
   return wbRefreshLock;
+}
+
+// ---------- Qoder 模型目录（v1.0.41）----------
+// worker 拉回 /algo/api/v2/model/list 后在本地解密再 parse，补丁把那份**明文**目录写到
+// qoderModelsFile；这里直接读，无需复刻 Cosy 签名或解磁盘上的加密缓存。
+//
+// 两套命名空间必须分清：
+//   · 目录里的 key（qfmodel / qmodel_38max / dmodel …）是 Qoder **客户端内**用的模型 id，
+//     其中 `qfmodel` = Qwen3.8-Flash、price_factor 0（免费）。
+//   · 外部 model server（api2-v2.qoder.sh）只认其中一部分，外加 `lite` 这个服务端别名
+//     ——实测 `lite` 落到通义千问 Qwen3，即客户端里那个免费的 Qwen3.8-Flash。
+// 所以下拉框只放外部真能调通的（QD_EXTERNAL_OK），其余照实列出并标注"仅客户端内可用"，
+// 免得用户选了必然 400 的模型。
+const QD_EXTERNAL_OK = new Set([
+  "lite", "auto", "ultimate", "performance",
+  "qmodel", "kmodel", "dmodel", "mmodel",
+]);
+let qdCatalogCache = { key: null, at: 0, val: null };
+function qdReadCatalog(cfg) {
+  const file = (cfg.qd && cfg.qd.modelsFile) || DEFAULTS.qd.modelsFile;
+  try {
+    const st = statSync(file);
+    if (qdCatalogCache.key === st.mtimeMs && Date.now() - qdCatalogCache.at < 5000) return qdCatalogCache.val;
+    const raw = JSON.parse(readFileSync(file, "utf8"));
+    const list = Array.isArray(raw && raw.app) ? raw.app : [];
+    if (!list.length) return { ok: false };
+    const all = list.map((m) => ({
+      key: String(m.key || ""),
+      name: String(m.display_name || m.key || ""),
+      free: m.is_free === true || m.price_factor === 0,
+      price: m.price_factor,
+      isDefault: m.is_default === true,
+      reasoning: m.is_reasoning === true,
+      maxInput: m.max_input_tokens,
+      external: QD_EXTERNAL_OK.has(String(m.key || "")),
+    }));
+    // `lite` 不在客户端目录里（是服务端别名），单独补进去并注明它就是免费那档
+    if (!all.some((m) => m.key === "lite")) {
+      all.unshift({ key: "lite", name: "Qwen3.8-Flash（服务端别名）", free: true, price: 0,
+        isDefault: true, reasoning: false, maxInput: null, external: true, alias: true });
+    }
+    const val = {
+      ok: true,
+      count: all.length,
+      models: all.filter((m) => m.external).map((m) => m.key),
+      all,
+      note: `目录共 ${all.length} 个，其中 ${all.filter((m) => m.external).length} 个可从本中转调用；`
+        + `其余仅限 Qoder 客户端内使用（走 Cosy 签名通道，外部无法调用）。`,
+    };
+    qdCatalogCache = { key: st.mtimeMs, at: Date.now(), val };
+    return val;
+  } catch {
+    return { ok: false };
+  }
 }
 
 // ---------- Qoder 令牌（v1.0.38）----------
@@ -1766,9 +1823,17 @@ const panel = http.createServer(async (req, res) => {
       const S = sliceOf(c2, p);
       // WorkBuddy 没有公开的模型目录接口（模型清单随客户端 product config 下发），
       // 返回当前可选列表即可——三款免费模型由发布机默认随版本推送
-      if (p === "wb" || p === "qd") {
-        // Qoder 同样没有公开的模型目录接口：服务端只认 lite / auto 两个别名，
-        // 由客户端内部按账号套餐决定实际落到哪个后端模型
+      if (p === "qd") {
+        // Qoder 的目录没有公开接口，但 worker 拉回后在本地解密再 parse——补丁把那份明文
+        // 写到了 tokenFile 同级的 qoder-models.json，这里直接读，不必复刻 Cosy 签名。
+        const r = qdReadCatalog(c2);
+        if (!r.ok) {
+          return json(res, 200, { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true,
+            note: "尚未读到 Qoder 模型目录（需 Qoder 客户端在运行且补丁已生效），当前显示的是内置默认列表" });
+        }
+        return json(res, 200, r);
+      }
+      if (p === "wb") {
         return json(res, 200, { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true });
       }
       if (p === "zen") {
