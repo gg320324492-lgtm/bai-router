@@ -367,7 +367,11 @@
         <tbody id="routeBody"></tbody>
       </table>
 
-      <div class="hint" style="margin-top:10px">Qoder 服务端只认 <b>lite</b>（普通用户默认）与 <b>auto</b>（自动选路）两个别名，实际落到哪个后端模型由账号套餐决定。四档默认都映射到 <b>lite</b>。</div>
+      <div class="hint" style="margin-top:10px" id="catHint">下拉里只列<b>能从本中转真正调用</b>的模型。Qoder 客户端内的模型目录与此不同——<span id="catMore">点下方「刷新模型列表」读取</span>。</div>
+      <div id="catBox" style="display:none;margin-top:10px">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:6px">Qoder 账号的完整模型目录（免费档已标出）：</div>
+        <div id="catList" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+      </div>
 
       <div class="saverow">
         <button class="btn-main" id="btnSave" style="padding:8px 20px">保存映射</button>
@@ -547,6 +551,32 @@ function renderStatus(s) {
   }
 }
 
+// Qoder 的完整模型目录：下拉只放外部真能调通的，其余照实列出并标注「仅客户端内」，
+// 免得选了必然 400。免费档（含 Qwen3.8-Flash）单独标出来。
+function renderCatalog(j) {
+  if (!j || !j.all || !j.all.length) {
+    if (j && j.note) $("catHint").innerHTML = j.note;
+    return;
+  }
+  const chip = (m) => {
+    const s = document.createElement("span");
+    s.style.cssText = "font-family:var(--mono);font-size:11px;padding:3px 8px;border-radius:6px;"
+      + (m.external ? "border:1px solid var(--line);color:var(--ink)" : "border:1px dashed var(--line);color:var(--dim)")
+      + (m.free ? ";border-color:var(--ok);color:var(--ok)" : "");
+    s.textContent = m.name + (m.free ? " · 免费" : "") + (m.external ? "" : " · 仅客户端内");
+    s.title = m.key + (m.price != null ? "　price_factor=" + m.price : "");
+    return s;
+  };
+  const box = $("catList");
+  box.innerHTML = "";
+  for (const m of j.all) box.appendChild(chip(m));
+  $("catBox").style.display = "";
+  $("catMore").textContent = "已读取 " + j.all.length + " 个";
+  $("catHint").innerHTML = j.note + " 下拉里只列能从本中转真正调用的那些。";
+  // 顺带刷新下拉的可选项（外部可用的那批）
+  try { qdCfg.qd.availableModels = j.models; renderRoute(); } catch (e) { }
+}
+
 function renderRoute() {
   const qdc = qdSlice(qdCfg);
   const models = qdc.availableModels || [];
@@ -593,19 +623,16 @@ function renderRoute() {
 }
 
 function renderKeyInfo() {
-  const z = qdSlice(qdCfg);
   const stat = $("tokStat");
-  if (stat) { const t2 = ((status && status.qd) || {}).token || {};
-    stat.innerHTML = t2.configured
-      ? '<span style="color:var(--ok)">✔ 已读到令牌</span>　<span class="mono">' + (t2.tokenFile || "") + "</span>"
-      : '<span style="color:var(--err)">✘ 未读到令牌</span>　请启动 Qoder 桌面端'; }
-  const has = !!z.apiKey;
-  stat.innerHTML = has
-    ? '<span>API Key：<b>已配置</b></span><span>上游：<b>' + (z.upstream || "") + '</b></span><span>可用模型：<b>' + ((z.availableModels || []).length) + ' 个</b></span>'
-    : '<span>令牌：<b class="warn">未读到</b></span>　请启动 Qoder 桌面端（补丁会自动写入令牌文件）';
-  fetch("/api/models?p=qd").then(r => r.json()).then(j => {
-    if (j && j.note) stat.innerHTML += '<br><span>' + j.note + '</span>';
-  }).catch(() => { });
+  const t = ((status && status.qd) || {}).token || {};
+  if (stat) {
+    stat.innerHTML = t.configured
+      ? '<span style="color:var(--ok)">✔ 已读到令牌</span>　<span class="mono">' + (t.tokenFile || "") + '</span>'
+      + '<br><span>令牌每次 Qoder 启动会轮换，中转按此文件现读，无需重启</span>'
+      : '<span style="color:var(--err)">✘ 未读到令牌</span>　请启动 Qoder 桌面端（补丁会自动写入令牌文件）';
+  }
+  // 每次轮询顺带刷新一次模型目录（服务端按 mtime 缓存，代价可忽略）
+  fetch("/api/models?p=qd").then((r) => r.json()).then(renderCatalog).catch(() => { });
 }
 
 function renderSys() {
@@ -632,6 +659,7 @@ async function poll() {
     const s = await api("/api/status");
     renderStatus(s);
     renderSteps();
+    renderKeyInfo();
   } catch {
     $("svc").innerHTML = `服务 <b class="off">○</b> 已停止`;
     setLed($("ledRelay"), "r");
