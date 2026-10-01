@@ -142,11 +142,21 @@ async function detectRuntime() {
 
 function spawnServer() {
   const cfg = readCfgSafe();
+  // NO_PROXY：回环 + useProxy=false 的上游域名（与 server.mjs computeNoProxy 同逻辑；
+  // 旧配置没有 sn/wb 块时按默认上游兜底）。Node 启动时缓存 env 代理配置，
+  // 这里不一致的话 server 自检会再修正重启一次——两处逻辑保持同步可省掉那一下。
+  const noProxyList = ["127.0.0.1", "localhost"];
+  const addNoProxyHost = (upstream, useProxy) => {
+    if (useProxy === true) return;
+    try { const h = new URL(upstream).host; if (h && !noProxyList.includes(h)) noProxyList.push(h); } catch { }
+  };
+  addNoProxyHost(cfg.wb?.upstream || "https://www.workbuddy.ai", cfg.wb?.useProxy);
+  addNoProxyHost(cfg.sn?.upstream || "https://token.sensenova.cn", cfg.sn?.useProxy);
   const env = {
     ...process.env,
     NODE_USE_ENV_PROXY: "1",
     ...(cfg.proxy ? { HTTPS_PROXY: cfg.proxy, HTTP_PROXY: cfg.proxy } : {}), // 空 = 直连（TUN/全局模式）
-    NO_PROXY: "127.0.0.1,localhost",
+    NO_PROXY: noProxyList.join(","),
     BAI_ROUTER_EXE: process.execPath,
     BAI_DATA_DIR: DATA_DIR,
     APP_VERSION: app.getVersion(),

@@ -77,29 +77,6 @@ const DEFAULTS = {
     availableModels: ["sensenova-6.8-flash-lite", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.2", "kimi-k3"],
     mapping: defaultMapping("sensenova-6.8-flash-lite", "SenseNova 6.8 Flash-Lite"),
   },
-  // WorkBuddy（腾讯 WorkBuddy AI 客户端附带的免费模型）—— 第三个可路由提供方。
-  // 上游只讲 OpenAI Chat Completions（且仅流式），中转内置 Anthropic↔OpenAI 协议桥；
-  // 认证不是 sk- 密钥，而是从 WorkBuddy 客户端捕获的 JWT 三件套（访问/刷新/设备令牌），
-  // 过期由 refreshToken 自动续期（有效期约一年，通常无感）。
-  wb: {
-    relayPort: 15742,
-    upstream: "https://www.workbuddy.ai",
-    defaultModel: "deepseek-v4.1-flash",
-    // 三款 0 积分免费模型（product config credits=x0.00）：DeepSeek-V4.1-Flash（1M ctx）、
-    // 混元 Hy4-Preview-F（1M ctx）、混元 HY3（192k ctx）
-    availableModels: ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"],
-    mapping: {
-      "claude-fable-5": { target: "deepseek-v4.1-flash", label: "DeepSeek-V4.1-Flash" },
-      "claude-sonnet-5": { target: "hy4-preview-f", label: "Hy4-Preview-F" },
-      "claude-opus-5": { target: "hy3", label: "HY3" },
-      "claude-haiku-4-5": { target: "deepseek-v4.1-flash", label: "DeepSeek-V4.1-Flash" },
-    },
-    accessToken: "",
-    refreshToken: "",
-    deviceToken: "",
-    userId: "",
-    useProxy: false, // www.workbuddy.ai 直连即可；仅当直连被拦时开启
-  },
 };
 function loadCfg() {
   try {
@@ -112,17 +89,10 @@ function loadCfg() {
       mapping: { ...DEFAULTS.sn.mapping, ...(snIn.mapping || {}) },
       availableModels: Array.isArray(snIn.availableModels) && snIn.availableModels.length ? snIn.availableModels : [...DEFAULTS.sn.availableModels],
     };
-    // wb 深合并：同上（旧 config 无 wb 块时整块补默认）
-    const wbIn = c.wb || {};
-    merged.wb = {
-      ...DEFAULTS.wb, ...wbIn,
-      mapping: { ...DEFAULTS.wb.mapping, ...(wbIn.mapping || {}) },
-      availableModels: Array.isArray(wbIn.availableModels) && wbIn.availableModels.length ? wbIn.availableModels : [...DEFAULTS.wb.availableModels],
-    };
     return merged;
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
-    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] } };
+    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] } };
   }
 }
 function saveCfg(cfg) {
@@ -226,23 +196,9 @@ function launchApplyScript() {
   child.unref();
 }
 
-// ---------- 启动环境自检：代理环境不对则以正确环境重启自己 ----------
-// NO_PROXY 计算：本机回环 + 所有"useProxy=false"的上游域名（SenseNova/WorkBuddy 默认直连）。
-// Node 启动时缓存 env 代理配置（运行时改 NO_PROXY 无效），这一步是"直连语义"唯一生效点；
-// useProxy 开关改动会在面板置 needRestart（重启即重新计算 NO_PROXY）。
-function computeNoProxy(cfg) {
-  const list = ["127.0.0.1", "localhost"];
-  const add = (host, useProxy) => { if (!useProxy && host && !list.includes(host)) list.push(host); };
-  add(hostOf(cfg.wb?.upstream || DEFAULTS.wb.upstream), cfg.wb?.useProxy === true);
-  add(hostOf(cfg.sn?.upstream || DEFAULTS.sn.upstream), cfg.sn?.useProxy === true);
-  return list.join(",");
-}
+// ---------- 启动环境自检：缺代理环境变量则以正确环境重启自己 ----------
 const cfg0 = loadCfg();
-const wantNoProxy = computeNoProxy(cfg0);
-const needEnvRestart =
-  process.env.NODE_USE_ENV_PROXY !== "1" ||
-  (process.env.BAI_ENV_FIXED !== "1" && (process.env.NO_PROXY || "") !== wantNoProxy);
-if (needEnvRestart) {
+if (process.env.NODE_USE_ENV_PROXY !== "1") {
   const child = spawn(
     process.execPath,
     [fileURLToPath(import.meta.url)],
@@ -253,14 +209,13 @@ if (needEnvRestart) {
       env: {
         ...process.env,
         NODE_USE_ENV_PROXY: "1",
-        BAI_ENV_FIXED: "1",
-        ...(cfg0.proxy ? { HTTPS_PROXY: cfg0.proxy, HTTP_PROXY: cfg0.proxy } : {}),
-        NO_PROXY: wantNoProxy,
+        ...(cfg0.proxy ? { HTTPS_PROXY: cfg0.proxy, HTTP_PROXY: cfg0.proxy } : {}), // 空代理 = 直连(TUN/全局模式)
+        NO_PROXY: "127.0.0.1,localhost",
       },
     }
   );
   child.unref();
-  log(`代理环境自检：已以修正后的 NO_PROXY 重启自己 -> pid ${child.pid}（NO_PROXY=${wantNoProxy}）`);
+  log(`缺 NODE_USE_ENV_PROXY，已以正确环境重启自己 -> pid ${child.pid}`);
   process.exit(0);
 }
 log(`路由台启动 relay=:${cfg0.relayPort} panel=:${cfg0.panelPort} (pid ${process.pid}) 代理=${cfg0.proxy || "直连"}`);
@@ -309,7 +264,7 @@ function applyProxy(found, reason) {
       const c = loadCfg();
       const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
         detached: true, stdio: "ignore", windowsHide: true, cwd: HERE,
-        env: { ...process.env, NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1", ...(c.proxy ? { HTTPS_PROXY: c.proxy, HTTP_PROXY: c.proxy } : {}), NO_PROXY: computeNoProxy(c) },
+        env: { ...process.env, NODE_USE_ENV_PROXY: "1", ...(c.proxy ? { HTTPS_PROXY: c.proxy, HTTP_PROXY: c.proxy } : {}), NO_PROXY: "127.0.0.1,localhost" },
       });
       child.unref();
       log("代理变更，服务自重启以应用新通道");
@@ -354,13 +309,9 @@ function onActivated() {
         if (def.sn && Array.isArray(def.sn.availableModels) && def.sn.availableModels.length) {
           cur.sn.availableModels = [...new Set([...(cur.sn.availableModels || []), ...def.sn.availableModels])];
         }
-        // WorkBuddy 侧同样并入（三款免费模型随版本进位推到存量机器）
-        if (def.wb && Array.isArray(def.wb.availableModels) && def.wb.availableModels.length) {
-          cur.wb.availableModels = [...new Set([...(cur.wb.availableModels || []), ...def.wb.availableModels])];
-        }
         cur._modelsSynced = APP_VERSION;
         saveCfg(cur);
-        log(`可选模型已同步发布机（${merged.length} 个 + SenseNova ${cur.sn.availableModels.length} 个 + WorkBuddy ${cur.wb.availableModels.length} 个）`);
+        log(`可选模型已同步发布机（${merged.length} 个 + SenseNova ${cur.sn.availableModels.length} 个）`);
       }
     }
   } catch (e) { log("模型同步跳过: " + e.message); }
@@ -387,7 +338,6 @@ function resolveModel(name, cfg) {
 // 每个提供方一份：B.AI 侧观察不能依赖 sn 侧流量，反之亦然。记录逻辑内联在 makeRelay 里。
 const recentCallsBai = [];  // {tier, served, at}
 const recentCallsSn = [];
-const recentCallsWb = [];
 function activeTier(store) {
   // 最近 30 分钟内被"真实会话"用过的档位；没有观察则返回 null（不再默认猜 Haiku）
   if (store.length && Date.now() - store[0].at < 30 * 60000) return store[0].tier;
@@ -404,7 +354,6 @@ function isApiResponseType(contentType) {
 const relayErrors = {
   bai: { kind: null, message: null, at: null },
   sn: { kind: null, message: null, at: null },
-  wb: { kind: null, message: null, at: null },
 };
 function noteRelayError(p, kind, message) {
   const slot = relayErrors[p] || relayErrors.bai;
@@ -458,12 +407,8 @@ async function readProbeJson(response) {
   }
 }
 
-// 直连上游：SenseNova 是境内服务，走 Clash 出海节点反而多一跳、且 Clash 没开时不该被带崩。
-// 用 node http/https 手工发请求，返回一个与 fetch 响应形状兼容的对象
-//
-// v1.0.31：NODE_USE_ENV_PROXY=1 时 http/https 核心模块同样吃 env 代理，且 Node 启动时缓存
-// 代理配置（运行时改 NO_PROXY 实测无效）。"直连语义"由启动期 computeNoProxy() 保证——
-// useProxy=false 的上游域名写进 NO_PROXY，启动自检不一致会带修正环境自重启一次。
+// 直连上游（不经 HTTPS_PROXY 环境变量）：SenseNova 是境内服务，走 Clash 出海节点反而多一跳、
+// 且 Clash 没开时不该被带崩。用 node http/https 手工发请求，返回一个与 fetch 响应形状兼容的对象
 // （status / headers.get / headers.forEach / body 为 node stream），让 relayHandler 两套传输共用处理逻辑。
 function directHttp(target, { method, headers, body, timeoutMs }) {
   return new Promise((resolve, reject) => {
@@ -492,406 +437,9 @@ function directHttp(target, { method, headers, body, timeoutMs }) {
   });
 }
 
-// ---------- WorkBuddy 协议桥（v1.0.31）：Anthropic ↔ OpenAI Chat Completions ----------
-// WorkBuddy 上游（www.workbuddy.ai/v2/chat/completions）只讲 OpenAI 协议且仅支持流式；
-// 这里把 Claude Code 的 /v1/messages 请求翻译过去，再把 OpenAI SSE 流翻回 Anthropic SSE。
-
-function wbTokenExp(tok) {
-  try {
-    const seg = String(tok).split(".")[1];
-    if (!seg) return null;
-    const p = JSON.parse(Buffer.from(seg.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
-    return typeof p.exp === "number" ? p.exp : null;
-  } catch { return null; }
-}
-async function readAllBody(r) {
-  if (!r || !r.body) return "";
-  const out = [];
-  for await (const c of r.body) out.push(typeof c === "string" ? Buffer.from(c) : c);
-  return Buffer.concat(out).toString("utf8");
-}
-let wbRefreshLock = null;
-// 令牌续期：POST /v2/plugin/auth/token/refresh（刷新令牌放 X-Refresh-Token 头，与 WorkBuddy 客户端一致）
-// 成功后就地写回 config.json（访问/刷新令牌成对滚动，有效期约一年，正常一年才需要续一次）
-function wbRefreshToken(cfg) {
-  const w = cfg.wb;
-  if (!w.refreshToken) throw new Error("WorkBuddy 刷新令牌为空，无法续期——请重新捕获令牌");
-  const base = (w.upstream || DEFAULTS.wb.upstream).replace(/\/+$/, "");
-  const headers = {
-    "content-type": "application/json",
-    "x-requested-with": "XMLHttpRequest",
-    "x-refresh-token": w.refreshToken,
-    authorization: `Bearer ${w.accessToken || ""}`,
-    "x-auth-refresh-source": "plugin",
-    "x-domain": hostOf(base) || "www.workbuddy.ai",
-    "user-agent": `B.AI-Router/${APP_VERSION}`,
-  };
-  const useProxy = w.useProxy === true;
-  return (async () => {
-    const r = useProxy
-      ? await fetch(base + "/v2/plugin/auth/token/refresh", { method: "POST", headers, body: "{}", signal: AbortSignal.timeout(15000) })
-      : await directHttp(base + "/v2/plugin/auth/token/refresh", { method: "POST", headers, body: "{}", timeoutMs: 15000 });
-    const txt = await readAllBody(r);
-    if (r.status !== 200) throw new Error(`WorkBuddy 令牌续期失败 HTTP ${r.status}: ${String(txt).slice(0, 160)}`);
-    let j = {};
-    try { j = JSON.parse(txt); } catch { }
-    const box = j.data && typeof j.data === "object" ? j.data : j;
-    const na = box.access_token || box.accessToken || box.token;
-    const nr = box.refresh_token || box.refreshToken;
-    if (typeof na !== "string" || na.length < 20) throw new Error("令牌续期响应里没有新的访问令牌");
-    w.accessToken = na;
-    if (typeof nr === "string" && nr.length > 20) w.refreshToken = nr;
-    saveCfg(cfg);
-    const exp = wbTokenExp(na);
-    log(`WorkBuddy 令牌已自动续期${exp ? "（新有效期至 " + new Date(exp * 1000).toLocaleDateString("zh-CN") + "）" : ""}`);
-    return w.accessToken;
-  })();
-}
-async function wbEnsureToken(cfg) {
-  const w = cfg.wb;
-  if (!w.accessToken) throw new Error("WorkBuddy 访问令牌未配置——到面板「WorkBuddy」页粘贴令牌");
-  const exp = wbTokenExp(w.accessToken);
-  if (exp && exp * 1000 - Date.now() > 120000) return w.accessToken;
-  if (!w.refreshToken) {
-    if (exp && exp * 1000 > Date.now()) return w.accessToken;
-    throw new Error("WorkBuddy 访问令牌已过期且没有刷新令牌，请重新捕获");
-  }
-  if (!wbRefreshLock) {
-    wbRefreshLock = wbRefreshToken(cfg).finally(() => { wbRefreshLock = null; });
-  }
-  return wbRefreshLock;
-}
-
-// WorkBuddy 网关对 Claude Code 的客户端指纹拦截（"Illegal API invocation from an unapproved
-// channel"）——实测两处确定性规则，均在 system 提示词内，中转侧剥除/改写（对模型行为无实质影响）：
-//   (1) 行首 "x-anthropic-billing-header:" 计费指纹行（Claude Code 写进 system 开头）；
-//   (2) "- To give feedback ... github.com/anthropics/claude-code/issues" 反馈指引行（措辞+链接组合）；
-//   (3) 旧版 Claude Code 开场句（前缀匹配）。
-// 若上游未来新增指纹规则，会以 400 显式报错并落盘 wb-last-4xx.json，届时在对应位置补充即可。
-const WB_CC_FINGERPRINT = "You are Claude Code, Anthropic's official CLI for Claude.";
-function wbSanitizeSystem(sys) {
-  let t = String(sys || "");
-  t = t.replace(/^x-anthropic-billing-header:[^\n]*\n?/gm, "");
-  t = t.replace(/^.*github\.com\/anthropics\/claude-code.*(?:\n|$)/gm, "");
-  if (t.startsWith(WB_CC_FINGERPRINT)) {
-    t = "You are a highly capable coding assistant operating in a developer's terminal." + t.slice(WB_CC_FINGERPRINT.length);
-  }
-  return t;
-}
-function wbToOpenAI(j) {
-  const msgs = [];
-  let sys = j.system;
-  if (Array.isArray(sys)) sys = sys.map((b) => (b && b.text) || "").join("\n");
-  // WorkBuddy 网关要求第一条必须是 system（缺省补一句，避免 11128）
-  msgs.push({ role: "system", content: wbSanitizeSystem((sys && String(sys).trim()) || "You are a helpful assistant.") });
-  for (const m of j.messages || []) {
-    const c = m.content;
-    if (typeof c === "string") { msgs.push({ role: m.role, content: c }); continue; }
-    if (!Array.isArray(c)) continue;
-    if (m.role === "assistant") {
-      let text = "";
-      const toolCalls = [];
-      for (const b of c) {
-        if (!b) continue;
-        if (b.type === "text") text += b.text || "";
-        else if (b.type === "tool_use") {
-          toolCalls.push({ id: b.id || "toolu_" + Math.random().toString(36).slice(2, 10), type: "function", function: { name: b.name, arguments: JSON.stringify(b.input || {}) } });
-        }
-        // thinking 块（含签名）对 OpenAI 上游无意义，丢弃
-      }
-      if (!text && !toolCalls.length) continue;
-      const am = { role: "assistant", content: text || null };
-      if (toolCalls.length) am.tool_calls = toolCalls;
-      msgs.push(am);
-    } else {
-      // user：tool_result 逐条转成 tool 消息（必须紧跟在带 tool_calls 的 assistant 后面），
-      // 普通文本/图片合并成一条 user 消息
-      const texts = [];
-      const parts = [];
-      let hasImage = false;
-      let hasToolResult = false;
-      for (const b of c) {
-        if (!b) continue;
-        if (b.type === "tool_result") {
-          hasToolResult = true;
-          let t = "";
-          if (typeof b.content === "string") t = b.content;
-          else if (Array.isArray(b.content)) {
-            t = b.content.map((x) => (x && x.type === "text" ? x.text : (x && x.type === "image" ? "[image]" : (x && x.text) || ""))).join("\n");
-          }
-          msgs.push({ role: "tool", tool_call_id: b.tool_use_id || "", content: t || "(empty)" });
-        } else if (b.type === "text") {
-          texts.push(b.text || "");
-          parts.push({ type: "text", text: b.text || "" });
-        } else if (b.type === "image" && b.source) {
-          const src = b.source;
-          if (src.type === "base64") { parts.push({ type: "image_url", image_url: { url: `data:${src.media_type || "image/png"};base64,${src.data || ""}` } }); hasImage = true; }
-          else if (src.type === "url") { parts.push({ type: "image_url", image_url: { url: src.url || "" } }); hasImage = true; }
-        }
-      }
-      if (hasImage && parts.length) msgs.push({ role: "user", content: parts });
-      else if (texts.join("\n")) msgs.push({ role: "user", content: texts.join("\n") });
-      else if (!hasToolResult) msgs.push({ role: "user", content: "" });
-    }
-  }
-  const out = {
-    model: j.model,
-    messages: msgs,
-    stream: true, // WorkBuddy 网关仅支持流式（非流式请求一律 11101）
-    max_tokens: typeof j.max_tokens === "number" && j.max_tokens >= 3 ? j.max_tokens : 4096,
-  };
-  if (Array.isArray(j.tools) && j.tools.length) {
-    out.tools = j.tools.filter((t) => t && t.name).map((t) => ({
-      type: "function",
-      function: {
-        name: t.name,
-        description: t.description || "",
-        parameters: t.input_schema && typeof t.input_schema === "object" ? t.input_schema : { type: "object", properties: {} },
-      },
-    }));
-    // WorkBuddy 网关的 tool_choice 是字符串类型（传对象会 400）
-    const tc = j.tool_choice;
-    if (tc && typeof tc === "object") {
-      if (tc.type === "none") out.tool_choice = "none";
-      else if (tc.type === "any") out.tool_choice = "required";
-      else out.tool_choice = "auto";
-    }
-  }
-  if (typeof j.temperature === "number") out.temperature = j.temperature;
-  if (typeof j.top_p === "number") out.top_p = j.top_p;
-  if (Array.isArray(j.stop_sequences) && j.stop_sequences.length) out.stop = j.stop_sequences;
-  return out;
-}
-
-// Anthropic 风格错误（Claude Code 按 type 分类重试/提示）
-function wbAnthroError(res, status, msg) {
-  if (res.headersSent || res.writableEnded) { try { res.end(); } catch { } return; }
-  const s = Number(status) >= 400 && Number(status) < 600 ? Number(status) : 502;
-  const typeMap = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 500: "api_error", 503: "overloaded_error", 529: "overloaded_error" };
-  const type = typeMap[s] || (s >= 500 ? "api_error" : "invalid_request_error");
-  res.writeHead(s, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-  res.end(JSON.stringify({ type: "error", error: { type, message: `[WorkBuddy] ${String(msg).slice(0, 400)}` } }));
-}
-
-async function* sseLines(body) {
-  let buf = "";
-  for await (const chunk of body) {
-    buf += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
-    let i;
-    while ((i = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, i).replace(/\r$/, "");
-      buf = buf.slice(i + 1);
-      yield line;
-    }
-  }
-  if (buf) yield buf;
-}
-
-// OpenAI SSE → Anthropic SSE（clientStream=false 时聚合成单条 Anthropic JSON 响应）
-async function wbPipe(r, res, { model, clientStream, inputJson }) {
-  const inTok = Math.max(1, Math.ceil(JSON.stringify(inputJson || {}).length / 4));
-  const msgId = "msg_wb_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  let idx = -1;
-  let cur = null;              // "text" | "thinking" | "tool"
-  let curToolOi = -1;
-  const toolParts = [];        // {oi, id, name, args} 按出现顺序
-  let text = "", thinking = "";
-  let finish = null, usage = null, outChars = 0;
-
-  const emit = (event, data) => {
-    if (!clientStream || res.writableEnded) return;
-    try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch { }
-  };
-  const closeCur = () => { if (cur) { emit("content_block_stop", { type: "content_block_stop", index: idx }); cur = null; } };
-  const openCur = (kind, block) => { idx++; cur = kind; emit("content_block_start", { type: "content_block_start", index: idx, content_block: block }); };
-
-  if (clientStream) {
-    res.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-store",
-      "x-accel-buffering": "no",
-    });
-    emit("message_start", {
-      type: "message_start",
-      message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inTok, output_tokens: 0 } },
-    });
-    emit("ping", { type: "ping" });
-  }
-
-  try {
-    for await (const raw of sseLines(r.body)) {
-      const line = raw.trimEnd();
-      if (!line) continue;
-      if (line.startsWith(":")) { emit("ping", { type: "ping" }); continue; } // 心跳
-      if (!line.startsWith("data:")) continue;
-      const payload = line.slice(5).trim();
-      if (payload === "[DONE]") break;
-      let d;
-      try { d = JSON.parse(payload); } catch { continue; }
-      if (d.usage) usage = d.usage;
-      const ch = Array.isArray(d.choices) && d.choices[0];
-      if (!ch) continue;
-      const delta = ch.delta || {};
-      const rc = delta.reasoning_content || delta.reasoning;
-      if (typeof rc === "string" && rc) {
-        if (cur !== "thinking") { closeCur(); openCur("thinking", { type: "thinking", thinking: "" }); }
-        thinking += rc; outChars += rc.length;
-        emit("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: rc } });
-      }
-      if (typeof delta.content === "string" && delta.content) {
-        if (cur !== "text") { closeCur(); openCur("text", { type: "text", text: "" }); }
-        text += delta.content; outChars += delta.content.length;
-        emit("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: delta.content } });
-      }
-      if (Array.isArray(delta.tool_calls)) {
-        for (const tc of delta.tool_calls) {
-          const oi = typeof tc.index === "number" ? tc.index : 0;
-          const fn = tc.function || {};
-          let tp = toolParts.find((t) => t.oi === oi);
-          if (oi !== curToolOi) {
-            closeCur();
-            if (!tp) { tp = { oi, id: tc.id || "toolu_" + oi + "_" + Date.now().toString(36), name: fn.name || "", args: "" }; toolParts.push(tp); }
-            if (fn.name) tp.name = fn.name;
-            openCur("tool", { type: "tool_use", id: tp.id, name: tp.name, input: {} });
-            curToolOi = oi;
-          } else if (!tp) {
-            tp = { oi, id: tc.id || "toolu_" + oi + "_" + Date.now().toString(36), name: fn.name || "", args: "" };
-            toolParts.push(tp);
-          }
-          if (fn.name) tp.name = fn.name;
-          if (typeof fn.arguments === "string" && fn.arguments) {
-            tp.args += fn.arguments;
-            emit("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: fn.arguments } });
-          }
-        }
-      }
-      if (ch.finish_reason) finish = ch.finish_reason;
-    }
-  } catch (e) {
-    // 上游流中断：把错误以 Anthropic error 事件/JSON 形式交还客户端
-    noteRelayError("wb", "network", `WorkBuddy 流中断: ${String(e && e.message || e).slice(0, 160)}`);
-    if (clientStream) {
-      emit("error", { type: "error", error: { type: "api_error", message: `[WorkBuddy] 上游流中断: ${String(e && e.message || e).slice(0, 200)}` } });
-      try { res.end(); } catch { }
-      return;
-    }
-    wbAnthroError(res, 502, `上游流中断: ${String(e && e.message || e).slice(0, 200)}`);
-    return;
-  }
-
-  closeCur();
-  const stopReason = finish === "length" ? "max_tokens" : (finish === "tool_calls" || toolParts.length) ? "tool_use" : "end_turn";
-  const outTok = (usage && usage.completion_tokens) || Math.max(1, Math.ceil(outChars / 4));
-  const inFinal = (usage && usage.prompt_tokens) || inTok;
-  if (clientStream) {
-    emit("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: inFinal, output_tokens: outTok } });
-    emit("message_stop", { type: "message_stop" });
-    try { res.end(); } catch { }
-    return;
-  }
-  const content = [];
-  if (thinking) content.push({ type: "thinking", thinking, signature: "" });
-  if (text) content.push({ type: "text", text });
-  for (const tp of toolParts) {
-    let input = {};
-    try { input = tp.args ? JSON.parse(tp.args) : {}; } catch { input = { _raw: tp.args }; }
-    content.push({ type: "tool_use", id: tp.id, name: tp.name, input });
-  }
-  const msg = { id: msgId, type: "message", role: "assistant", model, content, stop_reason: stopReason, stop_sequence: null, usage: { input_tokens: inFinal, output_tokens: outTok } };
-  res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-  res.end(JSON.stringify(msg));
-}
-
-// 一次 WorkBuddy 调用的完整生命周期：拿令牌 → 翻译 → 上游（401 自动续期重试 / 探测 429 退避）→ 翻流回来
-async function wbExchange({ cfg, S, j, isProbe, res, useProxy }) {
-  let token;
-  try { token = await wbEnsureToken(cfg); }
-  catch (e) { noteRelayError("wb", "auth", e.message); return wbAnthroError(res, 401, e.message); }
-
-  const ob = wbToOpenAI(j);
-  const base = (S.upstream || DEFAULTS.wb.upstream).replace(/\/+$/, "");
-  const url = base + "/v2/chat/completions";
-  const mkHeaders = (tok) => {
-    const w = cfg.wb;
-    const h = {
-      "content-type": "application/json",
-      "x-requested-with": "XMLHttpRequest",
-      authorization: `Bearer ${tok}`,
-      "x-product": "SaaS",
-      "user-agent": `B.AI-Router/${APP_VERSION}`,
-    };
-    if (w.userId) h["x-user-id"] = w.userId;
-    if (w.deviceToken) h["x-device-token"] = w.deviceToken;
-    h["x-domain"] = hostOf(base) || "www.workbuddy.ai";
-    return h;
-  };
-  const bodyStr = JSON.stringify(ob);
-  const doCall = (tok) => useProxy
-    ? fetch(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, signal: AbortSignal.timeout(isProbe ? 10000 : 30000) })
-    : directHttp(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, timeoutMs: isProbe ? 10000 : 30000 });
-
-  let r;
-  try {
-    r = await doCall(token);
-    // 令牌失效（401/403）→ 立即续期并重试一次
-    if ((r.status === 401 || r.status === 403) && cfg.wb.refreshToken) {
-      await readAllBody(r).catch(() => "");
-      try { token = await wbRefreshToken(cfg); r = await doCall(token); }
-      catch (e) { noteRelayError("wb", "auth", e.message); return wbAnthroError(res, 401, e.message); }
-    }
-    // 探测级小请求遇 429：静默退避重试（与 B.AI/SenseNova 行为一致）
-    for (let a = 0; r.status === 429 && isProbe && a < 3; a++) {
-      await readAllBody(r).catch(() => "");
-      await new Promise((rr) => setTimeout(rr, 400 * (a + 1)));
-      r = await doCall(token);
-    }
-    // "unapproved channel" 偶发抖动：重试一次（确定性指纹已由 wbSanitizeSystem 剥除）。
-    // 注意 400 响应体已被读走，若最终仍是错误，错误文案从 consumed400 兜底。
-    let consumed400 = "";
-    if (r.status === 400) {
-      consumed400 = await readAllBody(r).catch(() => "");
-      if (consumed400.includes("unapproved channel")) {
-        await new Promise((rr) => setTimeout(rr, 500));
-        r = await doCall(token);
-        consumed400 = r.status === 400 ? "" : consumed400;
-      }
-    }
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    const timedOut = (e && e.name === "AbortError") || msg.toLowerCase().includes("abort");
-    const friendly = timedOut
-      ? `WorkBuddy 上游在 ${isProbe ? 10 : 30}s 内未返回响应头，已中断本次请求`
-      : msg.includes("fetch failed") ? `无法连接 ${base}（网络或代理问题）` : msg;
-    noteRelayError("wb", timedOut ? "timeout" : msg.includes("fetch failed") ? "proxy" : "network", friendly);
-    return wbAnthroError(res, 502, friendly);
-  }
-
-  if (r.status !== 200) {
-    const txt = (await readAllBody(r).catch(() => "")) || consumed400;
-    noteRelayError("wb", r.status === 429 ? "rate_limit" : `upstream_${r.status}`, `WorkBuddy 上游 HTTP ${r.status}`);
-    let msg = txt;
-    try { const jj = JSON.parse(txt); msg = jj.msg || jj.message || (jj.error && jj.error.message) || txt; } catch { }
-    // 4xx 诊断：把被拒的翻译后请求体落一份，便于定位上游新增的校验/指纹规则
-    if (r.status >= 400 && r.status < 500) {
-      try { writeFileSync(path.join(DATA_DIR, "wb-last-4xx.json"), bodyStr); } catch { }
-      log(`WorkBuddy 上游 ${r.status} 拒绝了请求，翻译后请求体已存 wb-last-4xx.json：${String(msg).slice(0, 160)}`);
-    }
-    return wbAnthroError(res, r.status, msg);
-  }
-  const ct = r.headers.get("content-type") || "";
-  if (!ct.includes("text/event-stream")) {
-    const txt = await readAllBody(r).catch(() => "");
-    noteRelayError("wb", "upstream_bad", `WorkBuddy 返回非流式响应（${ct || "无 Content-Type"}）`);
-    let msg = txt;
-    try { const jj = JSON.parse(txt); msg = jj.msg || jj.message || (jj.error && jj.error.message) || txt; } catch { }
-    return wbAnthroError(res, 502, `上游返回非 SSE 响应: ${String(msg).slice(0, 200)}`);
-  }
-  await wbPipe(r, res, { model: j.model, clientStream: j.stream === true, inputJson: j }); // Anthropic 默认非流式
-}
-
 // 中转核心工厂：B.AI(:relayPort) 与 SenseNova(:sn.relayPort) 复用同一套逻辑，只是
 // 取哪份配置(slice)、是否走代理(useProxy)、把流量记到哪个 recentCalls(store) 不同。
-function makeRelay(p, store, getSlice, useProxy, opts = {}) {
+function makeRelay(p, store, getSlice, useProxy) {
   return http.createServer((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
@@ -900,7 +448,6 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
       const S = getSlice(cfg); // {upstream, mapping, defaultModel, availableModels}
       const sliceCfg = { mapping: S.mapping, availableModels: S.availableModels, defaultModel: S.defaultModel };
       let body = Buffer.concat(chunks);
-      let rewritten = null; // 模型解析后的请求 JSON（OpenAI 桥用）
       const ct = (req.headers["content-type"] || "").toLowerCase();
       if (body.length && ct.includes("json")) {
         try {
@@ -916,7 +463,6 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
               else { store.unshift({ tier, served: j.model, at: Date.now() }); if (store.length > 30) store.pop(); }
             }
           }
-          rewritten = j;
           body = Buffer.from(JSON.stringify(j));
         } catch { /* 非 JSON 原样透传 */ }
       }
@@ -926,19 +472,6 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
       // 放在 try 外声明——catch 里的超时归因也要用到
       const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();
       const headerTimeoutMs = isProbe ? 10000 : 30000;
-      // WorkBuddy（opts.openai）：上游只讲 OpenAI 且仅流式——独立协议桥处理，
-      // 请求（Anthropic→OpenAI）与响应（OpenAI SSE→Anthropic SSE）都在桥内翻译。
-      if (opts.openai) {
-        if (!rewritten) return wbAnthroError(res, 400, "请求体必须是 Anthropic messages JSON");
-        try {
-          await wbExchange({ cfg, S, j: rewritten, isProbe, res, useProxy: useProxy(cfg) });
-        } catch (e) {
-          noteRelayError(p, "network", String((e && e.message) || e));
-          if (!res.headersSent) wbAnthroError(res, 502, (e && e.message) || e);
-          else try { res.end(); } catch { }
-        }
-        return;
-      }
       const UP = S.upstream + req.url;
       const doCall = () => useProxy(cfg)
         ? fetch(UP, { method: req.method, headers, body: body.length ? body : undefined, signal: AbortSignal.timeout(headerTimeoutMs) })
@@ -993,11 +526,9 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
   });
 }
 
-// 三个中转：B.AI 走代理（出海）、SenseNova 走直连（境内，可被 sn.useProxy 覆盖）、
-// WorkBuddy 走直连（www.workbuddy.ai 直连可达，可被 wb.useProxy 覆盖；协议桥见 opts.openai）
+// 两个中转：B.AI 走代理（出海）、SenseNova 走直连（境内，可被 sn.useProxy 覆盖）
 const relay = makeRelay("bai", recentCallsBai, (cfg) => ({ upstream: cfg.upstream, mapping: cfg.mapping, defaultModel: cfg.defaultModel, availableModels: cfg.availableModels }), () => true);
 const snRelay = makeRelay("sn", recentCallsSn, (cfg) => ({ upstream: cfg.sn.upstream, mapping: cfg.sn.mapping, defaultModel: cfg.sn.defaultModel, availableModels: cfg.sn.availableModels }), (cfg) => cfg.sn.useProxy === true);
-const wbRelay = makeRelay("wb", recentCallsWb, (cfg) => ({ upstream: cfg.wb.upstream, mapping: cfg.wb.mapping, defaultModel: cfg.wb.defaultModel, availableModels: cfg.wb.availableModels }), (cfg) => cfg.wb.useProxy === true, { openai: true });
 
 // ---------- 文件级操作 ----------
 function readJson(file) {
@@ -1028,16 +559,6 @@ function sliceOf(cfg, p) {
       useProxy: s.useProxy === true,
     };
   }
-  if (p === "wb") {
-    const w = cfg.wb || {};
-    return {
-      // WorkBuddy 没有 sk- 密钥：key 用访问令牌充当（供指纹展示与"是否已配置"判断），中转本身不校验
-      p: "wb", zh: "WorkBuddy", key: w.accessToken || "", upstream: w.upstream || DEFAULTS.wb.upstream,
-      relayPort: w.relayPort || DEFAULTS.wb.relayPort, defaultModel: w.defaultModel || DEFAULTS.wb.defaultModel,
-      availableModels: w.availableModels || [...DEFAULTS.wb.availableModels], mapping: w.mapping || { ...DEFAULTS.wb.mapping },
-      useProxy: w.useProxy === true,
-    };
-  }
   return {
     p: "bai", zh: "B.AI", key: cfg.apiKey || "", upstream: cfg.upstream || DEFAULTS.upstream,
     relayPort: cfg.relayPort || DEFAULTS.relayPort, defaultModel: cfg.defaultModel || DEFAULTS.defaultModel,
@@ -1045,13 +566,13 @@ function sliceOf(cfg, p) {
     useProxy: true,
   };
 }
-const PROVIDERS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy" };
-const isOurs = (mode) => mode === "bai" || mode === "sn" || mode === "wb";
+const PROVIDERS = { bai: "B.AI", sn: "SenseNova" };
+const isOurs = (mode) => mode === "bai" || mode === "sn";
 function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
 
 // CLI 的 ANTHROPIC_BASE_URL 恒为提供方上游本体（B.AI=api.b.ai、sn=token.sensenova.cn），不经本地中转；
 // 只有桌面版走 127.0.0.1:<relay>。故两者用不同的判据。
-function cliMode(cfg, cfgKey, snKey, wbKey) {
+function cliMode(cfg, cfgKey, snKey) {
   try {
     const s = readJson(SETTINGS);
     const u = s?.env?.ANTHROPIC_BASE_URL || "";
@@ -1060,19 +581,16 @@ function cliMode(cfg, cfgKey, snKey, wbKey) {
     const c = cfg || loadCfg();
     if (cfgKey) r.keyMatch = key === cfgKey;
     if (snKey != null) r.keyMatchSn = key === snKey;
-    if (wbKey != null) r.keyMatchWb = key === wbKey;
     const bh = hostOf(c.upstream || DEFAULTS.upstream), sh = hostOf(c.sn?.upstream || DEFAULTS.sn.upstream);
     if (bh && u.includes(bh)) return { mode: "bai", ...r };
     if (sh && u.includes(sh)) return { mode: "sn", ...r };
-    // WorkBuddy 的 CLI 直接指向本地协议桥（CLI 讲 Anthropic，上游讲 OpenAI，必须过桥）
-    if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
     return { mode: "unknown", baseUrl: "" };
   }
 }
-function desktopMode(cfg, cfgKey, snKey, wbKey) {
+function desktopMode(cfg, cfgKey, snKey) {
   try {
     const f = desktopConfigFile();
     if (!f || !existsSync(f)) return { mode: "unknown", baseUrl: "" };
@@ -1083,10 +601,8 @@ function desktopMode(cfg, cfgKey, snKey, wbKey) {
     const c = cfg || loadCfg();
     if (cfgKey) r.keyMatch = key === cfgKey;
     if (snKey != null) r.keyMatchSn = key === snKey;
-    if (wbKey != null) r.keyMatchWb = key === wbKey;
     if (u.includes(`:${c.relayPort || DEFAULTS.relayPort}`)) return { mode: "bai", ...r };
     if (u.includes(`:${c.sn?.relayPort || DEFAULTS.sn.relayPort}`)) return { mode: "sn", ...r };
-    if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
@@ -1121,10 +637,9 @@ function applyToCli(S) {
   try { s = readJson(SETTINGS); } catch { s = {}; }
   s.env = s.env || {};
   const e = s.env;
-  e.ANTHROPIC_AUTH_TOKEN = S.key || "wb-local";
-  // B.AI 的 CLI 直连上游（靠 proxy env 出海）；SenseNova 境内直连；
-  // WorkBuddy 必须走本地协议桥（CLI 是 Anthropic 协议，上游只讲 OpenAI）
-  e.ANTHROPIC_BASE_URL = S.p === "wb" ? `http://127.0.0.1:${S.relayPort}` : S.upstream;
+  e.ANTHROPIC_AUTH_TOKEN = S.key;
+  // B.AI 的 CLI 直连上游（靠 proxy env 出海）；SenseNova 是境内服务，CLI 直连、清空代理
+  e.ANTHROPIC_BASE_URL = S.p === "sn" ? S.upstream : S.upstream;
   e.ANTHROPIC_MODEL = S.mapping["claude-haiku-4-5"]?.target || S.defaultModel;
   for (const t of TIERS) {
     e[t.envKey] = S.mapping[t.key]?.target || S.defaultModel;
@@ -1133,12 +648,11 @@ function applyToCli(S) {
   e.API_TIMEOUT_MS = e.API_TIMEOUT_MS || "3000000";
   e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
   e.NODE_USE_ENV_PROXY = "1";
-  if (S.p === "bai") {
+  if (S.p === "sn") {
+    delete e.HTTPS_PROXY; delete e.HTTP_PROXY; // 境内直连，无需 Clash
+  } else {
     e.HTTPS_PROXY = loadCfg().proxy;
     e.HTTP_PROXY = loadCfg().proxy;
-  } else {
-    // 境内提供方（SenseNova/WorkBuddy）直连、清空代理（WorkBuddy 桥在本机，NO_PROXY 已覆盖）
-    delete e.HTTPS_PROXY; delete e.HTTP_PROXY;
   }
   e.NO_PROXY = "127.0.0.1,localhost";
   writeAtomic(SETTINGS, JSON.stringify(s, null, 2) + "\n");
@@ -1300,8 +814,6 @@ async function statusPayload() {
   const [clash, ccswitch] = await Promise.all([checkClash(cfg), checkCcSwitch()]);
   const bai = providerStatus(cfg, "bai", recentCallsBai);
   const sn = providerStatus(cfg, "sn", recentCallsSn);
-  const wb = providerStatus(cfg, "wb", recentCallsWb);
-  const wbExp = wbTokenExp(cfg.wb?.accessToken);
   return {
     now: new Date().toISOString(),
     service: { up: true, uptimeSec: Math.floor((Date.now() - BOOT) / 1000), pid: process.pid },
@@ -1310,31 +822,16 @@ async function statusPayload() {
     proxy: cfg.proxy || "直连",
     ccswitch: { running: ccswitch },
     // 接线状态（两端各自归属哪个提供方）。keyMatch=对 B.AI key 的匹配，
-    // keyMatchSn/keyMatchWb 分别是对 SenseNova / WorkBuddy 凭据的匹配——各页各取各的对比对象。
-    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken),
-    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken),
-    // B.AI 灯/接线沿用旧字段名，SenseNova 灯挂 sn 下，WorkBuddy 灯挂 wb 下
+    // keyMatchSn=对 SenseNova key 的匹配——两页各取各的对比对象，指纹本身是实际生效值。
+    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey),
+    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey),
+    // B.AI 灯/接线沿用旧字段名，SenseNova 灯挂 sn 下
     relay: bai.relay, relayLast: bai.relayLast, upstream: bai.upstream, recent: bai.recent,
     sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, useProxy: cfg.sn?.useProxy === true },
-    wb: {
-      relay: wb.relay, relayLast: wb.relayLast, upstream: wb.upstream, recent: wb.recent,
-      useProxy: cfg.wb?.useProxy === true,
-      // 令牌体检：有无令牌、访问令牌到期时间、是否带刷新令牌
-      token: {
-        configured: !!cfg.wb?.accessToken,
-        expAt: wbExp ? new Date(wbExp * 1000).toISOString() : null,
-        expiresInDays: wbExp ? Math.max(0, Math.round((wbExp * 1000 - Date.now()) / 86400000)) : null,
-        hasRefresh: !!cfg.wb?.refreshToken,
-      },
-    },
   };
 }
 
-const lastTest = {
-  bai: { ok: null, model: null, ms: null, error: null, at: null },
-  sn: { ok: null, model: null, ms: null, error: null, at: null },
-  wb: { ok: null, model: null, ms: null, error: null, at: null },
-};
+const lastTest = { bai: { ok: null, model: null, ms: null, error: null, at: null }, sn: { ok: null, model: null, ms: null, error: null, at: null } };
 
 const panel = http.createServer(async (req, res) => {
   res.setHeader("access-control-allow-origin", "http://127.0.0.1:" + loadCfg().panelPort);
@@ -1359,11 +856,6 @@ const panel = http.createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "sn.html")));
     }
-    // v1.0.31: WorkBuddy 独立页面（三页导航并列）
-    if (req.method === "GET" && (u.pathname === "/wb" || u.pathname === "/workbuddy" || u.pathname === "/wb.html")) {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      return res.end(readFileSync(path.join(HERE, "wb.html")));
-    }
     if (req.method === "GET" && u.pathname === "/api/ping") return json(res, 200, { ok: true });
     if (req.method === "GET" && u.pathname === "/api/version") return json(res, 200, { version: APP_VERSION });
 
@@ -1371,15 +863,9 @@ const panel = http.createServer(async (req, res) => {
     // 下拉框不能只靠发布机默认列表；UI 的「刷新模型列表」按钮走这里。
     // v1.0.28: ?p=sn 时从 SenseNova 拉（境内直连，不走代理）；只保留可对话模型（output 含 text）。
     if (req.method === "GET" && u.pathname === "/api/models") {
-      const pRaw = u.searchParams.get("p");
-      const p = pRaw === "sn" ? "sn" : pRaw === "wb" ? "wb" : "bai";
+      const p = u.searchParams.get("p") === "sn" ? "sn" : "bai";
       const c2 = loadCfg();
       const S = sliceOf(c2, p);
-      // WorkBuddy 没有公开的模型目录接口（模型清单随客户端 product config 下发），
-      // 返回当前可选列表即可——三款免费模型由发布机默认随版本推送
-      if (p === "wb") {
-        return json(res, 200, { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true });
-      }
       let j;
       if (p === "sn") {
         const r = await directHttp(S.upstream + "/v1/models", {
@@ -1422,43 +908,30 @@ const panel = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && u.pathname === "/api/config") return json(res, 200, loadCfg());
 
-    // v1.0.28: 配置编辑按提供方分流。body.provider="sn"/"wb" 时读写 cfg.sn / cfg.wb 子对象，
-    // 否则维持 B.AI 顶层字段（apiKey/mapping/upstream/relayPort/panelPort…），互不影响。
-    // v1.0.31: WorkBuddy 无 sk- 密钥，改收 JWT 令牌四件套（accessToken/refreshToken/deviceToken/userId）。
+    // v1.0.28: 配置编辑按提供方分流。body.provider="sn" 时读写 cfg.sn 子对象，
+    // 否则维持 B.AI 顶层字段（apiKey/mapping/upstream/relayPort/panelPort…），两边互不影响。
     if (req.method === "POST" && u.pathname === "/api/config") {
       const b = await readBody(req);
       const cfg = loadCfg();
-      const P = b.provider === "sn" ? "sn" : b.provider === "wb" ? "wb" : "bai";
-      const sub = P === "sn" ? cfg.sn : P === "wb" ? cfg.wb : cfg; // 共用字段（mapping/upstream/…）落点
-      // —— API Key（仅 B.AI / SenseNova）——
+      const P = b.provider === "sn" ? "sn" : "bai";
+      const sn = cfg.sn;
+      // —— API Key ——
       if (typeof b.apiKey === "string" && b.apiKey.trim()) {
         const k = b.apiKey.trim();
         if (!k.startsWith("sk-")) return json(res, 400, { error: "API Key 应以 sk- 开头" });
-        if (P === "sn") cfg.sn.apiKey = k; else if (P === "bai") cfg.apiKey = k;
-      }
-      // —— WorkBuddy 令牌（出现字段即写入；空串=清除）——
-      if (P === "wb") {
-        for (const f of ["accessToken", "refreshToken", "deviceToken", "userId"]) {
-          if (typeof b[f] === "string") cfg.wb[f] = b[f].trim();
-        }
-        if (cfg.wb.accessToken && cfg.wb.accessToken.split(".").length !== 3) {
-          return json(res, 400, { error: "访问令牌应是 JWT（三段以 . 分隔）——请从捕获结果完整粘贴" });
-        }
+        if (P === "sn") sn.apiKey = k; else cfg.apiKey = k;
       }
       let needRestart = false;
-      // —— 代理：B.AI 走顶层 proxy（决定进程重启），SenseNova/WorkBuddy 走 useProxy 开关（每请求实时读，无需重启）——
+      // —— 代理：B.AI 走顶层 proxy（决定进程重启），SenseNova 走 useProxy 开关（每请求实时读，无需重启）——
       if (P === "bai" && typeof b.proxy === "string") {
         const p = b.proxy.trim();
         if (p && !/^https?:\/\/127\.0\.0\.1:\d+$/.test(p)) return json(res, 400, { error: "代理格式应为 http://127.0.0.1:端口，留空表示直连" });
         if ((cfg.proxy || "") !== p) { cfg.proxy = p; needRestart = true; }
       }
-      if (P !== "bai" && typeof b.useProxy === "boolean" && sub.useProxy !== b.useProxy) {
-        sub.useProxy = b.useProxy;
-        needRestart = true; // 直连/走代理由启动期 NO_PROXY 决定（Node 缓存 env 代理配置），改开关需重启
-      }
+      if (P === "sn" && typeof b.useProxy === "boolean") sn.useProxy = b.useProxy;
       // —— 映射表 ——
       if (b.mapping && typeof b.mapping === "object") {
-        const dst = sub.mapping;
+        const dst = P === "sn" ? sn.mapping : cfg.mapping;
         for (const t of TIERS) {
           const m = b.mapping[t.key];
           if (!m) continue;
@@ -1471,13 +944,13 @@ const panel = http.createServer(async (req, res) => {
       // —— 可选模型列表 ——
       if (Array.isArray(b.availableModels)) {
         const arr = b.availableModels.map((x) => String(x).trim().toLowerCase()).filter(Boolean);
-        if (arr.length) sub.availableModels = [...new Set(arr)];
+        if (arr.length) { if (P === "sn") sn.availableModels = [...new Set(arr)]; else cfg.availableModels = [...new Set(arr)]; }
       }
       // —— 上游地址（中转每请求实时读，无需重启）——
       if (typeof b.upstream === "string" && b.upstream.trim()) {
         const up = b.upstream.trim().replace(/\/+$/, "");
         if (!/^https?:\/\//.test(up)) return json(res, 400, { error: "上游地址需以 http(s):// 开头" });
-        sub.upstream = up;
+        if (P === "sn") sn.upstream = up; else cfg.upstream = up;
       }
       // —— 端口 ——
       if (b.panelPort != null && b.panelPort !== "") {
@@ -1485,13 +958,16 @@ const panel = http.createServer(async (req, res) => {
         if (!Number.isInteger(n) || n < 1024 || n > 65535) return json(res, 400, { error: `panelPort 需为 1024-65535 的整数` });
         if (n !== cfg.panelPort) { cfg.panelPort = n; needRestart = true; }
       }
+      const rpKey = P === "sn" ? "relayPort" : "relayPort";
       if (b.relayPort != null && b.relayPort !== "") {
         const n = Number(b.relayPort);
-        if (!Number.isInteger(n) || n < 1024 || n > 65535) return json(res, 400, { error: `relayPort 需为 1024-65535 的整数` });
-        if (n !== sub.relayPort) { sub.relayPort = n; needRestart = true; }
+        if (!Number.isInteger(n) || n < 1024 || n > 65535) return json(res, 400, { error: `${rpKey} 需为 1024-65535 的整数` });
+        const cur = P === "sn" ? sn.relayPort : cfg.relayPort;
+        if (n !== cur) { if (P === "sn") sn.relayPort = n; else cfg.relayPort = n; needRestart = true; }
       }
       if (typeof b.defaultModel === "string" && b.defaultModel.trim()) {
-        sub.defaultModel = b.defaultModel.trim().toLowerCase();
+        const dm = b.defaultModel.trim().toLowerCase();
+        if (P === "sn") sn.defaultModel = dm; else cfg.defaultModel = dm;
       }
       saveCfg(cfg);
       // 端上已接到该提供方的话，立即同步新映射
@@ -1517,17 +993,11 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.28: 一键接线按提供方分流；恢复（接回 CC Switch）在 /api/restore 里保持原样
     if (req.method === "POST" && u.pathname === "/api/apply") {
       const b = await readBody(req);
-      const P = b.provider === "sn" ? "sn" : b.provider === "wb" ? "wb" : "bai";
+      const P = b.provider === "sn" ? "sn" : "bai";
       const cfg = loadCfg();
       const S = sliceOf(cfg, P);
       const name = PROVIDERS[P];
-      if (!S.key) {
-        return json(res, 400, {
-          error: P === "wb"
-            ? "请先在「WorkBuddy」页粘贴访问令牌（JWT）——捕获方法见该页说明"
-            : `请先在「${name}」路由表里填写 API Key`,
-        });
-      }
+      if (!S.key) return json(res, 400, { error: `请先在「${name}」路由表里填写 API Key` });
       const doCli = b.cli !== false;
       const doDesk = b.desktop !== false;
       const warns = [];
@@ -1539,7 +1009,6 @@ const panel = http.createServer(async (req, res) => {
       if (ccRunning) warns.push("CC Switch 正在运行，它可能随时把配置改回去；切换前建议先退出它");
       warns.push("桌面版需完全退出并重开 Claude 才生效；CLI 新开终端生效");
       if (P === "sn") warns.push("SenseNova 有 TPM/RPM 限流，探测到 429 属正常，稍候即恢复；图像模型不参与对话路由");
-      if (P === "wb") warns.push("WorkBuddy 三款免费模型由 WorkBuddy 客户端账号提供（0 积分不限量）；令牌过期会自动用刷新令牌续期，无需重新接线");
       log(`一键切到 ${name}: cli=${doCli} desktop=${doDesk}`);
       return json(res, 200, { ok: true, provider: P, warnings: warns, snapshot: "已自动快照切换前的配置（可用于一键恢复）" });
     }
@@ -1557,9 +1026,9 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/test") {
       const cfg = loadCfg();
       const b = await readBody(req).catch(() => ({}));
-      const P = b.provider === "sn" ? "sn" : b.provider === "wb" ? "wb" : "bai";
+      const P = b.provider === "sn" ? "sn" : "bai";
       const S = sliceOf(cfg, P);
-      const store = P === "sn" ? recentCallsSn : P === "wb" ? recentCallsWb : recentCallsBai;
+      const store = P === "sn" ? recentCallsSn : recentCallsBai;
       const active = b.all ? null : activeTier(store);
       const targets = active ? [active] : TIERS.map((t) => t.key);
       const tierInfo = (key) => {
@@ -1631,7 +1100,7 @@ const panel = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && u.pathname === "/api/service/stop") {
-      json(res, 200, { ok: true, message: "服务即将停止（B.AI / SenseNova / WorkBuddy 中转一并停止）" });
+      json(res, 200, { ok: true, message: "服务即将停止（B.AI 中转与 SenseNova 中转一并停止）" });
       log("收到停止指令，进程退出");
       setTimeout(() => process.exit(0), 300);
       return;
@@ -1651,7 +1120,7 @@ const panel = http.createServer(async (req, res) => {
       const cfg = loadCfg();
       const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
         detached: true, stdio: "ignore", windowsHide: true, cwd: HERE,
-        env: { ...process.env, NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1", ...(cfg.proxy ? { HTTPS_PROXY: cfg.proxy, HTTP_PROXY: cfg.proxy } : {}), NO_PROXY: computeNoProxy(cfg) },
+        env: { ...process.env, NODE_USE_ENV_PROXY: "1", HTTPS_PROXY: cfg.proxy, HTTP_PROXY: cfg.proxy, NO_PROXY: "127.0.0.1,localhost" },
       });
       child.unref();
       json(res, 200, { ok: true, message: "服务正在重启" });
@@ -1753,7 +1222,7 @@ function listenWithRetry(srv, port, name) {
     if (e.code !== "EADDRINUSE") { log(`${name} 端口错误: ${e.message}`); process.exit(1); }
     if (attempts === 1) log(`${name} 端口 :${port} 暂被占用（多为重启交接），每 600ms 重试，最多 15 秒`);
     let peerHealthy = false;
-    if (!relay.listening && !snRelay.listening && !wbRelay.listening && !panel.listening) {
+    if (!relay.listening && !snRelay.listening && !panel.listening) {
       try {
         const pr = await fetch(`http://127.0.0.1:${cfg0.panelPort}/api/ping`, { signal: AbortSignal.timeout(1200) });
         peerHealthy = pr.ok;
@@ -1784,7 +1253,6 @@ function listenWithRetry(srv, port, name) {
 }
 listenWithRetry(relay, cfg0.relayPort, "中转");
 listenWithRetry(snRelay, cfg0.sn.relayPort, "SenseNova中转");
-listenWithRetry(wbRelay, cfg0.wb.relayPort, "WorkBuddy中转");
 listenWithRetry(panel, cfg0.panelPort, "面板");
 // 成功绑定中转端口 = 本实例成为唯一的活跃服务者，此时才允许合并配置/跑周期探测
 relay.once("listening", () => setTimeout(onActivated, 300));

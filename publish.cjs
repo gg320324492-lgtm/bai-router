@@ -26,6 +26,12 @@ try {
       const cur = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
       if (cur.sn) def.sn = { ...cur.sn, apiKey: "" };
     }
+    // wb（WorkBuddy）块：JWT 令牌绝不进发布机快照；发布机没配过就沿用代码默认（同样脱敏）
+    if (def.wb) { def.wb = { ...def.wb, accessToken: "", refreshToken: "", deviceToken: "" }; }
+    else {
+      const cur2 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
+      if (cur2.wb) def.wb = { ...cur2.wb, accessToken: "", refreshToken: "", deviceToken: "" };
+    }
     fs.writeFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), JSON.stringify(def, null, 2) + "\n");
     console.log(`» 默认快照已同步发布机: ${def.availableModels.length} 个模型${def.sn ? " + SenseNova " + def.sn.availableModels.length + " 个" : ""}`);
   } else console.log("» 未找到发布机配置，沿用仓库内 defaults 快照");
@@ -40,8 +46,9 @@ run("npx electron-builder --win nsis");
   const need = ["src/main.js", "src/preload.js", "src/install-consistency.js"];
   const miss = need.filter((f) => !list.includes(f));
   const snOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "sn.html"));
-  if (miss.length || !snOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html"));
-  console.log("» 发布闸门通过：asar 模块齐全，sn.html 已随包");
+  const wbOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "wb.html"));
+  if (miss.length || !snOk || !wbOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html"));
+  console.log("» 发布闸门通过：asar 模块齐全，sn.html / wb.html 已随包");
 }
 // upgrade.ps1：救砖/一键升级脚本，作为 release 资产随每个版本发布（旧版更新器损坏的用户无需打开网页）
 if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {

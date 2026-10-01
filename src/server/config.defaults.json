@@ -102,5 +102,38 @@
         "label": "SenseNova 6.8 Flash-Lite"
       }
     }
+  },
+  "wb": {
+    "relayPort": 15742,
+    "upstream": "https://www.workbuddy.ai",
+    "defaultModel": "deepseek-v4.1-flash",
+    "availableModels": [
+      "deepseek-v4.1-flash",
+      "hy4-preview-f",
+      "hy3"
+    ],
+    "mapping": {
+      "claude-fable-5": {
+        "target": "deepseek-v4.1-flash",
+        "label": "DeepSeek-V4.1-Flash"
+      },
+      "claude-sonnet-5": {
+        "target": "hy4-preview-f",
+        "label": "Hy4-Preview-F"
+      },
+      "claude-opus-5": {
+        "target": "hy3",
+        "label": "HY3"
+      },
+      "claude-haiku-4-5": {
+        "target": "deepseek-v4.1-flash",
+        "label": "DeepSeek-V4.1-Flash"
+      }
+    },
+    "accessToken": "",
+    "refreshToken": "",
+    "deviceToken": "",
+    "userId": "",
+    "useProxy": false
   }
 }
