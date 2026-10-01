@@ -78,6 +78,18 @@ const DEFAULTS = {
     availableModels: ["sensenova-6.8-flash-lite", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.2", "kimi-k3"],
     mapping: defaultMapping("sensenova-6.8-flash-lite", "SenseNova 6.8 Flash-Lite"),
   },
+  // OpenCode Zen（v1.0.37）—— 第四个可路由提供方。上游只讲 OpenAI 协议，复用通用协议桥。
+  // 实测（2026-10）：Zen 目录 8 个 -free 模型中服务端只放行 space-bunny-free，其余限客户端内使用；
+  // zen/go 通道需付费 Go 订阅 —— 故默认只挂这一个实测可用的。
+  zen: {
+    apiKey: "",
+    upstream: "https://opencode.ai/zen/v1",
+    relayPort: 15752,
+    defaultModel: "space-bunny-free",
+    availableModels: ["space-bunny-free"],
+    mapping: defaultMapping("space-bunny-free", "Space-Bunny-Free"),
+    useProxy: false,
+  },
   // WorkBuddy（腾讯 WorkBuddy AI 客户端附带的免费模型）—— 第三个可路由提供方。
   // 上游只讲 OpenAI Chat Completions（且仅流式），中转内置 Anthropic↔OpenAI 协议桥；
   // 认证不是 sk- 密钥，而是从 WorkBuddy 客户端捕获的 JWT 三件套（访问/刷新/设备令牌），
@@ -113,6 +125,13 @@ function loadCfg() {
       mapping: { ...DEFAULTS.sn.mapping, ...(snIn.mapping || {}) },
       availableModels: Array.isArray(snIn.availableModels) && snIn.availableModels.length ? snIn.availableModels : [...DEFAULTS.sn.availableModels],
     };
+    // zen 深合并（同上）
+    const zenIn = c.zen || {};
+    merged.zen = {
+      ...DEFAULTS.zen, ...zenIn,
+      mapping: { ...DEFAULTS.zen.mapping, ...(zenIn.mapping || {}) },
+      availableModels: Array.isArray(zenIn.availableModels) && zenIn.availableModels.length ? zenIn.availableModels : [...DEFAULTS.zen.availableModels],
+    };
     // wb 深合并：同上（旧 config 无 wb 块时整块补默认）
     const wbIn = c.wb || {};
     merged.wb = {
@@ -123,7 +142,7 @@ function loadCfg() {
     return merged;
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
-    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] } };
+    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] } };
   }
 }
 function saveCfg(cfg) {
@@ -236,6 +255,7 @@ function computeNoProxy(cfg) {
   const add = (host, useProxy) => { if (!useProxy && host && !list.includes(host)) list.push(host); };
   add(hostOf(cfg.wb?.upstream || DEFAULTS.wb.upstream), cfg.wb?.useProxy === true);
   add(hostOf(cfg.sn?.upstream || DEFAULTS.sn.upstream), cfg.sn?.useProxy === true);
+  add(hostOf(cfg.zen?.upstream || DEFAULTS.zen.upstream), cfg.zen?.useProxy === true);
   return list.join(",");
 }
 const cfg0 = loadCfg();
@@ -359,6 +379,9 @@ function onActivated() {
         if (def.wb && Array.isArray(def.wb.availableModels) && def.wb.availableModels.length) {
           cur.wb.availableModels = [...new Set([...(cur.wb.availableModels || []), ...def.wb.availableModels])];
         }
+        if (def.zen && Array.isArray(def.zen.availableModels) && def.zen.availableModels.length) {
+          cur.zen.availableModels = [...new Set([...(cur.zen.availableModels || []), ...def.zen.availableModels])];
+        }
         cur._modelsSynced = APP_VERSION;
         saveCfg(cur);
         log(`可选模型已同步发布机（${merged.length} 个 + SenseNova ${cur.sn.availableModels.length} 个 + WorkBuddy ${cur.wb.availableModels.length} 个）`);
@@ -389,6 +412,7 @@ function resolveModel(name, cfg) {
 const recentCallsBai = [];  // {tier, served, at}
 const recentCallsSn = [];
 const recentCallsWb = [];
+const recentCallsZen = [];
 function activeTier(store) {
   // 最近 30 分钟内被"真实会话"用过的档位；没有观察则返回 null（不再默认猜 Haiku）
   if (store.length && Date.now() - store[0].at < 30 * 60000) return store[0].tier;
@@ -406,6 +430,7 @@ const relayErrors = {
   bai: { kind: null, message: null, at: null },
   sn: { kind: null, message: null, at: null },
   wb: { kind: null, message: null, at: null },
+  zen: { kind: null, message: null, at: null },
 };
 function noteRelayError(p, kind, message) {
   const slot = relayErrors[p] || relayErrors.bai;
@@ -992,15 +1017,30 @@ async function wbPipe(r, res, { model, clientStream, inputJson }) {
 }
 
 // 一次 WorkBuddy 调用的完整生命周期：拿令牌 → 翻译 → 上游（401 自动续期重试 / 探测 429 退避）→ 翻流回来
-async function wbExchange({ cfg, S, j, isProbe, res, useProxy }) {
+// 通用 OpenAI 上游桥：p="wb"（WorkBuddy，需 JWT + WorkBuddy 专头 + 令牌续期）、
+// p="zen"（OpenCode Zen，Bearer API Key + 标准头）。请求翻译与响应回译完全共用。
+async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
+  const NAME = p === "zen" ? "OpenCode Zen" : "WorkBuddy";
   let token;
-  try { token = await wbEnsureToken(cfg); }
-  catch (e) { noteRelayError("wb", "auth", e.message); return wbAnthroError(res, 401, e.message); }
+  if (p === "zen") {
+    token = (cfg.zen && cfg.zen.apiKey) || "";
+    if (!token) { noteRelayError(p, "auth", "未配置 OpenCode Zen API Key"); return wbAnthroError(res, 401, "未配置 OpenCode Zen API Key——请到「OpenCode Zen」页填写"); }
+  } else {
+    try { token = await wbEnsureToken(cfg); }
+    catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
+  }
 
   const ob = wbToOpenAI(j);
-  const base = (S.upstream || DEFAULTS.wb.upstream).replace(/\/+$/, "");
-  const url = base + "/v2/chat/completions";
+  const base = (S.upstream || (p === "zen" ? DEFAULTS.zen.upstream : DEFAULTS.wb.upstream)).replace(/\/+$/, "");
+  const url = p === "zen" ? base + "/chat/completions" : base + "/v2/chat/completions";
   const mkHeaders = (tok) => {
+    if (p === "zen") {
+      return {
+        "content-type": "application/json",
+        authorization: `Bearer ${tok}`,
+        "user-agent": `B.AI-Router/${APP_VERSION}`,
+      };
+    }
     const w = cfg.wb;
     const h = {
       "content-type": "application/json",
@@ -1022,11 +1062,11 @@ async function wbExchange({ cfg, S, j, isProbe, res, useProxy }) {
   let r;
   try {
     r = await doCall(token);
-    // 令牌失效（401/403）→ 立即续期并重试一次
-    if ((r.status === 401 || r.status === 403) && cfg.wb.refreshToken) {
+    // 令牌失效（401/403）→ WorkBuddy 侧可续期并重试一次；Zen 侧 key 失效直接报错
+    if ((r.status === 401 || r.status === 403) && p === "wb" && cfg.wb.refreshToken) {
       await readAllBody(r).catch(() => "");
       try { token = await wbRefreshToken(cfg); r = await doCall(token); }
-      catch (e) { noteRelayError("wb", "auth", e.message); return wbAnthroError(res, 401, e.message); }
+      catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
     }
     // 探测级小请求遇 429：静默退避重试（与 B.AI/SenseNova 行为一致）
     for (let a = 0; r.status === 429 && isProbe && a < 3; a++) {
@@ -1049,28 +1089,28 @@ async function wbExchange({ cfg, S, j, isProbe, res, useProxy }) {
     const msg = String((e && e.message) || e);
     const timedOut = (e && e.name === "AbortError") || msg.toLowerCase().includes("abort");
     const friendly = timedOut
-      ? `WorkBuddy 上游在 ${isProbe ? 10 : 30}s 内未返回响应头，已中断本次请求`
+      ? `${NAME} 上游在 ${isProbe ? 10 : 30}s 内未返回响应头，已中断本次请求`
       : msg.includes("fetch failed") ? `无法连接 ${base}（网络或代理问题）` : msg;
-    noteRelayError("wb", timedOut ? "timeout" : msg.includes("fetch failed") ? "proxy" : "network", friendly);
+    noteRelayError(p, timedOut ? "timeout" : msg.includes("fetch failed") ? "proxy" : "network", friendly);
     return wbAnthroError(res, 502, friendly);
   }
 
   if (r.status !== 200) {
     const txt = (await readAllBody(r).catch(() => "")) || consumed400;
-    noteRelayError("wb", r.status === 429 ? "rate_limit" : `upstream_${r.status}`, `WorkBuddy 上游 HTTP ${r.status}`);
+    noteRelayError(p, r.status === 429 ? "rate_limit" : `upstream_${r.status}`, `${NAME} 上游 HTTP ${r.status}`);
     let msg = txt;
     try { const jj = JSON.parse(txt); msg = jj.msg || jj.message || (jj.error && jj.error.message) || txt; } catch { }
     // 4xx 诊断：把被拒的翻译后请求体落一份，便于定位上游新增的校验/指纹规则
     if (r.status >= 400 && r.status < 500) {
       try { writeFileSync(path.join(DATA_DIR, "wb-last-4xx.json"), bodyStr); } catch { }
-      log(`WorkBuddy 上游 ${r.status} 拒绝了请求，翻译后请求体已存 wb-last-4xx.json：${String(msg).slice(0, 160)}｜system 首行：${String((ob.messages && ob.messages[0] && ob.messages[0].content) || "").split("\n")[0].slice(0, 120)}`);
+      log(`${NAME} 上游 ${r.status} 拒绝了请求，翻译后请求体已存 wb-last-4xx.json：${String(msg).slice(0, 160)}｜system 首行：${String((ob.messages && ob.messages[0] && ob.messages[0].content) || "").split("\n")[0].slice(0, 120)}`);
     }
     return wbAnthroError(res, r.status, msg);
   }
   const ct = r.headers.get("content-type") || "";
   if (!ct.includes("text/event-stream")) {
     const txt = await readAllBody(r).catch(() => "");
-    noteRelayError("wb", "upstream_bad", `WorkBuddy 返回非流式响应（${ct || "无 Content-Type"}）`);
+    noteRelayError(p, "upstream_bad", `${NAME} 返回非流式响应（${ct || "无 Content-Type"}）`);
     let msg = txt;
     try { const jj = JSON.parse(txt); msg = jj.msg || jj.message || (jj.error && jj.error.message) || txt; } catch { }
     return wbAnthroError(res, 502, `上游返回非 SSE 响应: ${String(msg).slice(0, 200)}`);
@@ -1120,7 +1160,7 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
       if (opts.openai) {
         if (!rewritten) return wbAnthroError(res, 400, "请求体必须是 Anthropic messages JSON");
         try {
-          await wbExchange({ cfg, S, j: rewritten, isProbe, res, useProxy: useProxy(cfg) });
+          await openaiExchange(p, { cfg, S, j: rewritten, isProbe, res, useProxy: useProxy(cfg) });
         } catch (e) {
           noteRelayError(p, "network", String((e && e.message) || e));
           if (!res.headersSent) wbAnthroError(res, 502, (e && e.message) || e);
@@ -1187,6 +1227,8 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
 const relay = makeRelay("bai", recentCallsBai, (cfg) => ({ upstream: cfg.upstream, mapping: cfg.mapping, defaultModel: cfg.defaultModel, availableModels: cfg.availableModels }), () => true);
 const snRelay = makeRelay("sn", recentCallsSn, (cfg) => ({ upstream: cfg.sn.upstream, mapping: cfg.sn.mapping, defaultModel: cfg.sn.defaultModel, availableModels: cfg.sn.availableModels }), (cfg) => cfg.sn.useProxy === true);
 const wbRelay = makeRelay("wb", recentCallsWb, (cfg) => ({ upstream: cfg.wb.upstream, mapping: cfg.wb.mapping, defaultModel: cfg.wb.defaultModel, availableModels: cfg.wb.availableModels }), (cfg) => cfg.wb.useProxy === true, { openai: true });
+// OpenCode Zen：OpenAI 协议，复用同一套桥（apiKey 认证，无令牌续期）
+const zenRelay = makeRelay("zen", recentCallsZen, (cfg) => ({ upstream: cfg.zen.upstream, mapping: cfg.zen.mapping, defaultModel: cfg.zen.defaultModel, availableModels: cfg.zen.availableModels }), (cfg) => cfg.zen.useProxy === true, { openai: true });
 
 // ---------- 文件级操作 ----------
 function readJson(file) {
@@ -1217,6 +1259,15 @@ function sliceOf(cfg, p) {
       useProxy: s.useProxy === true,
     };
   }
+  if (p === "zen") {
+    const z = cfg.zen || {};
+    return {
+      p: "zen", zh: "OpenCode Zen", key: z.apiKey || "", upstream: z.upstream || DEFAULTS.zen.upstream,
+      relayPort: z.relayPort || DEFAULTS.zen.relayPort, defaultModel: z.defaultModel || DEFAULTS.zen.defaultModel,
+      availableModels: z.availableModels || [...DEFAULTS.zen.availableModels], mapping: z.mapping || { ...DEFAULTS.zen.mapping },
+      useProxy: z.useProxy === true,
+    };
+  }
   if (p === "wb") {
     const w = cfg.wb || {};
     return {
@@ -1234,13 +1285,13 @@ function sliceOf(cfg, p) {
     useProxy: true,
   };
 }
-const PROVIDERS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy" };
-const isOurs = (mode) => mode === "bai" || mode === "sn" || mode === "wb";
+const PROVIDERS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen" };
+const isOurs = (mode) => mode === "bai" || mode === "sn" || mode === "wb" || mode === "zen";
 function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
 
 // CLI 的 ANTHROPIC_BASE_URL 恒为提供方上游本体（B.AI=api.b.ai、sn=token.sensenova.cn），不经本地中转；
 // 只有桌面版走 127.0.0.1:<relay>。故两者用不同的判据。
-function cliMode(cfg, cfgKey, snKey, wbKey) {
+function cliMode(cfg, cfgKey, snKey, wbKey, zenKey) {
   try {
     const s = readJson(SETTINGS);
     const u = s?.env?.ANTHROPIC_BASE_URL || "";
@@ -1249,19 +1300,21 @@ function cliMode(cfg, cfgKey, snKey, wbKey) {
     const c = cfg || loadCfg();
     if (cfgKey) r.keyMatch = key === cfgKey;
     if (snKey != null) r.keyMatchSn = key === snKey;
+    if (zenKey != null) r.keyMatchZen = key === zenKey;
     if (wbKey != null) r.keyMatchWb = key === wbKey;
     const bh = hostOf(c.upstream || DEFAULTS.upstream), sh = hostOf(c.sn?.upstream || DEFAULTS.sn.upstream);
     if (bh && u.includes(bh)) return { mode: "bai", ...r };
     if (sh && u.includes(sh)) return { mode: "sn", ...r };
     // WorkBuddy 的 CLI 直接指向本地协议桥（CLI 讲 Anthropic，上游讲 OpenAI，必须过桥）
     if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
+    if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
     return { mode: "unknown", baseUrl: "" };
   }
 }
-function desktopMode(cfg, cfgKey, snKey, wbKey) {
+function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey) {
   try {
     const f = desktopConfigFile();
     if (!f || !existsSync(f)) return { mode: "unknown", baseUrl: "" };
@@ -1272,10 +1325,12 @@ function desktopMode(cfg, cfgKey, snKey, wbKey) {
     const c = cfg || loadCfg();
     if (cfgKey) r.keyMatch = key === cfgKey;
     if (snKey != null) r.keyMatchSn = key === snKey;
+    if (zenKey != null) r.keyMatchZen = key === zenKey;
     if (wbKey != null) r.keyMatchWb = key === wbKey;
     if (u.includes(`:${c.relayPort || DEFAULTS.relayPort}`)) return { mode: "bai", ...r };
     if (u.includes(`:${c.sn?.relayPort || DEFAULTS.sn.relayPort}`)) return { mode: "sn", ...r };
     if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
+    if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
@@ -1490,6 +1545,7 @@ async function statusPayload() {
   const bai = providerStatus(cfg, "bai", recentCallsBai);
   const sn = providerStatus(cfg, "sn", recentCallsSn);
   const wb = providerStatus(cfg, "wb", recentCallsWb);
+  const zen = providerStatus(cfg, "zen", recentCallsZen);
   const wbExp = wbTokenExp(cfg.wb?.accessToken);
   return {
     now: new Date().toISOString(),
@@ -1500,11 +1556,12 @@ async function statusPayload() {
     ccswitch: { running: ccswitch },
     // 接线状态（两端各自归属哪个提供方）。keyMatch=对 B.AI key 的匹配，
     // keyMatchSn/keyMatchWb 分别是对 SenseNova / WorkBuddy 凭据的匹配——各页各取各的对比对象。
-    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken),
-    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken),
+    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey),
+    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey),
     // B.AI 灯/接线沿用旧字段名，SenseNova 灯挂 sn 下，WorkBuddy 灯挂 wb 下
     relay: bai.relay, relayLast: bai.relayLast, upstream: bai.upstream, recent: bai.recent,
     sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, useProxy: cfg.sn?.useProxy === true },
+    zen: { relay: zen.relay, relayLast: zen.relayLast, upstream: zen.upstream, recent: zen.recent, useProxy: cfg.zen?.useProxy === true, keyConfigured: !!cfg.zen?.apiKey },
     wb: {
       relay: wb.relay, relayLast: wb.relayLast, upstream: wb.upstream, recent: wb.recent,
       useProxy: cfg.wb?.useProxy === true,
@@ -1523,6 +1580,7 @@ const lastTest = {
   bai: { ok: null, model: null, ms: null, error: null, at: null },
   sn: { ok: null, model: null, ms: null, error: null, at: null },
   wb: { ok: null, model: null, ms: null, error: null, at: null },
+  zen: { ok: null, model: null, ms: null, error: null, at: null },
 };
 
 const panel = http.createServer(async (req, res) => {
@@ -1553,6 +1611,11 @@ const panel = http.createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "wb.html")));
     }
+    // v1.0.37: OpenCode Zen 独立页面
+    if (req.method === "GET" && (u.pathname === "/zen" || u.pathname === "/opencode" || u.pathname === "/zen.html")) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      return res.end(readFileSync(path.join(HERE, "zen.html")));
+    }
     if (req.method === "GET" && u.pathname === "/api/ping") return json(res, 200, { ok: true });
     if (req.method === "GET" && u.pathname === "/api/version") return json(res, 200, { version: APP_VERSION });
 
@@ -1574,13 +1637,30 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.28: ?p=sn 时从 SenseNova 拉（境内直连，不走代理）；只保留可对话模型（output 含 text）。
     if (req.method === "GET" && u.pathname === "/api/models") {
       const pRaw = u.searchParams.get("p");
-      const p = pRaw === "sn" ? "sn" : pRaw === "wb" ? "wb" : "bai";
+      const p = pRaw === "sn" ? "sn" : pRaw === "wb" ? "wb" : pRaw === "zen" ? "zen" : "bai";
       const c2 = loadCfg();
       const S = sliceOf(c2, p);
       // WorkBuddy 没有公开的模型目录接口（模型清单随客户端 product config 下发），
       // 返回当前可选列表即可——三款免费模型由发布机默认随版本推送
       if (p === "wb") {
         return json(res, 200, { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true });
+      }
+      if (p === "zen") {
+        // Zen 提供公开模型目录（无需鉴权）；带 -free 的多数被服务端限客户端内使用，
+        // 这里如实返回并标注，供 UI 提示——不把不可用模型塞进下拉框。
+        let live = [];
+        try {
+          const fr = await fetch("https://opencode.ai/zen/v1/models", { signal: AbortSignal.timeout(15000) });
+          const jj = await fr.json();
+          live = (jj.data || []).map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean);
+        } catch { }
+        const free = live.filter((id) => id.includes("free"));
+        const knownOk = S.availableModels.filter((id) => live.includes(id) || !live.length);
+        return json(res, 200, {
+          ok: true, count: live.length, models: [...S.availableModels],
+          freeCount: free.length,
+          note: `Zen 目录共 ${live.length} 个模型，其中 ${free.length} 个标 free；实测仅 space-bunny-free 可从外部调用，其余限 OpenCode 客户端内使用`,
+        });
       }
       let j;
       if (p === "sn") {
@@ -1630,13 +1710,17 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/config") {
       const b = await readBody(req);
       const cfg = loadCfg();
-      const P = b.provider === "sn" ? "sn" : b.provider === "wb" ? "wb" : "bai";
-      const sub = P === "sn" ? cfg.sn : P === "wb" ? cfg.wb : cfg; // 共用字段（mapping/upstream/…）落点
+      const P = ["sn", "zen"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
+      const sub = P === "sn" ? cfg.sn : P === "wb" ? cfg.wb : P === "zen" ? cfg.zen : cfg; // 共用字段（mapping/upstream/…）落点
       // —— API Key（仅 B.AI / SenseNova）——
       if (typeof b.apiKey === "string" && b.apiKey.trim()) {
         const k = b.apiKey.trim();
-        if (!k.startsWith("sk-")) return json(res, 400, { error: "API Key 应以 sk- 开头" });
-        if (P === "sn") cfg.sn.apiKey = k; else if (P === "bai") cfg.apiKey = k;
+        // zen 的 key 是 oc_sk_ 开头（OpenCode Zen），其余提供方是 sk- 前缀
+        if (P === "zen") { cfg.zen.apiKey = k; }
+        else {
+          if (!k.startsWith("sk-")) return json(res, 400, { error: "API Key 应以 sk- 开头" });
+          if (P === "sn") cfg.sn.apiKey = k; else if (P === "bai") cfg.apiKey = k;
+        }
       }
       // —— WorkBuddy 令牌（出现字段即写入；空串=清除）——
       if (P === "wb") {
@@ -1719,7 +1803,7 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.28: 一键接线按提供方分流；恢复（接回 CC Switch）在 /api/restore 里保持原样
     if (req.method === "POST" && u.pathname === "/api/apply") {
       const b = await readBody(req);
-      const P = b.provider === "sn" ? "sn" : b.provider === "wb" ? "wb" : "bai";
+      const P = ["sn", "zen"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
       const cfg = loadCfg();
       const S = sliceOf(cfg, P);
       const name = PROVIDERS[P];
@@ -1742,6 +1826,7 @@ const panel = http.createServer(async (req, res) => {
       warns.push("桌面版需完全退出并重开 Claude 才生效；CLI 新开终端生效");
       if (P === "sn") warns.push("SenseNova 有 TPM/RPM 限流，探测到 429 属正常，稍候即恢复；图像模型不参与对话路由");
       if (P === "wb") warns.push("WorkBuddy 三款免费模型由 WorkBuddy 客户端账号提供（0 积分不限量）；令牌过期会自动用刷新令牌续期，无需重新接线");
+      if (P === "zen") warns.push("OpenCode Zen 的免费额度多数限客户端内使用，实测仅 space-bunny-free 可外部调用；购买 Go 订阅后可解锁 Go 通道的 30 个模型");
       log(`一键切到 ${name}: cli=${doCli} desktop=${doDesk}`);
       return json(res, 200, { ok: true, provider: P, warnings: warns, snapshot: "已自动快照切换前的配置（可用于一键恢复）" });
     }
@@ -1759,9 +1844,9 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/test") {
       const cfg = loadCfg();
       const b = await readBody(req).catch(() => ({}));
-      const P = b.provider === "sn" ? "sn" : b.provider === "wb" ? "wb" : "bai";
+      const P = ["sn", "zen"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
       const S = sliceOf(cfg, P);
-      const store = P === "sn" ? recentCallsSn : P === "wb" ? recentCallsWb : recentCallsBai;
+      const store = P === "sn" ? recentCallsSn : P === "wb" ? recentCallsWb : P === "zen" ? recentCallsZen : recentCallsBai;
       const active = b.all ? null : activeTier(store);
       const targets = active ? [active] : TIERS.map((t) => t.key);
       const tierInfo = (key) => {
@@ -1833,7 +1918,7 @@ const panel = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && u.pathname === "/api/service/stop") {
-      json(res, 200, { ok: true, message: "服务即将停止（B.AI / SenseNova / WorkBuddy 中转一并停止）" });
+      json(res, 200, { ok: true, message: "服务即将停止（B.AI / SenseNova / WorkBuddy / OpenCode Zen 中转一并停止）" });
       log("收到停止指令，进程退出");
       setTimeout(() => process.exit(0), 300);
       return;
@@ -1955,7 +2040,7 @@ function listenWithRetry(srv, port, name) {
     if (e.code !== "EADDRINUSE") { log(`${name} 端口错误: ${e.message}`); process.exit(1); }
     if (attempts === 1) log(`${name} 端口 :${port} 暂被占用（多为重启交接），每 600ms 重试，最多 15 秒`);
     let peerHealthy = false;
-    if (!relay.listening && !snRelay.listening && !wbRelay.listening && !panel.listening) {
+    if (!relay.listening && !snRelay.listening && !wbRelay.listening && !zenRelay.listening && !panel.listening) {
       try {
         const pr = await fetch(`http://127.0.0.1:${cfg0.panelPort}/api/ping`, { signal: AbortSignal.timeout(1200) });
         peerHealthy = pr.ok;
@@ -1987,6 +2072,7 @@ function listenWithRetry(srv, port, name) {
 listenWithRetry(relay, cfg0.relayPort, "中转");
 listenWithRetry(snRelay, cfg0.sn.relayPort, "SenseNova中转");
 listenWithRetry(wbRelay, cfg0.wb.relayPort, "WorkBuddy中转");
+listenWithRetry(zenRelay, cfg0.zen.relayPort, "OpenCodeZen中转");
 listenWithRetry(panel, cfg0.panelPort, "面板");
 // 成功绑定中转端口 = 本实例成为唯一的活跃服务者，此时才允许合并配置/跑周期探测
 relay.once("listening", () => setTimeout(onActivated, 300));

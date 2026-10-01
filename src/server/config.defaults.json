@@ -133,5 +133,33 @@
     "deviceToken": "",
     "userId": "91a1b55c-54b8-4257-81b5-59263f1029e5",
     "useProxy": false
+  },
+  "zen": {
+    "apiKey": "",
+    "upstream": "https://opencode.ai/zen/v1",
+    "relayPort": 15752,
+    "defaultModel": "space-bunny-free",
+    "availableModels": [
+      "space-bunny-free"
+    ],
+    "mapping": {
+      "claude-fable-5": {
+        "target": "space-bunny-free",
+        "label": "Space-Bunny-Free"
+      },
+      "claude-sonnet-5": {
+        "target": "space-bunny-free",
+        "label": "Space-Bunny-Free"
+      },
+      "claude-opus-5": {
+        "target": "space-bunny-free",
+        "label": "Space-Bunny-Free"
+      },
+      "claude-haiku-4-5": {
+        "target": "space-bunny-free",
+        "label": "Space-Bunny-Free"
+      }
+    },
+    "useProxy": false
   }
 }
