@@ -6,6 +6,9 @@
 <title>B.AI 路由台</title>
 <style>
   :root {
+    --scroll-thumb: #33363f;
+    --scroll-thumb-h: #454957;
+    --banner-bg: #23252d;
     --shadow: 0 8px 28px rgba(0,0,0,.5);
     --glow: .8;
     --led-off: #3a4247;
@@ -30,6 +33,9 @@
   }
   /* 浅色主题（由右上角按钮切换；默认暗色） */
   html[data-theme="light"] {
+    --scroll-thumb: #c9c9c4;
+    --scroll-thumb-h: #a8a8a2;
+    --banner-bg: #ffffff;
     --shadow: 0 8px 24px rgba(24,22,40,.12);
     --glow: .35;
     --led-off: #b9bdc7;
@@ -56,7 +62,7 @@
     background: #33363f; border-radius: 99px;
     border: 3px solid var(--bg);
   }
-  ::-webkit-scrollbar-thumb:hover { background: #454957; border: 2px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-h); border: 2px solid var(--bg); }
   ::-webkit-scrollbar-corner { background: var(--bg); }
   ::selection { background: rgba(232,163,61,.35); }
   html { background: var(--bg); }
@@ -99,6 +105,7 @@
   /* 非 Electron 环境（浏览器直开面板）不显示窗口按钮 */
   body.no-frame header { padding-top: 28px; }
   body.no-frame .winCtrls { display: none; }
+  body.no-frame .themeBtn { right: 16px; }   /* 浏览器直开：没有窗口按钮，无需让位 */
   header h1 { padding-left: 4px; }
   .logo-dot {
     width: 11px; height: 11px; border-radius: 50%;
@@ -267,7 +274,7 @@
   /* ---------- 内嵌通知横幅（替代系统弹窗/气泡） ---------- */
   .banner-wrap { position: fixed; right: 18px; bottom: 18px; z-index: 50; display: flex; flex-direction: column; gap: 10px; max-width: 360px; }
   .banner {
-    background: #23252d; border: 1px solid var(--line); border-left: 3px solid var(--amber);
+    background: var(--banner-bg); border: 1px solid var(--line); border-left: 3px solid var(--amber);
     border-radius: 9px; padding: 12px 14px; font-size: 13px; color: var(--ink);
     box-shadow: var(--shadow); display: none; animation: rise .25s ease;
   }
@@ -299,7 +306,7 @@
   #stopBtn { color: #b06a6a; }
 
   /* 主题切换按钮 */
-  .themeBtn { position: fixed; top: 14px; right: 16px; z-index: 60; display: flex; align-items: center; gap: 6px;
+  .themeBtn { position: fixed; top: 14px; right: 152px; z-index: 60; display: flex; align-items: center; gap: 6px;
     font-family: var(--mono); font-size: 11px; letter-spacing: 1px; color: var(--dim); background: var(--panel);
     border: 1px solid var(--line); border-radius: 99px; padding: 6px 12px; cursor: pointer; }
   .themeBtn:hover { color: var(--ink); border-color: var(--dim); }

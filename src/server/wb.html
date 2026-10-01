@@ -7,6 +7,9 @@
 <style>
   /* WorkBuddy 页：与 B.AI/SenseNova 页同构，紫色主色，独立导航 tab */
   :root {
+    --scroll-thumb: #3a3450;
+    --scroll-thumb-h: #4a4364;
+    --banner-bg: #262133;
     --shadow: 0 8px 28px rgba(0,0,0,.5);
     --glow: .8;
     --led-off: #3a4247;
@@ -31,6 +34,9 @@
   }
   /* 浅色主题（由右上角按钮切换；默认暗色） */
   html[data-theme="light"] {
+    --scroll-thumb: #cdc4e0;
+    --scroll-thumb-h: #b5a9cf;
+    --banner-bg: #ffffff;
     --shadow: 0 8px 24px rgba(24,22,40,.12);
     --glow: .35;
     --led-off: #b9bdc7;
@@ -52,8 +58,8 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   ::-webkit-scrollbar { width: 11px; height: 11px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
-  ::-webkit-scrollbar-thumb { background: #3a3450; border-radius: 99px; border: 3px solid var(--bg); }
-  ::-webkit-scrollbar-thumb:hover { background: #4a4364; }
+  ::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 99px; border: 3px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-h); }
   ::-webkit-scrollbar-corner { background: var(--bg); }
   ::selection { background: rgba(155,127,240,.35); }
   html { background: var(--bg); }
@@ -89,6 +95,7 @@
   /* 非 Electron 环境（浏览器直开面板）不显示窗口按钮 */
   body.no-frame header { padding-top: 28px; }
   body.no-frame .winCtrls { display: none; }
+  body.no-frame .themeBtn { right: 16px; }   /* 浏览器直开：没有窗口按钮，无需让位 */
   header h1 { padding-left: 4px; }
   .logo-dot { width: 11px; height: 11px; border-radius: 50%; background: var(--accent); align-self: center; box-shadow: 0 0 10px rgba(155,127,240,.8); }
   h1 { font-size: 20px; font-weight: 600; letter-spacing: 1px; }
@@ -190,7 +197,7 @@
   .result.good { border-color: rgba(87,184,120,.4); color: var(--good-text); }
   .result.bad { border-color: rgba(224,93,93,.45); color: var(--bad-text); }
   .banner-wrap { position: fixed; right: 18px; bottom: 18px; z-index: 50; display: flex; flex-direction: column; gap: 10px; max-width: 360px; }
-  .banner { background: #262133; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 9px; padding: 12px 14px; font-size: 13px; color: var(--ink); box-shadow: var(--shadow); display: none; position: relative; animation: rise .25s ease; }
+  .banner { background: var(--banner-bg); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 9px; padding: 12px 14px; font-size: 13px; color: var(--ink); box-shadow: var(--shadow); display: none; position: relative; animation: rise .25s ease; }
   .banner.show { display: block; }
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
   @media (prefers-reduced-motion: reduce) { .banner { animation: none; } }
@@ -227,7 +234,7 @@
   .tokstat b.warn { color: var(--err); }
 
   /* 主题切换按钮 */
-  .themeBtn { position: fixed; top: 14px; right: 16px; z-index: 60; display: flex; align-items: center; gap: 6px;
+  .themeBtn { position: fixed; top: 14px; right: 152px; z-index: 60; display: flex; align-items: center; gap: 6px;
     font-family: var(--mono); font-size: 11px; letter-spacing: 1px; color: var(--dim); background: var(--panel);
     border: 1px solid var(--line); border-radius: 99px; padding: 6px 12px; cursor: pointer; }
   .themeBtn:hover { color: var(--ink); border-color: var(--dim); }

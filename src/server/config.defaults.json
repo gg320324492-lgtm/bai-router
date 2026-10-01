@@ -112,8 +112,8 @@
     ],
     "mapping": {
       "claude-fable-5": {
-        "target": "deepseek-v4.1-flash",
-        "label": "DeepSeek-V4.1-Flash"
+        "target": "hy4-preview-f",
+        "label": "Hy4-Preview-F"
       },
       "claude-sonnet-5": {
         "target": "hy4-preview-f",
@@ -124,8 +124,8 @@
         "label": "HY3"
       },
       "claude-haiku-4-5": {
-        "target": "deepseek-v4.1-flash",
-        "label": "DeepSeek-V4.1-Flash"
+        "target": "hy4-preview-f",
+        "label": "Hy4-Preview-F"
       }
     },
     "accessToken": "",
