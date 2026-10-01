@@ -70,6 +70,37 @@
       "label": "MiMo-V2.5"
     }
   },
+  "sn": {
+    "apiKey": "",
+    "upstream": "https://token.sensenova.cn",
+    "relayPort": 15732,
+    "defaultModel": "sensenova-6.8-flash-lite",
+    "availableModels": [
+      "sensenova-6.8-flash-lite",
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+      "glm-5.2",
+      "kimi-k3"
+    ],
+    "mapping": {
+      "claude-fable-5": {
+        "target": "sensenova-6.8-flash-lite",
+        "label": "SenseNova 6.8 Flash-Lite"
+      },
+      "claude-sonnet-5": {
+        "target": "sensenova-6.8-flash-lite",
+        "label": "SenseNova 6.8 Flash-Lite"
+      },
+      "claude-opus-5": {
+        "target": "sensenova-6.8-flash-lite",
+        "label": "SenseNova 6.8 Flash-Lite"
+      },
+      "claude-haiku-4-5": {
+        "target": "sensenova-6.8-flash-lite",
+        "label": "SenseNova 6.8 Flash-Lite"
+      }
+    }
+  },
   "wb": {
     "relayPort": 15742,
     "upstream": "https://www.workbuddy.ai",
@@ -102,36 +133,5 @@
     "deviceToken": "",
     "userId": "91a1b55c-54b8-4257-81b5-59263f1029e5",
     "useProxy": false
-  },
-  "sn": {
-    "apiKey": "",
-    "upstream": "https://token.sensenova.cn",
-    "relayPort": 15732,
-    "defaultModel": "sensenova-6.8-flash-lite",
-    "availableModels": [
-      "sensenova-6.8-flash-lite",
-      "deepseek-v4-pro",
-      "deepseek-v4-flash",
-      "glm-5.2",
-      "kimi-k3"
-    ],
-    "mapping": {
-      "claude-fable-5": {
-        "target": "sensenova-6.8-flash-lite",
-        "label": "SenseNova 6.8 Flash-Lite"
-      },
-      "claude-sonnet-5": {
-        "target": "sensenova-6.8-flash-lite",
-        "label": "SenseNova 6.8 Flash-Lite"
-      },
-      "claude-opus-5": {
-        "target": "sensenova-6.8-flash-lite",
-        "label": "SenseNova 6.8 Flash-Lite"
-      },
-      "claude-haiku-4-5": {
-        "target": "sensenova-6.8-flash-lite",
-        "label": "SenseNova 6.8 Flash-Lite"
-      }
-    }
   }
 }
