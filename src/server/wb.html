@@ -145,6 +145,30 @@
   .banner .x { position: absolute; right: 8px; top: 6px; background: none; border: none; color: var(--dim); cursor: pointer; font-size: 14px; padding: 0; }
   footer { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; font-family: var(--mono); font-size: 10.5px; color: var(--dim); margin-top: 8px; }
   footer .paths { flex: 1; min-width: 260px; }
+  /* 两步引导 */
+  .step { display: flex; gap: 16px; padding: 18px 0; border-bottom: 1px dashed var(--line); }
+  .step:last-of-type { border-bottom: none; padding-bottom: 6px; }
+  .stepNo { width: 128px; flex: none; }
+  .stepNo .num { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 50%; background: var(--panel2); border: 1px solid var(--line); color: var(--dim); font-family: var(--mono); font-size: 13px; font-weight: 700; }
+  .step.done .stepNo .num { background: var(--ok); border-color: var(--ok); color: #06210f; }
+  .step.active .stepNo .num { background: var(--accent); border-color: var(--accent); color: #17102b; }
+  .stepTitle { font-size: 14px; font-weight: 600; margin-top: 8px; }
+  .stepState { font-family: var(--mono); font-size: 10.5px; color: var(--dim); margin-top: 3px; }
+  .step.done .stepState { color: var(--ok); }
+  .step.active .stepState { color: var(--accent); }
+  .stepBody { flex: 1; padding-top: 2px; }
+  .stepDesc { font-size: 12.5px; color: var(--dim); margin-bottom: 12px; line-height: 1.6; }
+  .stepAct { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .stepHint { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .step.locked .btn-main { opacity: .45; }
+  @media (max-width: 700px) { .step { flex-direction: column; gap: 8px; } .stepNo { width: auto; } .stepTitle { display: inline-block; margin: 0 0 0 8px; } .stepState { display: inline-block; margin-left: 8px; } }
+  /* 捕获等待进度 */
+  .progress { display: flex; gap: 14px; align-items: center; margin-top: 14px; padding: 14px 16px; border: 1px solid rgba(155,127,240,.45); background: var(--accent-soft); border-radius: 9px; }
+  .progress .spin { width: 20px; height: 20px; flex: none; border: 2px solid rgba(155,127,240,.3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .progress .spin { animation: none; } }
+  .progress .pTitle { font-size: 13px; font-weight: 600; }
+  .progress .pDesc { font-size: 12px; color: var(--dim); margin-top: 3px; }
   .tokstat { display: flex; gap: 14px; flex-wrap: wrap; font-family: var(--mono); font-size: 11px; color: var(--dim); margin-bottom: 10px; }
   .tokstat b { color: var(--ink); font-weight: 600; }
   .tokstat b.warn { color: var(--err); }
@@ -183,10 +207,61 @@
     </div>
   </div>
 
+  <!-- 使用指引（两步） -->
+  <div class="card guide">
+    <div class="head">
+      <span class="eyebrow">用法</span><span class="title">两步开始使用（新电脑照做即可）</span>
+      <span class="aux" id="guideAux"></span>
+    </div>
+    <div class="body">
+      <div class="step" id="step1">
+        <div class="stepNo">
+          <span class="num">1</span>
+          <div class="stepTitle">一键获取令牌</div>
+          <div class="stepState" id="state1">检测中…</div>
+        </div>
+        <div class="stepBody">
+          <div class="stepDesc">自动从本机 WorkBuddy 客户端取登录令牌（令牌只存内存，必须取一次）。</div>
+          <div class="stepAct">
+            <button class="btn-main" id="btnCapture">一键获取令牌</button>
+            <span class="stepHint" id="hint1"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="step" id="step2">
+        <div class="stepNo">
+          <span class="num">2</span>
+          <div class="stepTitle">接入 WorkBuddy</div>
+          <div class="stepState" id="state2">等待上一步</div>
+        </div>
+        <div class="stepBody">
+          <div class="stepDesc">把 Claude Code（终端 + 桌面版）接到 WorkBuddy 的三款免费模型。</div>
+          <div class="stepAct">
+            <button class="btn-main" id="btnWb">一键接入 WorkBuddy</button>
+            <div class="checks">
+              <label><input type="checkbox" id="ckCli" checked>终端 CLI</label>
+              <label><input type="checkbox" id="ckDesk" checked>桌面版</label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="result" id="applyResult"></div>
+      <div class="progress" id="captureProgress" style="display:none">
+        <div class="spin"></div>
+        <div>
+          <div class="pTitle" id="pTitle">正在等待 WorkBuddy 触发…</div>
+          <div class="pDesc" id="pDesc"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- 接线 -->
   <div class="card">
     <div class="head">
-      <span class="eyebrow">01</span><span class="title">当前接线</span>
+      <span class="eyebrow">状态</span><span class="title">当前接线</span>
       <span class="aux" id="patchTime"></span>
     </div>
     <div class="body">
@@ -204,22 +279,16 @@
       <div class="notice" id="notice"></div>
 
       <div class="actions">
-        <button class="btn-main" id="btnWb">接通 WorkBuddy</button>
         <button class="btn-ghost" id="btnRestore">接回 CC Switch</button>
-        <div class="checks">
-          <label><input type="checkbox" id="ckCli" checked>终端 CLI</label>
-          <label><input type="checkbox" id="ckDesk" checked>桌面版</label>
-        </div>
       </div>
       <div class="hint">接通后：终端 CLI 与桌面版都指向本地协议桥 <span id="hintRelayPort">:15742</span>（CLI 讲 Anthropic 协议、WorkBuddy 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。</div>
-      <div class="result" id="applyResult"></div>
     </div>
   </div>
 
   <!-- 路由表 -->
   <div class="card">
     <div class="head">
-      <span class="eyebrow">02</span><span class="title">路由表 · 模型映射（三款免费模型）</span>
+      <span class="eyebrow">模型</span><span class="title">路由表 · 模型映射（三款免费模型）</span>
       <span class="aux">改完保存即生效，无需重启</span>
     </div>
     <div class="body">
@@ -241,11 +310,11 @@
     </div>
   </div>
 
-  <!-- 令牌 -->
-  <div class="card">
-    <div class="head">
-      <span class="eyebrow">03</span><span class="title">WorkBuddy 令牌</span>
-      <span class="aux">JWT · 自动续期</span>
+  <!-- 令牌（高级：手动填写，平时用不到） -->
+  <div class="card foldable collapsed" id="cardTok">
+    <div class="head" id="headTok">
+      <span class="eyebrow">高级</span><span class="title">手动填写令牌</span>
+      <span class="aux">平时用不到 · 一键获取失败时的备用方式</span>
     </div>
     <div class="body">
       <div class="tokstat" id="tokStat">正在读取令牌状态…</div>
@@ -269,9 +338,9 @@
       </div>
 
       <div class="hint" style="margin-top:12px">
-        令牌怎么来：WorkBuddy 客户端登录后，令牌只存内存、不上明盘，需要捕获一次。方法：启动 WorkBuddy → 开一个会话发条消息 →
-        同时抓取其发出的 <b>POST https://www.workbuddy.ai/v2/chat/completions</b> 请求头里的 Authorization（去掉 "Bearer "）、
-        X-Refresh-Token、X-Device-Token、X-User-Id 粘到这里（F12 开发者工具 Network 面板最方便）。保存后中转会自动维护续期。
+        仅在「一键获取令牌」失败时使用。手动拿令牌：浏览器里登录 <b>workbuddy.ai</b>，按 F12 打开开发者工具 → Network，
+        随便发一条对话，点开 <b>/v2/chat/completions</b> 请求，把请求头里的 Authorization（去掉开头的 "Bearer "）、
+        X-Refresh-Token、X-Device-Token、X-User-Id 依次粘到上面四个框，点保存。令牌有效期约一年，到期会自动续期。
       </div>
 
       <div class="saverow">
@@ -284,7 +353,7 @@
   <!-- WorkBuddy 设置 -->
   <div class="card foldable" id="cardSys">
     <div class="head" id="headSys">
-      <span class="eyebrow">04</span><span class="title">WorkBuddy 设置</span>
+      <span class="eyebrow">设置</span><span class="title">WorkBuddy 设置</span>
       <span class="aux">上游 / 中转端口 / 通道</span>
     </div>
     <div class="body">
@@ -514,6 +583,7 @@ async function refreshConfig() {
   renderRoute();
   renderTokens();
   renderSys();
+  renderSteps();
 }
 
 async function poll() {
@@ -521,6 +591,7 @@ async function poll() {
   try {
     const s = await api("/api/status");
     renderStatus(s);
+    renderSteps();
   } catch {
     $("svc").innerHTML = `服务 <b class="off">○</b> 已停止`;
     setLed($("ledRelay"), "r");
@@ -541,13 +612,88 @@ async function withBusy(btn, fn) {
   finally { btn.disabled = false; btn.textContent = old; busy = false; poll(); }
 }
 
+/* ---------- 两步引导：状态与动作 ---------- */
+function tokenReady() { return !!(wbCfg && wbCfg.wb && wbCfg.wb.accessToken); }
+function wiredToWb() { return !!status && ((status.cli.mode === "wb") || (status.desktop.mode === "wb")); }
+
+function renderSteps() {
+  const s1 = $("step1"), s2 = $("step2");
+  const tok = tokenReady();
+  const wired = wiredToWb();
+  // 步骤一
+  s1.classList.toggle("done", tok);
+  s1.classList.toggle("active", !tok);
+  $("state1").textContent = tok ? "✓ 已完成" : "待完成";
+  $("btnCapture").textContent = tok ? "重新获取令牌" : "一键获取令牌";
+  // 步骤二
+  s2.classList.toggle("done", tok && wired);
+  s2.classList.toggle("active", tok && !wired);
+  s2.classList.toggle("locked", !tok);
+  $("btnWb").disabled = !tok || busy;
+  $("state2").textContent = !tok ? "等待步骤一完成" : (wired ? "✓ 已接入" : "待完成");
+  $("state2").style.color = (!tok) ? "" : (wired ? "var(--ok)" : "var(--accent)");
+  $("hint1").textContent = tok ? "" : "本机需已安装并登录 WorkBuddy 客户端";
+  $("guideAux").textContent = (tok && wired) ? "全部就绪" : (tok ? "还差第 2 步" : "从第 1 步开始");
+}
+
+// 捕获期间的"等待中"面板（轮播提示，缓解等待焦虑）
+let capTimer = null, capTick = 0;
+const CAP_TIPS = [
+  "正在等待 WorkBuddy 触发…",
+  "如果 10 秒内没反应，请打开 WorkBuddy 客户端随便发一条消息",
+  "钩子已就位，WorkBuddy 一跑起来就会自动抓到令牌",
+  "仍在等待中…（最长 2 分 30 秒，可随时关闭页面重试）",
+];
+function showCaptureProgress(on) {
+  const box = $("captureProgress");
+  box.style.display = on ? "flex" : "none";
+  clearInterval(capTimer);
+  if (!on) return;
+  capTick = 0;
+  $("pTitle").textContent = CAP_TIPS[0];
+  $("pDesc").textContent = "完成后会自动还原对 WorkBuddy 的临时改动，不影响它正常使用。";
+  capTimer = setInterval(() => {
+    capTick = Math.min(capTick + 1, CAP_TIPS.length - 1);
+    $("pTitle").textContent = CAP_TIPS[capTick];
+  }, 12000);
+}
+
+$("btnCapture").addEventListener("click", async () => {
+  const btn = $("btnCapture");
+  busy = true; btn.disabled = true; btn.textContent = "获取中…";
+  showCaptureProgress(true);
+  showResult($("applyResult"), "正在获取令牌，请按提示操作 WorkBuddy…", true);
+  try {
+    const r = await api("/api/wb/capture", { method: "POST" });
+    if (r.ok) {
+      showResult($("applyResult"), "✔ 令牌获取成功（" + (r.masked || "") + "），已自动填入并保存。\n接下来点第 2 步「一键接入 WorkBuddy」即可。", true);
+      showInfo("令牌已获取", "第 1 步完成，接下来点「一键接入 WorkBuddy」。");
+    } else {
+      showResult($("applyResult"), "✘ 获取失败：" + r.error + "\n可展开下方「手动填写令牌」作为备用方式。", false);
+    }
+  } catch (e) {
+    showResult($("applyResult"), "✘ 获取失败：" + e.message, false);
+  } finally {
+    showCaptureProgress(false);
+    busy = false; btn.disabled = false;
+    await refreshConfig().catch(() => { });
+    await poll();
+    renderSteps();
+  }
+});
+
 $("btnWb").addEventListener("click", () => withBusy($("btnWb"), async () => {
+  if (!tokenReady()) {
+    showResult($("applyResult"), "请先完成第 1 步「一键获取令牌」。", false);
+    return;
+  }
   const r = await api("/api/apply", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ provider: PROVIDER, cli: $("ckCli").checked, desktop: $("ckDesk").checked }),
   });
   showResult($("applyResult"),
-    "✔ 已接通 WorkBuddy（切换前配置已自动快照）\n" + r.warnings.map((w) => "· " + w).join("\n"), true);
+    "✔ 已接入 WorkBuddy（切换前配置已自动快照）\n" + r.warnings.map((w) => "· " + w).join("\n"), true);
+  showInfo("接入完成", "现在可以在 Claude Code 的模型菜单里选择 WorkBuddy 的三款免费模型了。");
 }));
 
 $("btnRestore").addEventListener("click", () => withBusy($("btnRestore"), async () => {
@@ -654,6 +800,19 @@ $("btnResetModels").addEventListener("click", () => withBusy($("btnResetModels")
   await refreshConfig();
   showResult($("sysResult"), "✔ 已恢复为三款免费模型：" + DEFAULT_WB_MODELS.join("、"), true);
 }));
+
+/* 手动令牌卡折叠 */
+(() => {
+  const card = $("cardTok"), head = $("headTok");
+  if (!card || !head) return;
+  head.setAttribute("tabindex", "0");
+  head.setAttribute("role", "button");
+  const sync = () => head.setAttribute("aria-expanded", String(!card.classList.contains("collapsed")));
+  sync();
+  const toggle = () => { card.classList.toggle("collapsed"); sync(); };
+  head.addEventListener("click", toggle);
+  head.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
+})();
 
 /* WorkBuddy 设置卡折叠 */
 (() => {
