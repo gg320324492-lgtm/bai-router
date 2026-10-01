@@ -6,6 +6,13 @@
 <title>B.AI 路由台</title>
 <style>
   :root {
+    --shadow: 0 8px 28px rgba(0,0,0,.5);
+    --glow: .8;
+    --led-off: #3a4247;
+    --good-text: #a9dcb9;
+    --bad-text: #e8a7a7;
+    --on-accent: #17102b;
+    --on-accent-ok: #06210f;
     color-scheme: dark; /* 让原生控件(下拉弹层/滚动条)跟随深色，不再白底出戏 */
     --bg: #16171b;
     --panel: #1d1f25;
@@ -21,6 +28,26 @@
     --mono: "Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace;
     --sans: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   }
+  /* 浅色主题（由右上角按钮切换；默认暗色） */
+  html[data-theme="light"] {
+    --shadow: 0 8px 24px rgba(24,22,40,.12);
+    --glow: .35;
+    --led-off: #b9bdc7;
+    --good-text: #1f7a45;
+    --bad-text: #b3352f;
+    --on-accent: #ffffff;
+    --on-accent-ok: #ffffff;
+    color-scheme: light;
+    --bg: #f6f6f4;
+    --panel: #ffffff;
+    --panel2: #efefec;
+    --line: #dcdcd6;
+    --amber: #c07d16;
+    --amber-soft: rgba(192,125,22,.12);
+    --ink: #23242a;
+    --dim: #6d707a;
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
   /* 深色滚动条（与主题统一，替代 Electron 默认白色滚动条） */
   ::-webkit-scrollbar { width: 11px; height: 11px; }
@@ -53,7 +80,7 @@
   .logo-dot {
     width: 11px; height: 11px; border-radius: 50%;
     background: var(--amber); align-self: center;
-    box-shadow: 0 0 10px rgba(232,163,61,.8);
+    box-shadow: 0 0 10px rgba(232,163,61,var(--glow));
   }
   h1 { font-size: 20px; font-weight: 600; letter-spacing: 1px; }
   h1 small { font-family: var(--mono); font-size: 11px; color: var(--dim); letter-spacing: 3px; margin-left: 10px; font-weight: 400; }
@@ -103,7 +130,7 @@
   }
   .lamp .name { font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--dim); text-transform: uppercase; }
   .lamp .val { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; }
-  .led { width: 9px; height: 9px; border-radius: 50%; background: #3a3d47; flex: none; }
+  .led { width: 9px; height: 9px; border-radius: 50%; background: var(--led-off); flex: none; }
   .led.g { background: var(--ok); box-shadow: 0 0 8px rgba(87,184,120,.7); }
   .led.r { background: var(--err); box-shadow: 0 0 8px rgba(224,93,93,.7); }
   .led.a { background: var(--amber); box-shadow: 0 0 8px rgba(232,163,61,.7); }
@@ -121,8 +148,8 @@
   .patch .who .keyfp { display: block; font-family: var(--mono); font-size: 10px; margin-top: 2px; cursor: help; }
   .patch .wire { flex: 1; display: flex; align-items: center; min-width: 60px; }
   .patch .wire svg { width: 100%; height: 12px; display: block; overflow: visible; }
-  .patch .wire .ln { stroke: var(--wire, #3a3d47); stroke-width: 1.5; }
-  .patch .wire .arw { fill: var(--wire, #3a3d47); }
+  .patch .wire .ln { stroke: var(--wire, var(--led-off)); stroke-width: 1.5; }
+  .patch .wire .arw { fill: var(--wire, var(--led-off)); }
   .patch.state-bai { --wire: var(--amber); }
   .patch.state-cc { --wire: var(--blue); }
   .patch.state-bai .ln, .patch.state-cc .ln { stroke-dasharray: 7 5; animation: wireflow 1.1s linear infinite; }
@@ -219,7 +246,7 @@
   .banner {
     background: #23252d; border: 1px solid var(--line); border-left: 3px solid var(--amber);
     border-radius: 9px; padding: 12px 14px; font-size: 13px; color: var(--ink);
-    box-shadow: 0 8px 28px rgba(0,0,0,.5); display: none; animation: rise .25s ease;
+    box-shadow: var(--shadow); display: none; animation: rise .25s ease;
   }
   .banner.show { display: block; }
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
@@ -238,8 +265,8 @@
     white-space: pre-wrap; word-break: break-all;
   }
   .result.show { display: block; }
-  .result.good { border-color: rgba(87,184,120,.4); color: #a9dcb9; }
-  .result.bad { border-color: rgba(224,93,93,.45); color: #e8a7a7; }
+  .result.good { border-color: rgba(87,184,120,.4); color: var(--good-text); }
+  .result.bad { border-color: rgba(224,93,93,.45); color: var(--bad-text); }
 
   footer {
     display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
@@ -247,9 +274,17 @@
   }
   footer .paths { flex: 1; min-width: 260px; }
   #stopBtn { color: #b06a6a; }
+
+  /* 主题切换按钮 */
+  .themeBtn { position: fixed; top: 14px; right: 16px; z-index: 60; display: flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 11px; letter-spacing: 1px; color: var(--dim); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 99px; padding: 6px 12px; cursor: pointer; }
+  .themeBtn:hover { color: var(--ink); border-color: var(--dim); }
 </style>
 </head>
 <body>
+<button class="themeBtn" id="themeBtn" type="button" title="切换亮色 / 暗色主题"><span id="themeIcon">☾</span><span id="themeText">暗色</span></button>
+
 <div class="wrap">
 
   <header>
@@ -949,6 +984,33 @@ $("btnProxyDetect").addEventListener("click", async () => {
 poll();
 refreshConfig().catch((e) => showResult($("applyResult"), "配置加载失败：" + e.message, false));
 setInterval(poll, 5000);
+
+/* 主题切换（三页共用同一选择，localStorage 记忆；首次跟随系统深浅偏好） */
+(() => {
+  const KEY = "bai.theme";
+  const apply = (t) => {
+    document.documentElement.setAttribute("data-theme", t);
+    const i = document.getElementById("themeIcon"), x = document.getElementById("themeText");
+    if (i) i.textContent = t === "light" ? "☀" : "☾";
+    if (x) x.textContent = t === "light" ? "亮色" : "暗色";
+  };
+  let t = null;
+  try { t = localStorage.getItem(KEY); } catch { }
+  if (!t) {
+    // 没选过 → 跟随系统；系统也没说就保持暗色（与历史表现一致）
+    try { t = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"; }
+    catch (e) { t = "dark"; }
+  }
+  apply(t);
+  const btn = document.getElementById("themeBtn");
+  if (btn) btn.addEventListener("click", () => {
+    t = (document.documentElement.getAttribute("data-theme") === "light") ? "dark" : "light";
+    try { localStorage.setItem(KEY, t); } catch { }
+    apply(t);
+  });
+  // 跨页同步（同源其它标签页切换时跟随）
+  window.addEventListener("storage", (e) => { if (e.key === KEY && e.newValue) apply(e.newValue); });
+})();
 </script>
 </body>
 </html>

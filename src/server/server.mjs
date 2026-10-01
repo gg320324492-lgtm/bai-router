@@ -694,7 +694,10 @@ async function wbCaptureRestore() {
 }
 
 async function wbCaptureToken(timeoutMs = 150000) {
-  if (wbCapState.active) throw new Error("已有一次捕获正在进行，请稍候");
+  if (wbCapState.active) {
+    const secs = Math.round((Date.now() - wbCapState.startedAt) / 1000);
+    throw new Error(`上一次获取还在进行中（已等待 ${secs} 秒）。请在 WorkBuddy 客户端里发一条消息，或稍候重试`);
+  }
   const script = await findWbCliScript();
   if (!script) throw new Error("未找到 WorkBuddy 程序（请确认本机已安装 WorkBuddy AI 客户端）");
   const outFile = path.join(DATA_DIR, "wb-captured-token.json");
@@ -728,7 +731,9 @@ async function wbCaptureToken(timeoutMs = 150000) {
             if (obj.deviceToken) cfg.wb.deviceToken = obj.deviceToken;
             if (obj.userId) cfg.wb.userId = obj.userId;
             saveCfg(cfg);
-            log("WorkBuddy 令牌捕获：成功");
+            // 抓到即还原：不等超时，立刻让 WorkBuddy 的脚本恢复原状
+            await wbCaptureRestore();
+            log("WorkBuddy 令牌捕获：成功（钩子已立即还原）");
             return { ok: true, masked: keyFp(obj.accessToken) };
           }
         }
