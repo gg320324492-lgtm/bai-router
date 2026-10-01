@@ -3,56 +3,56 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WorkBuddy 路由 · B.AI 路由台</title>
+<title>Qoder 路由 · B.AI 路由台</title>
 <style>
-  /* WorkBuddy 页：与 B.AI/SenseNova 页同构，紫色主色，独立导航 tab */
+  /* Qoder 页：与其它页同构，青蓝主色，独立导航 tab */
   :root {
-    --scroll-thumb: #3a3450;
-    --scroll-thumb-h: #4a4364;
-    --banner-bg: #262133;
+    --scroll-thumb: #33454f;
+    --scroll-thumb-h: #42555f;
+    --banner-bg: #1c2a31;
     --shadow: 0 8px 28px rgba(0,0,0,.5);
     --glow: .8;
     --led-off: #3a4247;
     --good-text: #a9dcb9;
     --bad-text: #e8a7a7;
-    --on-accent: #17102b;
+    --on-accent: #0d2b33;
     --on-accent-ok: #06210f;
     color-scheme: dark;
-    --bg: #16141c;
-    --panel: #1d1a25;
-    --panel2: #242030;
-    --line: #322c40;
-    --accent: #9b7ff0;
-    --accent-soft: rgba(155,127,240,.14);
+    --bg: #131a1e;
+    --panel: #19232a;
+    --panel2: #1f2c34;
+    --line: #2b3b45;
+    --accent: #3fa8c4;
+    --accent-soft: rgba(63,168,196,.14);
     --ok: #57b878;
     --err: #e05d5d;
     --blue: #6b9bd8;
-    --ink: #e8e4f0;
-    --dim: #918aa0;
+    --ink: #e2ecf0;
+    --dim: #8798a2;
     --mono: "Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace;
     --sans: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   }
   /* 浅色主题（由右上角按钮切换；默认暗色） */
   html[data-theme="light"] {
-    --scroll-thumb: #cdc4e0;
-    --scroll-thumb-h: #b5a9cf;
+    --scroll-thumb: #cfe0e5;
+    --scroll-thumb-h: #b3c9d2;
     --banner-bg: #ffffff;
     --shadow: 0 8px 24px rgba(24,22,40,.12);
     --glow: .35;
-    --led-off: #b9bdc7;
+    --led-off: #c2ced3;
     --good-text: #1f7a45;
     --bad-text: #b3352f;
     --on-accent: #ffffff;
     --on-accent-ok: #ffffff;
     color-scheme: light;
-    --bg: #f6f4fb;
+    --bg: #f2f7f8;
     --panel: #ffffff;
-    --panel2: #efeafc;
-    --line: #ddd5f0;
-    --accent: #6a4fd0;
+    --panel2: #e6f0f2;
+    --line: #d3e4e9;
+    --accent: #2b7f96;
     --accent-soft: rgba(106,79,208,.12);
-    --ink: #241f33;
-    --dim: #6b6480;
+    --ink: #1e2c33;
+    --dim: #61757e;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -61,12 +61,12 @@
   ::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 99px; border: 3px solid var(--bg); }
   ::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-h); }
   ::-webkit-scrollbar-corner { background: var(--bg); }
-  ::selection { background: rgba(155,127,240,.35); }
+  ::selection { background: rgba(63,168,196,.35); }
   html { background: var(--bg); }
   body {
     font-family: var(--sans); color: var(--ink); font-size: 14px; line-height: 1.6;
     padding: 28px 16px 60px;
-    background: radial-gradient(1100px 500px at 50% -220px, rgba(155,127,240,.08), transparent 60%), var(--bg);
+    background: radial-gradient(1100px 500px at 50% -220px, rgba(63,168,196,.08), transparent 60%), var(--bg);
   }
   .wrap { max-width: 860px; margin: 0 auto; }
   /* v1.0.34 自绘标题栏：与内容区同一底色，取消分隔线，整体成为一整块 */
@@ -97,13 +97,13 @@
   body.no-frame .winCtrls { display: none; }
   body.no-frame .themeBtn { right: 16px; }   /* 浏览器直开：没有窗口按钮，无需让位 */
   header h1 { padding-left: 4px; }
-  .logo-dot { width: 11px; height: 11px; border-radius: 50%; background: var(--accent); align-self: center; box-shadow: 0 0 10px rgba(155,127,240,.8); }
+  .logo-dot { width: 11px; height: 11px; border-radius: 50%; background: var(--accent); align-self: center; box-shadow: 0 0 10px rgba(63,168,196,.8); }
   h1 { font-size: 20px; font-weight: 600; letter-spacing: 1px; }
   h1 small { font-family: var(--mono); font-size: 11px; color: var(--dim); letter-spacing: 3px; margin-left: 10px; font-weight: 400; }
   .prov-nav { display: flex; gap: 4px; margin-left: 8px; }
   .prov-tab { font-family: var(--mono); font-size: 11px; letter-spacing: 1px; text-decoration: none; color: var(--dim); border: 1px solid var(--line); border-bottom: none; padding: 5px 14px 6px; border-radius: 8px 8px 0 0; background: transparent; }
   .prov-tab:hover { color: var(--ink); }
-  .prov-tab.active { color: var(--accent); border-color: rgba(155,127,240,.45); background: var(--accent-soft); }
+  .prov-tab.active { color: var(--accent); border-color: rgba(63,168,196,.45); background: var(--accent-soft); }
   .svc { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--dim); display: flex; align-items: center; gap: 8px; }
   .svc b { color: var(--ok); font-weight: 600; }
   .svc b.off { color: var(--err); }
@@ -121,7 +121,7 @@
   .led { width: 9px; height: 9px; border-radius: 50%; background: var(--led-off); flex: none; }
   .led.g { background: var(--ok); box-shadow: 0 0 8px rgba(87,184,120,.7); }
   .led.r { background: var(--err); box-shadow: 0 0 8px rgba(224,93,93,.7); }
-  .led.a { background: var(--accent); box-shadow: 0 0 8px rgba(155,127,240,.7); }
+  .led.a { background: var(--accent); box-shadow: 0 0 8px rgba(63,168,196,.7); }
   .led.pulse { animation: pulse 2.2s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: .45; } }
   @media (prefers-reduced-motion: reduce) { .led.pulse { animation: none; } }
@@ -142,10 +142,10 @@
   @keyframes wireflow { to { stroke-dashoffset: -12; } }
   @media (prefers-reduced-motion: reduce) { .patch .ln { animation: none !important; } }
   .badge { font-family: var(--mono); font-size: 10px; letter-spacing: 1px; padding: 3px 9px; border-radius: 99px; border: 1px solid; white-space: nowrap; }
-  .badge.mine { color: var(--accent); border-color: rgba(155,127,240,.45); background: var(--accent-soft); }
+  .badge.mine { color: var(--accent); border-color: rgba(63,168,196,.45); background: var(--accent-soft); }
   .badge.other { color: var(--blue); border-color: rgba(107,155,216,.4); background: rgba(107,155,216,.1); }
   .badge.unk { color: var(--dim); border-color: var(--line); background: transparent; }
-  .notice { display: none; margin: 12px 0 2px; padding: 10px 14px; border-radius: 8px; font-size: 13px; border: 1px solid rgba(155,127,240,.4); background: var(--accent-soft); }
+  .notice { display: none; margin: 12px 0 2px; padding: 10px 14px; border-radius: 8px; font-size: 13px; border: 1px solid rgba(63,168,196,.4); background: var(--accent-soft); }
   .notice.show { display: block; }
   .notice.err { border-color: rgba(224,93,93,.45); background: rgba(224,93,93,.09); }
   .actions { display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap; align-items: center; }
@@ -223,8 +223,8 @@
   .step.locked .btn-main { opacity: .45; }
   @media (max-width: 700px) { .step { flex-direction: column; gap: 8px; } .stepNo { width: auto; } .stepTitle { display: inline-block; margin: 0 0 0 8px; } .stepState { display: inline-block; margin-left: 8px; } }
   /* 捕获等待进度 */
-  .progress { display: flex; gap: 14px; align-items: center; margin-top: 14px; padding: 14px 16px; border: 1px solid rgba(155,127,240,.45); background: var(--accent-soft); border-radius: 9px; }
-  .progress .spin { width: 20px; height: 20px; flex: none; border: 2px solid rgba(155,127,240,.3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.9s linear infinite; }
+  .progress { display: flex; gap: 14px; align-items: center; margin-top: 14px; padding: 14px 16px; border: 1px solid rgba(63,168,196,.45); background: var(--accent-soft); border-radius: 9px; }
+  .progress .spin { width: 20px; height: 20px; flex: none; border: 2px solid rgba(63,168,196,.3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.9s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .progress .spin { animation: none; } }
   .progress .pTitle { font-size: 13px; font-weight: 600; }
@@ -250,12 +250,12 @@
 
   <header>
     <span class="logo-dot"></span>
-    <h1>WorkBuddy 路由<small>腾讯 · 免费模型</small></h1>
+    <h1>Qoder<small>Qoder · Free 套餐</small></h1>
     <nav class="prov-nav">
       <a href="/" class="prov-tab">B.AI</a>
       <a href="/sn" class="prov-tab">SenseNova</a>
-      <a href="/wb" class="prov-tab active">WorkBuddy</a>
-      <a href="/zen" class="prov-tab">OpenCode Zen</a>
+      <a href="/wb" class="prov-tab">WorkBuddy</a>
+      <a href="/qd" class="prov-tab active">Qoder</a>
 </nav>
     <span class="svc" id="svc">服务 <b>●</b> —</span>
     <button class="themeBtn" id="themeBtn" type="button" title="切换亮色 / 暗色主题"><span id="themeIcon">☾</span><span id="themeText">暗色</span></button>
@@ -269,54 +269,50 @@
   <!-- 信号灯 -->
   <div class="lamps" style="margin-bottom:18px">
     <div class="lamp">
-      <div class="name">WorkBuddy 中转</div>
+      <div class="name">Qoder 中转</div>
       <div class="val"><span class="led" id="ledRelay"></span><span id="txtRelay">—</span></div>
-      <div class="sub" id="subRelay" title="">:15742 → 协议桥</div>
+      <div class="sub" id="subRelay" title="">:15762 → 协议桥</div>
     </div>
     <div class="lamp">
-      <div class="name">WorkBuddy 上游</div>
+      <div class="name">Qoder 上游</div>
       <div class="val"><span class="led" id="ledUp"></span><span id="txtUp">未测试</span></div>
       <div class="sub" id="subUp">点「测试连通」检查</div>
     </div>
     <div class="lamp">
       <div class="name">访问令牌</div>
       <div class="val"><span class="led" id="ledTok"></span><span id="txtTok">—</span></div>
-      <div class="sub" id="subTok">JWT 有效期</div>
+      <div class="sub" id="subTok">读取自 Qoder 客户端</div>
     </div>
   </div>
 
-  <!-- 使用指引（两步） -->
+  <!-- 快速开始 -->
   <div class="card guide">
     <div class="head">
-      <span class="eyebrow">用法</span><span class="title">两步开始使用（新电脑照做即可）</span>
+      <span class="eyebrow">用法</span><span class="title">接入 Qoder</span>
       <span class="aux" id="guideAux"></span>
     </div>
     <div class="body">
       <div class="step" id="step1">
         <div class="stepNo">
           <span class="num">1</span>
-          <div class="stepTitle">一键获取令牌</div>
-          <div class="stepState" id="state1">检测中…</div>
+          <div class="stepTitle">启动 Qoder 桌面端</div>
+          <div class="stepState" id="state1">待完成</div>
         </div>
         <div class="stepBody">
-          <div class="stepDesc">自动从本机 WorkBuddy 客户端取登录令牌（令牌只存内存，必须取一次）。</div>
-          <div class="stepAct">
-            <button class="btn-main" id="btnCapture">一键获取令牌</button>
-            <span class="stepHint" id="hint1"></span>
-          </div>
+          <div class="stepDesc">登录 Qoder 桌面端并保持运行。补丁会在它的 worker 里挂一个钩子，把当前 <span class="mono">jt-…</span> 令牌实时写到 <span class="mono">%TEMP%/qoder-token.json</span>，本中转每次请求现读——<b>无需任何手动粘贴</b>。令牌每次 Qoder 启动会轮换，中转自动跟随。</div>
         </div>
       </div>
 
       <div class="step" id="step2">
         <div class="stepNo">
           <span class="num">2</span>
-          <div class="stepTitle">接入 WorkBuddy</div>
+          <div class="stepTitle">一键接入</div>
           <div class="stepState" id="state2">等待上一步</div>
         </div>
         <div class="stepBody">
-          <div class="stepDesc">把 Claude Code（终端 + 桌面版）接到 WorkBuddy 的三款免费模型。</div>
+          <div class="stepDesc">把 Claude Code（终端 + 桌面版）接到 Qoder 账号的 <b>Free 套餐</b>额度。</div>
           <div class="stepAct">
-            <button class="btn-main" id="btnWb">一键接入 WorkBuddy</button>
+            <button class="btn-main" id="btnQd">一键接入 Qoder</button>
             <div class="checks">
               <label><input type="checkbox" id="ckCli" checked>终端 CLI</label>
               <label><input type="checkbox" id="ckDesk" checked>桌面版</label>
@@ -326,13 +322,6 @@
       </div>
 
       <div class="result" id="applyResult"></div>
-      <div class="progress" id="captureProgress" style="display:none">
-        <div class="spin"></div>
-        <div>
-          <div class="pTitle" id="pTitle">正在等待 WorkBuddy 触发…</div>
-          <div class="pDesc" id="pDesc"></div>
-        </div>
-      </div>
     </div>
   </div>
 
@@ -359,25 +348,25 @@
       <div class="actions">
         <button class="btn-ghost" id="btnRestore">接回 CC Switch</button>
       </div>
-      <div class="hint">接通后：终端 CLI 与桌面版都指向本地协议桥 <span id="hintRelayPort">:15742</span>（CLI 讲 Anthropic 协议、WorkBuddy 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。</div>
+      <div class="hint">接通后：终端 CLI 与桌面版都指向本地协议桥 <span id="hintRelayPort">:15762</span>（CLI 讲 Anthropic 协议、Qoder 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。</div>
     </div>
   </div>
 
   <!-- 路由表 -->
   <div class="card">
     <div class="head">
-      <span class="eyebrow">模型</span><span class="title">路由表 · 模型映射（三款免费模型）</span>
+      <span class="eyebrow">模型</span><span class="title">路由表 · 模型映射</span>
       <span class="aux">改完保存即生效，无需重启</span>
     </div>
     <div class="body">
       <table class="route">
         <thead>
-          <tr><th style="width:32%">Claude 档位</th><th style="width:34%">→ WorkBuddy 模型</th><th>界面显示名</th></tr>
+          <tr><th style="width:32%">Claude 档位</th><th style="width:34%">→ Qoder 模型</th><th>界面显示名</th></tr>
         </thead>
         <tbody id="routeBody"></tbody>
       </table>
 
-      <div class="hint" style="margin-top:10px">三款均为 WorkBuddy 账号下 0 积分不限量的免费模型：DeepSeek-V4.1-Flash（100 万上下文）、Hy4-Preview-F（100 万上下文）、HY3（19.2 万上下文）。促销结束后若恢复计费，WorkBuddy 客户端里会显示需积分的模型。</div>
+      <div class="hint" style="margin-top:10px">Qoder 服务端只认 <b>lite</b>（普通用户默认）与 <b>auto</b>（自动选路）两个别名，实际落到哪个后端模型由账号套餐决定。四档默认都映射到 <b>lite</b>。</div>
 
       <div class="saverow">
         <button class="btn-main" id="btnSave" style="padding:8px 20px">保存映射</button>
@@ -388,58 +377,45 @@
     </div>
   </div>
 
-  <!-- 令牌（高级：手动填写，平时用不到） -->
+  <!-- 令牌（Qoder 无需手动填写，这里只做状态说明） -->
   <div class="card foldable collapsed" id="cardTok">
     <div class="head" id="headTok">
-      <span class="eyebrow">高级</span><span class="title">手动填写令牌</span>
-      <span class="aux">平时用不到 · 一键获取失败时的备用方式</span>
+      <span class="eyebrow">令牌</span><span class="title">令牌从哪来</span>
+      <span class="aux">正常无需任何操作</span>
     </div>
     <div class="body">
       <div class="tokstat" id="tokStat">正在读取令牌状态…</div>
 
-      <div class="keyrow">
-        <span class="k">访问令牌</span>
-        <input type="password" id="accessToken" autocomplete="off" placeholder="eyJ…（JWT，三段）" style="flex:1;min-width:260px">
-        <button class="btn-sm" id="tokToggle" type="button">显示</button>
-      </div>
-      <div class="keyrow">
-        <span class="k">刷新令牌</span>
-        <input type="password" id="refreshToken" autocomplete="off" placeholder="eyJ…（用于到期自动续期）" style="flex:1;min-width:260px">
-      </div>
-      <div class="keyrow">
-        <span class="k">设备令牌</span>
-        <input type="password" id="deviceToken" autocomplete="off" placeholder="v3:AAAA…（X-Device-Token，可留空）" style="flex:1;min-width:260px">
-      </div>
-      <div class="keyrow">
-        <span class="k">用户 ID</span>
-        <input type="text" id="userId" autocomplete="off" placeholder="91a1b55c-…（X-User-Id，可留空）" style="flex:1;min-width:260px">
-      </div>
-
       <div class="hint" style="margin-top:12px">
-        仅在「一键获取令牌」失败时使用。手动拿令牌：浏览器里登录 <b>workbuddy.ai</b>，按 F12 打开开发者工具 → Network，
-        随便发一条对话，点开 <b>/v2/chat/completions</b> 请求，把请求头里的 Authorization（去掉开头的 "Bearer "）、
-        X-Refresh-Token、X-Device-Token、X-User-Id 依次粘到上面四个框，点保存。令牌有效期约一年，到期会自动续期。
+        Qoder 的 <span class="mono">jt-…</span> 令牌<b>每次客户端启动都会轮换</b>，所以它不会被存进 config.json，
+        也不会写进 Claude 的 settings.json——中转每次请求现读，Qoder 换令牌后无需重启中转即自动跟随。
       </div>
-
-      <div class="saverow">
-        <button class="btn-main" id="btnSaveTok" style="padding:8px 20px">保存令牌</button>
+      <div class="hint" style="margin-top:8px">
+        来源是 <span class="mono">qoder-patch/patch_worker.py</span>：它给 Qoder 的 agent worker
+        （<span class="mono">resources/app.asar.unpacked/…/dist/_worker/qoder-worker-runtime.obf.mjs</span>）
+        打了一个小补丁，在每次带鉴权的出站请求上把当前令牌覆盖写入
+        <span class="mono">%TEMP%/qoder-token.json</span>。
       </div>
-      <div class="result" id="tokResult"></div>
+      <div class="hint" style="margin-top:8px">
+        <b>前提：Qoder 桌面端必须保持运行</b>。关掉它就不会再刷新令牌文件，中转会读到上一次的旧令牌并返回 401。
+        如需彻底还原客户端，执行 <span class="mono">python patch_worker.py revert</span>。
+      </div>
     </div>
   </div>
 
-  <!-- WorkBuddy 设置 -->
+  <!-- Qoder 设置 -->
   <div class="card foldable" id="cardSys">
     <div class="head" id="headSys">
-      <span class="eyebrow">设置</span><span class="title">WorkBuddy 设置</span>
-      <span class="aux">上游 / 中转端口 / 通道</span>
+      <span class="eyebrow">设置</span><span class="title">Qoder 设置</span>
+      <span class="aux">API Key / 上游 / 中转端口</span>
     </div>
     <div class="body">
       <div class="grid2">
-        <div class="fld"><label for="fUpstream">上游地址（OpenAI 协议，内置桥翻译）</label><input type="text" id="fUpstream" placeholder="https://www.workbuddy.ai"></div>
-        <div class="fld"><label for="fRelayPort">WorkBuddy 中转端口</label><input type="text" id="fRelayPort" placeholder="15742"></div>
+        <div class="fld"><label>令牌（jt-…）</label><input type="text" id="fTokenView" readonly placeholder="启动 Qoder 后自动读取" style="font-family:var(--mono);opacity:.75"></div>
+        <div class="fld"><label for="fUpstream">上游地址（OpenAI 协议，内置桥翻译）</label><input type="text" id="fUpstream" placeholder="https://api2-v2.qoder.sh/model/v1"></div>
+        <div class="fld"><label for="fRelayPort">Qoder 中转端口</label><input type="text" id="fRelayPort" placeholder="15762"></div>
       </div>
-      <label class="checks" style="margin-top:12px"><input type="checkbox" id="ckUseProxy">让 WorkBuddy 也走本机代理（默认直连；仅当直连被拦时开启）</label>
+      <label class="checks" style="margin-top:12px"><input type="checkbox" id="ckUseProxy">让 Qoder 也走本机代理（默认直连；仅当直连被拦时开启）</label>
       <div class="fld" style="margin-top:12px">
         <label>可选模型列表（下拉框内容，一行一个）</label>
         <textarea id="fModels" rows="5" spellcheck="false"></textarea>
@@ -467,17 +443,17 @@
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
-const PROVIDER = "wb";
+const PROVIDER = "qd";
 const TIERS = [
   { key: "claude-fable-5",   zh: "Fable · 最强" },
   { key: "claude-sonnet-5",  zh: "Sonnet · 均衡" },
   { key: "claude-opus-5",    zh: "Opus · 重型" },
   { key: "claude-haiku-4-5", zh: "Haiku · 快速" },
 ];
-const MODE_TXT = { bai: "B.AI", sn: "SENSENOVA", wb: "WORKBUDDY", ccswitch: "CC SWITCH", other: "其他", unknown: "未知" };
-const DEFAULT_WB_MODELS = ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"];
+const MODE_TXT = { bai: "B.AI", sn: "SENSENOVA", wb: "WORKBUDDY", zen: "ZEN", qd: "QODER", ccswitch: "CC SWITCH", other: "其他", unknown: "未知" };
+const DEFAULT_QD_MODELS = ["lite", "auto"];
 // 模型 ID → 漂亮显示名
-const BRANDS = { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" };
+const BRANDS = { lite: "Qoder Lite", auto: "Qoder Auto" };
 function prettyName(id) {
   return String(id).split("-").map((seg) => {
     const low = seg.toLowerCase();
@@ -488,7 +464,7 @@ function prettyName(id) {
     return seg.charAt(0).toUpperCase() + seg.slice(1);
   }).join("-");
 }
-let wbCfg = null, status = null, busy = false;
+let qdCfg = null, status = null, busy = false;
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -497,55 +473,51 @@ async function api(path, opts) {
   return j;
 }
 function setLed(el, state, pulse) { el.className = "led " + state + (pulse ? " pulse" : ""); }
-function wbSlice(cfg) { return cfg.wb || {}; }
+function qdSlice(cfg) { return cfg.qd || {}; }
 
 function renderStatus(s) {
   status = s;
-  const wb = s.wb || {};
-  $("svc").innerHTML = `服务 <b class="${s.service.up ? "" : "off"}">●</b> :${(wb.relay || {}).port || "—"} / :${s.panel.port}`;
-  // 中转灯（WorkBuddy 专属那份错误归因）
-  setLed($("ledRelay"), wb.relay && wb.relay.up ? "g pulse" : "r");
-  $("txtRelay").textContent = wb.relay && wb.relay.up ? "运行中" : "已停止";
-  const rl = wb.relayLast || {};
+  const qd = s.qd || {};
+  $("svc").innerHTML = `服务 <b class="${s.service.up ? "" : "off"}">●</b> :${(qd.relay || {}).port || "—"} / :${s.panel.port}`;
+  // 中转灯（各提供方独立记一份错误归因）
+  setLed($("ledRelay"), qd.relay && qd.relay.up ? "g pulse" : "r");
+  $("txtRelay").textContent = qd.relay && qd.relay.up ? "运行中" : "已停止";
+  const rl = qd.relayLast || {};
   const rlFresh = rl.at && Date.now() - new Date(rl.at).getTime() < 30 * 60000;
-  $("subRelay").textContent = rlFresh ? `最近错误·${rl.kind}: ${rl.message}` : `:${(wb.relay || {}).port} → 协议桥 → 上游`;
+  $("subRelay").textContent = rlFresh ? `最近错误·${rl.kind}: ${rl.message}` : `:${(qd.relay || {}).port} → 协议桥 → 上游`;
   $("subRelay").title = rlFresh ? `${rl.at}\n${rl.message}` : "";
   // 上游灯
-  const up = wb.upstream || {};
-  if (wb.recent && wb.recent.tier) {
-    const fresh = wb.recent.observedAt && (Date.now() - new Date(wb.recent.observedAt).getTime() < 30 * 60000);
+  const up = qd.upstream || {};
+  if (qd.recent && qd.recent.tier) {
+    const fresh = qd.recent.observedAt && (Date.now() - new Date(qd.recent.observedAt).getTime() < 30 * 60000);
     if (up.tested === true) { setLed($("ledUp"), "g"); $("txtUp").textContent = `${up.model} ${up.ms}ms`; }
     else if (up.tested === false) { setLed($("ledUp"), "r"); $("txtUp").textContent = "测试失败"; }
     else { setLed($("ledUp"), fresh ? "g" : "a"); $("txtUp").textContent = fresh ? "正常" : "待测试"; }
-    $("subUp").textContent = fresh ? `使用中: ${wb.recent.label}` : (up.error || "尚未观察到 Claude 调用");
+    $("subUp").textContent = fresh ? `使用中: ${qd.recent.label}` : (up.error || "尚未观察到 Claude 调用");
   } else {
     setLed($("ledUp"), up.tested === true ? "g" : up.tested === false ? "r" : "a");
     $("txtUp").textContent = up.tested === true ? `正常 ${up.ms}ms` : up.tested === false ? "失败" : "未测试";
     $("subUp").textContent = up.tested === true ? (up.model || "") : (up.error || "点「测试连通」检查");
   }
   // 令牌灯
-  const tk = (wb.token || {});
+  const tk = (qd.token || {});
   if (!tk.configured) {
     setLed($("ledTok"), "r");
-    $("txtTok").textContent = "未配置";
-    $("subTok").textContent = "在下方粘贴访问令牌";
-  } else if (tk.expiresInDays != null && tk.expiresInDays <= 7) {
-    setLed($("ledTok"), "a pulse");
-    $("txtTok").textContent = `剩 ${tk.expiresInDays} 天`;
-    $("subTok").textContent = tk.hasRefresh ? "将自动续期" : "无刷新令牌，到期需重新捕获";
+    $("txtTok").textContent = "未读到";
+    $("subTok").textContent = "请启动 Qoder 桌面端";
   } else {
     setLed($("ledTok"), "g");
-    $("txtTok").textContent = tk.expiresInDays != null ? `剩 ${tk.expiresInDays} 天` : "已配置";
-    $("subTok").textContent = tk.expAt ? "有效期至 " + new Date(tk.expAt).toLocaleDateString("zh-CN") : "";
+    $("txtTok").textContent = "已就绪";
+    $("subTok").textContent = "随 Qoder 启动自动轮换";
   }
   // 接线徽章（本页视角：wb=高亮，其余=灰/蓝）
   const setBadge = (el, m) => {
-    const cls = m.mode === "wb" ? "mine" : m.mode === "unknown" ? "unk" : "other";
+    const cls = m.mode === "qd" ? "mine" : m.mode === "unknown" ? "unk" : "other";
     el.className = "badge " + cls;
     el.textContent = MODE_TXT[m.mode] || m.mode;
     el.title = m.baseUrl || "";
     const patch = el === $("cliBadge") ? $("patchCli") : $("patchDesk");
-    patch.classList.toggle("state-mine", m.mode === "wb");
+    patch.classList.toggle("state-mine", m.mode === "qd");
     patch.classList.toggle("state-other", m.mode === "bai" || m.mode === "sn" || m.mode === "ccswitch");
     let kf = patch.querySelector(".keyfp");
     if (m.keyFp) {
@@ -554,7 +526,7 @@ function renderStatus(s) {
       const ok = !mine || m.keyMatchWb !== false;
       kf.textContent = (ok ? "🔑" : "⚠️") + m.keyFp;
       kf.style.color = ok ? "var(--dim)" : "var(--err)";
-      kf.title = mine ? (ok ? `此端实际使用的凭据：${m.keyFp}（与本页一致）` : `此端凭据(${m.keyFp}) 与本页令牌不一致！重开对应终端/桌面版，或重新点「接通 WorkBuddy」。`) : `此端实际使用的凭据：${m.keyFp}（未接 WorkBuddy，本页不比对）`;
+      kf.title = mine ? (ok ? `此端实际使用的凭据：${m.keyFp}（与本页一致）` : `此端凭据(${m.keyFp}) 与本页令牌不一致！重开对应终端/桌面版，或重新点「接入 Qoder」。`) : `此端实际使用的凭据：${m.keyFp}（未接 Qoder，本页不比对）`;
       kf.style.display = "";
     } else if (kf) kf.style.display = "none";
   };
@@ -566,21 +538,21 @@ function renderStatus(s) {
   n.classList.remove("show", "err");
   const oursElsewhere = (s.cli.mode === "bai" || s.cli.mode === "sn") || (s.desktop.mode === "bai" || s.desktop.mode === "sn");
   if (oursElsewhere) {
-    n.textContent = "当前有一端接在 B.AI / SenseNova 上——点「接通 WorkBuddy」会把它换过来（切换前自动快照，可一键接回）。";
+    n.textContent = "当前有一端接在 B.AI / SenseNova 上——点「接入 Qoder」会把它换过来（切换前自动快照，可一键接回）。";
     n.classList.add("show");
   } else if (s.ccswitch.running) {
-    n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 WorkBuddy 突然失效，回到这里点「接通 WorkBuddy」恢复。";
+    n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 Claude Code 突然失效，回到这里点「接入 Qoder」恢复。";
     n.classList.add("show");
   }
 }
 
 function renderRoute() {
-  const wb = wbSlice(wbCfg);
-  const models = wb.availableModels || [];
+  const qdc = qdSlice(qdCfg);
+  const models = qdc.availableModels || [];
   const tb = $("routeBody");
   tb.innerHTML = "";
   TIERS.forEach((t) => {
-    const m = (wb.mapping || {})[t.key] || { target: "", label: t.zh };
+    const m = (qdc.mapping || {})[t.key] || { target: "", label: t.zh };
     const opts = [...models, "__custom__"];
     const isCustom = !models.includes(m.target);
     const tr = document.createElement("tr");
@@ -619,47 +591,36 @@ function renderRoute() {
   });
 }
 
-function renderTokens() {
-  const wb = wbSlice(wbCfg);
-  $("accessToken").value = wb.accessToken || "";
-  $("refreshToken").value = wb.refreshToken || "";
-  $("deviceToken").value = wb.deviceToken || "";
-  $("userId").value = wb.userId || "";
-  // 令牌体检条（与状态灯互补，这里给精确日期）
+function renderKeyInfo() {
+  const z = qdSlice(qdCfg);
   const stat = $("tokStat");
-  const exp = (() => {
-    try {
-      const seg = String(wb.accessToken || "").split(".")[1];
-      if (!seg) return null;
-      const p = JSON.parse(atob(seg.replace(/-/g, "+").replace(/_/g, "/")));
-      return typeof p.exp === "number" ? p.exp : null;
-    } catch { return null; }
-  })();
-  if (!wb.accessToken) stat.innerHTML = `<span>访问令牌：<b class="warn">未配置</b></span>`;
-  else {
-    const days = exp ? Math.max(0, Math.round((exp * 1000 - Date.now()) / 86400000)) : null;
-    stat.innerHTML =
-      `<span>访问令牌：<b>已配置</b></span>` +
-      (exp ? `<span>有效期至 <b>${new Date(exp * 1000).toLocaleDateString("zh-CN")}</b>（剩 ${days} 天）</span>` : `<span>有效期：<b>无法解析</b></span>`) +
-      `<span>刷新令牌：<b>${wb.refreshToken ? "有（自动续期）" : "无"}</b></span>` +
-      `<span>设备令牌：<b>${wb.deviceToken ? "有" : "无"}</b></span>` +
-      `<span>用户 ID：<b>${wb.userId ? "有" : "无"}</b></span>`;
-  }
+  if (stat) { const t2 = ((status && status.qd) || {}).token || {};
+    stat.innerHTML = t2.configured
+      ? '<span style="color:var(--ok)">✔ 已读到令牌</span>　<span class="mono">' + (t2.tokenFile || "") + "</span>"
+      : '<span style="color:var(--err)">✘ 未读到令牌</span>　请启动 Qoder 桌面端'; }
+  const has = !!z.apiKey;
+  stat.innerHTML = has
+    ? '<span>API Key：<b>已配置</b></span><span>上游：<b>' + (z.upstream || "") + '</b></span><span>可用模型：<b>' + ((z.availableModels || []).length) + ' 个</b></span>'
+    : '<span>令牌：<b class="warn">未读到</b></span>　请启动 Qoder 桌面端（补丁会自动写入令牌文件）';
+  fetch("/api/models?p=qd").then(r => r.json()).then(j => {
+    if (j && j.note) stat.innerHTML += '<br><span>' + j.note + '</span>';
+  }).catch(() => { });
 }
 
 function renderSys() {
-  const wb = wbSlice(wbCfg);
-  $("fUpstream").value = wb.upstream || "";
-  $("fRelayPort").value = wb.relayPort || "";
-  $("fModels").value = (wb.availableModels || []).join("\n");
-  $("ckUseProxy").checked = wb.useProxy === true;
-  const hr = $("hintRelayPort"); if (hr) hr.textContent = ":" + (wb.relayPort || 15742);
+  const qdc = qdSlice(qdCfg);
+  $("fTokenView").value = (((status && status.qd) || {}).token || {}).configured ? "jt-…（已就绪）" : "";
+  $("fUpstream").value = qdc.upstream || "";
+  $("fRelayPort").value = qdc.relayPort || "";
+  $("fModels").value = (qdc.availableModels || []).join("\n");
+  $("ckUseProxy").checked = qdc.useProxy === true;
+  const hr = $("hintRelayPort"); if (hr) hr.textContent = ":" + (qdc.relayPort || 15762);
 }
 
 async function refreshConfig() {
-  wbCfg = await api("/api/config");
+  qdCfg = await api("/api/config");
   renderRoute();
-  renderTokens();
+  renderKeyInfo();
   renderSys();
   renderSteps();
 }
@@ -691,79 +652,31 @@ async function withBusy(btn, fn) {
 }
 
 /* ---------- 两步引导：状态与动作 ---------- */
-function tokenReady() { return !!(wbCfg && wbCfg.wb && wbCfg.wb.accessToken); }
-function wiredToWb() { return !!status && ((status.cli.mode === "wb") || (status.desktop.mode === "wb")); }
+function keyReady() { return !!(status && status.qd && status.qd.token && status.qd.token.configured); }
+function wiredToQd() { return !!status && ((status.cli.mode === "qd") || (status.desktop.mode === "qd")); }
 
 function renderSteps() {
   const s1 = $("step1"), s2 = $("step2");
-  const tok = tokenReady();
-  const wired = wiredToWb();
+  const tok = keyReady();
+  const wired = wiredToQd();
   // 步骤一
   s1.classList.toggle("done", tok);
   s1.classList.toggle("active", !tok);
   $("state1").textContent = tok ? "✓ 已完成" : "待完成";
-  $("btnCapture").textContent = tok ? "重新获取令牌" : "一键获取令牌";
   // 步骤二
   s2.classList.toggle("done", tok && wired);
   s2.classList.toggle("active", tok && !wired);
   s2.classList.toggle("locked", !tok);
-  $("btnWb").disabled = !tok || busy;
+  $("btnQd").disabled = !tok || busy;
   $("state2").textContent = !tok ? "等待步骤一完成" : (wired ? "✓ 已接入" : "待完成");
   $("state2").style.color = (!tok) ? "" : (wired ? "var(--ok)" : "var(--accent)");
-  $("hint1").textContent = tok ? "" : "本机需已安装并登录 WorkBuddy 客户端";
+
   $("guideAux").textContent = (tok && wired) ? "全部就绪" : (tok ? "还差第 2 步" : "从第 1 步开始");
 }
 
-// 捕获期间的"等待中"面板（轮播提示，缓解等待焦虑）
-let capTimer = null, capTick = 0;
-const CAP_TIPS = [
-  "正在等待 WorkBuddy 触发…",
-  "如果 10 秒内没反应，请打开 WorkBuddy 客户端随便发一条消息",
-  "钩子已就位，WorkBuddy 一跑起来就会自动抓到令牌",
-  "仍在等待中…（最长 2 分 30 秒，可随时关闭页面重试）",
-];
-function showCaptureProgress(on) {
-  const box = $("captureProgress");
-  box.style.display = on ? "flex" : "none";
-  clearInterval(capTimer);
-  if (!on) return;
-  capTick = 0;
-  $("pTitle").textContent = CAP_TIPS[0];
-  $("pDesc").textContent = "完成后会自动还原对 WorkBuddy 的临时改动，不影响它正常使用。";
-  capTimer = setInterval(() => {
-    capTick = Math.min(capTick + 1, CAP_TIPS.length - 1);
-    $("pTitle").textContent = CAP_TIPS[capTick];
-  }, 12000);
-}
-
-$("btnCapture").addEventListener("click", async () => {
-  const btn = $("btnCapture");
-  if (btn.disabled) return;            // 防连点
-  busy = true; btn.disabled = true; btn.textContent = "获取中…";
-  showCaptureProgress(true);
-  showResult($("applyResult"), "正在获取令牌，请按提示操作 WorkBuddy…", true);
-  try {
-    const r = await api("/api/wb/capture", { method: "POST" });
-    if (r.ok) {
-      showResult($("applyResult"), "✔ 令牌获取成功（" + (r.masked || "") + "），已自动填入并保存。\n接下来点第 2 步「一键接入 WorkBuddy」即可。", true);
-      showInfo("令牌已获取", "第 1 步完成，接下来点「一键接入 WorkBuddy」。");
-    } else {
-      showResult($("applyResult"), "✘ 获取失败：" + r.error + "\n可展开下方「手动填写令牌」作为备用方式。", false);
-    }
-  } catch (e) {
-    showResult($("applyResult"), "✘ 获取失败：" + e.message, false);
-  } finally {
-    showCaptureProgress(false);
-    busy = false; btn.disabled = false;
-    await refreshConfig().catch(() => { });
-    await poll();
-    renderSteps();
-  }
-});
-
-$("btnWb").addEventListener("click", () => withBusy($("btnWb"), async () => {
-  if (!tokenReady()) {
-    showResult($("applyResult"), "请先完成第 1 步「一键获取令牌」。", false);
+$("btnQd").addEventListener("click", () => withBusy($("btnQd"), async () => {
+  if (!keyReady()) {
+    showResult($("applyResult"), "请先完成第 1 步：启动 Qoder 桌面端并保持运行（令牌会自动写入 %TEMP%/qoder-token.json）。", false);
     return;
   }
   const r = await api("/api/apply", {
@@ -771,8 +684,8 @@ $("btnWb").addEventListener("click", () => withBusy($("btnWb"), async () => {
     body: JSON.stringify({ provider: PROVIDER, cli: $("ckCli").checked, desktop: $("ckDesk").checked }),
   });
   showResult($("applyResult"),
-    "✔ 已接入 WorkBuddy（切换前配置已自动快照）\n" + r.warnings.map((w) => "· " + w).join("\n"), true);
-  showInfo("接入完成", "现在可以在 Claude Code 的模型菜单里选择 WorkBuddy 的三款免费模型了。");
+    "✔ 已接入 Qoder（切换前配置已自动快照）\n" + r.warnings.map((w) => "· " + w).join("\n"), true);
+  showInfo("接入完成", "现在可以在 Claude Code 的模型菜单里选择 Qoder 的模型了。");
 }));
 
 $("btnRestore").addEventListener("click", () => withBusy($("btnRestore"), async () => {
@@ -820,29 +733,6 @@ $("btnTest").addEventListener("click", () => withBusy($("btnTest"), async () => 
     !!r.ok);
 }));
 
-$("tokToggle").addEventListener("click", () => {
-  const showAll = ["accessToken", "refreshToken", "deviceToken"].map((id) => $(id));
-  const showing = showAll[0].type === "text";
-  showAll.forEach((el) => { el.type = showing ? "password" : "text"; });
-  $("tokToggle").textContent = showing ? "显示" : "隐藏";
-});
-
-$("btnSaveTok").addEventListener("click", () => withBusy($("btnSaveTok"), async () => {
-  const r = await api("/api/config", {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      provider: PROVIDER,
-      accessToken: $("accessToken").value.trim(),
-      refreshToken: $("refreshToken").value.trim(),
-      deviceToken: $("deviceToken").value.trim(),
-      userId: $("userId").value.trim(),
-    }),
-  });
-  showResult($("tokResult"), "✔ 令牌已保存\n" + (r.hints || []).map((h) => "· " + h).join("\n"), true);
-  await refreshConfig();
-  poll();
-}));
-
 $("btnSaveSys").addEventListener("click", () => withBusy($("btnSaveSys"), async () => {
   const body = {
     provider: PROVIDER,
@@ -874,26 +764,13 @@ $("btnSaveSys").addEventListener("click", () => withBusy($("btnSaveSys"), async 
 $("btnResetModels").addEventListener("click", () => withBusy($("btnResetModels"), async () => {
   const r = await api("/api/config", {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ provider: PROVIDER, availableModels: DEFAULT_WB_MODELS }),
+    body: JSON.stringify({ provider: PROVIDER, availableModels: DEFAULT_QD_MODELS }),
   });
   await refreshConfig();
-  showResult($("sysResult"), "✔ 已恢复为三款免费模型：" + DEFAULT_WB_MODELS.join("、"), true);
+  showResult($("sysResult"), "✔ 已恢复为三款免费模型：" + DEFAULT_QD_MODELS.join("、"), true);
 }));
 
-/* 手动令牌卡折叠 */
-(() => {
-  const card = $("cardTok"), head = $("headTok");
-  if (!card || !head) return;
-  head.setAttribute("tabindex", "0");
-  head.setAttribute("role", "button");
-  const sync = () => head.setAttribute("aria-expanded", String(!card.classList.contains("collapsed")));
-  sync();
-  const toggle = () => { card.classList.toggle("collapsed"); sync(); };
-  head.addEventListener("click", toggle);
-  head.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
-})();
-
-/* WorkBuddy 设置卡折叠 */
+/* 设置卡折叠 */
 (() => {
   const card = $("cardSys"), head = $("headSys");
   head.setAttribute("tabindex", "0");
@@ -921,7 +798,7 @@ function showInfo(title, msg, ms = 6000) {
 $("bnrInfoX").onclick = () => $("bnrInfo").classList.remove("show");
 
 if (window.baiDesktop) {
-  $("footPaths").textContent = "WorkBuddy 与 B.AI/SenseNova 各自独立配置，共用同一个路由台服务";
+  $("footPaths").textContent = "Qoder 与 B.AI/SenseNova/WorkBuddy/Zen 各自独立配置，共用同一个路由台服务";
   api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
   window.baiDesktop.onAppEvent((ev) => {
     if (ev.kind === "recovered") showInfo("服务恢复", ev.text);
