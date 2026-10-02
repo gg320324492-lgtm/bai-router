@@ -62,13 +62,16 @@
 
   /* 本路由台自家提供的渠道。此前每页各自硬编码一份"还有别的端接在谁身上"的判断，
    * 结果各漏一部分（sn 页漏了 zen/qd，wb/zen/qd 三页都只列了 bai+sn）——第五家一加
-   * 进来就又漂移。收口到这里。 */
-  window.BAI_OURS = ["bai", "sn", "wb", "zen", "qd"];
+   * 进来就又漂移。收口到这里，且不再写死名单：渠道集合就是清单的键集。
+   * （旧页 sn/wb/zen/qd.html 仍引用这两个全局；新模板只用清单。） */
+  window.BAI_OURS = Object.keys(window.BAI_PROVIDERS || {});
   window.baiIsOurs = (m) => window.BAI_OURS.includes(m);
-  /* 本页该拿哪个 keyMatch 字段来比对自己的凭据（此前各页都写死成 keyMatchWb） */
-  window.baiKeyMatchField = (provider) => ({
-    bai: "keyMatch", sn: "keyMatchSn", wb: "keyMatchWb", zen: "keyMatchZen", qd: "keyMatchQd",
-  }[provider] || "keyMatch");
+  /* 本页该拿哪个 keyMatch 字段来比对自己的凭据（此前各页都写死成 keyMatchWb）。
+   * 名单同样从清单取：每家自己声明 keyMatch；没声明的回落到 bai 的通用字段。 */
+  window.baiKeyMatchField = (provider) => {
+    const p = (window.BAI_PROVIDERS || {})[provider];
+    return (p && p.keyMatch) || "keyMatch";
+  };
 
   /* ======================================================================
    * 2. 保留区：更新横幅 / 底栏三按钮 / 备用升级 / 停止服务
@@ -322,78 +325,29 @@
   const SHORT = P.shortName || String((P.lampNames && P.lampNames.relay) || "")
     .replace(/\s*中转$/, "") || P.tab || key;
 
-  /* 徽章文字：清单 badgeText 优先，否则 tab 大写；zen 的 tab 是 "OpenCode Zen"，
-     旧页徽章写的是 "ZEN"，故这里补一张小表（补进 providers.js 的 badgeText 后可删）。 */
-  const BADGE_FALLBACK = { zen: "ZEN" };
+  /* 徽章文字：清单 badgeText 优先，否则 tab 大写（"OpenCode Zen" → "ZEN" 的家自己声明）。 */
   for (const k in MANIFEST) {
     const t = MANIFEST[k].tab || k;
-    MODE_TXT[k] = MANIFEST[k].badgeText || BADGE_FALLBACK[k] || t.toUpperCase();
+    MODE_TXT[k] = MANIFEST[k].badgeText || t.toUpperCase();
   }
 
-  /* /api/config 的形状：bai 在顶层，其余四家在同名子对象 */
-  const sliceOf = (c, p) => (p === "bai" ? (c || {}) : ((c || {})[p] || {}));
-  /* /api/status 的形状：bai 的 relay/upstream/recent 在顶层，其余在同名子对象 */
-  const stOf = (s) => (key === "bai" ? (s || {}) : ((s || {})[key] || {}));
+  /* /api/config 与 /api/status 的形状由清单 shape 决定：
+     "flat" = 本家数据在顶层（原 bai）；"nested" = 在同名子对象里（其余各家）。 */
+  const flatShape = (p) => ((MANIFEST[p] || {}).shape === "flat");
+  const sliceOf = (c, p) => (flatShape(p) ? (c || {}) : ((c || {})[p] || {}));
+  const stOf = (s) => (flatShape(key) ? (s || {}) : ((s || {})[key] || {}));
 
   let cfg = null, status = null, busy = false, cards = [];
   const slice = () => sliceOf(cfg, key);
   const st = () => stOf(status);
 
-  /* 清单未提供、但旧页面上有、且无法由其它字段推出的少量文案/数据。
-     每条都注明来源页；providers.js 补上同名字段后会自动优先用清单的值。 */
-  const FB = {
-    bai: {
-      brands: { qwen: "Qwen", glm: "GLM", deepseek: "DeepSeek", hy: "HY", mimo: "MiMo", kimi: "Kimi", minimax: "MiniMax" },
-      labelSuffix: " 1M",
-      noCallHint: "尚未观察到 Claude Code 调用",
-      testNote: {
-        single: "（测试的就是你 Claude Code 里显示的那个模型，名字完全一致）",
-        all: "（最近 30 分钟没观察到真实对话流量，已测全部四档；在 Claude Code 发条消息后再点，会自动对准当前档位）",
-      },
-      modelsRefreshMsg: "✔ 已拉取上游模型目录 {count} 个\n已更新可选模型列表（四个映射目标强制保留）",
-      eventTitles: { check: "检查更新 / 部署" },
-      sys: { proxy: true, panelPort: true, proxyDetect: true, useProxyRow: false },
-    },
-    sn: {
-      brands: { sensenova: "SenseNova", deepseek: "DeepSeek", glm: "GLM", kimi: "Kimi", neo: "Neo", u: "U" },
-      testNote: { all: "（最近 30 分钟没观察到真实对话流量，已测全部四档；SenseNova 有 TPM 限流，429 稍候再测即可）" },
-      modelsRefreshMsg: "✔ 已拉取可对话模型 {count} 个（图像模型已自动排除）\n下拉框已更新（映射目标强制保留）",
-    },
-    wb: {
-      brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
-      defaultModels: ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"],
-      applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 WorkBuddy 的三款免费模型了。",
-      resetModelsMsg: "✔ 已恢复为三款免费模型：{list}",
-      step1Hint: "请先完成第 1 步「一键获取令牌」。",
-    },
-    zen: {
-      brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
-      // 原先抄的是 WorkBuddy 的三款（deepseek-v4.1-flash/hy4-preview-f/hy3）——
-      // Zen 免费档里唯一能外部调用的是 space-bunny-free。
-      defaultModels: ["space-bunny-free"],
-      cred: { txtOk: "已配置", subOk: "在下方「Zen 设置」管理", subNone: "在下方「Zen 设置」填 oc_sk_ 密钥" },
-      sys: { apiKey: true },
-      applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 Zen 的免费模型了。",
-      resetModelsMsg: "✔ 已恢复为 Zen 免费模型：{list}",
-      step1Hint: "请先完成第 1 步：在下方「Zen 设置」填入 API Key 并保存。",
-    },
-    qd: {
-      brands: { lite: "Qoder Lite", auto: "Qoder Auto" },
-      defaultModels: ["lite", "auto"],
-      cred: { kind: "file", txtOk: "已就绪", subOk: "随 Qoder 启动自动轮换", txtNone: "未读到", subNone: "请启动 Qoder 桌面端", preview: "jt-…（已就绪）" },
-      sys: { tokenView: true },
-      applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 Qoder 的模型了。",
-      resetModelsMsg: "✔ 已恢复为 Qoder 默认模型：{list}",
-      step1Hint: "请先完成第 1 步：启动 Qoder 桌面端并保持运行（令牌会自动写入 %TEMP%/qoder-token.json）。",
-    },
-  }[key] || {};
-
-  /* 清单优先，其次兜底表 */
-  const opt = (name) => (P[name] != null ? P[name] : FB[name]);
+  /* v1.0.48：原先这里的 FB[key] 兜底表已整表搬进 providers.js 对应条目。
+     现在唯一的数据源就是清单；下列取值全部直读 P。 */
+  const opt = (name) => P[name];
   const DEFAULT_MODELS = opt("defaultModels") || [];
   const BRANDS = opt("brands") || {};
   const LABEL_SUFFIX = opt("labelSuffix") || "";
-  const CRED = Object.assign({}, FB.cred || {}, C);
+  const CRED = C;
 
   const GUIDE = Array.isArray(P.guide) ? P.guide : [];
   const HAS_GUIDE = GUIDE.length > 0;
@@ -430,7 +384,7 @@
   function buildSysExtras() {
     const slot = $("slot-sys");
     if (!slot) return;
-    const S = FB.sys || {};
+    const S = P.sys || {};
     if (S.proxy || S.panelPort || S.proxyDetect) {
       const g = document.createElement("div");
       g.className = "grid2";
@@ -546,21 +500,20 @@
     const SL = P.settingsLabels || {};
     const bridge = /协议桥/.test(String((P.lampSubs && P.lampSubs.relay) || ""));
     applyText("lblUpstream", SL.upstream || `上游地址（${bridge ? "OpenAI 协议，内置桥翻译" : "Anthropic 兼容"}）`);
-    applyText("lblRelayPort", SL.relayPort || `${key === "bai" ? "" : SHORT + " "}中转端口`);
+    applyText("lblRelayPort", SL.relayPort || "中转端口");
+    const SYS = P.sys || {};
     const upRow = $("useProxyRow");
     if (upRow) {
-      const on = (FB.sys || {}).useProxyRow !== false;
+      const on = SYS.useProxyRow !== false;
       showEl(upRow, on);
       if (on) applyText("useProxyText", P.useProxyText || `让 ${SHORT} 也走本机代理（默认直连；仅当直连被拦时开启）`);
     }
     buildSysExtras();
-    /* B.AI 独有「部署到本机…」；「恢复默认模型」只有清单给了默认清单的页面才有 */
-    showEl($("btnDeploy"), !!((FB.sys || {}).deploy || key === "bai"));
+    /* 「部署到本机…」与「刷新模型列表」由清单 sys 开关控制（后者只有真有可拉实时目录的
+       家有：wb 的模型清单随客户端 product config 下发、zen/qd 各有专属目录卡）。 */
+    showEl($("btnDeploy"), !!SYS.deploy);
     showEl($("btnResetModels"), DEFAULT_MODELS.length > 0);
-    /* 「刷新模型列表」只有 B.AI / SenseNova 真有可拉的实时目录：wb 的模型清单随客户端
-       product config 下发（无接口），zen/qd 各自有专属目录卡（model-catalog）。清单里
-       没有字段能区分这两组——它们在其它字段上完全一致——故按 key 判定。 */
-    showEl($("btnModels"), key === "bai" || key === "sn");
+    showEl($("btnModels"), !!SYS.modelsRefresh);
 
     /* 4.7 页脚 */
     if (has("footPaths")) {
@@ -1048,7 +1001,7 @@
   }
 
   async function refreshModels() {
-    const r = await api(key === "bai" ? "/api/models" : "/api/models?p=" + key);
+    const r = await api(P.modelsEndpoint || "/api/models?p=" + key);
     const S = slice();
     const curTargets = TIERS
       .map((t) => String(((S.mapping || {})[t.key] || {}).target || "").toLowerCase())
@@ -1244,7 +1197,7 @@
   function wireFooter() {
     if (window.baiDesktop) {
       if (has("verTxt")) api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
-      const T = Object.assign({}, (FB.eventTitles || {}), (P.eventTitles || {}));
+      const T = P.eventTitles || {};
       window.baiDesktop.onAppEvent((ev) => {
         if (!ev) return;
         if (ev.kind === "recovered") showInfo(T.recovered || "服务恢复", ev.text);

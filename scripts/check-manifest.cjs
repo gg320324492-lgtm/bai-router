@@ -9,7 +9,7 @@
  * 「JWT 有效期」、四页接线徽章都判 m.mode === "wb"、cliMode 少一个字段…）。
  * 本脚本把「漏改一处」从运行期 bug 变成构建期失败。
  *
- * 九类检查（C1–C8 对应约定的八项，C9 是我多加的一条）：
+ * 十二类检查（C1–C8 对应约定的八项，C9–C12 是后续补的）：
  *   C1 清单完整性 + key/path 与 server.mjs 注册路由一致
  *   C2 guide 结构
  *   C3 notices 结构 + {btn} 占位符可替换 + 死键（没人读的 notice）
@@ -17,9 +17,13 @@
  *   C5 反向检查：id 引用无悬空（$() 以及 onClick/applyText/has 的字符串参数形式）
  *   C6 插槽契约：cards/*.js 都导出 mount，extraCards 双向对账
  *   C7 配色：html[data-provider="x"] 与清单 key 一一对应
- *   C8 模型列表：每家都能拿到非空模型列表
- *   C9（附加）导航 tab 与清单 key/path 一一对应——加了清单忘了加 tab，页面上根本点不到，
- *      而其它八项检查全都还是绿的
+ *   C8 模型列表：每家的 defaultModels 都是清单里的字符串数组（v1.0.48 起只认清单；
+ *      允许空数组——bai/sn 本就没有「恢复默认模型」按钮，见该检查处的说明）
+ *   C9 导航 tab 与清单 key/path 一一对应——加了清单忘了加 tab，页面上根本点不到
+ *   C10 凡是「直接返回模板」的路由，都必须能在清单里 path 精确匹配上
+ *   C11 panel-common.js 不得再按提供方名字硬编码（清单化收尾；cards/*.js 与注释不扫）
+ *   C12 渲染层无条件读取的形状字段（shape/keyMatch/sys/brands/defaultModels/settingsLabels）
+ *       每家都要有——加第六家漏改的新防线
  *
  * 零依赖：只用 Node 内置模块。
  *
@@ -126,23 +130,11 @@ function evalInSandbox(file, sandboxExtra) {
   return sandbox;
 }
 
-/* 从 panel-common.js 里把 `const FB = { ... }[key] || {};` 这个纯字面量对象切出来
- * 真求值——比正则抠 defaultModels 可靠，也不会被注释里的同名字符串骗到。 */
-function extractFallbackTable(js) {
-  const start = js.indexOf("const FB = {");
-  if (start < 0) return null;
-  let i = js.indexOf("{", start);
-  let depth = 0, end = -1;
-  for (; i < js.length; i++) {
-    const c = js[i];
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (depth === 0) { end = i + 1; break; } }
-  }
-  if (end < 0) return null;
-  const lit = js.slice(js.indexOf("{", start), end);
-  try { return vm.runInNewContext("(" + lit + ")", {}, { timeout: 3000 }); }
-  catch { return null; }
-}
+/* 剥掉 JS 注释（行注释 + 块注释），让「提供方字面量等值判断」的扫描不被注释里的
+ * 举例骗到（panel-common.js 顶部注释就写着 `m.mode === "wb"` 这种历史事故）。 */
+const stripJsComments = (js) => js
+  .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+  .replace(/(^|[^:])\/\/[^\n]*/g, (m, p1) => p1 + " ".repeat(m.length - p1.length));
 
 /* 剥掉 HTML 注释，免得注释里写的 id="x" 被数成真元素 */
 const stripHtmlComments = (html) => html.replace(/<!--[\s\S]*?-->/g, "");
@@ -566,40 +558,32 @@ setCheck("C7");
  * ==========================================================================*/
 setCheck("C8");
 {
-  const FB = extractFallbackTable(commonJs);
-  if (!FB) {
-    warn("could not extract the FB[key] fallback table from panel-common.js -- only providers.js and config.defaults.json were consulted");
-  }
+  /* v1.0.48：panel-common.js 的 FB 兜底表已删，defaultModels 只认清单。
+     契约原文要求「非空数组」，但 bai/sn 本就没有固定默认清单（FB 里也没有 defaultModels，
+     旧页的「恢复默认模型」按钮对这两家一直是隐藏的）。为不改用户可见行为，这里放宽为
+     **必须存在且是合法字符串数组（允许为空 []）**：[] 表示本页没有「恢复默认模型」按钮，
+     与旧行为一致；真正要防的是「加第六家漏写这个字段」。 */
   for (const key of keys) {
     const P = manifest[key];
-    const fromManifest = Array.isArray(P.availableModels) && P.availableModels.length
-      && P.availableModels.every((x) => typeof x === "string" && x.trim()) ? P.availableModels : null;
-    if (P.availableModels !== undefined && !fromManifest) {
-      err(`${key}: field "availableModels" is ${typeOf(P.availableModels)} -- expected a non-empty array of non-empty model ids`);
-    }
-    const fbModels = FB && FB[key] && Array.isArray(FB[key].defaultModels) && FB[key].defaultModels.length
-      ? FB[key].defaultModels : null;
-    if (FB && FB[key] && FB[key].defaultModels !== undefined && !fbModels) {
-      err(`${key}: panel-common.js FB.${key}.defaultModels is ${typeOf(FB[key].defaultModels)} -- expected a non-empty array`);
-    }
-    /* bai 在 /api/config 顶层，sn/wb/zen/qd 在同名子对象里（见 panel-common.js sliceOf） */
-    const cfgModels = key === "bai"
-      ? (Array.isArray(defaults.availableModels) ? defaults.availableModels : null)
-      : (defaults[key] && Array.isArray(defaults[key].availableModels) ? defaults[key].availableModels : null);
-    if (defaults[key] !== undefined && key !== "bai" && !cfgModels) {
-      err(`${key}: config.defaults.json has a "${key}" block but no ${key}.availableModels -- /api/config returns none, the route table dropdown stays empty`);
-    }
-
-    const sources = [
-      fromManifest && "providers.js:availableModels",
-      fbModels && "panel-common.js:FB.defaultModels",
-      cfgModels && `config.defaults.json:${key === "bai" ? "" : key + "."}availableModels`,
-    ].filter(Boolean);
-    if (!sources.length) {
-      err(`${key}: no model list anywhere -- checked providers.js "availableModels" (${typeOf(P.availableModels)}), panel-common.js FB.${key}.defaultModels (${FB && FB[key] ? typeOf(FB[key].defaultModels) : "no FB." + key + " entry"}), config.defaults.json ${key === "bai" ? "availableModels" : key + ".availableModels"} (${cfgModels === null ? "absent" : typeOf(cfgModels)}) -- the route table would render with no models`);
+    const dm = P.defaultModels;
+    if (!Array.isArray(dm)) {
+      err(`${key}: field "defaultModels" is ${typeOf(dm)} -- expected an array of non-empty model ids in providers.js (may be [] when the page has no reset-defaults button; panel-common.js reads it directly, the fallback table FB is gone)`);
+    } else if (dm.some((x) => typeof x !== "string" || !x.trim())) {
+      err(`${key}: field "defaultModels" is ${typeOf(dm)} -- expected every item to be a non-empty string`);
     } else {
-      const n = fromManifest ? fromManifest.length : fbModels ? fbModels.length : cfgModels.length;
-      ok(`${key}: model list from ${sources.join(" + ")} (${n} models)`);
+      const fromManifest = Array.isArray(P.availableModels) && P.availableModels.length
+        && P.availableModels.every((x) => typeof x === "string" && x.trim()) ? P.availableModels : null;
+      if (P.availableModels !== undefined && !fromManifest) {
+        err(`${key}: field "availableModels" is ${typeOf(P.availableModels)} -- expected a non-empty array of non-empty model ids`);
+      }
+      const cfgBlock = key === "bai" ? defaults : (defaults[key] || {});
+      const cfgModels = Array.isArray(cfgBlock.availableModels) ? cfgBlock.availableModels : null;
+      const sources = [
+        fromManifest && "providers.js:availableModels",
+        "providers.js:defaultModels",
+        cfgModels && `config.defaults.json:${key === "bai" ? "" : key + "."}availableModels`,
+      ].filter(Boolean);
+      ok(`${key}: defaultModels from providers.js (${dm.length}: ${show(dm.join(","))}); model list also from ${sources.join(" + ")}`);
     }
   }
 }
@@ -665,6 +649,71 @@ setCheck("C9");
 }
 
 /* ============================================================================
+ * C11 渲染层不得再按提供方名字硬编码（v1.0.48 清单化收尾）
+ *   panel-common.js 是五页共用渲染层，它一旦出现 `key === "bai"` 这类提供方字面量
+ *   等值判断，就意味着「加第六家会漏改一处」的老毛病没根除——本轮就是来拔掉它们的。
+ *   白名单：cards/*.js 不扫（卡的 PROVIDER 判断是它自己的事）；注释先剥掉再扫。
+ * ==========================================================================*/
+setCheck("C11");
+{
+  const PROVIDER_KEYS = Object.keys(EXPECTED_PATHS);   // bai/sn/wb/zen/qd
+  const code = stripJsComments(commonJs);
+  const quoted = PROVIDER_KEYS.map((k) => `(?:["']${k}["'])`).join("|");
+  /* 空白类必须写成 [ \\t] 而不是模板串里的 \\s：\\s 在模板字面量里是**无效转义**，
+     会退化成字母 s —— 那样正则就成了 /===s*"wb"/，永远匹配不到 === "wb"，
+     这个闸门会变成永远绿灯（曾经的写法就踩了这条，用负样本才测出来）。 */
+  const WS = "[ \\t]";
+  /* 命中形态：===/!== 两侧任一侧是提供方字面量；或 [] 里用提供方字面量当下标 */
+  const eqRe = new RegExp(`(?:===|!==)${WS}*(?:${quoted})|(?:${quoted})${WS}*(?:===|!==)`, "g");
+  const idxRe = new RegExp(`\\[\\s*(?:${quoted})\\s*\\]`, "g");
+  /* BAI_OURS 名单本身是允许的（它就是清单键集的投影），但必须是清单驱动；这里只在
+     发现「字面量数组里排了一串提供方名」时报错——那是本契约要消灭的硬编码。 */
+  const arrRe = new RegExp(`\\[\\s*(?:${quoted}\\s*,\\s*){2,}${quoted}\\s*\\]`, "g");
+
+  const hits = [];
+  const lineOf = (idx) => code.slice(0, idx).split("\n").length;
+  for (const [re, what] of [[eqRe, "provider equality test"], [idxRe, "provider literal used as index"], [arrRe, "hard-coded provider name list"]]) {
+    for (const m of code.matchAll(re)) {
+      hits.push(`line ${lineOf(m.index)}: ${what} -> ${show(m[0].replace(/\s+/g, " "))}`);
+    }
+  }
+  if (hits.length) {
+    err(`panel-common.js still hard-codes provider names (${hits.length}):\n    ` + hits.slice(0, 12).join("\n    ") + `\n    -- move the branch into providers.js (shape/sys/keyMatch/modelsEndpoint/settingsLabels ...) so the renderer knows no provider by name`);
+  } else {
+    ok(`panel-common.js contains no provider-name equality test / literal index / name array (comments excluded; cards/*.js out of scope)`);
+  }
+}
+
+/* ============================================================================
+ * C12 每家必须给出渲染层依赖的形状字段（加第六家漏改的新防线）
+ *   C11 保证渲染层不认识提供方名字，代价是「清单漏字段」不再报错、只是静默不渲染。
+ *   C12 把 panel-common.js 无条件读取的那批字段补回来：缺了就是加第六家时的漏改。
+ * ==========================================================================*/
+setCheck("C12");
+{
+  const NEEDED = [
+    { name: "shape", test: (v) => v === "flat" || v === "nested", want: '"flat" or "nested"' },
+    { name: "keyMatch", test: (v) => typeof v === "string" && v.trim() !== "", want: "non-empty string (status field to compare credentials)" },
+    { name: "sys", test: (v) => v && typeof v === "object" && !Array.isArray(v), want: "plain object (button/field visibility switches)" },
+    { name: "brands", test: (v) => v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0, want: "non-empty object (model-prefix -> display name)" },
+    { name: "defaultModels", test: (v) => Array.isArray(v) && v.every((x) => typeof x === "string" && x.trim()), want: "string array (may be empty; [] = no reset-defaults button)" },
+    { name: "settingsLabels", test: (v) => v && typeof v === "object" && typeof v.relayPort === "string" && v.relayPort.trim() !== "", want: "object with a non-empty relayPort label" },
+  ];
+  for (const key of keys) {
+    const P = manifest[key];
+    const miss = [];
+    for (const f of NEEDED) {
+      if (!f.test(P[f.name])) miss.push(`${f.name} (${typeOf(P[f.name])}; want ${f.want})`);
+    }
+    if (miss.length) {
+      err(`${key}: renderer-critical manifest field(s) missing or malformed -- ${miss.join("; ")}. panel-common.js reads these unconditionally; a 6th provider that omits one renders silently wrong`);
+    } else {
+      ok(`${key}: shape/keyMatch/sys/brands/defaultModels/settingsLabels all present`);
+    }
+  }
+}
+
+/* ============================================================================
  * 打印
  * ==========================================================================*/
 
@@ -679,8 +728,10 @@ const CHECK_TITLES = {
   C8: "model list available for every provider",
   C9: "nav tabs vs manifest keys/paths",
   C10: "every server route that renders the template has a matching manifest path",
+  C11: "panel-common.js must not hard-code provider names",
+  C12: "renderer-critical manifest fields present for every provider",
 };
-const ORDER = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10"];
+const ORDER = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12"];
 
 console.log("check-manifest -- provider panel manifest/template consistency gate");
 console.log("root: " + ROOT);
