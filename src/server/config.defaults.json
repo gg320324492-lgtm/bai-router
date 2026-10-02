@@ -3,6 +3,16 @@
   "upstream": "https://api.b.ai",
   "proxy": "http://127.0.0.1:7897",
   "relayPort": 15722,
+  "failover": {
+    "enabled": false,
+    "chain": [
+      "qd",
+      "bai",
+      "sn",
+      "zen",
+      "wb"
+    ]
+  },
   "panelPort": 15723,
   "defaultModel": "qwen3.8-flash",
   "availableModels": [
@@ -157,6 +167,7 @@
     },
     "token": "",
     "tokenFile": "C:\\Users\\admin\\AppData\\Local\\Temp\\qoder-token.json",
+    "modelsFile": "C:\\Users\\admin\\AppData\\Local\\Temp\\qoder-models.json",
     "useProxy": false
   },
   "wb": {

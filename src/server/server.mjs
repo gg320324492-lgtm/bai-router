@@ -10,6 +10,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
 import os from "node:os";
+import {
+  CaptureRes, failoverCooldown, failoverClear, failoverAvailable, failoverSnapshot,
+  shouldFailover, FAILOVER_COOLDOWN_MS,
+} from "./failover.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -90,6 +94,14 @@ const DEFAULTS = {
     mapping: defaultMapping("space-bunny-free", "Space-Bunny-Free"),
     useProxy: false,
   },
+  // 自动故障转移：Claude Code 只接一次线（指向当前提供方那个端口），之后由中转自己
+  // 决定用谁。默认关闭——改变请求去向这种事得用户点头才开。
+  failover: {
+    enabled: false,
+    // 转移顺序（当前提供方永远排第一，手动选的才是首选）。未配置凭据的会被自动跳过。
+    chain: ["qd", "bai", "sn", "zen", "wb"],
+  },
+
   // Qoder（qoder.com 桌面端附带的 Free 套餐）—— 第五个可路由提供方。
   // 上游只讲 OpenAI 协议（/model/v1/chat/completions），复用通用协议桥。
   // 认证不是 sk- 密钥，而是 jt- 开头的 jobToken，且**每次 Qoder 启动都会轮换**——
@@ -158,6 +170,11 @@ function loadCfg() {
       mapping: { ...DEFAULTS.wb.mapping, ...(wbIn.mapping || {}) },
       availableModels: Array.isArray(wbIn.availableModels) && wbIn.availableModels.length ? wbIn.availableModels : [...DEFAULTS.wb.availableModels],
     };
+    // failover 深合并
+    merged.failover = { ...DEFAULTS.failover, ...(c.failover || {}) };
+    if (!Array.isArray(merged.failover.chain) || !merged.failover.chain.length) {
+      merged.failover.chain = [...DEFAULTS.failover.chain];
+    }
     // qd 深合并（同上）
     const qdIn = c.qd || {};
     merged.qd = {
@@ -168,7 +185,7 @@ function loadCfg() {
     return merged;
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
-    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] } };
+    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] }, failover: { ...DEFAULTS.failover, chain: [...DEFAULTS.failover.chain] } };
   }
 }
 function saveCfg(cfg) {
@@ -1272,6 +1289,11 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     : directHttp(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, timeoutMs: isProbe ? 10000 : 30000 });
 
   let r;
+  // 声明必须在 try 之外：下面 try/catch 之后（r.status !== 200 分支）还要用它们，
+  // 放进 try 里就成了块级作用域，那边引用不到（报 "is not defined"）。
+  let consumed400 = "";
+  let consumedBodyHint = "";
+
   try {
     r = await doCall(token);
     // 令牌失效（401/403）→ WorkBuddy 侧可续期并重试一次；Zen 侧 key 失效直接报错；
@@ -1307,8 +1329,6 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     }
     // "unapproved channel" 偶发抖动：重试一次（确定性指纹已由 wbSanitizeSystem 剥除）。
     // 注意 400 响应体已被读走，若最终仍是错误，错误文案从 consumed400 兜底。
-    let consumed400 = "";
-    let consumedBodyHint = "";
     if (r.status === 400) {
       consumed400 = await readAllBody(r).catch(() => "");
       if (consumed400.includes("unapproved channel")) {
@@ -1376,6 +1396,114 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
 
 // 中转核心工厂：B.AI(:relayPort) 与 SenseNova(:sn.relayPort) 复用同一套逻辑，只是
 // 取哪份配置(slice)、是否走代理(useProxy)、把流量记到哪个 recentCalls(store) 不同。
+// 按"故障转移链"依次尝试。fo 形如 {provider:"qd", slice, useProxy, opts}。
+// 每家一次尝试都先写进影子 res：首个响应是错误就丢弃换下一家，是 200 才落盘。
+async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, tier0) {
+  const foCfg = cfg.failover || {};
+  if (!foCfg.enabled) {
+    await dispatchOne(fo, req, res, cfg, body, rewritten, isProbe);
+    return;
+  }
+  const order = (Array.isArray(foCfg.chain) && foCfg.chain.length ? foCfg.chain : [fo.provider])
+    .filter(Boolean);
+  // 当前提供方永远排第一——手动选的就是首选，不该被配置里的顺序顶掉
+  const chain = [fo.provider, ...order.filter((x) => x !== fo.provider)];
+  const tries = [];
+  let lastErr = "";
+  // 每个目标渠道都要按**它自己的**路由表重新把档位解析成模型名：主渠道的映射在别的
+  // 渠道往往不存在（Qoder 的 lite / WorkBuddy 的 deepseek-* / Zen 的 space-bunny-free
+  // 互不相通）。不重解析的话转移过去必然 400 "Model is unavailable"。
+  const bodyFor = (target) => {
+    if (!tier0 || !rewritten) return { body, rewritten };
+    const m = resolveModel(tier0, {
+      mapping: target.S.mapping, availableModels: target.S.availableModels, defaultModel: target.S.defaultModel,
+    });
+    return { body: Buffer.from(JSON.stringify({ ...rewritten, model: m })), rewritten: { ...rewritten, model: m } };
+  };
+  for (const provider of chain) {
+    if (provider !== fo.provider && !failoverAvailable(provider)) { tries.push({ provider, skipped: "冷却中" }); continue; }
+    // 目标渠道必须已配置凭据，否则跳（避免拿一个必然 401 的渠道去试）
+    if (!providerConfigured(provider, cfg)) { tries.push({ provider, skipped: "未配置" }); continue; }
+    const target = provider === fo.provider ? fo : relaySpec(provider, cfg);
+    if (!target) { tries.push({ provider, skipped: "未知渠道" }); continue; }
+    const cap = new CaptureRes(res);
+    const sub = bodyFor(target);
+    try {
+      await dispatchOne(target, req, cap, cfg, sub.body, sub.rewritten, isProbe);
+    } catch (e) {
+      cap.discard();
+      lastErr = String((e && e.message) || e);
+      tries.push({ provider, ok: false, err: lastErr.slice(0, 120) });
+      failoverCooldown(provider, lastErr);
+      noteRelayError(provider, "failover", `转移走（异常）：${lastErr.slice(0, 120)}`);
+      continue;
+    }
+    if (cap.ok()) {
+      failoverClear(provider);
+      tries.push({ provider, ok: true });
+      if (tries.length > 1) noteFailoverEvent(fo.provider, tries);
+      return;
+    }
+    // 影子判定为失败：换一个
+    const status = cap.status || 0;
+    tries.push({ provider, ok: false, status, err: String(describeError(cap) || "").slice(0, 110) });
+    if (!shouldFailover(status)) {
+      // 不该转移（多半是 400 请求本身有问题）——把这次的真实错误原样还给客户端
+      noteFailoverEvent(fo.provider, tries);
+      if (cap.flushBuffered()) return;
+      return wbAnthroError(res, status || 502,
+        `${target.label} 返回 ${status || "网络错误"}，此错误重试其他渠道也不会好转：${describeError(cap)}`);
+    }
+    lastErr = describeError(cap) || `HTTP ${status}`;
+    failoverCooldown(provider, lastErr);
+    noteRelayError(provider, "failover", `转移走（HTTP ${status}）：${String(lastErr).slice(0, 120)}`);
+  }
+  noteFailoverEvent(fo.provider, tries);
+  return wbAnthroError(res, 502,
+    `所有渠道都失败了。最后一次：${lastErr || "未知"}（链路：${tries.map((t) => t.provider + (t.ok ? "✓" : t.skipped ? "(" + t.skipped + ")" : "✗")).join(" → ")}）`);
+}
+
+function describeError(cap) {
+  try {
+    if (!cap.buf || !cap.buf.length) return `HTTP ${cap.status || 0}`;
+    const txt = Buffer.concat(cap.buf).toString("utf8");
+    const m = txt.match(/"message"\s*:\s*"([^"]{1,200})"/);
+    if (m) return m[1];
+    const m2 = txt.match(/"error"\s*:\s*"([^"]{1,200})"/);
+    return m2 ? m2[1] : txt.slice(0, 160);
+  } catch { return ""; }
+}
+
+function noteFailoverEvent(from, tries) {
+  const detail = tries.map((t) => `${t.provider}:${t.ok ? "成功" : t.skipped || ("失败[st=" + t.status + (t.err ? "/" + String(t.err).slice(0,40) : "") + "]")}`).join("；");
+  log(`故障转移（入口 ${from}）→ ${detail}`);
+}
+
+function dispatchOne(fo, req, res, cfg, body, rewritten, isProbe) {
+  return handleUpstream(fo, req, res, cfg, body, rewritten, isProbe);
+}
+
+function providerConfigured(provider, cfg) {
+  if (provider === "bai") return !!cfg.apiKey;
+  if (provider === "sn") return !!cfg.sn?.apiKey;
+  if (provider === "wb") return !!cfg.wb?.accessToken;
+  if (provider === "zen") return !!cfg.zen?.apiKey;
+  if (provider === "qd") { try { qdEnsureToken(cfg); return true; } catch { return false; } }
+  return false;
+}
+
+function relaySpec(provider, cfg) {
+  const meta = {
+    bai: ["B.AI", () => true, {}],
+    sn: ["SenseNova", () => cfg.sn?.useProxy === true, {}],
+    wb: ["WorkBuddy", () => cfg.wb?.useProxy === true, { openai: true }],
+    zen: ["OpenCode Zen", () => cfg.zen?.useProxy === true, { openai: true }],
+    qd: ["Qoder", () => cfg.qd?.useProxy === true, { openai: true }],
+  }[provider];
+  if (!meta) return null;
+  return { provider, label: meta[0], useProxy: meta[1], opts: meta[2], S: sliceOf(cfg, provider) };
+}
+
 function makeRelay(p, store, getSlice, useProxy, opts = {}) {
   return http.createServer((req, res) => {
     const chunks = [];
@@ -1386,6 +1514,7 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
       const sliceCfg = { mapping: S.mapping, availableModels: S.availableModels, defaultModel: S.defaultModel };
       let body = Buffer.concat(chunks);
       let rewritten = null; // 模型解析后的请求 JSON（OpenAI 桥用）
+      let tier0 = null;      // 原始档位（故障转移时要按目标渠道的映射重新解析成模型名）
       const ct = (req.headers["content-type"] || "").toLowerCase();
       if (body.length && ct.includes("json")) {
         try {
@@ -1393,6 +1522,7 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
           if (typeof j.max_tokens === "number" && j.max_tokens < 3) j.max_tokens = 3; // 桌面版健康探测兼容
           if (typeof j.model === "string") {
             const tier = normalizeModel(j.model);
+            tier0 = tier; // 记下原始档位，转移时按新渠道的映射重解析
             j.model = resolveModel(j.model, sliceCfg);
             // 只观察"真实会话"流量：max_tokens≥512 的对话请求。
             // 桌面版后台小请求(健康探测/起标题/摘要, max_tokens 通常 ≤128)不算"用户正在用的档位"
@@ -1405,77 +1535,89 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
           body = Buffer.from(JSON.stringify(j));
         } catch { /* 非 JSON 原样透传 */ }
       }
-      const headers = {};
-      for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
-      // 探活级小请求（max_tokens≤8，桌面版健康检查/模型探测）：遇 429 静默退避重试 + 更短超时。
-      // 放在 try 外声明——catch 里的超时归因也要用到
+      // 探活级小请求（max_tokens≤8）：更短超时
       const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();
-      const headerTimeoutMs = isProbe ? 10000 : 30000;
-      // WorkBuddy（opts.openai）：上游只讲 OpenAI 且仅流式——独立协议桥处理，
-      // 请求（Anthropic→OpenAI）与响应（OpenAI SSE→Anthropic SSE）都在桥内翻译。
-      if (opts.openai) {
-        if (!rewritten) return wbAnthroError(res, 400, "请求体必须是 Anthropic messages JSON");
-        try {
-          await openaiExchange(p, { cfg, S, j: rewritten, isProbe, res, useProxy: useProxy(cfg) });
-        } catch (e) {
-          noteRelayError(p, "network", String((e && e.message) || e));
-          if (!res.headersSent) wbAnthroError(res, 502, (e && e.message) || e);
-          else try { res.end(); } catch { }
-        }
-        return;
-      }
-      const UP = S.upstream + req.url;
-      const doCall = () => useProxy(cfg)
-        ? fetch(UP, { method: req.method, headers, body: body.length ? body : undefined, signal: AbortSignal.timeout(headerTimeoutMs) })
-        : directHttp(UP, { method: req.method, headers, body: body.length ? body : undefined, timeoutMs: headerTimeoutMs });
       try {
-        const { Readable } = await import("node:stream");
-        let r;
-        // v1.0.19: 上游超时只限"连接+响应头"——头一到就放行（SSE 流式正文不限时）。
-        for (let attempt = 0; ; attempt++) {
-          r = await doCall();
-          if (!isProbe || r.status !== 429 || attempt >= 3) break;
-          if (r.body && r.body.resume) r.body.resume(); // 丢弃 429 响应体（node stream 需 resume 否则挂起）
-          await new Promise((rr) => setTimeout(rr, 400 * (attempt + 1)));
-        }
-        // 429 可能是不带 Content-Type 的空响应；先单独处理，不能误判为代理 HTML。
-        if (r.status === 429) {
-          noteRelayError(p, "rate_limit", "上游 429 限流（免费渠道并发敏感）");
-          return sendRateLimitError(res, r);
-        }
-        // Anthropic API 端点只应返回 JSON 或 SSE；其余类型通常是代理/WAF
-        // 的 HTML 页面。转换为标准 JSON 错误，避免调用端误报 JSON 解析异常。
-        if (req.url.startsWith("/v1/") && !isApiResponseType(r.headers.get("content-type"))) {
-          return sendUnexpectedUpstreamResponse(res, r);
-        }
-        if (r.status >= 400) noteRelayError(p, `upstream_${r.status}`, `上游 HTTP ${r.status}（${req.url}）`);
-        const h = {};
-        // fetch 已自动解压响应体，content-encoding 必须剥掉，否则客户端按 gzip 解明文会炸。
-        // node 直连不解压：对 sn 保留 content-encoding，交给客户端解压。
-        const strip = r._nodeStream
-          ? ["content-length", "transfer-encoding", "connection"]
-          : ["content-length", "transfer-encoding", "connection", "content-encoding"];
-        r.headers.forEach((v, k) => { if (!strip.includes(k)) h[k] = v; });
-        res.writeHead(r.status, h);
-        if (r.body) {
-          const stream = r._nodeStream ? r.body : Readable.fromWeb(r.body);
-          stream.pipe(res);
-          stream.on("error", () => res.end());
-        } else res.end();
+        await attemptWithFailover({ provider: p, S, useProxy, opts }, req, res, cfg, body, rewritten, isProbe, tier0);
       } catch (e) {
-        const msg = String((e && e.message) || e);
-        if (useProxy(cfg) && msg.includes("fetch failed")) scheduleProxyCheck(0, "上游连接失败触发"); // 代理可能换了端口/挂了 → 自动探测
-        // v1.0.19: 超时/网络错误给出人话归因，并记录到面板"本地中转"灯
-        const timedOut = e?.name === "AbortError" || msg.toLowerCase().includes("abort");
-        const friendly = timedOut
-          ? `上游 ${S.upstream} 在 ${isProbe ? 10 : 30}s 内未返回响应头（节点慢或被墙），已中断本次请求`
-          : msg;
-        noteRelayError(p, timedOut ? "timeout" : msg.includes("fetch failed") ? "proxy" : "network", friendly);
-        if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { type: "relay_error", message: friendly } }));
+        try { log('FODEBUG STACK: ' + String(e && e.stack)); } catch {}
+        if (!res.headersSent) wbAnthroError(res, 502, String((e && e.message) || e));
+        else try { res.end(); } catch { }
       }
     });
   });
+}
+
+// 一次尝试：把请求送到本渠道的上游并把响应写进 res（可能是影子 res）。
+// 从 makeRelay 里原样抽出，只把闭合的 p/S/useProxy/opts 换成 fo.*。
+async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
+        const headers = {};
+        for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
+        // isProbe 由入口算好后传入（同时决定中转观察与超时档位），这里不再重算
+        const headerTimeoutMs = isProbe ? 10000 : 30000;
+        // WorkBuddy（fo.opts.openai）：上游只讲 OpenAI 且仅流式——独立协议桥处理，
+        // 请求（Anthropic→OpenAI）与响应（OpenAI SSE→Anthropic SSE）都在桥内翻译。
+        if (fo.opts.openai) {
+          if (!rewritten) return wbAnthroError(res, 400, "请求体必须是 Anthropic messages JSON");
+          try {
+            await openaiExchange(fo.provider, { cfg, S: fo.S, j: rewritten, isProbe, res, useProxy: fo.useProxy(cfg) });
+          } catch (e) {
+            noteRelayError(fo.provider, "network", String((e && e.message) || e));
+            if (!res.headersSent) wbAnthroError(res, 502, (e && e.message) || e);
+            else try { res.end(); } catch { }
+          }
+          return;
+        }
+        const UP = fo.S.upstream + req.url;
+        const doCall = () => fo.useProxy(cfg)
+          ? fetch(UP, { method: req.method, headers, body: body.length ? body : undefined, signal: AbortSignal.timeout(headerTimeoutMs) })
+          : directHttp(UP, { method: req.method, headers, body: body.length ? body : undefined, timeoutMs: headerTimeoutMs });
+        try {
+          const { Readable } = await import("node:stream");
+          let r;
+          // v1.0.19: 上游超时只限"连接+响应头"——头一到就放行（SSE 流式正文不限时）。
+          for (let attempt = 0; ; attempt++) {
+            r = await doCall();
+            if (!isProbe || r.status !== 429 || attempt >= 3) break;
+            if (r.body && r.body.resume) r.body.resume(); // 丢弃 429 响应体（node stream 需 resume 否则挂起）
+            await new Promise((rr) => setTimeout(rr, 400 * (attempt + 1)));
+          }
+          // 429 可能是不带 Content-Type 的空响应；先单独处理，不能误判为代理 HTML。
+          if (r.status === 429) {
+            noteRelayError(fo.provider, "rate_limit", "上游 429 限流（免费渠道并发敏感）");
+            return sendRateLimitError(res, r);
+          }
+          // Anthropic API 端点只应返回 JSON 或 SSE；其余类型通常是代理/WAF
+          // 的 HTML 页面。转换为标准 JSON 错误，避免调用端误报 JSON 解析异常。
+          if (req.url.startsWith("/v1/") && !isApiResponseType(r.headers.get("content-type"))) {
+            return sendUnexpectedUpstreamResponse(res, r);
+          }
+          if (r.status >= 400) noteRelayError(fo.provider, `upstream_${r.status}`, `上游 HTTP ${r.status}（${req.url}）`);
+          const h = {};
+          // fetch 已自动解压响应体，content-encoding 必须剥掉，否则客户端按 gzip 解明文会炸。
+          // node 直连不解压：对 sn 保留 content-encoding，交给客户端解压。
+          const strip = r._nodeStream
+            ? ["content-length", "transfer-encoding", "connection"]
+            : ["content-length", "transfer-encoding", "connection", "content-encoding"];
+          r.headers.forEach((v, k) => { if (!strip.includes(k)) h[k] = v; });
+          res.writeHead(r.status, h);
+          if (r.body) {
+            const stream = r._nodeStream ? r.body : Readable.fromWeb(r.body);
+            stream.pipe(res);
+            stream.on("error", () => res.end());
+          } else res.end();
+        } catch (e) {
+          const msg = String((e && e.message) || e);
+          if (fo.useProxy(cfg) && msg.includes("fetch failed")) scheduleProxyCheck(0, "上游连接失败触发"); // 代理可能换了端口/挂了 → 自动探测
+          // v1.0.19: 超时/网络错误给出人话归因，并记录到面板"本地中转"灯
+          const timedOut = e?.name === "AbortError" || msg.toLowerCase().includes("abort");
+          const friendly = timedOut
+            ? `上游 ${fo.S.upstream} 在 ${isProbe ? 10 : 30}s 内未返回响应头（节点慢或被墙），已中断本次请求`
+            : msg;
+          noteRelayError(fo.provider, timedOut ? "timeout" : msg.includes("fetch failed") ? "proxy" : "network", friendly);
+          if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { type: "relay_error", message: friendly } }));
+        }
 }
 
 // 三个中转：B.AI 走代理（出海）、SenseNova 走直连（境内，可被 sn.useProxy 覆盖）、
@@ -1827,6 +1969,7 @@ async function statusPayload() {
   return {
     now: new Date().toISOString(),
     service: { up: true, uptimeSec: Math.floor((Date.now() - BOOT) / 1000), pid: process.pid },
+  failover: { enabled: cfg.failover?.enabled === true, chain: cfg.failover?.chain || [], cooling: failoverSnapshot() },
     panel: { port: cfg.panelPort, up: true },
     clash,
     proxy: cfg.proxy || "直连",
@@ -2032,6 +2175,13 @@ const panel = http.createServer(async (req, res) => {
         else {
           if (!k.startsWith("sk-")) return json(res, 400, { error: "API Key 应以 sk- 开头" });
           if (P === "sn") cfg.sn.apiKey = k; else if (P === "bai") cfg.apiKey = k;
+        }
+      }
+      // —— 故障转移开关与链路顺序（provider=bai 那一份顶层配置）——
+      if (P === "bai" && b.failover) {
+        if (typeof b.failover.enabled === "boolean") cfg.failover = { ...(cfg.failover || {}), enabled: b.failover.enabled };
+        if (Array.isArray(b.failover.chain)) {
+          cfg.failover = { ...(cfg.failover || {}), chain: b.failover.chain.filter((x) => ["bai","sn","wb","zen","qd"].includes(x)) };
         }
       }
       // —— Qoder 令牌（一般不用填：正常由 worker 补丁写入 tokenFile，此处仅手动兜底）——

@@ -38,6 +38,8 @@ try {
       const cur3 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
       if (cur3.zen) def.zen = { ...cur3.zen, apiKey: "" };
     }
+    // failover 无凭据，但保险起见把 chain 收敛到已知提供方
+    if (def.failover) { def.failover.chain = (def.failover.chain || []).filter((x) => [bai,sn,wb,zen,qd].includes(x)); }
     // qd（Qoder）块：token 是手动兜底用的 jt- jobToken，绝不进快照
     // （正常路径下它恒为空——真实令牌由 worker 补丁写在 %TEMP%\qoder-token.json，不落 config）
     if (def.qd) { def.qd = { ...def.qd, token: "" }; }
@@ -64,8 +66,10 @@ run("npx electron-builder --win nsis");
   const qdOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "qd.html"));
   // 五个页面都 <script src="/panel-common.js">，缺了它所有页面的底栏与更新控件都会消失
   const pcOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "panel-common.js"));
-  if (miss.length || !snOk || !wbOk || !zenOk || !qdOk || !pcOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html") + (zenOk ? "" : " + resources/server/zen.html") + (qdOk ? "" : " + resources/server/qd.html") + (pcOk ? "" : " + resources/server/panel-common.js"));
-  console.log("» 发布闸门通过：asar 模块齐全，sn/wb/zen/qd.html 与 panel-common.js 已随包");
+  // server.mjs 静态 import 了 failover.mjs，缺了整个服务起不来
+  const foOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "failover.mjs"));
+  if (miss.length || !snOk || !wbOk || !zenOk || !qdOk || !pcOk || !foOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html") + (zenOk ? "" : " + resources/server/zen.html") + (qdOk ? "" : " + resources/server/qd.html") + (pcOk ? "" : " + resources/server/panel-common.js") + (foOk ? "" : " + resources/server/failover.mjs"));
+  console.log("» 发布闸门通过：asar 模块齐全，sn/wb/zen/qd.html、panel-common.js、failover.mjs 已随包");
 }
 // upgrade.ps1：救砖/一键升级脚本，作为 release 资产随每个版本发布（旧版更新器损坏的用户无需打开网页）
 if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {
