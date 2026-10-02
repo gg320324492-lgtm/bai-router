@@ -948,11 +948,23 @@
     renderSteps();
   }
 
-  async function withBusy(btn, fn) {
+  /* 失败信息的落点：按钮所在卡片末尾的 .result（契约：每张卡的 .body 末尾恰好一个），
+     找不到才退回 #applyResult。旧实现无条件写 #applyResult，于是 SenseNova 点
+     「刷新模型列表」失败时，错误冒到页面顶部不相干的「当前接线」卡里，按钮旁边一片空白。
+     卡片内的落点由 DOM 结构决定，调用点不必各自声明；确实需要时可传第三参显式覆盖。
+     槽在点按钮时就取定（而非报错后才找），避免 fn() 里的重绘改变判断依据。 */
+  function errSlotOf(btn, explicit) {
+    if (explicit) return explicit;
+    const card = btn && btn.closest ? btn.closest(".card") : null;
+    return (card && q(".result", card)) || $("applyResult");
+  }
+
+  async function withBusy(btn, fn, errSlot) {
+    const slot = errSlotOf(btn, errSlot);
     busy = true;
     const old = btn ? btn.textContent : "";
     if (btn) { btn.disabled = true; btn.textContent = "处理中…"; }
-    try { await fn(); } catch (e) { showResult($("applyResult"), "出错了：" + e.message, false); }
+    try { await fn(); } catch (e) { showResult(slot, "出错了：" + e.message, false); }
     finally {
       if (btn) { btn.disabled = false; btn.textContent = old; }
       busy = false;
