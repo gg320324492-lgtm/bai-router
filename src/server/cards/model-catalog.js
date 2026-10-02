@@ -1,0 +1,204 @@
+/* cards/model-catalog.js —— Zen / Qoder 两页的「模型目录」区。
+ *
+ * 两个页面各有一块，结构一样、id 不同，于是按 ctx.PROVIDER 分支：
+ *   zen → /api/models?p=zen （zen.html 的 renderZenCatalog / renderZenInfo）
+ *   qd  → /api/models?p=qd  （qd.html 的 renderCatalog / renderKeyInfo）
+ * 逻辑、配色、文案全部照抄源页，连 qd 那三段「令牌从哪来」的说明也一并搬过来
+ * （它原本挂在 cardTok 卡上，extraCards 里没有单独的条目，见交付说明）。
+ *
+ * 下面用到契约里没列的两个钩子（都做了存在性判断，缺了也不报错）：
+ *   ctx.renderRoute()          —— 目录读回来后要重画下拉框（原页直接调 renderRoute()）
+ *   window.BAI_MODEL_LABELS    —— qd 的「key → 显示名」映射，供下拉框显示友好名
+ */
+window.BAI_CARDS = window.BAI_CARDS || {};
+window.BAI_CARDS["model-catalog"] = {
+  mount(ctx) {
+    const $ = ctx.$ || ((id) => document.getElementById(id));
+    const slot = ctx.slot || $("slot-extra") || (() => {
+      const d = document.createElement("div");
+      (document.querySelector(".wrap") || document.body).appendChild(d);
+      return d;
+    })();
+    const PROVIDER = ctx.PROVIDER || "zen";
+    const QD = PROVIDER === "qd";
+
+    /* ---------- markup（原样，未改一个字） ---------- */
+    if (QD) {
+      slot.insertAdjacentHTML("beforeend", `
+        <!-- 令牌（Qoder 无需手动填写，这里只做状态说明） -->
+        <div class="card foldable collapsed" id="cardTok">
+          <div class="head" id="headTok">
+            <span class="eyebrow">令牌</span><span class="title">令牌从哪来</span>
+            <span class="aux">正常无需任何操作</span>
+          </div>
+          <div class="body">
+            <div class="tokstat" id="tokStat">正在读取令牌状态…</div>
+
+            <div class="hint" style="margin-top:12px">
+              Qoder 的 <span class="mono">jt-…</span> 令牌<b>每次客户端启动都会轮换</b>，所以它不会被存进 config.json，
+              也不会写进 Claude 的 settings.json——中转每次请求现读，Qoder 换令牌后无需重启中转即自动跟随。
+            </div>
+            <div class="hint" style="margin-top:8px">
+              来源是 <span class="mono">qoder-patch/patch_worker.py</span>：它给 Qoder 的 agent worker
+              （<span class="mono">resources/app.asar.unpacked/…/dist/_worker/qoder-worker-runtime.obf.mjs</span>）
+              打了一个小补丁，在每次带鉴权的出站请求上把当前令牌覆盖写入
+              <span class="mono">%TEMP%/qoder-token.json</span>。
+            </div>
+            <div class="hint" style="margin-top:8px">
+              <b>前提：Qoder 桌面端必须保持运行</b>。关掉它就不会再刷新令牌文件，中转会读到上一次的旧令牌并返回 401。
+              如需彻底还原客户端，执行 <span class="mono">python patch_worker.py revert</span>。
+            </div>
+          </div>
+        </div>
+
+        <div class="hint" style="margin-top:10px" id="catHint">下拉里只列<b>能从本中转真正调用</b>的模型。Qoder 客户端内的模型目录与此不同——<span id="catMore">点下方「刷新模型列表」读取</span>。</div>
+        <div id="catBox" style="display:none;margin-top:10px">
+          <div style="font-size:12px;color:var(--dim);margin-bottom:6px">Qoder 账号的完整模型目录（免费档已标出）：</div>
+          <div id="catList" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+        </div>`);
+    } else {
+      slot.insertAdjacentHTML("beforeend", `
+        <div class="hint" style="margin-top:10px" id="zenCatHint">下拉里只列<b>能从本中转真正调用</b>的模型。Zen 的公开目录共八十多个，但绝大多数被上游按产品策略锁住——<span id="zenCatMore">点下方「刷新模型列表」读取</span>。</div>
+        <div id="zenCatBox" style="display:none;margin-top:10px">
+          <div style="font-size:12px;color:var(--dim);margin-bottom:6px">Zen 公开模型目录（<span style="color:var(--ok)">绿框=可外部调用</span>，虚线=上游锁定）：</div>
+          <div id="zenCatList" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+        </div>`);
+    }
+
+    /* 「令牌从哪来」卡的折叠交互（qd 页原样，不记忆选择） */
+    if (QD) {
+      const card = $("cardTok"), head = $("headTok");
+      if (card && head) {
+        head.setAttribute("tabindex", "0");
+        head.setAttribute("role", "button");
+        const sync = () => head.setAttribute("aria-expanded", String(!card.classList.contains("collapsed")));
+        sync();
+        const toggle = () => { card.classList.toggle("collapsed"); sync(); };
+        head.addEventListener("click", toggle);
+        head.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
+      }
+    }
+
+    /* ---------- 画目录（原样） ---------- */
+
+    // Zen 公开目录：全部列出并标注可用性。下拉只放真能调通的，其余照实展示，
+    // 免得用户以为"上游没有这个模型"，其实是产品级封锁（FreeTierError）。
+    function renderZenCatalog(j) {
+      if (!j || !j.all || !j.all.length) {
+        if (j && j.note) $("zenCatHint").textContent = j.note;
+        return;
+      }
+      const box = $("zenCatList");
+      box.innerHTML = "";
+      for (const m of j.all) {
+        const s = document.createElement("span");
+        s.style.cssText = "font-family:var(--mono);font-size:11px;padding:3px 8px;border-radius:6px;"
+          + (m.external ? "border:1px solid var(--ok);color:var(--ok)"
+                        : (m.free ? "border:1px dashed var(--line);color:var(--dim)"
+                                  : "border:1px solid var(--line);color:var(--dim)"));
+        s.textContent = m.key + (m.external ? " · 可用" : (m.free ? " · 免费档限客户端内" : " · 需付费额度"));
+        box.appendChild(s);
+      }
+      $("zenCatBox").style.display = "";
+      $("zenCatHint").textContent = j.note;
+      // 同 qd：#zenCatMore 嵌在 #zenCatHint 里，先写 textContent 会抹掉它，故先写提示再重建
+      let zmore = document.getElementById("zenCatMore");
+      if (!zmore) {
+        zmore = document.createElement("span");
+        zmore.id = "zenCatMore";
+        $("zenCatHint").appendChild(document.createTextNode(" "));
+        $("zenCatHint").appendChild(zmore);
+      }
+      zmore.textContent = "已读取 " + j.all.length + " 个";
+      applyModels(j, null);
+    }
+
+    // Qoder 的完整模型目录：下拉只放外部真能调通的，其余照实列出并标注「仅客户端内」，
+    // 免得选了必然 400。免费档（含 Qwen3.8-Flash）单独标出来。
+    function renderCatalog(j) {
+      if (!j || !j.all || !j.all.length) {
+        if (j && j.note) $("catHint").innerHTML = j.note;
+        return;
+      }
+      const chip = (m) => {
+        const s = document.createElement("span");
+        s.style.cssText = "font-family:var(--mono);font-size:11px;padding:3px 8px;border-radius:6px;"
+          + (m.external ? "border:1px solid var(--line);color:var(--ink)" : "border:1px dashed var(--line);color:var(--dim)")
+          + (m.free ? ";border-color:var(--ok);color:var(--ok)" : "");
+        s.textContent = (m.external && qdLabels && qdLabels[m.key]) || m.name
+          + (m.free ? " · 免费" : "") + (m.external ? "" : " · 仅客户端内");
+        s.title = m.key + (m.price != null ? "　price_factor=" + m.price : "");
+        return s;
+      };
+      const box = $("catList");
+      box.innerHTML = "";
+      for (const m of j.all) box.appendChild(chip(m));
+      $("catBox").style.display = "";
+      // 顺序有讲究：#catMore 原本嵌在 #catHint 里，先写 innerHTML 会把它连同内部
+      // 整段抹掉，后面再 $("catMore") 就是 null → TypeError。所以先写提示，再重建它。
+      $("catHint").innerHTML = j.note + " 下拉里只列能从本中转真正调用的那些。";
+      let more = document.getElementById("catMore");
+      if (!more) {
+        more = document.createElement("span");
+        more.id = "catMore";
+        $("catHint").appendChild(document.createTextNode(" "));
+        $("catHint").appendChild(more);
+      }
+      more.textContent = "已读取 " + j.all.length + " 个";
+      // 顺带刷新下拉的可选项与显示名
+      applyModels(j, j.labels || null);
+    }
+
+    let qdLabels = null;   // key -> 显示名，来自 /api/models?p=qd
+
+    // 把目录里的「外部可调用」那批写进当前 provider 的 availableModels 并重画下拉。
+    // ctx.cfg 在页面刚加载、配置还没回来时是 null —— 早期版本在这里直接静默抛错，
+    // 结果下拉框永远停在 config.defaults.json 的默认值（Qoder 只剩 lite/auto 两项，
+    // 而实际可调用的有 8 个）。所以先把配置等回来，再写。
+    async function applyModels(j, labels) {
+      if (labels) { qdLabels = labels; window.BAI_MODEL_LABELS = labels; }
+      try {
+        if (!ctx.cfg && typeof ctx.refreshConfig === "function") await ctx.refreshConfig();
+        const c = ctx.cfg && ctx.cfg[PROVIDER];
+        if (c) c.availableModels = j.models;
+        if (typeof ctx.renderRoute === "function") ctx.renderRoute();
+      } catch (e) { /* 目录渲染失败不该拖垮页面 */ }
+    }
+
+    /* ---------- 取数据（原样：各自打自己的 ?p= ） ---------- */
+
+
+    function renderKeyInfo(status) {
+      const stat = $("tokStat");
+      const t = ((status && status.qd) || {}).token || {};
+      if (stat) {
+        stat.innerHTML = t.configured
+          ? '<span style="color:var(--ok)">✔ 已读到令牌</span>　<span class="mono">' + (t.tokenFile || "") + '</span>'
+          + '<br><span>令牌每次 Qoder 启动会轮换，中转按此文件现读，无需重启</span>'
+          : '<span style="color:var(--err)">✘ 未读到令牌</span>　请启动 Qoder 桌面端（补丁会自动写入令牌文件）';
+      }
+    }
+
+    // 目录刷新：服务端按 mtime 缓存 30 分钟，代价可忽略，所以每轮轮询都可以刷。
+    function fetchCatalog() {
+      fetch("/api/models?p=" + PROVIDER).then((r) => r.json()).then(QD ? renderCatalog : renderZenCatalog).catch(() => { });
+    }
+    fetchCatalog();
+
+    // 首屏就读一次（源页是在 refreshConfig 里做的）
+    if (QD) renderKeyInfo(ctx.status);
+
+    return {
+      // 轮询刷新：qd 顺带刷新令牌状态与目录（与源页 renderKeyInfo 同一时机）；
+      // zen 的目录与 status 无关，源页也只在 refreshConfig 时读，保持如此。
+      update(status) {
+        if (QD) { renderKeyInfo(status || ctx.status); fetchCatalog(); }
+      },
+      // 配置刷新 / 「刷新模型列表」之后手动叫一次
+      refresh() {
+        if (QD) renderKeyInfo(ctx.status);
+        fetchCatalog();
+      },
+    };
+  },
+};

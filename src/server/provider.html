@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<!--
+  provider.html —— 五家提供方（B.AI / SenseNova / WorkBuddy / OpenCode Zen / Qoder）共用的唯一模板。
+  由 src/server/provider.html 一份模板 + panel-common.css + panel-common.js + providers.js 渲染。
+
+  约定（见 REFACTOR-CONTRACT.md）：
+  · 本文件只放「外壳 + 容器 + 插槽」，具体文案一律来自 providers.js 清单，由 panel-common.js 注入。
+  · 不得出现任何 inline <style>；唯一的 inline <script> 是 <head> 里那一段 data-provider 引导，
+    因为它必须在 panel-common.js 之前跑，且要在首帧前定好配色（html[data-provider] 切换强调色）。
+  · id 一处都不能改：契约「元素 id 约定」里列的全部 id 都在下面，且只出现一次。
+  · #bnrUpdate / #updBtn / #btnSelfUpd / #stopBtn 由 panel-common.js 注入，不写在这里。
+
+  插槽（供 panel-common.js / cards/*.js 挂载，空着不影响任何一屏的排版）：
+  #slot-lamps  .lamps 之后  —— 各家额外的灯（B.AI 的 Clash 代理灯、ui/sn 的 CC Switch 灯）
+  #slot-step1  引导第 1 步  —— 各家第 1 步的按钮（WorkBuddy 的「一键获取令牌」+ 等待进度）
+  #slot-route  路由表内   —— 各家在路由卡里的专属区块（ui/sn 的 API Key 行）
+  #slot-sys    设置卡内   —— 各家专属的设置字段（B.AI 的本地代理/面板端口/自动检测代理、Qoder 的只读令牌框）
+  #slot-extra  设置卡之后、<footer> 之前 —— 整张专属卡（B.AI 自动故障转移、WorkBuddy 令牌、
+               Zen/Qoder 模型目录），按清单 extraCards 依次加载 /cards/<name>.js
+-->
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>路由台</title>
+<link rel="stylesheet" href="/panel-common.css">
+<script>
+/* 唯一允许的内联脚本：只做一件事 —— 从路径推出当前 provider key，写到 <html data-provider>。
+   必须早于 panel-common.js 执行，也要早于首帧，否则会先闪一下错误的强调色。 */
+(function () {
+  var seg = location.pathname.replace(/^\/+/, "").split("/")[0];
+  document.documentElement.setAttribute("data-provider", seg || "bai");
+})();
+</script>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header>
+    <span class="logo-dot"></span>
+    <h1 id="h1"><span id="h1Text">路由台</span><small id="h1Sub"></small></h1>
+    <nav class="prov-nav" id="provNav">
+      <a href="/" class="prov-tab" data-key="bai">B.AI</a>
+      <a href="/sn" class="prov-tab" data-key="sn">SenseNova</a>
+      <a href="/wb" class="prov-tab" data-key="wb">WorkBuddy</a>
+      <a href="/zen" class="prov-tab" data-key="zen">OpenCode Zen</a>
+      <a href="/qd" class="prov-tab" data-key="qd">Qoder</a>
+    </nav>
+    <span class="svc" id="svc">服务 <b>●</b> —</span>
+    <button class="themeBtn" id="themeBtn" type="button" title="切换亮色 / 暗色主题"><span id="themeIcon">☾</span><span id="themeText">暗色</span></button>
+    <span class="winCtrls" id="winCtrls" aria-hidden="true">
+      <button id="winMin" title="最小化" aria-label="最小化"><svg viewBox="0 0 10 10"><rect x="1" y="4.5" width="8" height="1"/></svg></button>
+      <button id="winMax" title="最大化" aria-label="最大化"><svg viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1"/></svg></button>
+      <button id="winClose" class="close" title="关闭" aria-label="关闭"><svg viewBox="0 0 10 10"><path d="M1 1 L9 9 M9 1 L1 9" stroke="currentColor" stroke-width="1.2" fill="none"/></svg></button>
+    </span>
+  </header>
+
+  <!-- 信号灯：三盏固定容器，panel-common.js 按清单 lamps 决定显示哪几盏 -->
+  <div class="lamps" style="margin-bottom:18px">
+    <div class="lamp" id="lampRelay">
+      <div class="name" id="nameRelay">中转</div>
+      <div class="val"><span class="led" id="ledRelay"></span><span id="txtRelay">—</span></div>
+      <div class="sub" id="subRelay" title=""></div>
+    </div>
+    <div class="lamp" id="lampUp">
+      <div class="name" id="nameUp">上游</div>
+      <div class="val"><span class="led" id="ledUp"></span><span id="txtUp">未测试</span></div>
+      <div class="sub" id="subUp">点「测试连通」检查</div>
+    </div>
+    <div class="lamp" id="lampTok">
+      <div class="name" id="nameTok">凭据</div>
+      <div class="val"><span class="led" id="ledTok"></span><span id="txtTok">—</span></div>
+      <div class="sub" id="subTok"></div>
+    </div>
+  </div>
+  <!-- 插槽：各家额外的灯（B.AI 的 Clash 代理灯、ui/sn 的 CC Switch 灯） -->
+  <div id="slot-lamps"></div>
+
+  <!-- 两步引导 -->
+  <div class="card guide">
+    <div class="head">
+      <span class="eyebrow" id="eyebGuide">用法</span><span class="title" id="ttlGuide">两步开始使用（新电脑照做即可）</span>
+      <span class="aux" id="guideAux"></span>
+    </div>
+    <div class="body">
+      <div class="step" id="step1">
+        <div class="stepNo">
+          <span class="num">1</span>
+          <div class="stepTitle" id="ttlStep1"></div>
+          <div class="stepState" id="state1">待完成</div>
+        </div>
+        <div class="stepBody">
+          <div class="stepDesc" id="descStep1"></div>
+          <!-- 插槽：各家第 1 步的动作（WorkBuddy 的「一键获取令牌」按钮 + 捕获等待进度条） -->
+          <div class="stepAct" id="slot-step1"></div>
+        </div>
+      </div>
+
+      <div class="step" id="step2">
+        <div class="stepNo">
+          <span class="num">2</span>
+          <div class="stepTitle" id="ttlStep2"></div>
+          <div class="stepState" id="state2">等待上一步</div>
+        </div>
+        <div class="stepBody">
+          <div class="stepDesc" id="descStep2"></div>
+          <div class="stepAct">
+            <button class="btn-main" id="btnApply">接通</button>
+            <div class="checks">
+              <label><input type="checkbox" id="ckCli" checked>终端 CLI</label>
+              <label><input type="checkbox" id="ckDesk" checked>桌面版</label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="result" id="applyResult"></div>
+    </div>
+  </div>
+
+  <!-- 接线 -->
+  <div class="card">
+    <div class="head">
+      <span class="eyebrow" id="eyebPatch">状态</span><span class="title" id="ttlPatch">当前接线</span>
+      <span class="aux" id="patchTime"></span>
+    </div>
+    <div class="body">
+      <div class="patch" id="patchCli">
+        <div class="who"><div class="n">终端 CLI</div><div class="d">settings.json</div></div>
+        <div class="wire"><svg preserveAspectRatio="none" viewBox="0 0 100 12"><path class="ln" d="M0 6 H96"/><path class="arw" d="M93 2 L99 6 L93 10 Z"/></svg></div>
+        <span class="badge unk" id="cliBadge">…</span>
+      </div>
+      <div class="patch" id="patchDesk">
+        <div class="who"><div class="n">桌面版 Claude</div><div class="d">configLibrary</div></div>
+        <div class="wire"><svg preserveAspectRatio="none" viewBox="0 0 100 12"><path class="ln" d="M0 6 H96"/><path class="arw" d="M93 2 L99 6 L93 10 Z"/></svg></div>
+        <span class="badge unk" id="deskBadge">…</span>
+      </div>
+
+      <div class="notice"></div>
+
+      <div class="actions">
+        <button class="btn-ghost" id="btnRestore">接回 CC Switch</button>
+      </div>
+      <div class="hint" id="patchHint">接通后：终端 CLI 与桌面版都指向本地协议桥 <span id="hintRelayPort"></span>（CLI 讲 Anthropic 协议、上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。</div>
+    </div>
+  </div>
+
+  <!-- 路由表 -->
+  <div class="card">
+    <div class="head">
+      <span class="eyebrow" id="eyebRoute">模型</span><span class="title" id="ttlRoute">路由表 · 模型映射</span>
+      <span class="aux" id="auxRoute">改完保存即生效，无需重启</span>
+    </div>
+    <div class="body">
+      <table class="route">
+        <thead>
+          <tr><th style="width:32%">Claude 档位</th><th style="width:34%" id="thTarget">→ 模型</th><th>界面显示名</th></tr>
+        </thead>
+        <tbody id="routeBody"></tbody>
+      </table>
+
+      <div class="hint" id="routeHint"></div>
+      <!-- 插槽：各家在路由卡里的专属区块（ui/sn 的 API Key 行） -->
+      <div id="slot-route"></div>
+
+      <div class="saverow">
+        <button class="btn-main" id="btnSave">保存映射</button>
+        <button class="btn-ghost" id="btnTest">测试连通</button>
+        <button class="btn-ghost" id="btnModels" title="从上游 /v1/models 拉取当前真实模型目录，更新下拉框">刷新模型列表</button>
+        <label class="checks" style="font-size:12px"><input type="checkbox" id="ckAllTiers">测全部四档</label>
+      </div>
+      <div class="result" id="testResult"></div>
+    </div>
+  </div>
+
+  <!-- 本机设置 -->
+  <div class="card foldable" id="cardSys">
+    <div class="head" id="headSys">
+      <span class="eyebrow" id="eyebSys">设置</span><span class="title" id="ttlSys">本机设置</span>
+      <span class="aux" id="sysAux"></span>
+    </div>
+    <div class="body">
+      <div class="grid2">
+        <div class="fld"><label for="fUpstream" id="lblUpstream">上游地址</label><input type="text" id="fUpstream" placeholder=""></div>
+        <div class="fld"><label for="fRelayPort" id="lblRelayPort">中转端口</label><input type="text" id="fRelayPort" placeholder=""></div>
+      </div>
+      <!-- 插槽：各家专属的设置字段（B.AI 的本地代理 / 面板端口 / 自动检测代理，Qoder 的只读令牌框） -->
+      <div id="slot-sys"></div>
+      <label class="checks" id="useProxyRow" style="margin-top:12px"><input type="checkbox" id="ckUseProxy"><span id="useProxyText"></span></label>
+      <div class="fld" style="margin-top:12px">
+        <label>可选模型列表（下拉框内容，一行一个）</label>
+        <textarea id="fModels" rows="5" spellcheck="false"></textarea>
+      </div>
+      <div class="saverow">
+        <button class="btn-main" id="btnSaveSys">保存设置</button>
+        <button class="btn-ghost" id="btnDeploy">部署到本机…</button>
+        <button class="btn-ghost" id="btnResetModels" title="恢复为发布机默认的三款免费模型">恢复三款免费模型</button>
+      </div>
+      <div class="result" id="sysResult"></div>
+    </div>
+  </div>
+
+  <!-- 插槽：各家专属的整块卡片，按清单 extraCards 顺序挂载 /cards/<name>.js -->
+  <div id="slot-extra"></div>
+
+  <footer>
+    <span class="paths" id="footPaths"></span>
+    <span id="verTxt" style="font-family:var(--mono)"></span>
+  </footer>
+</div>
+
+<div class="banner-wrap">
+  <div class="banner" id="bnrInfo">
+    <div class="t" id="bnrInfoTitle"></div>
+    <div id="bnrInfoMsg" style="font-size:12px;color:var(--dim)"></div>
+    <button class="x" id="bnrInfoX" type="button" title="关闭">✕</button>
+  </div>
+</div>
+
+<script src="/providers.js"></script>
+<script src="/panel-common.js"></script>
+</body>
+</html>
