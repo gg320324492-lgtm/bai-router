@@ -1,3 +1,8 @@
 node_modules/
 dist/
 cert/
+
+# 服务端的「种子配置」回退文件（server.mjs:29 在 DATA_DIR 无 config.json 时会尝试它）。
+# 它与随包的 config.defaults.json 逐字节相同、apiKey 为空，不进安装包（extraResources 是白名单）。
+# 排除是为了防止哪天 git add -A 把一份本机配置提交上去。
+src/server/config.json

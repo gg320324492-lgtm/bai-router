@@ -9,6 +9,18 @@
  *  - {btn} 会被替换成 primaryBtn（主按钮的完整文字）。
  *  - 下面标注「契约外补充」的字段，是契约 schema 里没有、但文案无法由其它字段推导出来的，
  *    不写就会丢字；panel-common.js 需要读它们。
+ *
+ * v1.0.48 起，此前散落在 panel-common.js 的 FB 兜底表与形状开关也搬进来了。判据是
+ * 「panel-common.js 里不再出现任何提供方名字」，所以本清单必须为每家提供：
+ *  - brands / defaultModels / labelSuffix / noCallHint / testNote / modelsRefreshMsg /
+ *    applyInfoMsg / resetModelsMsg / step1Hint / eventTitles / cred / sys：原先的 FB 字段
+ *  - shape："flat"（本家数据在 /api/config 与 /api/status 顶层，只有 bai）或 "nested"
+ *    （在同名子对象里）。config 与 status 的形状在本项目里总是相同，故合并成一个字段。
+ *  - keyMatch：/api/status 里本页该比对的凭据字段（server.mjs 的 keyMatch/keyMatchSn/…）。
+ *  - modelsEndpoint：拉模型目录的路由；null = 按默认 "?p=<key>" 拼接。
+ *  - settingsLabels：设置卡里可被覆盖的标签（relayPort 必须有，否则回退到通用拼接）。
+ *  - sys.*：按钮/字段显隐开关（deploy / modelsRefresh / useProxyRow / proxy / panelPort /
+ *    proxyDetect / tokenView / apiKey）。
  */
 window.BAI_PROVIDERS = {
 
@@ -49,6 +61,23 @@ window.BAI_PROVIDERS = {
     routeTitle: "路由表 · 模型映射",
     routeKey: { label: "API Key", placeholder: "" },   // 契约外补充：路由表里的密钥行
     wireHint: null,                           // 契约外补充：本页接线卡没有说明句
+
+    /* ---- v1.0.48 清单化：原先散在 panel-common.js 的 FB 兜底表与形状开关 ---- */
+    brands: { qwen: "Qwen", glm: "GLM", deepseek: "DeepSeek", hy: "HY", mimo: "MiMo", kimi: "Kimi", minimax: "MiniMax" },
+    defaultModels: [],                        // 本页没有「恢复默认模型」按钮（无固定清单）
+    labelSuffix: " 1M",
+    noCallHint: "尚未观察到 Claude Code 调用",
+    testNote: {
+      single: "（测试的就是你 Claude Code 里显示的那个模型，名字完全一致）",
+      all: "（最近 30 分钟没观察到真实对话流量，已测全部四档；在 Claude Code 发条消息后再点，会自动对准当前档位）",
+    },
+    modelsRefreshMsg: "✔ 已拉取上游模型目录 {count} 个\n已更新可选模型列表（四个映射目标强制保留）",
+    eventTitles: { check: "检查更新 / 部署" },
+    keyMatch: "keyMatch",                     // status 里本页该比对的凭据字段
+    shape: "flat",                            // /api/config 与 /api/status 里本家数据在顶层
+    sys: { proxy: true, panelPort: true, proxyDetect: true, useProxyRow: false, deploy: true, modelsRefresh: true },
+    modelsEndpoint: "/api/models",            // 本页拉模型目录的路由不带 ?p=
+    settingsLabels: { relayPort: "中转端口" },   // 本页不加提供方前缀（旧三元表达式 key === "bai" ? "" : …）
         notices: {
       // 通用兜底：另一端接在本路由台的任一渠道上。措辞与其余四页一致。
       stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
@@ -99,6 +128,17 @@ window.BAI_PROVIDERS = {
     routeTitle: "路由表 · 模型映射",
     routeKey: { label: "API Key", placeholder: "sk-…（SenseNova token-plan 密钥）" },
     wireHint: "SenseNova 是境内服务，CLI 直连、不需要 Clash；桌面版经由本地中转 <span id=\"hintRelayPort\">:15732</span>。切到 SenseNova 会顶掉当前 B.AI 接线，随时可「接回 CC Switch」或用 B.AI 页重新接通。",
+
+    /* ---- v1.0.48 清单化 ---- */
+    brands: { sensenova: "SenseNova", deepseek: "DeepSeek", glm: "GLM", kimi: "Kimi", neo: "Neo", u: "U" },
+    defaultModels: [],                        // 本页没有「恢复默认模型」按钮
+    testNote: { all: "（最近 30 分钟没观察到真实对话流量，已测全部四档；SenseNova 有 TPM 限流，429 稍候再测即可）" },
+    modelsRefreshMsg: "✔ 已拉取可对话模型 {count} 个（图像模型已自动排除）\n下拉框已更新（映射目标强制保留）",
+    keyMatch: "keyMatchSn",
+    shape: "nested",
+    sys: { modelsRefresh: true },
+    modelsEndpoint: null,                     // 默认按 ?p=<key> 拼接
+    settingsLabels: { relayPort: "SenseNova 中转端口" },
     notices: {
       stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
       ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 SenseNova 突然失效，回到这里点「{btn}」恢复。",
@@ -155,6 +195,18 @@ window.BAI_PROVIDERS = {
     routeTitle: "路由表 · 模型映射（三款免费模型）",
     routeKey: null,                           // 路由表里没有密钥行，凭据在「手动填写令牌」卡里
     wireHint: "接通后：终端 CLI 与桌面版都指向本地协议桥 <span id=\"hintRelayPort\">:15742</span>（CLI 讲 Anthropic 协议、WorkBuddy 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。",
+
+    /* ---- v1.0.48 清单化 ---- */
+    brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
+    defaultModels: ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"],
+    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 WorkBuddy 的三款免费模型了。",
+    resetModelsMsg: "✔ 已恢复为三款免费模型：{list}",
+    step1Hint: "请先完成第 1 步「一键获取令牌」。",
+    keyMatch: "keyMatchWb",
+    shape: "nested",
+    sys: {},
+    modelsEndpoint: null,
+    settingsLabels: { relayPort: "WorkBuddy 中转端口" },
     notices: {
       // 注意：wb.html 原文这里写的是「接通 WorkBuddy」，而按钮文字是「一键接入 WorkBuddy」。
       // 按契约统一用 {btn}，因此渲染出来会变成「一键接入 WorkBuddy」——见交付说明，待确认。
@@ -209,6 +261,22 @@ window.BAI_PROVIDERS = {
     routeTitle: "路由表 · 模型映射",
     routeKey: null,                           // 密钥填在「Zen 设置」里
     wireHint: "接通后：终端 CLI 与桌面版都指向本地协议桥 <span id=\"hintRelayPort\">:15752</span>（CLI 讲 Anthropic 协议、Zen 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。",
+
+    /* ---- v1.0.48 清单化 ---- */
+    brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
+    // 原先抄的是 WorkBuddy 的三款（deepseek-v4.1-flash/hy4-preview-f/hy3）——
+    // Zen 免费档里唯一能外部调用的是 space-bunny-free。
+    defaultModels: ["space-bunny-free"],
+    cred: { txtOk: "已配置", subOk: "在下方「Zen 设置」管理", subNone: "在下方「Zen 设置」填 oc_sk_ 密钥" },
+    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 Zen 的免费模型了。",
+    resetModelsMsg: "✔ 已恢复为 Zen 免费模型：{list}",
+    step1Hint: "请先完成第 1 步：在下方「Zen 设置」填入 API Key 并保存。",
+    keyMatch: "keyMatchZen",
+    badgeText: "ZEN",                         // 本页徽章写 ZEN（其余家 = tab 大写）
+    shape: "nested",
+    sys: { apiKey: true },
+    modelsEndpoint: null,
+    settingsLabels: { relayPort: "OpenCode Zen 中转端口" },
     notices: {
       stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
       ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 OpenCode Zen 突然失效，回到这里点「{btn}」恢复。",
@@ -261,6 +329,19 @@ window.BAI_PROVIDERS = {
     routeTitle: "路由表 · 模型映射",
     routeKey: null,                           // 令牌由补丁实时写入，没有手填框
     wireHint: "接通后：终端 CLI 与桌面版都指向本地协议桥 <span id=\"hintRelayPort\">:15762</span>（CLI 讲 Anthropic 协议、Qoder 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。",
+
+    /* ---- v1.0.48 清单化 ---- */
+    brands: { lite: "Qoder Lite", auto: "Qoder Auto" },
+    defaultModels: ["lite", "auto"],
+    cred: { kind: "file", txtOk: "已就绪", subOk: "随 Qoder 启动自动轮换", txtNone: "未读到", subNone: "请启动 Qoder 桌面端", preview: "jt-…（已就绪）" },
+    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 Qoder 的模型了。",
+    resetModelsMsg: "✔ 已恢复为 Qoder 默认模型：{list}",
+    step1Hint: "请先完成第 1 步：启动 Qoder 桌面端并保持运行（令牌会自动写入 %TEMP%/qoder-token.json）。",
+    keyMatch: "keyMatchQd",
+    shape: "nested",
+    sys: { tokenView: true },
+    modelsEndpoint: null,
+    settingsLabels: { relayPort: "Qoder 中转端口" },
     notices: {
       stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
       ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 Claude Code 突然失效，回到这里点「{btn}」恢复。",
