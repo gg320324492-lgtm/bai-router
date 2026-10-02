@@ -1,7 +1,7 @@
 {
   "name": "bai-router",
   "productName": "B.AI Router",
-  "version": "1.0.45",
+  "version": "1.0.46",
   "private": true,
   "description": "B.AI 模型路由台：Claude Code / Claude 桌面版 外接模型的一键切换与中转",
   "author": "pc",
@@ -31,6 +31,9 @@
         "to": "server",
         "filter": [
           "server.mjs",
+          "panel-common.css",
+          "providers.js",
+          "provider.html",
           "failover.mjs",
           "ui.html",
           "sn.html",
@@ -41,6 +44,10 @@
           "diag.html",
           "config.defaults.json"
         ]
+      },
+      {
+        "from": "src/server/cards",
+        "to": "server/cards"
       },
       {
         "from": "build/icon.ico",

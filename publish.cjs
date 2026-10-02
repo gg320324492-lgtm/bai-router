@@ -1,6 +1,6 @@
 // 一键发布新版本：先改 package.json 的 version，然后运行  node publish.mjs "更新说明"
 // 流程：electron-builder 构建 → gh release create v<version> (exe + latest.yml)
-const { execSync } = require("child_process");
+const { execSync, execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
@@ -59,6 +59,25 @@ try {
 } catch (e) { console.log("» 快照同步跳过:", e.message); }
 
 if (fs.existsSync(path.join(ROOT, "dist", exe))) console.log(`⚠ dist/${exe} 已存在——若确认重发请先删除或升版本号`);
+
+// 清单/模板一致性闸门（v1.0.46）：五页收敛成「一份模板 + 一份清单」后，
+// 加第 6 家最容易漏改一处就静默出错（上一轮就出过五处复制粘贴漂移）。
+// scripts/check-manifest.cjs 把这类漏改变成构建期失败——放在 electron-builder 之前，
+// 先花 0.1 秒拦住，别等打包五分钟才发现。
+const CHECK_MANIFEST = path.join(ROOT, "scripts", "check-manifest.cjs");
+const runCheckManifest = (stage) => {
+  console.log(`» 发布闸门 [${stage}]：校验清单/模板/插槽/配色一致性`);
+  try {
+    execFileSync(process.execPath, [CHECK_MANIFEST], { cwd: ROOT, stdio: "inherit" });
+  } catch (e) {
+    if (e && e.code === "ENOENT") {
+      throw new Error(`发布闸门失败：找不到 ${CHECK_MANIFEST}`);
+    }
+    throw new Error(`发布闸门失败：scripts/check-manifest.cjs 未通过（见上方 ${stage} 阶段的报错）。发布已中止。`);
+  }
+};
+runCheckManifest("preflight");
+
 run("npx electron-builder --win nsis");
 // 发布闸门：打包产物必须模块齐全（v1.0.29 曾漏打包 install-consistency.js 导致启动即崩）
 {
@@ -74,9 +93,21 @@ run("npx electron-builder --win nsis");
   const pcOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "panel-common.js"));
   // server.mjs 静态 import 了 failover.mjs，缺了整个服务起不来
   const foOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "failover.mjs"));
-  if (miss.length || !snOk || !wbOk || !zenOk || !qdOk || !pcOk || !foOk) throw new Error("打包产物缺文件: " + miss.join(",") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html") + (zenOk ? "" : " + resources/server/zen.html") + (qdOk ? "" : " + resources/server/qd.html") + (pcOk ? "" : " + resources/server/panel-common.js") + (foOk ? "" : " + resources/server/failover.mjs"));
-  console.log("» 发布闸门通过：asar 模块齐全，sn/wb/zen/qd.html、panel-common.js、failover.mjs 已随包");
+  // v1.0.46 五页收敛成一份模板：模板/清单/CSS 任缺其一，五个页面全白屏
+  const srv = path.join(ROOT, "dist", "win-unpacked", "resources", "server");
+  const need2 = ["provider.html", "providers.js", "panel-common.css", "failover.mjs"];
+  const miss2 = need2.filter((x) => !fs.existsSync(path.join(srv, x)));
+  const cardsDir = path.join(srv, "cards");
+  const cardOk = ["failover.js", "model-catalog.js", "token-capture.js"]
+    .filter((x) => !fs.existsSync(path.join(cardsDir, x)));
+  if (miss.length || miss2.length || cardOk.length) throw new Error(
+    "打包产物缺文件: " + miss.concat(miss2).concat(cardOk.map((x) => "cards/" + x)).join(",")
+    + (snOk ? "" : " + resources/server/sn.html") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html") + (zenOk ? "" : " + resources/server/zen.html") + (qdOk ? "" : " + resources/server/qd.html") + (pcOk ? "" : " + resources/server/panel-common.js") + (foOk ? "" : " + resources/server/failover.mjs"));
+  console.log("» 发布闸门通过：asar 模块齐全；provider.html / providers.js / panel-common.css / panel-common.js / failover.mjs / cards/* 已随包");
 }
+// 清单/模板一致性闸门的第二道：打包完再验一次，防止构建过程动了这些文件
+// （或 dist 里的副本是旧的）才发布出去。
+runCheckManifest("post-build");
 // upgrade.ps1：救砖/一键升级脚本，作为 release 资产随每个版本发布（旧版更新器损坏的用户无需打开网页）
 if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {
   fs.copyFileSync(path.join(ROOT, "scripts", "upgrade.ps1"), path.join(ROOT, "dist", "upgrade.ps1"));

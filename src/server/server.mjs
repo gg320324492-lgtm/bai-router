@@ -2026,32 +2026,62 @@ const panel = http.createServer(async (req, res) => {
     if (!hostOk || !originOk) return json(res, 403, { error: "forbidden: 面板只接受本机回环访问" });
   }
   try {
-    if (req.method === "GET" && (u.pathname === "/" || u.pathname === "/index.html")) {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      return res.end(readFileSync(path.join(HERE, "ui.html")));
+    // v1.0.46: 五家提供方页面收敛为**同一份模板** provider.html + 清单 providers.js。
+    // 此前每家一份、54–70% 逐字重复，加到第五家时出了五处复制粘贴漂移（错配的文案、
+    // 永远不亮的高亮、判断错 provider 的灯）。现在加一家 = 清单加一条。
+    //
+    // 回退：**不要**只把这几行改回读 ui/sn/wb/zen/qd.html —— panel-common.js 已重写成
+    // 自带渲染层的整页驱动脚本，与旧页的内联渲染逻辑会同时驱动同一页、互相打架，
+    // 旧页面并不能配新 panel-common.js 工作。正确回退是把整个重构一起退：
+    // 该重构未拆成多次提交，故 `git checkout -- src/`（并删掉新增的 provider.html /
+    // providers.js / panel-common.css / cards/）即回到 v1.0.45 的完整一致状态。
+    // 别名一律 **302 重定向**到规范路径，绝不直接渲染模板。
+    // 原因：provider.html + panel-common.js 是按「清单 path 与当前 pathname 精确相等」
+    // 来认页面的（panel-common.js 顶部那个 for 循环）。别名若也返回模板，清单匹配不上 →
+    // 渲染层在 `if (!P ...) return` 处整个退出，页面只剩外壳——导航和底栏在、所有
+    // 交互都不在，且没有任何提示，比 404 难查得多。HEAD 上 /index.html 是完全可用的
+    // （老 server.mjs 的第一个分支），直接发模板等于把它变成半死页。
+    const PROVIDER_ALIAS = {
+      "/index.html": "/", "/ui.html": "/",
+      "/sensenova": "/sn", "/sn.html": "/sn",
+      "/workbuddy": "/wb", "/wb.html": "/wb",
+      "/opencode": "/zen", "/zen.html": "/zen",
+      "/qoder": "/qd", "/qd.html": "/qd",
+    };
+    if (req.method === "GET" && PROVIDER_ALIAS[u.pathname]) {
+      res.writeHead(302, { location: PROVIDER_ALIAS[u.pathname], "cache-control": "no-store" });
+      return res.end();
     }
-    // v1.0.28: SenseNova 独立页面（与 B.AI 页并列，经 header 导航互跳）
-    if (req.method === "GET" && (u.pathname === "/sn" || u.pathname === "/sensenova" || u.pathname === "/sn.html")) {
+    // 只认五个规范路径。这里写成显式比较而非数组 includes，是为了让
+    // scripts/check-manifest.cjs 的 C1（清单 path 必须在服务端有对应分支）与
+    // C10（渲染模板的路径必须有清单 path 匹配）能用字面量 grep 判断。
+    if (req.method === "GET" && (
+      u.pathname === "/" || u.pathname === "/sn" || u.pathname === "/wb" ||
+      u.pathname === "/zen" || u.pathname === "/qd"
+    )) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      return res.end(readFileSync(path.join(HERE, "sn.html")));
-    }
-    // v1.0.31: WorkBuddy 独立页面（三页导航并列）
-    if (req.method === "GET" && (u.pathname === "/wb" || u.pathname === "/workbuddy" || u.pathname === "/wb.html")) {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      return res.end(readFileSync(path.join(HERE, "wb.html")));
-    }
-    // v1.0.37: OpenCode Zen 独立页面
-    if (req.method === "GET" && (u.pathname === "/zen" || u.pathname === "/opencode" || u.pathname === "/zen.html")) {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      return res.end(readFileSync(path.join(HERE, "zen.html")));
-    }
-    // v1.0.38: Qoder 独立页面
-    if (req.method === "GET" && (u.pathname === "/qd" || u.pathname === "/qoder" || u.pathname === "/qd.html")) {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      return res.end(readFileSync(path.join(HERE, "qd.html")));
+      return res.end(readFileSync(path.join(HERE, "provider.html")));
     }
 
     // v1.0.40: 五个提供方页面共用的底栏/更新控件（单一来源，避免各页复制后漂移）
+    // provider.html 引用的三样共享资源。缺任何一个，五个页面都会白屏。
+    if (req.method === "GET" && u.pathname === "/panel-common.css") {
+      res.writeHead(200, { "content-type": "text/css; charset=utf-8", "cache-control": "no-store" });
+      return res.end(readFileSync(path.join(HERE, "panel-common.css")));
+    }
+    if (req.method === "GET" && u.pathname === "/providers.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
+      return res.end(readFileSync(path.join(HERE, "providers.js")));
+    }
+    // 专属卡片模块：/cards/<name>.js，name 白名单化，避免变成任意文件读取
+    if (req.method === "GET" && u.pathname.startsWith("/cards/") && u.pathname.endsWith(".js")) {
+      const card = u.pathname.slice(7, -3);
+      if (!/^[a-z][a-z0-9-]*$/.test(card)) return json(res, 400, { error: "bad card name" });
+      const f = path.join(HERE, "cards", card + ".js");
+      if (!existsSync(f)) return json(res, 404, { error: "no such card" });
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
+      return res.end(readFileSync(f));
+    }
     if (req.method === "GET" && u.pathname === "/panel-common.js") {
       res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "panel-common.js")));
