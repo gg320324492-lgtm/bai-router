@@ -426,7 +426,7 @@ function renderStatus(s) {
     el.title = m.baseUrl || "";
     const patch = el === $("cliBadge") ? $("patchCli") : $("patchDesk");
     patch.classList.toggle("state-sn", m.mode === "sn");
-    patch.classList.toggle("state-other", m.mode === "bai" || m.mode === "wb" || m.mode === "ccswitch");
+    patch.classList.toggle("state-other", m.mode === "bai" || m.mode === "sn" || m.mode === "ccswitch");
     let kf = patch.querySelector(".keyfp");
     if (m.keyFp) {
       if (!kf) { kf = document.createElement("span"); kf.className = "keyfp"; patch.querySelector(".who").appendChild(kf); }
@@ -445,9 +445,9 @@ function renderStatus(s) {
   // 提示条
   const n = $("notice");
   n.classList.remove("show", "err");
-  const oursElsewhere = (s.cli.mode === "bai") || (s.desktop.mode === "bai") || (s.cli.mode === "wb") || (s.desktop.mode === "wb");
+  const oursElsewhere = window.baiIsOurs ? [s.cli.mode, s.desktop.mode].some(window.baiIsOurs) : false;
   if (oursElsewhere) {
-    n.textContent = "当前有一端接在 B.AI / WorkBuddy 上——点「接通 SenseNova」会把它换过来（切换前自动快照，可一键接回）。";
+    n.textContent = "当前有一端接在本路由台的其他渠道上——点「接通 SenseNova」会把它换过来（切换前自动快照，可一键接回）。";
     n.classList.add("show");
   } else if (s.ccswitch.running) {
     n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 SenseNova 突然失效，回到这里点「接通 SenseNova」恢复。";

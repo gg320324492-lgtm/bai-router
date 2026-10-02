@@ -1703,7 +1703,7 @@ function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
 
 // CLI 的 ANTHROPIC_BASE_URL 恒为提供方上游本体（B.AI=api.b.ai、sn=token.sensenova.cn），不经本地中转；
 // 只有桌面版走 127.0.0.1:<relay>。故两者用不同的判据。
-function cliMode(cfg, cfgKey, snKey, wbKey, zenKey) {
+function cliMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey) {
   try {
     const s = readJson(SETTINGS);
     const u = s?.env?.ANTHROPIC_BASE_URL || "";
@@ -1714,6 +1714,7 @@ function cliMode(cfg, cfgKey, snKey, wbKey, zenKey) {
     if (snKey != null) r.keyMatchSn = key === snKey;
     if (zenKey != null) r.keyMatchZen = key === zenKey;
     if (wbKey != null) r.keyMatchWb = key === wbKey;
+    if (qdKey != null) r.keyMatchQd = key === qdKey;
     const bh = hostOf(c.upstream || DEFAULTS.upstream), sh = hostOf(c.sn?.upstream || DEFAULTS.sn.upstream);
     if (bh && u.includes(bh)) return { mode: "bai", ...r };
     if (sh && u.includes(sh)) return { mode: "sn", ...r };
@@ -1728,7 +1729,7 @@ function cliMode(cfg, cfgKey, snKey, wbKey, zenKey) {
     return { mode: "unknown", baseUrl: "" };
   }
 }
-function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey) {
+function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey) {
   try {
     const f = desktopConfigFile();
     if (!f || !existsSync(f)) return { mode: "unknown", baseUrl: "" };
@@ -1741,6 +1742,7 @@ function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey) {
     if (snKey != null) r.keyMatchSn = key === snKey;
     if (zenKey != null) r.keyMatchZen = key === zenKey;
     if (wbKey != null) r.keyMatchWb = key === wbKey;
+    if (qdKey != null) r.keyMatchQd = key === qdKey;
     if (u.includes(`:${c.relayPort || DEFAULTS.relayPort}`)) return { mode: "bai", ...r };
     if (u.includes(`:${c.sn?.relayPort || DEFAULTS.sn.relayPort}`)) return { mode: "sn", ...r };
     if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
@@ -1976,8 +1978,8 @@ async function statusPayload() {
     ccswitch: { running: ccswitch },
     // 接线状态（两端各自归属哪个提供方）。keyMatch=对 B.AI key 的匹配，
     // keyMatchSn/keyMatchWb 分别是对 SenseNova / WorkBuddy 凭据的匹配——各页各取各的对比对象。
-    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey),
-    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey),
+    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey, cfg.qd?.token || "qd-local"),
+    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey, cfg.qd?.token || "qd-local"),
     // B.AI 灯/接线沿用旧字段名，SenseNova 灯挂 sn 下，WorkBuddy 灯挂 wb 下
     relay: bai.relay, relayLast: bai.relayLast, upstream: bai.upstream, recent: bai.recent,
     sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, useProxy: cfg.sn?.useProxy === true },
