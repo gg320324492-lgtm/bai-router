@@ -3,16 +3,6 @@
   "upstream": "https://api.b.ai",
   "proxy": "http://127.0.0.1:7897",
   "relayPort": 15722,
-  "failover": {
-    "enabled": false,
-    "chain": [
-      "qd",
-      "bai",
-      "sn",
-      "zen",
-      "wb"
-    ]
-  },
   "panelPort": 15723,
   "defaultModel": "qwen3.8-flash",
   "availableModels": [

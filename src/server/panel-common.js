@@ -13,7 +13,7 @@
   document.getElementById("panelCommonReady") // 占位：重复加载时直接返回
     || Object.defineProperty(document, "panelCommonReady", { value: 1, configurable: true });
 
-  /* ---------- 1. 补齐其余四页缺失的样式（横幅进度条 / 按钮行 / 退出按钮配色） ---------- */
+  /* ---------- 1. 补齐其余四页缺失的样式（横幅进度条 / 按钮行 / 退出按钮配色 / 常驻底栏） ---------- */
   if (!document.getElementById("panelCommonCss")) {
     const st = document.createElement("style");
     st.id = "panelCommonCss";
@@ -23,6 +23,20 @@
       .banner .row { display: flex; gap: 8px; margin-top: 8px; }
       .banner button { font-size: 12px; padding: 5px 12px; border-radius: 6px; }
       #stopBtn { color: #b06a6a; }
+
+      /* 底栏常驻：检查更新 / 备用升级 / 退出软件不能随页面滚走。
+         sticky 而非 fixed —— 内容列宽 860px 居中，fixed 会横跨整个窗口宽度、与
+         居中的内容对不齐；sticky 贴着同一列的底边，且滚到页面末尾时自然落回原位，
+         不会出现"页尾多出一条空白"。z-index 低于 .banner-wrap(50)，通知横幅仍在上层。 */
+      footer {
+        position: sticky;
+        bottom: 0;
+        z-index: 10;
+        padding: 10px 0 4px;
+        margin-top: 14px;
+        background: var(--bg);
+        box-shadow: 0 -1px 0 var(--line), 0 -12px 20px -14px rgba(0,0,0,.45);
+      }
     `;
     document.head.appendChild(st);
   }
