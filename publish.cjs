@@ -38,8 +38,14 @@ try {
       const cur3 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
       if (cur3.zen) def.zen = { ...cur3.zen, apiKey: "" };
     }
-    // failover 无凭据，但保险起见把 chain 收敛到已知提供方
-    if (def.failover) { def.failover.chain = (def.failover.chain || []).filter((x) => [bai,sn,wb,zen,qd].includes(x)); }
+    // failover（自动故障转移）：本机配置通常没有这个块（默认关闭），而快照是整体拷贝
+    // 本机 config 去覆盖 defaults.json 的——不显式保留的话，每次发布都会把它从随包快照里
+    // 冲掉。chain 顺带收敛到已知提供方。
+    {
+      const curFo = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
+      const srcFo = def.failover || curFo.failover;
+      if (srcFo) def.failover = { ...srcFo, chain: (srcFo.chain || []).filter((x) => ["bai", "sn", "wb", "zen", "qd"].includes(x)) };
+    }
     // qd（Qoder）块：token 是手动兜底用的 jt- jobToken，绝不进快照
     // （正常路径下它恒为空——真实令牌由 worker 补丁写在 %TEMP%\qoder-token.json，不落 config）
     if (def.qd) { def.qd = { ...def.qd, token: "" }; }
