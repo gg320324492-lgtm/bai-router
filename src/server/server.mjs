@@ -531,15 +531,112 @@ function sendUnexpectedUpstreamResponse(res, upstream) {
   }));
 }
 
+// ---------- 上游失败的"人话"归因 ----------
+// 上游的失败原因通常藏在响应体里（{"error": …}），而空响应体、HTML 拦截页被笼统说成
+// "非 JSON"既自相矛盾（同一个括号里 Content-Type 还写着 application/json），又把这轮
+// 真正的原因（key 没权限 / 模型名不对 / 额度用尽）全丢了。下面几个函数只负责把失败
+// 翻译成一句能直接读懂的话；解析成功时 readProbeJson 照常返回原对象，
+// 成功/失败判定与 HTTP 状态码透传一律不动。
+// 这些状态码九成就是这几条原因，而上游在空响应体里一个字都不说。
+const PROBE_HINTS = {
+  400: "，常见原因是：模型名不被这个 Key 支持，或请求被上游校验拒绝",
+  401: "，常见原因是：API Key 没填或填错",
+  403: "，常见原因是：这个 Key 没有该模型权限，或额度已用尽",
+  404: "，常见原因是：上游地址或模型名写错",
+  429: "，常见原因是：免费渠道并发限流，等 30 秒左右再试",
+};
+// 响应体是合法 JSON 但带 error 字段——上游最常见的拒绝格式，写法有五六种：
+//   {"error":{"message":…}} / {"error":"Forbidden"} / {"error":{"code":…,"type":…}} / {"message":…} / {"msg":…}
+// 挨个试一遍，抠到就返回；抠不到返回 null（绝不用空串冒充"已说明"）。
+function upstreamErrorText(j, max = 50) {
+  const pick = (v) => (typeof v === "string" && v.trim() ? v.trim().replace(/\s+/g, " ").slice(0, max) : null);
+  if (typeof j === "string") return pick(j);
+  if (!j || typeof j !== "object") return null;
+  const e = j.error;
+  if (e && typeof e === "object") return pick(e.message) || pick(e.detail) || pick(e.code) || pick(e.type) || null;
+  if (e != null) return pick(e);
+  return pick(j.message) || pick(j.msg) || pick(j.detail) || null;
+}
+// OpenAI 兼容上游（WorkBuddy / Zen / Qoder）非 2xx 时的正文归因。
+// 旧写法是 `jj.msg || jj.message || jj.error.message || txt` —— 四个都取不到就把整段原始正文
+// 原样交给用户：整页 HTML 拦截页、整段 JSON、几百字英文堆栈，一句话里说不清也读不动。
+// 这里按"空 / HTML / JSON 无 error 字段 / 其它非 JSON"分级，一律换成人话并限长。
+function upstreamBodyText(txt, max = 160) {
+  const raw = String(txt || "").trim();
+  if (!raw) return "上游返回空响应体，没给出任何错误信息";
+  if (/^\s*</.test(raw)) {
+    const title = (raw.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1];
+    return `上游返回 HTML 页面而不是接口响应${title ? `（页面标题：${title.trim().slice(0, 60)}）` : ""}——多半被代理或 WAF 拦下，请确认代理通道与上游地址`;
+  }
+  try {
+    const said = upstreamErrorText(JSON.parse(raw), max);
+    if (said) return said;
+    return `上游返回了 JSON 但里面没有 error 字段，无法判断原因：${raw.slice(0, 120)}`;
+  } catch { /* 不是 JSON */ }
+  return `上游返回了非 JSON 内容：${raw.slice(0, 120)}`;
+}
+// 解析失败（或根本没正文）时的归因：按"最可能的解释"分级，不再一律叫"非 JSON"。
+function probeBodyError(response, raw) {
+  const status = response.status;
+  const type = response.headers.get("content-type") || "未知";
+  const hint = PROBE_HINTS[status] || "";
+  const body = String(raw || "").trim();
+  if (!body) {
+    // 上游返 4xx/5xx 却不给正文（B.AI 实测常这样）：它没告诉我们原因，
+    // 只能把状态码和 request-id 摊开——后者拿去问上游/看日志能直接定位到那一次请求。
+    // 刻意不带 Content-Type：正文为空时它没有任何信息量，正是它让旧文案自相矛盾。
+    const rid = response.headers.get("x-request-id") || response.headers.get("request-id") || "";
+    return new Error(`上游返回空响应体（HTTP ${status}${rid ? `，request-id ${String(rid).slice(0, 32)}` : ""}）——没带任何错误信息${hint}`);
+  }
+  if (/^\s*</.test(body)) {
+    return new Error(`上游返回 HTML 页面而不是接口响应（HTTP ${status}）——多半被代理或 WAF 拦下，请确认代理通道与上游地址${hint}`);
+  }
+  return new Error(`上游返回的内容不是合法 JSON（HTTP ${status}，Content-Type: ${type}）：${body.slice(0, 120)}`);
+}
 async function readProbeJson(response) {
   const raw = await response.text();
-  try {
-    return JSON.parse(raw);
-  } catch {
-    const type = response.headers.get("content-type") || "未知";
-    const kind = /^\s*</.test(raw) ? "HTML 页面" : "非 JSON 内容";
-    throw new Error(`上游返回${kind}（HTTP ${response.status}，Content-Type: ${type}）`);
+  let j = null;
+  try { j = JSON.parse(raw); } catch { j = null; }
+  // 失败优先归因。三个调用点（/api/models 的 sn 与默认分支、/api/test 的档位探测）
+  // 拿到 JSON 后都只会读 error.message，"Forbidden" 这类裸字符串错误就整条丢了。
+  if (response.status >= 400) {
+    if (j === null) throw probeBodyError(response, raw);
+    const said = upstreamErrorText(j);
+    if (!said) throw new Error(`上游返回 HTTP ${response.status}，但没带错误说明${PROBE_HINTS[response.status] || ""}`);
+    // 上游已经把状态码和原因说全了（多半是本机中转转译过的 429/502），别再复述一遍
+    if (said.includes(`HTTP ${response.status}`)) throw new Error(`上游错误：${said}`);
+    throw new Error(`上游拒绝请求（HTTP ${response.status}${PROBE_HINTS[response.status] || ""}）：${said}`);
   }
+  if (j === null) throw probeBodyError(response, raw);
+  return j;
+}
+
+// 面板「上游」那盏灯的副行只有一行高度，错误文案必须自己收着。旧写法逐档原样拼接有两个毛病：
+//   ① 配置里常有多个档位指向同一模型（Sonnet 与 Opus 都映射 HY3），同一句话会重复三遍；
+//   ② 四档各带一段原因 → 副行被撑成三行高，把整排灯卡拉高、底边对不齐。
+// 故：按 label 去重 → 优先给"几档中几档失败 + 哪些档位"的概览 → 原因最多列 2 项、
+// 其余用数量收尾 → 总量硬性截到 120 字。
+const TIER_ERR_MAX = 120;
+function summarizeTierErrors(tiers) {
+  const bad = tiers.filter((x) => !x.ok);
+  if (!bad.length) return null;
+  const uniq = new Map();
+  for (const x of bad) if (!uniq.has(x.label)) uniq.set(x.label, String(x.error || "未知错误"));
+  const labels = [...uniq.keys()];
+  const reasons = [...new Set(uniq.values())];
+  // 全部档位栽在同一件事上（key/额度/模型名整体不可用，最常见）→ 只说一次，别按档位复述
+  const full = reasons.length === 1
+    ? `${tiers.length} 档中 ${bad.length} 档失败（${labels.join("、")}）：${reasons[0]}`
+    : `${tiers.length} 档中 ${bad.length} 档失败：${labels.join("、")}。${
+      [...uniq].slice(0, 2).map(([label, err]) => `${label}: ${err}`).join("；")
+    }${labels.length > 2 ? `；其余 ${labels.length - 2} 档的原因从略` : ""}`;
+  if (full.length <= TIER_ERR_MAX) return full;
+  // 概览优先保留（"几档中几档、哪些档位"才是用户要的第一眼信息），细节按剩余预算裁剪
+  const head = `${tiers.length} 档中 ${bad.length} 档失败（${labels.join("、")}）`;
+  const room = TIER_ERR_MAX - head.length - 2;
+  return room > 4
+    ? `${head}：${reasons.join(" / ").slice(0, room)}…`
+    : head.slice(0, TIER_ERR_MAX);
 }
 
 // 直连上游：SenseNova 是境内服务，走 Clash 出海节点反而多一跳、且 Clash 没开时不该被带崩。
@@ -1349,8 +1446,8 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
 
   if (r.status !== 200) {
     const txt = (await readAllBody(r).catch(() => "")) || consumed400 || consumedBodyHint;
-    let msg = txt;
-    try { const jj = JSON.parse(txt); msg = jj.msg || jj.message || (jj.error && jj.error.message) || txt; } catch { }
+    // 只把翻译后的这句话给用户；下面的 Zen 归因仍按原始 txt 匹配，不受影响
+    const msg = upstreamBodyText(txt, 200);
 
     // 归因：Zen 的几种典型拒绝各有明确含义，直接翻译成人话，别让用户对着裸错误码猜。
     let why = "";
@@ -1387,9 +1484,7 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   if (!ct.includes("text/event-stream")) {
     const txt = await readAllBody(r).catch(() => "");
     noteRelayError(p, "upstream_bad", `${NAME} 返回非流式响应（${ct || "无 Content-Type"}）`);
-    let msg = txt;
-    try { const jj = JSON.parse(txt); msg = jj.msg || jj.message || (jj.error && jj.error.message) || txt; } catch { }
-    return wbAnthroError(res, 502, `上游返回非 SSE 响应: ${String(msg).slice(0, 200)}`);
+    return wbAnthroError(res, 502, String(`上游返回非 SSE 响应：${upstreamBodyText(txt, 140)}`).slice(0, 200));
   }
   await wbPipe(r, res, { model: j.model, clientStream: j.stream === true, inputJson: j }); // Anthropic 默认非流式
 }
@@ -2149,6 +2244,17 @@ const panel = http.createServer(async (req, res) => {
             : "未读到 Zen 公开目录（网络或上游暂时不可达），当前显示内置列表",
         });
       }
+      // 走到这里的只有 sn 与 bai 两家——qd/wb/zen 在上面各自的分支里已经 return：
+      // qd 读本地明文目录、wb 返回静态列表、zen 是无需鉴权的公开目录，三家都不吃 key。
+      // 这两家要带 Bearer 打上游，key 为空时上游只会回一句 401/403（SenseNova 干脆是
+      // 光秃秃的 "Forbidden"），原样透出去就成了天书——用户看不出是自己的 key 没填。
+      // 所以空 key 一律**不去打上游**，直接说人话。400 而非 200：让前端的 api() 抛错，
+      // 错误才会经 withBusy 落到按钮旁边的结果槽，而不是被当成"拉取成功、0 个模型"。
+      if (!S.key) {
+        return json(res, 400, {
+          error: `尚未填写 ${S.zh} API Key，无法拉取模型目录——请先在路由卡填入并点「保存映射」`,
+        });
+      }
       let j;
       if (p === "sn") {
         const r = await directHttp(S.upstream + "/v1/models", {
@@ -2158,7 +2264,7 @@ const panel = http.createServer(async (req, res) => {
           const { Readable } = await import("node:stream");
           return await Readable.from(r.body).reduce((s, c) => s + c, "");
         } });
-        if (r.status >= 400) throw new Error(j?.error?.message || `HTTP ${r.status}`);
+        if (r.status >= 400) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
         // SenseNova 目录带 modalities：只把能输出文本的模型作为可路由目标
         const chat = (j.data || []).filter((m) => (m.output_modalities || ["text"]).includes("text"));
         const models = [...new Set(chat.map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))].sort();
@@ -2169,7 +2275,7 @@ const panel = http.createServer(async (req, res) => {
         signal: AbortSignal.timeout(15000),
       });
       j = await readProbeJson(r);
-      if (!r.ok) throw new Error(j?.error?.message || `HTTP ${r.status}`);
+      if (!r.ok) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
       const models = [...new Set((j.data || []).map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))].sort();
       return json(res, 200, { ok: true, count: models.length, models });
     }
@@ -2373,7 +2479,7 @@ const panel = http.createServer(async (req, res) => {
             });
             const j = await readProbeJson(r);
             const ms = Date.now() - t0;
-            if (!r.ok) throw new Error(j?.error?.message || `HTTP ${r.status}`);
+            if (!r.ok) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
             return { tier, label: info.label, target: info.target, served: j.model, ok: true, ms, error: null };
           } catch (e) { lastErr = String(e?.message || e).slice(0, 100); }
         }
@@ -2391,7 +2497,7 @@ const panel = http.createServer(async (req, res) => {
         ok: pass === tiers.length,
         model: tiers[0]?.label || null,
         ms: tiers[0]?.ms || null,
-        error: pass === tiers.length ? null : tiers.filter((x) => !x.ok).map((x) => `${x.label}: ${x.error}`).join("；"),
+        error: summarizeTierErrors(tiers),
         at: new Date().toISOString(),
       });
       return json(res, 200, { ok: pass === tiers.length, provider: P, tiers, pass, total: tiers.length, active });
