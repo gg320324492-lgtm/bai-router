@@ -82,6 +82,16 @@
 
   const has = (id) => !!document.getElementById(id);
 
+  // 本路由台自家提供的五家渠道。此前每页各自硬编码一份"还有别的端接在谁身上"的判断，
+  // 结果各漏一部分（sn 页漏了 zen/qd，wb/zen/qd 三页都只列了 bai+sn）——第五家一加进来
+  // 就又漂移。收口到这里，新增提供方只需改这一处。
+  window.BAI_OURS = ["bai", "sn", "wb", "zen", "qd"];
+  window.baiIsOurs = (m) => window.BAI_OURS.includes(m);
+  // 本页该拿哪个 keyMatch 字段来比对自己的凭据（此前各页都写死成 keyMatchWb）
+  window.baiKeyMatchField = (provider) => ({
+    bai: "keyMatch", sn: "keyMatchSn", wb: "keyMatchWb", zen: "keyMatchZen", qd: "keyMatchQd",
+  }[provider] || "keyMatch");
+
   /* ---------- 4. 备用升级：独立于 electron-updater 的自救援通道 ---------- */
   let suTimer = null;
   function paintSelf(st) {

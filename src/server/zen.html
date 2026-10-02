@@ -280,9 +280,9 @@
       <div class="sub" id="subUp">点「测试连通」检查</div>
     </div>
     <div class="lamp">
-      <div class="name">访问令牌</div>
+      <div class="name">API Key</div>
       <div class="val"><span class="led" id="ledTok"></span><span id="txtTok">—</span></div>
-      <div class="sub" id="subTok">JWT 有效期</div>
+      <div class="sub" id="subTok">oc_sk_… 密钥</div>
     </div>
   </div>
 
@@ -362,7 +362,7 @@
     <div class="body">
       <table class="route">
         <thead>
-          <tr><th style="width:32%">Claude 档位</th><th style="width:34%">→ WorkBuddy 模型</th><th>界面显示名</th></tr>
+          <tr><th style="width:32%">Claude 档位</th><th style="width:34%">→ Zen 模型</th><th>界面显示名</th></tr>
         </thead>
         <tbody id="routeBody"></tbody>
       </table>
@@ -382,47 +382,9 @@
     </div>
   </div>
 
-  <!-- 令牌（高级：手动填写，平时用不到） -->
-  <div class="card foldable collapsed" id="cardTok">
-    <div class="head" id="headTok">
-      <span class="eyebrow">高级</span><span class="title">手动填写令牌</span>
-      <span class="aux">平时用不到 · 一键获取失败时的备用方式</span>
-    </div>
-    <div class="body">
-      <div class="tokstat" id="tokStat">正在读取令牌状态…</div>
-
-      <div class="keyrow">
-        <span class="k">访问令牌</span>
-        <input type="password" id="accessToken" autocomplete="off" placeholder="eyJ…（JWT，三段）" style="flex:1;min-width:260px">
-        <button class="btn-sm" id="tokToggle" type="button">显示</button>
-      </div>
-      <div class="keyrow">
-        <span class="k">刷新令牌</span>
-        <input type="password" id="refreshToken" autocomplete="off" placeholder="eyJ…（用于到期自动续期）" style="flex:1;min-width:260px">
-      </div>
-      <div class="keyrow">
-        <span class="k">设备令牌</span>
-        <input type="password" id="deviceToken" autocomplete="off" placeholder="v3:AAAA…（X-Device-Token，可留空）" style="flex:1;min-width:260px">
-      </div>
-      <div class="keyrow">
-        <span class="k">用户 ID</span>
-        <input type="text" id="userId" autocomplete="off" placeholder="91a1b55c-…（X-User-Id，可留空）" style="flex:1;min-width:260px">
-      </div>
-
-      <div class="hint" style="margin-top:12px">
-        仅在「一键获取令牌」失败时使用。手动拿令牌：浏览器里登录 <b>workbuddy.ai</b>，按 F12 打开开发者工具 → Network，
-        随便发一条对话，点开 <b>/v2/chat/completions</b> 请求，把请求头里的 Authorization（去掉开头的 "Bearer "）、
-        X-Refresh-Token、X-Device-Token、X-User-Id 依次粘到上面四个框，点保存。令牌有效期约一年，到期会自动续期。
-      </div>
-
-      <div class="saverow">
-        <button class="btn-main" id="btnSaveTok" style="padding:8px 20px">保存令牌</button>
-      </div>
-      <div class="result" id="tokResult"></div>
-    </div>
-  </div>
-
-  <!-- WorkBuddy 设置 -->
+  <!-- 密钥说明：Zen 只有一个 API Key（oc_sk_…），在下方「Zen 设置」里填，没有"令牌四件套"那回事 -->
+  <!-- （本卡此前整块抄自 WorkBuddy 页，残留 workbuddy.ai / X-Device-Token / JWT 四格输入框，v1.0.45 删除）-->
+  <!-- Zen 设置 -->
   <div class="card foldable" id="cardSys">
     <div class="head" id="headSys">
       <span class="eyebrow">设置</span><span class="title">Zen 设置</span>
@@ -498,7 +460,7 @@ function renderStatus(s) {
   status = s;
   const zen = s.zen || {};
   $("svc").innerHTML = `服务 <b class="${s.service.up ? "" : "off"}">●</b> :${(zen.relay || {}).port || "—"} / :${s.panel.port}`;
-  // 中转灯（WorkBuddy 专属那份错误归因）
+  // 中转灯（各提供方在服务端独立记一份错误归因）
   setLed($("ledRelay"), zen.relay && zen.relay.up ? "g pulse" : "r");
   $("txtRelay").textContent = zen.relay && zen.relay.up ? "运行中" : "已停止";
   const rl = zen.relayLast || {};
@@ -519,37 +481,35 @@ function renderStatus(s) {
     $("subUp").textContent = up.tested === true ? (up.model || "") : (up.error || "点「测试连通」检查");
   }
   // 令牌灯
-  const tk = (zen.token || {});
-  if (!tk.configured) {
+  // Zen 的凭据是长期 API Key，没有到期/刷新那套概念——这里只反映"配没配"。
+  // （此前照抄 WorkBuddy 的 token.expiresInDays/hasRefresh 逻辑，而 /api/status 的
+  //  zen 块根本不返回 token 对象，于是这盏灯永远显示"未配置"。）
+  if (zen.keyConfigured) {
+    setLed($("ledTok"), "g");
+    $("txtTok").textContent = "已配置";
+    $("subTok").textContent = "在下方「Zen 设置」管理";
+  } else {
     setLed($("ledTok"), "r");
     $("txtTok").textContent = "未配置";
-    $("subTok").textContent = "在下方粘贴访问令牌";
-  } else if (tk.expiresInDays != null && tk.expiresInDays <= 7) {
-    setLed($("ledTok"), "a pulse");
-    $("txtTok").textContent = `剩 ${tk.expiresInDays} 天`;
-    $("subTok").textContent = tk.hasRefresh ? "将自动续期" : "无刷新令牌，到期需重新捕获";
-  } else {
-    setLed($("ledTok"), "g");
-    $("txtTok").textContent = tk.expiresInDays != null ? `剩 ${tk.expiresInDays} 天` : "已配置";
-    $("subTok").textContent = tk.expAt ? "有效期至 " + new Date(tk.expAt).toLocaleDateString("zh-CN") : "";
+    $("subTok").textContent = "在下方「Zen 设置」填 oc_sk_ 密钥";
   }
   // 接线徽章（本页视角：wb=高亮，其余=灰/蓝）
   const setBadge = (el, m) => {
-    const cls = m.mode === "wb" ? "mine" : m.mode === "unknown" ? "unk" : "other";
+    const cls = m.mode === "zen" ? "mine" : m.mode === "unknown" ? "unk" : "other";
     el.className = "badge " + cls;
     el.textContent = MODE_TXT[m.mode] || m.mode;
     el.title = m.baseUrl || "";
     const patch = el === $("cliBadge") ? $("patchCli") : $("patchDesk");
-    patch.classList.toggle("state-mine", m.mode === "wb");
+    patch.classList.toggle("state-mine", m.mode === "zen");
     patch.classList.toggle("state-other", m.mode === "bai" || m.mode === "sn" || m.mode === "ccswitch");
     let kf = patch.querySelector(".keyfp");
     if (m.keyFp) {
       if (!kf) { kf = document.createElement("span"); kf.className = "keyfp"; patch.querySelector(".who").appendChild(kf); }
-      const mine = m.mode === "wb";
-      const ok = !mine || m.keyMatchWb !== false;
+      const mine = m.mode === "zen";
+      const ok = !mine || m[window.baiKeyMatchField(PROVIDER)] !== false;
       kf.textContent = (ok ? "🔑" : "⚠️") + m.keyFp;
       kf.style.color = ok ? "var(--dim)" : "var(--err)";
-      kf.title = mine ? (ok ? `此端实际使用的凭据：${m.keyFp}（与本页一致）` : `此端凭据(${m.keyFp}) 与本页令牌不一致！重开对应终端/桌面版，或重新点「接通 WorkBuddy」。`) : `此端实际使用的凭据：${m.keyFp}（未接 WorkBuddy，本页不比对）`;
+      kf.title = mine ? (ok ? `此端实际使用的凭据：${m.keyFp}（与本页一致）` : `此端凭据(${m.keyFp}) 与本页令牌不一致！重开对应终端/桌面版，或重新点「一键接入 OpenCode Zen」。`) : `此端实际使用的凭据：${m.keyFp}（未接 WorkBuddy，本页不比对）`;
       kf.style.display = "";
     } else if (kf) kf.style.display = "none";
   };
@@ -559,12 +519,12 @@ function renderStatus(s) {
   // 提示条
   const n = $("notice");
   n.classList.remove("show", "err");
-  const oursElsewhere = (s.cli.mode === "bai" || s.cli.mode === "sn") || (s.desktop.mode === "bai" || s.desktop.mode === "sn");
+  const oursElsewhere = window.baiIsOurs ? [s.cli.mode, s.desktop.mode].some(window.baiIsOurs) : false;
   if (oursElsewhere) {
-    n.textContent = "当前有一端接在 B.AI / SenseNova 上——点「接通 WorkBuddy」会把它换过来（切换前自动快照，可一键接回）。";
+    n.textContent = "当前有一端接在本路由台的其他渠道上——点「一键接入 OpenCode Zen」会把它换过来（切换前自动快照，可一键接回）。";
     n.classList.add("show");
   } else if (s.ccswitch.running) {
-    n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 WorkBuddy 突然失效，回到这里点「接通 WorkBuddy」恢复。";
+    n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 OpenCode Zen 突然失效，回到这里点「一键接入 OpenCode Zen」恢复。";
     n.classList.add("show");
   }
 }
@@ -638,13 +598,9 @@ function renderRoute() {
   });
 }
 
-function renderKeyInfo() {
-  const z = zenSlice(zenCfg);
-  const stat = $("tokStat");
-  const has = !!z.apiKey;
-  stat.innerHTML = has
-    ? '<span>API Key：<b>已配置</b></span><span>上游：<b>' + (z.upstream || "") + '</b></span><span>可用模型：<b>' + ((z.availableModels || []).length) + ' 个</b></span>'
-    : '<span>API Key：<b class="warn">未配置</b></span>　去 opencode.ai/console 生成后填入下方「Zen 设置」';
+function renderZenInfo() {
+  // 令牌四件套（访问/刷新/设备/用户 ID）那套是 WorkBuddy 的，Zen 只有一个 API Key，
+  // 在下方「Zen 设置」里填即可。此处只负责刷新模型目录——服务端按 30 分钟缓存，不会打爆公开接口。
   fetch("/api/models?p=zen").then((r) => r.json()).then(renderZenCatalog).catch(() => { });
 }
 
@@ -661,7 +617,7 @@ function renderSys() {
 async function refreshConfig() {
   zenCfg = await api("/api/config");
   renderRoute();
-  renderKeyInfo();
+  renderZenInfo();
   renderSys();
   renderSteps();
 }
@@ -774,28 +730,6 @@ $("btnTest").addEventListener("click", () => withBusy($("btnTest"), async () => 
     !!r.ok);
 }));
 
-$("tokToggle").addEventListener("click", () => {
-  const showAll = ["accessToken", "refreshToken", "deviceToken"].map((id) => $(id));
-  const showing = showAll[0].type === "text";
-  showAll.forEach((el) => { el.type = showing ? "password" : "text"; });
-  $("tokToggle").textContent = showing ? "显示" : "隐藏";
-});
-
-$("btnSaveTok").addEventListener("click", () => withBusy($("btnSaveTok"), async () => {
-  const r = await api("/api/config", {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      provider: PROVIDER,
-      accessToken: $("accessToken").value.trim(),
-      refreshToken: $("refreshToken").value.trim(),
-      deviceToken: $("deviceToken").value.trim(),
-      userId: $("userId").value.trim(),
-    }),
-  });
-  showResult($("tokResult"), "✔ 令牌已保存\n" + (r.hints || []).map((h) => "· " + h).join("\n"), true);
-  await refreshConfig();
-  poll();
-}));
 
 $("btnSaveSys").addEventListener("click", () => withBusy($("btnSaveSys"), async () => {
   const body = {
@@ -836,7 +770,7 @@ $("btnResetModels").addEventListener("click", () => withBusy($("btnResetModels")
   showResult($("sysResult"), "✔ 已恢复为三款免费模型：" + DEFAULT_WB_MODELS.join("、"), true);
 }));
 
-/* WorkBuddy 设置卡折叠 */
+/* Zen 设置卡折叠 */
 (() => {
   const card = $("cardSys"), head = $("headSys");
   head.setAttribute("tabindex", "0");

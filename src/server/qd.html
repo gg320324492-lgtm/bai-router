@@ -528,7 +528,7 @@ function renderStatus(s) {
     if (m.keyFp) {
       if (!kf) { kf = document.createElement("span"); kf.className = "keyfp"; patch.querySelector(".who").appendChild(kf); }
       const mine = m.mode === "wb";
-      const ok = !mine || m.keyMatchWb !== false;
+      const ok = !mine || m[window.baiKeyMatchField(PROVIDER)] !== false;
       kf.textContent = (ok ? "🔑" : "⚠️") + m.keyFp;
       kf.style.color = ok ? "var(--dim)" : "var(--err)";
       kf.title = mine ? (ok ? `此端实际使用的凭据：${m.keyFp}（与本页一致）` : `此端凭据(${m.keyFp}) 与本页令牌不一致！重开对应终端/桌面版，或重新点「接入 Qoder」。`) : `此端实际使用的凭据：${m.keyFp}（未接 Qoder，本页不比对）`;
@@ -541,12 +541,12 @@ function renderStatus(s) {
   // 提示条
   const n = $("notice");
   n.classList.remove("show", "err");
-  const oursElsewhere = (s.cli.mode === "bai" || s.cli.mode === "sn") || (s.desktop.mode === "bai" || s.desktop.mode === "sn");
+  const oursElsewhere = window.baiIsOurs ? [s.cli.mode, s.desktop.mode].some(window.baiIsOurs) : false;
   if (oursElsewhere) {
-    n.textContent = "当前有一端接在 B.AI / SenseNova 上——点「接入 Qoder」会把它换过来（切换前自动快照，可一键接回）。";
+    n.textContent = "当前有一端接在本路由台的其他渠道上——点「一键接入 Qoder」会把它换过来（切换前自动快照，可一键接回）。";
     n.classList.add("show");
   } else if (s.ccswitch.running) {
-    n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 Claude Code 突然失效，回到这里点「接入 Qoder」恢复。";
+    n.textContent = "CC Switch 正在运行——它可能随时把配置改回 15721。若 Claude Code 突然失效，回到这里点「一键接入 Qoder」恢复。";
     n.classList.add("show");
   }
 }
