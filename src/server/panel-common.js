@@ -250,7 +250,8 @@
       .trim();
   };
 
-  let modalEl = null;   // 懒创建：只有真的要弹时才建 DOM
+  let modalEl = null;        // 懒创建：只有真的要弹时才建 DOM
+  let lastModalState = null; // 最后一次渲染弹框用的 state，收起时据此把横幅接回来
   function ensureUpdateModal() {
     if (modalEl) return modalEl;
     modalEl = document.createElement("div");
@@ -274,8 +275,9 @@
       '</div>';
     document.body.appendChild(modalEl);
     /* 「稍后」与点遮罩空白处 = 收起弹框（两种「先不看」的直觉操作等价）。
-       不 cancel 下载（既有链路没有取消能力），也不清状态，横幅仍会显示进度——
-       用户改主意时还能从横幅回到安装。 */
+       不 cancel 下载（既有链路没有取消能力），也不清状态。
+       收起时把右下角横幅接回来：弹框期间横幅是让位的（见 onAppEvent 的互斥逻辑），
+       关掉后若不接回，用户就再也看不到「还在后台下载」以及「可以重启安装了」。 */
     $("updModalLater").onclick = () => closeUpdateModal();
     $("updModalMask").onclick = () => closeUpdateModal();
     /* 「立即安装」：走既有安装流程。download 阶段它会开始下载、ready 阶段它会
@@ -286,14 +288,18 @@
     return modalEl;
   }
 
+  /* 收起弹框。lastModalState 记住最后一次渲染用的状态，用来把横幅接回来——
+     弹框让位期间横幅一直没被 paintUpdate 碰过，不重画的话它会停在旧内容上。 */
   function closeUpdateModal() {
     if (modalEl) modalEl.style.display = "none";
+    if (lastModalState) { try { paintUpdate(lastModalState); } catch { } }
   }
 
   /* 渲染弹框。rawNotes 为假值（""/null/undefined/[]/纯空白）时整块日志区隐藏，
      弹框退回「标题 + 副标题 + 按钮」的极简形态——这正是契约点名的老包降级项。 */
   function paintUpdateModal(st) {
     ensureUpdateModal();
+    lastModalState = st;   // 收起时据此把横幅接回来
     const title = $("updModalTitle"), sub = $("updModalSub");
     const barWrap = $("updModalBarWrap"), bar = $("updModalBar");
     const go = $("updModalGo");
@@ -477,15 +483,28 @@
 
     window.baiDesktop.onAppEvent((ev) => {
       if (!ev || ev.kind !== "update") return;
-      paintUpdate(ev.state);
+      const s = ev.state || {};
       /* v1.0.52 弹框分流：只有「用户手动检查」才发现的新版本才弹模态框
          （主进程按 manualCheckAt 时间窗判定后写进 state.manual）。
          自动检查（启动 8 秒后 / 每 12 小时一次）state.manual 为假 —— 保持静默，
          只留下角横幅，不打扰用户，避免每次开机都弹一次框的倒退。
-         后续的下载进度事件沿用同一 state.manual，所以弹框会一路跟到 ready。 */
-      const s = ev.state || {};
-      if (s.manual === true && (s.phase === "downloading" || s.phase === "ready")) {
+         后续的下载进度事件沿用同一 state.manual，所以弹框会一路跟到 ready。
+
+         两者互斥（v1.0.54）：手动时**不再同时**摆出右下角横幅——弹框和横幅
+         说的是同一件事，一屏两个通知既冗余又抢注意力（用户实拍反馈）。
+         横幅改由「稍后」时接回来：关掉弹框后仍能从横幅看下载进度，
+         不丢「后台还在下」这个信息。 */
+      const wantsModal = s.manual === true && (s.phase === "downloading" || s.phase === "ready");
+      if (wantsModal) {
+        const b = $("bnrUpdate");
+        if (b) b.classList.remove("show");   // 弹框接管提示，横幅让位
         paintUpdateModal(s);
+      } else {
+        /* 非手动（自动检查 / 已是最新 / 出错）时，把可能还开着的弹框收掉。
+           不能只画横幅就完事：手动那次把弹框打开后，若后续来了个自动事件
+           （manual 为假），弹框会一直挂在屏幕中央——「自动检查静默」就破功了。 */
+        closeUpdateModal();
+        paintUpdate(s);
       }
     });
     if (has("bnrUpdGo")) $("bnrUpdGo").onclick = () => window.baiDesktop.installUpdate();
