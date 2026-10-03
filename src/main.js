@@ -508,6 +508,18 @@ let autoUpdater = null;
 let manualCheckAt = 0;   // 用户主动点「检查更新」的时刻（区分 自动/手动 失败的提示方式）
 let autoFailRetried = false; // 本会话内自动检查失败后的静默重试只做一次
 let trayMenuRef = null;
+// 把 electron-updater 的 releaseNotes 归一化成字符串（面板只认 state.releaseNotes 一个字段名）。
+// 类型见 node_modules/builder-util-runtime/out/updateInfo.d.ts:52：
+//   string | Array<ReleaseNoteInfo> | null
+// - string：latest.yml 里直接写的一整段（本项目的默认形态，见 build.releaseInfo.releaseNotesFile）
+// - 数组：只有开了 fullChangelog 才会出现，每项 {version, note}，按顺序取 .note 拼接
+// - null/undefined/空：老版本发布的包没有该字段 → 返回空串，面板据此优雅降级
+function normalizeReleaseNotes(notes) {
+  if (!notes) return "";
+  if (typeof notes === "string") return notes;
+  if (Array.isArray(notes)) return notes.map((n) => (n && typeof n.note === "string" ? n.note : "")).filter(Boolean).join("\n\n");
+  return "";
+}
 function setupUpdater() {
   if (!app.isPackaged) return; // 开发/绿色模式没有 app-update.yml，跳过
   try {
@@ -517,7 +529,7 @@ function setupUpdater() {
     au.autoInstallOnAppQuit = true;
     au.on("checking-for-update", () => { updateState = { phase: "checking" }; syncTray(); });
     au.on("update-available", (info) => {
-      updateState = { phase: "downloading", version: info.version, percent: 0 };
+      updateState = { phase: "downloading", version: info.version, percent: 0, releaseNotes: normalizeReleaseNotes(info.releaseNotes) };
       syncTray();
       notifyWindow("app-event", { kind: "update", state: updateState });
     });
@@ -543,7 +555,8 @@ function setupUpdater() {
     au.on("update-downloaded", (info) => {
       if (dlWatchdog) { clearTimeout(dlWatchdog); dlWatchdog = null; }
       lastPct = -5;
-      updateState = { phase: "ready", version: info.version };
+      // 保留 update-available 阶段已解析出的日志；若该事件被跳过（如已缓存秒就绪）再兜底解析一次
+      updateState = { phase: "ready", version: info.version, releaseNotes: (updateState && updateState.releaseNotes) || normalizeReleaseNotes(info.releaseNotes) };
       syncTray();
       notifyWindow("app-event", { kind: "update", state: updateState });
     });

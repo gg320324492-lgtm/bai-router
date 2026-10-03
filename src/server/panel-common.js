@@ -89,6 +89,7 @@
       <div class="t" id="bnrUpdTitle">更新</div>
       <div class="bar" id="bnrUpdBarWrap"><i id="bnrUpdBar"></i></div>
       <div id="bnrUpdMsg" style="font-size:12px;color:var(--dim)"></div>
+      <div id="bnrUpdNotes" style="display:none"></div>
       <div class="row" id="bnrUpdRow" style="display:none">
         <button class="btn-main" id="bnrUpdGo" type="button" style="padding:6px 14px;font-size:12px">重启安装</button>
         <button class="btn-sm" id="bnrUpdSelf" type="button" style="display:none">备用升级</button>
@@ -251,6 +252,65 @@
       }
     };
 
+    /* --- 2.6.1 更新日志（本次更新了什么） ---
+       日志可能很长，直接铺开会把右下角的横幅撑得满屏高，所以默认只露前几行、
+       点「详情」再展开。展开态只在内存里（isOpenNotes），刷新页面即回到折叠；
+       不写 localStorage —— 它是「本次更新」的一次性说明，没必要跨会话记住。
+       同一个会话里跨事件保持用户的选择：用户既然点开了，就别在下一轮进度
+       回调里又给他收回去。 */
+    const NOTES_MAX = 3;            // 折起来时可见的行数（按换行算，不按字符宽度）
+    const NOTES_BULLET = "· ";      // 与 #bnrUpdMsg 同款点号前缀
+    const isOpenNotes = { v: false };
+
+    /* 把日志整成纯文本：数组（老版本只给 note 字段）先摊平；去掉 shell 味的
+       "### " 与 markdown 加粗标记，避免在 <pre> 里露出裸符号。确如契约所说
+       releaseNotes 可能是 string | Array<{note}> | null —— 两种都要能吃下。
+       反过来，主进程已把它归一成字符串时这里就是恒等变换，不重复加工。 */
+    const notesToText = (raw) => {
+      if (raw == null) return "";
+      if (Array.isArray(raw)) {
+        return raw.map((r) => (r && typeof r.note === "string" ? r.note : "")).filter(Boolean).join("\n\n");
+      }
+      if (typeof raw !== "string") return "";
+      return raw
+        .replace(/^[ \t]*#{1,6}[ \t]*/gm, "")
+        .replace(/\*\*/g, "")
+        .replace(/\r\n?/g, "\n")
+        .trim();
+    };
+    const notesLines = (txt) => String(txt || "").split("\n").map((l) => l.trim()).filter(Boolean);
+
+    /* 渲染日志区。没有日志时（老包不带 releaseNotes，或字段是 null/[]/空白）
+       整块 #bnrUpdNotes 保持 display:none —— 不显示空框、不报错，横幅退回
+       与加此功能之前逐字一致的样子。这正是契约点名的降级项。 */
+    function paintNotes(raw) {
+      const box = $("bnrUpdNotes");
+      if (!box) return;
+      const txt = notesToText(raw);
+      if (!txt) { box.style.display = "none"; box.innerHTML = ""; return; }
+      box.style.display = "";
+      const lines = notesLines(txt);
+      const more = lines.length > NOTES_MAX;
+      /* 折叠行的选择：默认只显示前 NOTES_MAX 行。用「前 N 行」而不是「第一行」，
+         是因为更新说明常写成「- 改点1 / - 改点2 …」，只给一行反而看不出改了啥。 */
+      const shown = isOpenNotes.v ? lines : lines.slice(0, NOTES_MAX);
+      const rest = lines.length - NOTES_MAX;
+      let html = `<pre class="notes">${esc(shown.map((l) => NOTES_BULLET + l).join("\n"))}</pre>`;
+      if (more) {
+        /* 用 <button> 而不是 <a>：横幅里已有多个 button，样式统一好收口，且不被
+           C5 的 id 反向检查盯上（那个检查只看 $()/onClick/applyText/has 的字符串）。 */
+        const label = isOpenNotes.v
+          ? "收起"
+          : `详情（还有 ${rest} 行）`;
+        html += `<button class="btn-sm notesToggle" id="bnrUpdNotesBtn" type="button" style="margin-top:6px;padding:3px 10px;font-size:11px">${esc(label)}</button>`;
+      }
+      box.innerHTML = html;
+      if (more) {
+        const btn = $("bnrUpdNotesBtn");
+        if (btn) btn.onclick = () => { isOpenNotes.v = !isOpenNotes.v; paintNotes(raw); };
+      }
+    }
+
     const paintUpdate = (st) => {
       const b = $("bnrUpdate");
       if (!st || st.phase === "latest" || st.phase === "checking") { b.classList.remove("show"); return; }
@@ -290,6 +350,10 @@
       }
       $("bnrUpdGo").textContent = "重启安装";
       $("bnrUpdGo").onclick = () => window.baiDesktop.installUpdate();
+      /* 只在这里渲染一次日志。error 分支在上面已 return，走不到这里；
+         downloading / ready 都会落到这里——所以那两处**不要**再各调一次，
+         否则同一事件会重建两遍 #bnrUpdNotes（innerHTML 被覆盖、按钮重建）。 */
+      paintNotes(st.releaseNotes);
     };
 
     window.baiDesktop.onAppEvent((ev) => {

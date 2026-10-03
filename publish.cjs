@@ -8,8 +8,23 @@ const ROOT = __dirname;
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
 const v = pkg.version;
 const owner = pkg.build.publish[0].owner, repo = pkg.build.publish[0].repo;
-const notes = process.argv[2] || `v${v}`;
 const exe = `BARRouter-Setup-${v}.exe`;
+
+// 更新日志来源（v1.0.51）：release-notes.md 是唯一权威来源。
+// 理由：该文件同时被 electron-builder（build.releaseInfo.releaseNotesFile）写进
+// latest.yml —— 也就是客户端「软件内更新」真正读的那份。命令行 `node publish.cjs "..."` 只发
+// GitHub release 页面（人看的），两者分开就会漂移（这就是本次要修的"数据链路断在中间"）。
+// 所以：文件存在 → 一律以文件为准，命令行参数降级为「GitHub release 正文」的补充说明；
+// 文件不存在 → 回退到旧的命令行参数行为，保证老习惯仍可用，不硬失败。
+const notesFile = path.join(ROOT, "release-notes.md");
+let notes = process.argv[2] || "";
+const hasNotesFile = fs.existsSync(notesFile);
+if (hasNotesFile) {
+  notes = fs.readFileSync(notesFile, "utf8").trim();
+  if (!notes) { console.log("⚠ release-notes.md 为空——将回退到命令行参数/默认值"); notes = process.argv[2] || `v${v}`; }
+} else {
+  notes = process.argv[2] || `v${v}`;
+}
 
 const run = (cmd) => { console.log("»", cmd); execSync(cmd, { cwd: ROOT, stdio: "inherit", env: { ...process.env, ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/" } }); };
 
@@ -108,6 +123,26 @@ runCheckManifest("post-build");
 if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {
   fs.copyFileSync(path.join(ROOT, "scripts", "upgrade.ps1"), path.join(ROOT, "dist", "upgrade.ps1"));
 }
-run(`gh release create v${v} -R ${owner}/${repo} "dist/${exe}" "dist/${exe}.blockmap" "dist/upgrade.ps1" "dist/latest.yml" --title "v${v}" --notes "${notes.replace(/"/g, "'")}"`);
+/* 用 execFileSync + 参数数组，而不是把内容拼进 shell 字符串。
+   原因：notes 现在是 release-notes.md 的全文（多行 markdown，含反引号）。拼进
+   `gh ... --notes "…"` 后，双引号内的反引号会被 bash 当**命令替换**执行——
+   实测「含反引号 `echo INJECTED` 的文本」会变成「含反引号 INJECTED 的文本」，
+   日志正文被破坏，且等同于把发版脚本变成任意命令执行入口。参数数组不经过 shell。 */
+const gh = (args) => {
+  console.log("» gh", args.map((a) => (a.length > 60 ? a.slice(0, 57) + "…" : a)).join(" "));
+  return execFileSync("gh", args, { cwd: ROOT, stdio: ["ignore", "inherit", "inherit"] });
+};
+gh([
+  "release", "create", `v${v}`, "-R", `${owner}/${repo}`,
+  `dist/${exe}`, `dist/${exe}.blockmap`, "dist/upgrade.ps1", "dist/latest.yml",
+  "--title", `v${v}`, "--notes", notes,
+]);
+// 命令行参数没有被当作正文时（文件存在），把它作为「发布说明」追加到 GitHub release
+// 正文——单纯给人看的备注，不影响 latest.yml。失败只警告：客户端更新日志不依赖它。
+if (hasNotesFile && process.argv[2] && process.argv[2] !== notes) {
+  try {
+    gh(["release", "edit", `v${v}`, "-R", `${owner}/${repo}`, "--notes", `${notes}\n\n---\n\n${process.argv[2]}`]);
+  } catch (e) { console.log("⚠ GitHub release 正文追加备注失败（不影响软件内更新日志）：", e.message); }
+}
 console.log(`\n✔ 已发布 v${v} → https://github.com/${owner}/${repo}/releases/tag/v${v}`);
 console.log("  各电脑上的软件将在启动 8 秒内或点「检查更新」时自动收到新版。");
