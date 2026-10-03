@@ -349,6 +349,21 @@ textarea { background: var(--bg); color: var(--ink); border: 1px solid var(--lin
 @media (prefers-reduced-motion: reduce) { .banner { animation: none; } }
 .banner .t { font-weight: 600; margin-bottom: 4px; }
 .banner .x { position: absolute; right: 8px; top: 6px; background: none; border: none; color: var(--dim); cursor: pointer; font-size: 14px; padding: 0; }
+/* 更新日志在横幅里的展示（v1.0.51 的 #bnrUpdNotes 用）。
+   这条曾缺失：panel-common.js 注入的是裸 <pre class="notes">，而当时 CSS 里
+   只有 v1.0.52 弹框的 `.updModalCard .notes`（后代选择器，管不到横幅）。
+   <pre> 默认 white-space:pre 不折行，长中文段落把横幅一路撑出屏幕——
+   .banner-wrap 的 max-width:360px 只约束容器，拦不住内容溢出。
+   故这里必须显式折行 + 限宽，且让 flex 链可以收缩（min-width:0）。 */
+.banner .notes {
+  margin: 6px 0 0; padding: 8px 10px; max-height: 34vh; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
+  font-family: var(--mono); font-size: 11px; line-height: 1.65; color: var(--dim);
+  white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+  max-width: 100%; box-sizing: border-box;
+}
+/* 让注入的日志容器能跟着横幅一起收窄（flex 子项默认 min-width:auto 会拒绝收缩）*/
+#bnrUpdNotes { min-width: 0; max-width: 100%; overflow: hidden; }
 
 /* 更新横幅的下载进度条（panel-common.js 注入的 #bnrUpdate 用；原 ui.html 内联过一份） */
 .banner .bar { height: 4px; background: var(--line); border-radius: 99px; margin: 8px 0 6px; overflow: hidden; }
