@@ -357,6 +357,47 @@ textarea { background: var(--bg); color: var(--ink); border: 1px solid var(--lin
 .banner button { font-size: 12px; padding: 5px 12px; border-radius: 6px; }
 
 /* ============================================================================
+   15b. 更新模态对话框（v1.0.52）
+        手动「检查更新」发现新版本时弹出，让用户先看更新日志再决定装不装。
+        此前（v1.0.51）日志挂在下角 .banner 上，位置不显眼 + 自动下载立刻覆盖
+        成「下载中 3%」，用户根本没看到——故改为主动弹出的模态框。
+        配色全部复用已有变量（--accent/--panel/--line/--ink/--dim/--banner-bg/
+        --shadow），不引入新色；五家 provider 靠 html[data-provider] 自动切换强调色。
+   ========================================================================== */
+.updModal { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; }
+/* 遮罩：半透明压暗背景，点它同样收起弹框（与「稍后」等价） */
+.updModalMask { position: absolute; inset: 0; background: rgba(0, 0, 0, .55); }
+.updModalCard {
+  position: relative; z-index: 1;
+  width: min(560px, calc(100vw - 40px));
+  /* 弹框整体高度也设上限，窄屏/超长日志时不会高过窗口 */
+  max-height: calc(100vh - 80px);
+  display: flex; flex-direction: column;
+  background: var(--banner-bg); border: 1px solid var(--line);
+  border-left: 3px solid var(--accent); border-radius: 10px;
+  box-shadow: var(--shadow); padding: 18px 20px; color: var(--ink);
+  animation: rise .25s ease;
+}
+@media (prefers-reduced-motion: reduce) { .updModalCard { animation: none; } }
+.updModalCard .t { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+.updModalCard .sub { font-size: 12.5px; color: var(--dim); margin-bottom: 10px; }
+/* 下载进度条：复用 .banner .bar 的观感（4px、--accent 填充） */
+.updModalCard .bar { height: 4px; background: var(--line); border-radius: 99px; margin: 4px 0 10px; overflow: hidden; flex: none; }
+.updModalCard .bar i { display: block; height: 100%; background: var(--accent); width: 0%; transition: width .4s ease; }
+/* 日志区：这块是唯一会变高的部分，用 max-height + overflow-y 让它自己内部滚动，
+   从而无论日志多长，弹框都不会撑高、更不会撑爆窗口（外层 flex 列 + min-height:0
+   保证它可以被压缩到剩余空间内）。 */
+.updModalCard .notesWrap { display: flex; flex-direction: column; min-height: 0; margin-bottom: 14px; }
+.updModalCard .notesLbl { font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--dim); text-transform: uppercase; margin-bottom: 6px; flex: none; }
+.updModalCard .notes {
+  margin: 0; padding: 10px 12px; max-height: 42vh; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--ink);
+  white-space: pre-wrap; word-break: break-word;
+}
+.updModalCard .row { display: flex; gap: 10px; align-items: center; flex: none; }
+
+/* ============================================================================
    16. 底栏
        底栏常驻：检查更新 / 备用升级 / 退出软件不能随页面滚走。
        sticky 而非 fixed —— 内容列宽 860px 居中，fixed 会横跨整个窗口宽度、与

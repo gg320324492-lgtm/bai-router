@@ -506,6 +506,15 @@ function maybeFirstRunDeploy() {
 // ---------- 自动更新（全部静默化：状态进面板横幅 + 托盘提示，不弹系统窗） ----------
 let autoUpdater = null;
 let manualCheckAt = 0;   // 用户主动点「检查更新」的时刻（区分 自动/手动 失败的提示方式）
+// v1.0.52：判断「这次发现新版本，是不是用户手动点出来的」——决定弹框还是静默后台下载。
+// 用「时间窗口」而非只看 manualCheckAt 是否非零：自动检查每 12 小时一轮，
+// manualCheckAt 可能残留几小时前的旧值，仅判非零会把自动发现误判成手动。
+// 窗口 3 分钟与 error 分支同口径。update-available 可能在 checkForUpdates() 的
+// await 返回前就触发，而 manualCheckAt 在调用前已写好，所以窗口期判据一定成立。
+const MANUAL_WINDOW_MS = 3 * 60 * 1000;
+function isManualCheck() {
+  return manualCheckAt > 0 && Date.now() - manualCheckAt < MANUAL_WINDOW_MS;
+}
 let autoFailRetried = false; // 本会话内自动检查失败后的静默重试只做一次
 let trayMenuRef = null;
 // 把 electron-updater 的 releaseNotes 归一化成字符串（面板只认 state.releaseNotes 一个字段名）。
@@ -525,19 +534,38 @@ function setupUpdater() {
   try {
     const { autoUpdater: au } = require("electron-updater");
     autoUpdater = au;
-    au.autoDownload = true;
+    // v1.0.52：关掉「检测到就自动下载」。原来为 true 时，发现新版本立即开下，
+    // 用户还没来得及看更新日志，横幅就变成「下载中 3%」——日志形同虚设。
+    // 改 false 后由下面的 update-available 按手动/自动分流：
+    //   手动 → 只上报事件（manual:true），等用户点「立即安装」再 downloadUpdate()
+    //   自动 → 立刻 downloadUpdate()，后台静默下载，用户无感（保持原有体验）
+    au.autoDownload = false;
     au.autoInstallOnAppQuit = true;
     au.on("checking-for-update", () => { updateState = { phase: "checking" }; syncTray(); });
     au.on("update-available", (info) => {
-      updateState = { phase: "downloading", version: info.version, percent: 0, releaseNotes: normalizeReleaseNotes(info.releaseNotes) };
+      const manual = isManualCheck();
+      const releaseNotes = normalizeReleaseNotes(info.releaseNotes);
+      // phase 仍写 "downloading"：面板横幅的既有渲染只认 downloading/ready 两态，
+      // 手动分支下这也是「有新版待处理」的正确语义（真正下载时会被 download-progress 覆盖）。
+      // manual 是本版新增字段，渲染层据此决定要不要弹模态框。
+      updateState = { phase: "downloading", version: info.version, percent: 0, releaseNotes, manual };
       syncTray();
       notifyWindow("app-event", { kind: "update", state: updateState });
+      if (manual) {
+        // 手动：不下载，把决定权交给用户（弹框里的「立即安装」会触发 downloadUpdate）
+        logMain(`手动检查发现新版本 v${info.version}，等待用户确认（不自动下载）`);
+      } else {
+        // 自动：维持「后台自动更新」的既有行为——静默下载，不通知用户
+        logMain(`自动检查发现新版本 v${info.version}，后台静默下载`);
+        au.downloadUpdate().catch((e) => { logMain("自动下载启动失败: " + String((e && e.message) || e).slice(0, 120)); });
+      }
     });
     au.on("update-not-available", () => { updateState = { phase: "latest" }; syncTray(); });
     let lastPct = -5;
     let dlWatchdog = null;
     au.on("download-progress", (p) => {
       const pct = Math.round(p.percent);
+      // 展开旧 state 时 version/releaseNotes/manual 都会保留（进度事件只补 percent）
       updateState = { ...(updateState || { phase: "downloading" }), phase: "downloading", percent: pct };
       if (pct - lastPct >= 5 || pct === 100) { lastPct = pct; notifyWindow("app-event", { kind: "update", state: updateState }); }
       syncTray();
@@ -555,8 +583,10 @@ function setupUpdater() {
     au.on("update-downloaded", (info) => {
       if (dlWatchdog) { clearTimeout(dlWatchdog); dlWatchdog = null; }
       lastPct = -5;
-      // 保留 update-available 阶段已解析出的日志；若该事件被跳过（如已缓存秒就绪）再兜底解析一次
-      updateState = { phase: "ready", version: info.version, releaseNotes: (updateState && updateState.releaseNotes) || normalizeReleaseNotes(info.releaseNotes) };
+      // 保留 update-available 阶段已解析出的日志与 manual 标记；若该事件被跳过
+      // （如已缓存秒就绪）再兜底解析日志。manual 一路带到 ready，弹框在下载完成后
+      // 仍知道自己是「手动那次」发起的，按钮语义才连贯（下载中→可安装）。
+      updateState = { phase: "ready", version: info.version, releaseNotes: (updateState && updateState.releaseNotes) || normalizeReleaseNotes(info.releaseNotes), manual: !!(updateState && updateState.manual) };
       syncTray();
       notifyWindow("app-event", { kind: "update", state: updateState });
     });
@@ -565,7 +595,8 @@ function setupUpdater() {
       syncTray();
       // 两种情况都落日志：自动失败记"已静默"，手动失败记明文——
       // 否则"点了检查更新没反应"在 app.log 里查无实据，无法区分是没找到还是根本没发出去。
-      if (Date.now() - manualCheckAt < 3 * 60 * 1000) {
+      // 复用 isManualCheck()：与 update-available 的手动判定同源，避免两处口径漂移。
+      if (isManualCheck()) {
         logMain("手动检查更新失败: " + updateState.msg);
         notifyWindow("app-event", { kind: "update", state: updateState });
       } else {
@@ -583,7 +614,20 @@ function setupUpdater() {
 }
 
 function installReadyUpdate() {
-  if (!autoUpdater || !updateState || updateState.phase !== "ready") return;
+  if (!autoUpdater || !updateState) return;
+  // v1.0.52 手动流程：发现新版本时并未下载，用户点「立即安装」= 开始下载。
+  // 下载完成会自动进 ready 并发 update-downloaded 事件（弹框/横幅随即切到可安装态），
+  // 这里只负责启动，不能 quitAndInstall——此时根本没有已下载的安装包。
+  if (updateState.phase === "downloading") {
+    logMain("用户确认安装，开始下载 v" + (updateState.version || "?"));
+    autoUpdater.downloadUpdate().catch((e) => {
+      updateState = { phase: "error", msg: String((e && e.message) || e).slice(0, 160) };
+      syncTray();
+      notifyWindow("app-event", { kind: "update", state: updateState });
+    });
+    return;
+  }
+  if (updateState.phase !== "ready") return;
   // 面板横幅/托盘菜单点「安装更新」即直接执行，不再二次确认
   quitting = true;
   setImmediate(() => autoUpdater.quitAndInstall(false, true));
@@ -616,21 +660,28 @@ function syncTray() {
 
 async function manualCheckUpdate() {
   showWindow();
+  // 手动检查的「身份戳」——必须在任何分支/await 之前打下，update-available 才认得出这次是手动。
+  // 原先它写在 try 里、且在两个 early-return 之后，会导致：
+  //   自动检查已发现新版（state=downloading/ready，manual=false）时用户再点「检查更新」，
+  //   走 early-return 重发旧 state，manual 仍是 false → 弹框不出现，用户又「什么都没看到」。
+  manualCheckAt = Date.now();
   if (!autoUpdater) {
     notifyWindow("app-event", { kind: "check", text: "绿色/开发模式不支持自动更新，仅安装版可用", sticky: true });
     return;
   }
-  if (updateState && updateState.phase === "ready") { notifyWindow("app-event", { kind: "update", state: updateState }); return; }
-  if (updateState && updateState.phase === "downloading") { notifyWindow("app-event", { kind: "update", state: updateState }); return; }
+  // 已有待处理的新版（不论来自自动还是手动）：补上 manual:true 重发，让弹框照常打开
+  if (updateState && (updateState.phase === "ready" || updateState.phase === "downloading")) {
+    notifyWindow("app-event", { kind: "update", state: { ...updateState, manual: true } });
+    return;
+  }
   try {
     notifyWindow("app-event", { kind: "check", text: "正在检查更新…" });
-    manualCheckAt = Date.now();
     const r = await autoUpdater.checkForUpdates();
     logMain("手动检查更新完成: " + (r ? (r.updateInfo ? `远端最新 v${r.updateInfo.version}` : JSON.stringify(r).slice(0, 120)) : "无返回值"));
     if (r && r.isUpdateAvailable === false) {
       notifyWindow("app-event", { kind: "check", text: "已是最新版本 v" + app.getVersion() });
     }
-    // 有更新：update-available 事件自动切到下载横幅，无需弹窗
+    // 有更新：update-available 事件已带 manual:true 上报，渲染层据此弹模态框
   } catch (e) {
     // 失败详情已由 au.on("error") 弹「更新失败」横幅（含重试/备用升级按钮），
     // 这里不再补发第二条，避免一次失败双横幅轰炸
