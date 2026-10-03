@@ -216,6 +216,125 @@
     });
   }
 
+  /* --- 2.6 更新模态对话框（v1.0.52）
+   * 契约：手动点「检查更新」发现新版本时才弹（主进程把 state.manual 置 true）；
+   * 自动检查（启动 8 秒后、每 12 小时一次）保持静默，只走右下角横幅，不打扰用户。
+   *
+   * 为什么是页面内自绘而不是主进程 dialog.showMessageBox：① 主题/配色与面板统一
+   * （系统弹窗是浅色 OS 风格，和五家各自的强调色对不上）；② 更新日志可能很长，
+   * 原生弹窗在多行文本上排版与滚动都不受控；③ 弹窗要与横幅一样实时跟随
+   * 「下载中 N% → 可安装」的状态变化，原生弹窗做不到边显示边更新。
+   *
+   * 弹框元素由本文件 createElement 注入，**不写进 provider.html**——
+   * check-manifest.cjs 的 C4 要求那 52 个契约 id 在模板里各出现且仅出现一次，
+   * 加在模板里会破坏该不变式（v1.0.51 的 #bnrUpdNotes 同理，加在 HTML 串里）。
+   *
+   * 生命周期：手动发现新版（manual:true, phase:"downloading", percent:0）→ 弹框；
+   * 下载进度事件（phase:"downloading"）实时把 percent 打进副标题与进度条；
+   * 下载完成（phase:"ready"）按钮从「下载并安装」变成「立即重启安装」。
+   * 用户点「稍后」= 只收起弹框（后台继续下载，横幅仍在，不误删已下流量）。 */
+
+  /* 日志文本归一化：主进程已归一成字符串，但这里仍按契约把
+     string | Array<{note}> | null 都吃下——与 paintNotes 同一套降级思路，
+     只是弹框里要显示**全文**，所以不做折叠，全部交给 CSS 滚动。 */
+  const modalNotesText = (raw) => {
+    if (raw == null) return "";
+    if (Array.isArray(raw)) {
+      return raw.map((r) => (r && typeof r.note === "string" ? r.note : "")).filter(Boolean).join("\n\n");
+    }
+    if (typeof raw !== "string") return "";
+    return raw
+      .replace(/^[ \t]*#{1,6}[ \t]*/gm, "")   // 去掉 "### " 之类的 shell 味标题前缀
+      .replace(/\*\*/g, "")                    // 去掉 markdown 加粗，免得在 <pre> 里露裸星号
+      .replace(/\r\n?/g, "\n")
+      .trim();
+  };
+
+  let modalEl = null;   // 懒创建：只有真的要弹时才建 DOM
+  function ensureUpdateModal() {
+    if (modalEl) return modalEl;
+    modalEl = document.createElement("div");
+    modalEl.className = "updModal";
+    modalEl.id = "updModal";
+    modalEl.style.display = "none";
+    modalEl.innerHTML =
+      '<div class="updModalMask" id="updModalMask"></div>' +
+      '<div class="updModalCard" role="dialog" aria-modal="true" aria-labelledby="updModalTitle">' +
+        '<div class="t" id="updModalTitle">发现新版本</div>' +
+        '<div class="sub" id="updModalSub"></div>' +
+        '<div class="bar" id="updModalBarWrap"><i id="updModalBar"></i></div>' +
+        '<div class="notesWrap" id="updModalNotesWrap">' +
+          '<div class="notesLbl">更新日志</div>' +
+          '<pre class="notes" id="updModalNotes"></pre>' +
+        '</div>' +
+        '<div class="row">' +
+          '<button class="btn-main" id="updModalGo" type="button">立即安装</button>' +
+          '<button class="btn-sm" id="updModalLater" type="button">稍后</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(modalEl);
+    /* 「稍后」与点遮罩空白处 = 收起弹框（两种「先不看」的直觉操作等价）。
+       不 cancel 下载（既有链路没有取消能力），也不清状态，横幅仍会显示进度——
+       用户改主意时还能从横幅回到安装。 */
+    $("updModalLater").onclick = () => closeUpdateModal();
+    $("updModalMask").onclick = () => closeUpdateModal();
+    /* 「立即安装」：走既有安装流程。download 阶段它会开始下载、ready 阶段它会
+       quitAndInstall，两态由主进程 installReadyUpdate() 自己分流，渲染层不重复判断。 */
+    $("updModalGo").onclick = () => {
+      if (window.baiDesktop) window.baiDesktop.installUpdate();
+    };
+    return modalEl;
+  }
+
+  function closeUpdateModal() {
+    if (modalEl) modalEl.style.display = "none";
+  }
+
+  /* 渲染弹框。rawNotes 为假值（""/null/undefined/[]/纯空白）时整块日志区隐藏，
+     弹框退回「标题 + 副标题 + 按钮」的极简形态——这正是契约点名的老包降级项。 */
+  function paintUpdateModal(st) {
+    ensureUpdateModal();
+    const title = $("updModalTitle"), sub = $("updModalSub");
+    const barWrap = $("updModalBarWrap"), bar = $("updModalBar");
+    const go = $("updModalGo");
+
+    title.textContent = `发现新版本 v${st.version || "?"}`;
+
+    if (st.phase === "ready") {
+      sub.textContent = "新版本已下载完成，重启即可安装（中转会中断几秒）。";
+      barWrap.style.display = "none";
+      go.textContent = "立即重启安装";
+      go.disabled = false;
+    } else {
+      const pct = Math.max(0, Math.min(100, Number(st.percent) || 0));
+      sub.textContent = pct > 0
+        ? `正在下载：${pct}%（下载完成后按钮会变成「立即重启安装」）`
+        : "点「立即安装」开始下载；也可以稍后再说。";
+      barWrap.style.display = "";
+      bar.style.width = pct + "%";
+      /* 下载中把按钮置灰：文案已说明在下载，此时它没有可执行的语义。
+         用户不会被锁死——「稍后」始终可点（收起弹框后右下角横幅仍显示进度），
+         再点一次「检查更新」也会走 manualCheckUpdate 的补发分支把弹框重新打开。 */
+      go.textContent = pct > 0 ? "正在下载…" : "立即安装";
+      go.disabled = pct > 0;
+    }
+
+    /* 日志区降级：没有日志就整块 hide，不留空框、不报错。 */
+    const wrap = $("updModalNotesWrap");
+    const txt = modalNotesText(st.releaseNotes);
+    if (!txt) {
+      wrap.style.display = "none";
+      $("updModalNotes").textContent = "";
+    } else {
+      wrap.style.display = "";
+      /* 纯文本 + <pre> + CSS 的 max-height/overflow-y：日志多长都只在这块里滚，
+         不会把弹框撑高、更不会撑爆窗口（见 panel-common.css 的 .updModal .notes）。 */
+      $("updModalNotes").textContent = txt;
+    }
+
+    if (modalEl.style.display === "none") modalEl.style.display = "";
+  }
+
   /* --- 2.6 桌面壳 / 浏览器 的页脚按钮差异 + 更新状态渲染 --- */
   if (window.baiDesktop) {
     if (has("stopBtn")) $("stopBtn").textContent = "退出软件";
@@ -357,7 +476,17 @@
     };
 
     window.baiDesktop.onAppEvent((ev) => {
-      if (ev && ev.kind === "update") paintUpdate(ev.state);
+      if (!ev || ev.kind !== "update") return;
+      paintUpdate(ev.state);
+      /* v1.0.52 弹框分流：只有「用户手动检查」才发现的新版本才弹模态框
+         （主进程按 manualCheckAt 时间窗判定后写进 state.manual）。
+         自动检查（启动 8 秒后 / 每 12 小时一次）state.manual 为假 —— 保持静默，
+         只留下角横幅，不打扰用户，避免每次开机都弹一次框的倒退。
+         后续的下载进度事件沿用同一 state.manual，所以弹框会一路跟到 ready。 */
+      const s = ev.state || {};
+      if (s.manual === true && (s.phase === "downloading" || s.phase === "ready")) {
+        paintUpdateModal(s);
+      }
     });
     if (has("bnrUpdGo")) $("bnrUpdGo").onclick = () => window.baiDesktop.installUpdate();
   }
