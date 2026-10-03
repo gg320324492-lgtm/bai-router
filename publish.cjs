@@ -85,10 +85,6 @@ run("npx electron-builder --win nsis");
   const list = execSync(`npx --yes @electron/asar l "${asar}"`, { cwd: ROOT }).toString().replace(/\\/g, "/");
   const need = ["src/main.js", "src/preload.js", "src/install-consistency.js"];
   const miss = need.filter((f) => !list.includes(f));
-  const snOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "sn.html"));
-  const wbOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "wb.html"));
-  const zenOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "zen.html"));
-  const qdOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "qd.html"));
   // 五个页面都 <script src="/panel-common.js">，缺了它所有页面的底栏与更新控件都会消失
   const pcOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "panel-common.js"));
   // server.mjs 静态 import 了 failover.mjs，缺了整个服务起不来
@@ -102,7 +98,7 @@ run("npx electron-builder --win nsis");
     .filter((x) => !fs.existsSync(path.join(cardsDir, x)));
   if (miss.length || miss2.length || cardOk.length) throw new Error(
     "打包产物缺文件: " + miss.concat(miss2).concat(cardOk.map((x) => "cards/" + x)).join(",")
-    + (snOk ? "" : " + resources/server/sn.html") + (snOk ? "" : " + resources/server/sn.html") + (wbOk ? "" : " + resources/server/wb.html") + (zenOk ? "" : " + resources/server/zen.html") + (qdOk ? "" : " + resources/server/qd.html") + (pcOk ? "" : " + resources/server/panel-common.js") + (foOk ? "" : " + resources/server/failover.mjs"));
+    + (pcOk ? "" : " + resources/server/panel-common.js") + (foOk ? "" : " + resources/server/failover.mjs"));
   console.log("» 发布闸门通过：asar 模块齐全；provider.html / providers.js / panel-common.css / panel-common.js / failover.mjs / cards/* 已随包");
 }
 // 清单/模板一致性闸门的第二道：打包完再验一次，防止构建过程动了这些文件

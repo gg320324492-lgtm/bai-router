@@ -63,7 +63,8 @@
   /* 本路由台自家提供的渠道。此前每页各自硬编码一份"还有别的端接在谁身上"的判断，
    * 结果各漏一部分（sn 页漏了 zen/qd，wb/zen/qd 三页都只列了 bai+sn）——第五家一加
    * 进来就又漂移。收口到这里，且不再写死名单：渠道集合就是清单的键集。
-   * （旧页 sn/wb/zen/qd.html 仍引用这两个全局；新模板只用清单。） */
+   * （这两个全局当年是给旧页 sn/wb/zen/qd.html 用的，旧页已于 v1.0.48/v1.0.49 删除，
+   * 这里仍旧挂出去只为兼容可能残留的旧调用，新模板只用清单。） */
   window.BAI_OURS = Object.keys(window.BAI_PROVIDERS || {});
   window.baiIsOurs = (m) => window.BAI_OURS.includes(m);
   /* 本页该拿哪个 keyMatch 字段来比对自己的凭据（此前各页都写死成 keyMatchWb）。
@@ -309,12 +310,14 @@
   }
   const P = KEY ? (MANIFEST[KEY] || {}) : null;
 
-  /* 过渡期兜底：只保留区生效，两种情况 ——
+  /* 兜底守卫：只保留区生效，两种情况 ——
      1) 清单里没有当前路径（providers.js 还没这个提供方）
-     2) 页面不是新模板（没有 #slot-extra 插槽，说明还是旧的 ui/sn/wb/zen/qd.html，
-        它们各自带内联 <script>，共享渲染层再跑一遍会双重绑定） */
+     2) 页面里没有 #slot-extra 插槽。旧五页（ui/sn/wb/zen/qd.html）已于 v1.0.46 被
+        provider.html 取代、v1.0.49 删除，所以这已不可能是「旧页」，只可能是模板损坏、
+        加载顺序出错或路由发错了文件。此处仍必须返回：模板缺插槽时共享渲染层再跑一遍，
+        会和页面自带的内联 <script> 双重绑定。 */
   if (!P || !has("slot-extra")) {
-    console.warn("[panel-common] " + here + " 不是新模板（无 #slot-extra），只启用保留区");
+    console.warn("[panel-common] " + here + " 缺少 #slot-extra 插槽（模板损坏或加载顺序错误），只启用保留区");
     return;
   }
   P.key = P.key || KEY;

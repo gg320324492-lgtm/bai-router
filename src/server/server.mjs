@@ -1544,7 +1544,9 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     tries.push({ provider, ok: false, status, err: String(describeError(cap) || "").slice(0, 110) });
     if (!shouldFailover(status)) {
       // 不该转移（多半是 400 请求本身有问题）——把这次的真实错误原样还给客户端
-      noteFailoverEvent(fo.provider, tries);
+      // 注意：这里是**没有发生转移**的分支（换渠道也没用，直接原样返回）。
+      // 措辞必须与行为一致，否则排查时会被"故障转移"字样误导成渠道切换过。
+      noteChannelAttempt(fo.provider, tries);
       if (cap.flushBuffered()) return;
       return wbAnthroError(res, status || 502,
         `${target.label} 返回 ${status || "网络错误"}，此错误重试其他渠道也不会好转：${describeError(cap)}`);
@@ -1569,9 +1571,19 @@ function describeError(cap) {
   } catch { return ""; }
 }
 
+// 下面两个函数共用同一种"试过哪些渠道"的描述，抽出来免得两处格式串各自漂移。
+function describeTries(tries) {
+  return tries.map((t) => `${t.provider}:${t.ok ? "成功" : t.skipped || ("失败[st=" + t.status + (t.err ? "/" + String(t.err).slice(0,40) : "") + "]")}`).join("；");
+}
+
 function noteFailoverEvent(from, tries) {
-  const detail = tries.map((t) => `${t.provider}:${t.ok ? "成功" : t.skipped || ("失败[st=" + t.status + (t.err ? "/" + String(t.err).slice(0,40) : "") + "]")}`).join("；");
-  log(`故障转移（入口 ${from}）→ ${detail}`);
+  log(`故障转移（入口 ${from}）→ ${describeTries(tries)}`);
+}
+
+// 与 noteFailoverEvent 的区别：这里**没有**发生渠道转移——命中不该转移的错误（如 400），
+// 原错误被直接还给客户端。措辞刻意避开"故障转移"，只陈述试过哪些渠道。
+function noteChannelAttempt(from, tries) {
+  log(`渠道尝试（入口 ${from}，未转移）→ ${describeTries(tries)}`);
 }
 
 function dispatchOne(fo, req, res, cfg, body, rewritten, isProbe) {
