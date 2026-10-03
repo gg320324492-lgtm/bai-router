@@ -40,7 +40,17 @@ let quitting = false;
 let panelPort = 15723;
 let relayPort = 15722;
 let snRelayPort = 15732; // v1.0.28: SenseNova 独立中转端口（同样纳入启动预检回收）
-let updateState = null; // {version, downloaded}
+let updateState = null; // {version, txid, phase, percent, releaseNotes, manual}
+
+/* v1.0.55 事务标识：每次「发现新版本」开启一个更新事务，txid 单调递增。
+   为什么版本号不够：用户可以在下载 vX 的途中再点「检查更新」，而远端此时
+   可能仍是 vX（日志里就出现过同一秒连发两条「手动检查更新完成: 远端最新 v1.0.54」）。
+   只按 version 比对时，这种「同版本的新一次检查」与旧事务无法区分，
+   旧事务的 download-progress 会被误认成当前事务的进度重新点亮横幅。
+   版本号负责「看的是哪个版本」（渲染层跨版本切换），txid 负责「是不是同一次事务」
+   （同版本重开检查时也要整体切换）。两者一起随 state 下发，两端口径一致。 */
+let updateTxSeq = 0;
+function newUpdateTx() { return ++updateTxSeq; }
 
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch { }
 try {
@@ -545,10 +555,33 @@ function setupUpdater() {
     au.on("update-available", (info) => {
       const manual = isManualCheck();
       const releaseNotes = normalizeReleaseNotes(info.releaseNotes);
+      /* v1.0.55 契约 2：让「当前待处理的版本」只有一个。
+         用户在下 vA 的途中又点「检查更新」，checkForUpdates() 会再发一次
+         update-available。两种情形分开处理：
+
+         情形一 · version 变了（vA → vB）：这是用户实拍 bug 的根源。
+           旧事务必须先作废，否则它的 download-progress 会继续往 updateState 里灌数据，
+           屏幕上同时出现「vB 的弹框」+「vA 的下载横幅」。
+           autoUpdater 没有公开的 cancel API，所以做「作废旧事务」：
+             - 换一个新 txid，旧事务的迟到事件因 txid 更小被渲染层丢弃；
+             - 记一条日志，方便 app.log 排查「下载到一半又换了目标」。
+
+         情形二 · version 没变（vA → vA）：**必须保留当前事务的 txid 与 percent**。
+           因为 autoUpdater 每次 checkForUpdates 都会重发 update-available，
+           而手动检查现在必定会真的去查远端（见 manualCheckUpdate）——
+           若这里也换 txid 并把 percent 归零，一次「下载中再点检查」就会把
+           进度条打回 0%，看起来像重新开始下载，是明显倒退。
+           percent 归零只应发生在「确实换了一笔新事务」时。 */
+      const sameTx = updateState && updateState.txid != null && updateState.version === info.version;
+      if (updateState && updateState.txid && updateState.version !== info.version) {
+        logMain(`放弃处理中的 v${updateState.version}，改处理 v${info.version}`);
+      }
       // phase 仍写 "downloading"：面板横幅的既有渲染只认 downloading/ready 两态，
       // 手动分支下这也是「有新版待处理」的正确语义（真正下载时会被 download-progress 覆盖）。
       // manual 是本版新增字段，渲染层据此决定要不要弹模态框。
-      updateState = { phase: "downloading", version: info.version, percent: 0, releaseNotes, manual };
+      updateState = sameTx
+        ? { ...updateState, manual, releaseNotes: releaseNotes || updateState.releaseNotes }
+        : { phase: "downloading", version: info.version, txid: newUpdateTx(), percent: 0, releaseNotes, manual };
       syncTray();
       notifyWindow("app-event", { kind: "update", state: updateState });
       if (manual) {
@@ -565,8 +598,15 @@ function setupUpdater() {
     let dlWatchdog = null;
     au.on("download-progress", (p) => {
       const pct = Math.round(p.percent);
-      // 展开旧 state 时 version/releaseNotes/manual 都会保留（进度事件只补 percent）
-      updateState = { ...(updateState || { phase: "downloading" }), phase: "downloading", percent: pct };
+      /* v1.0.55 契约 2：download-progress 的载荷里没有版本号，无法自证属于哪个事务。
+         归因规则（与渲染层同构，两端都用「当前事务」这一把尺）：
+           - 当前 state 是 downloading → 就是它，补 percent；
+           - 否则（ready/error/latest，或尚无 state）→ 这多半是上一笔被作废的下载
+             迟到的进度。此时**忽略**，否则会把已经切到 vB 的界面重新拉回下载态、
+             或把 ready 的安装包重新画成进度条。
+         被作废事务的后续进度事件正是这样被挡在门外的。 */
+      if (!updateState || updateState.phase !== "downloading") return;
+      updateState = { ...updateState, phase: "downloading", percent: pct };
       if (pct - lastPct >= 5 || pct === 100) { lastPct = pct; notifyWindow("app-event", { kind: "update", state: updateState }); }
       syncTray();
       // 看门狗：100% 后 25 秒仍未收到 ready → 主动再查一次（已下载文件会被秒判就绪）
@@ -583,10 +623,25 @@ function setupUpdater() {
     au.on("update-downloaded", (info) => {
       if (dlWatchdog) { clearTimeout(dlWatchdog); dlWatchdog = null; }
       lastPct = -5;
+      /* v1.0.55 契约 2：作废旧事务后，它的 update-downloaded 仍可能迟到到达
+         （autoUpdater 无法真正取消下载，vA 下完照样会报 ready）。
+         若照单全收，state 会被改回 vA——屏幕上就又出现「已就绪 vA」与「下载中 vB」
+         两个版本并存，正是要修的那个 bug。
+         判据：当前 state 正处理的是另一个版本 → 这个 ready 属于被作废的事务，丢弃。
+         例外：当前没有 state（启动后直接秒就绪的缓存包），此时 info.version 就是唯一线索，
+         没有「冲突的当前版本」可比较，照常接受并开新事务。 */
+      if (updateState && updateState.version && updateState.version !== info.version) {
+        logMain(`忽略已作废事务的 ready 事件（v${info.version}，当前处理 v${updateState.version}）`);
+        return;
+      }
       // 保留 update-available 阶段已解析出的日志与 manual 标记；若该事件被跳过
       // （如已缓存秒就绪）再兜底解析日志。manual 一路带到 ready，弹框在下载完成后
       // 仍知道自己是「手动那次」发起的，按钮语义才连贯（下载中→可安装）。
-      updateState = { phase: "ready", version: info.version, releaseNotes: (updateState && updateState.releaseNotes) || normalizeReleaseNotes(info.releaseNotes), manual: !!(updateState && updateState.manual) };
+      // v1.0.55：同版本沿用既有 txid，保证「弹框/横幅认的事务」与
+      // 「installReadyUpdate 认的事务」始终一致。
+      const sameVer = updateState && updateState.version === info.version;
+      const txid = sameVer ? updateState.txid : newUpdateTx();
+      updateState = { phase: "ready", version: info.version, txid, releaseNotes: (sameVer && updateState.releaseNotes) || normalizeReleaseNotes(info.releaseNotes), manual: !!(sameVer && updateState.manual) };
       syncTray();
       notifyWindow("app-event", { kind: "update", state: updateState });
     });
@@ -619,7 +674,27 @@ function installReadyUpdate() {
   // 下载完成会自动进 ready 并发 update-downloaded 事件（弹框/横幅随即切到可安装态），
   // 这里只负责启动，不能 quitAndInstall——此时根本没有已下载的安装包。
   if (updateState.phase === "downloading") {
+    /* v1.0.55 契约 1：下载中重复点「立即安装」不应再盲调一次 downloadUpdate()。
+       注意 phase==="downloading" 天然覆盖两种情形：
+         (a) 发现新版本待用户确认（downloadStarted 未置、percent 为 0）——本次点击才该启动下载；
+         (b) 下载已经跑起来了（downloadStarted 已置）——本次点击是重复触发，直接忽略。
+       为什么用显式 downloadStarted 而不是 percent>0：下载刚开始的几秒 percent 还是 0，
+       用户连点两下就会各启一次下载；electron-updater 对同一次下载有幂等保护，
+       但**跨版本**（vA 下到一半又去下 vB）状态会乱，所以必须在入口就挡住。
+       不做「替换目标版本」的智能处理：检查更新跑在 invokes 的 await 之外，
+       让 installReadyUpdate 去并发地改检查目标会把两件事绞在一起；
+       目标版本变了应由「检查更新」路径统一收口（见 manualCheckUpdate / update-available）。 */
+    if (updateState.downloadStarted) {
+      logMain("已在下载 v" + (updateState.version || "?") + "，忽略重复的安装请求");
+      // 补发一次当前状态，让「立即安装」被连点时界面仍保持在下载态（按钮不会闪回可点）
+      notifyWindow("app-event", { kind: "update", state: updateState });
+      return;
+    }
     logMain("用户确认安装，开始下载 v" + (updateState.version || "?"));
+    // 先落标记再启动下载：downloadUpdate() 是异步的，若等它 resolve 再置位，
+    // 中间这段窗口里的第二次点击仍会漏进去，等于没防。
+    updateState = { ...updateState, downloadStarted: true };
+    syncTray();
     autoUpdater.downloadUpdate().catch((e) => {
       updateState = { phase: "error", msg: String((e && e.message) || e).slice(0, 160) };
       syncTray();
@@ -669,14 +744,23 @@ async function manualCheckUpdate() {
     notifyWindow("app-event", { kind: "check", text: "绿色/开发模式不支持自动更新，仅安装版可用", sticky: true });
     return;
   }
-  // 已有待处理的新版（不论来自自动还是手动）：补上 manual:true 重发，让弹框照常打开
-  if (updateState && (updateState.phase === "ready" || updateState.phase === "downloading")) {
-    notifyWindow("app-event", { kind: "update", state: { ...updateState, manual: true } });
-    return;
-  }
+  /* v1.0.55 契约 2：不再「见到有待处理新版就 early-return 重发旧状态」。
+     旧写法正是用户实拍 bug 的直接成因：
+       下载 vA 的途中点「检查更新」→ early-return 把 **vA** 的 downloading 状态
+       当手动事务重发（弹框写 vA），而随后真正的 checkForUpdates() 没被调用，
+       新版本 vB 直到下一次检查才被发现——屏幕上于是并存两个事务的通知。
+     新写法：无论当前有没有待处理事务，都真的去查一次远端。这样：
+       - 远端仍是当前版本 → update-available 不会触发，走到下面的补发分支，
+         仅把 manual 补成 true 重开弹框（保住既有「再点一次把弹框叫回来」的体验）；
+       - 远端是**另一个**版本 → update-available 会带新 txid 开启新事务，
+         旧事务被作废（收尾逻辑见 update-available / download-progress），
+         屏幕上整体切到新版本，绝不并存。
+     注意：这里不再提前 return，所以下面的补发分支要等检查结果出来后再判断。 */
+  let rechecked = false;
   try {
     notifyWindow("app-event", { kind: "check", text: "正在检查更新…" });
     const r = await autoUpdater.checkForUpdates();
+    rechecked = true;
     logMain("手动检查更新完成: " + (r ? (r.updateInfo ? `远端最新 v${r.updateInfo.version}` : JSON.stringify(r).slice(0, 120)) : "无返回值"));
     if (r && r.isUpdateAvailable === false) {
       notifyWindow("app-event", { kind: "check", text: "已是最新版本 v" + app.getVersion() });
@@ -688,6 +772,15 @@ async function manualCheckUpdate() {
     if (!updateState || updateState.phase !== "error") {
       notifyWindow("app-event", { kind: "check", text: "检查更新失败：" + String((e && e.message) || e).slice(0, 100) + "（多为网络/代理未就绪，开 Clash 后重试）", sticky: true });
     }
+    return; // 失败时不补发旧事务，避免把错误态又拉回下载态
+  }
+  /* 检查已有结论但 update-available 没带来新事务（远端仍是当前在处理的那个版本，
+     或已是最新）——此时若存在待处理事务，补上 manual:true 重发一次，
+     保住既有体验：自动检查发现的版本，用户手动点一次「检查更新」也能把弹框叫回来。
+     若刚才是新版本，update-available 已带着新 txid 发过事件，这里不再补发
+     （补发会把同一次事务渲染两遍）。 */
+  if (rechecked && updateState && (updateState.phase === "ready" || updateState.phase === "downloading")) {
+    notifyWindow("app-event", { kind: "update", state: { ...updateState, manual: true } });
   }
 }
 
