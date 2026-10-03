@@ -6,3 +6,8 @@ cert/
 # 它与随包的 config.defaults.json 逐字节相同、apiKey 为空，不进安装包（extraResources 是白名单）。
 # 排除是为了防止哪天 git add -A 把一份本机配置提交上去。
 src/server/config.json
+
+# 手工留下的历史备份（*.bak / *.bak-v1.0.27 这类）。删掉旧页后这些备份备份的是
+# 已不存在的文件，留在仓库里只是死重量；真要留档就走 git 历史。
+*.bak
+*.bak-*
