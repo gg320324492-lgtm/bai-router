@@ -481,28 +481,80 @@
       paintNotes(st.releaseNotes);
     };
 
+    /* v1.0.55 当前事务跟踪。
+       契约核心：横幅与弹框**不是互斥的两件事**，而是**同一个事务的两个视图**。
+       v1.0.54 把「手动」翻译成「只弹框、不画横幅」，掩盖了两个并行事务并存的真因——
+       用户在下 vA 的途中点检查又拿到 vB 时，vB 走手动分支弹框、vA 的进度事件
+       走非手动分支重画横幅，一屏就同时出现两个版本的通知。
+       真正的规则：认准「当前正在显示哪个事务」，只渲染它；其余一律丢弃。
+       事务标识 = txid（主进程单调递增）。
+       为什么不用 version 排序：版本号是字符串，且可能「同版本重开一次检查」，
+       无法区分同版本的两笔事务谁新谁旧；txid 是数字且只增不减，天然可分先后。
+       version 仍随 state 下发，用于标题/日志文案。 */
+    /* curTxid：当前正在显示的事务；seenTxid：迄今见过的最大 txid（水位线）。
+       分开记是必要的：latest/checking 会把 curTxid 清成 null（没有事务在显示了），
+       但若只靠 curTxid 判旧，null 会让下面那个 `s.txid < curTxid` 守卫整个失效——
+       于是一笔已作废事务迟到的进度/ready 会被放行，把刚收起来的弹框又弹回来。
+       水位线不与「当前显示哪笔」绑定，作废后仍能挡住迟到的旧事件。
+       （实测复现：latest 之后再收 txid=1 的进度事件，弹框会复活。） */
+    let curTxid = null;    // 当前显示的事务 tid；null = 当前无事务在显示
+    let seenTxid = 0;      // 水位线：见过的最大 txid，只增不减
+
     window.baiDesktop.onAppEvent((ev) => {
       if (!ev || ev.kind !== "update") return;
       const s = ev.state || {};
+
+      /* 无 txid 的状态（checking / latest / 以及任何没带事务字段的兜底态）：
+         它们不构成一笔更新事务。latest/checking 是「没有新版在跑」的终态，
+         把当前事务取消掉并把界面清干净（收横幅、收弹框）。 */
+      if (s.txid == null) {
+        if (s.phase === "latest" || s.phase === "checking") curTxid = null;
+        closeUpdateModal();
+        paintUpdate(s);
+        return;
+      }
+
+      /* 丢弃旧事务迟到的事件——这是本版最关键的一行。
+         场景：下载 vA（txid=1）途中点检查又发现 vB（txid=2），界面已整体切到 vB；
+         此时 vA 可能还有一个 download-progress / update-downloaded / error 事件正在路上。
+         若照单全收，它会以 vA 的身份重画横幅，屏幕上就又出现 vA 的进度条——
+         正是用户实拍的那个 bug。txid 单调递增，所以「比当前小」= 旧事务，直接丢。
+         相等 = 当前事务的后续事件（进度/ready），放行。
+         error 也一并丢弃：作废旧事务时，旧下载报错是新流程的预期副作用
+         （autoUpdater 无法真正取消，旧任务失败在所难免），
+         把它弹成「更新失败」横幅只会误导用户——错误横幅应只反映当前事务的失败。
+         （真正需要暴露的 error 一定发生在其自身 txid 就是当前值时，不会被这里挡。）
+         注意这里比较的是数字，主进程保证 txid 只增不减，不会回绕到旧值。
+         比对的是 **seenTxid 水位线**而不是 curTxid：latest/checking 之后 curTxid 为 null，
+         用它作判据会让守卫失效（见上面的说明）。 */
+      if (s.txid < seenTxid) return;
+      seenTxid = s.txid;
+
+      /* 事务切换：txid 变了（更大 = 新事务；更小的情况上面已 return）。
+         换事务时先收掉上一笔的弹框，清掉它残留的 DOM 内容与「稍后」接回横幅的挂钩，
+         再让本次事件按自己的视图重画，保证屏幕上的横幅/弹框始终同属一笔事务。 */
+      if (s.txid !== curTxid) {
+        closeUpdateModal();
+        curTxid = s.txid;
+      }
+
       /* v1.0.52 弹框分流：只有「用户手动检查」才发现的新版本才弹模态框
          （主进程按 manualCheckAt 时间窗判定后写进 state.manual）。
          自动检查（启动 8 秒后 / 每 12 小时一次）state.manual 为假 —— 保持静默，
          只留下角横幅，不打扰用户，避免每次开机都弹一次框的倒退。
          后续的下载进度事件沿用同一 state.manual，所以弹框会一路跟到 ready。
-
-         两者互斥（v1.0.54）：手动时**不再同时**摆出右下角横幅——弹框和横幅
-         说的是同一件事，一屏两个通知既冗余又抢注意力（用户实拍反馈）。
-         横幅改由「稍后」时接回来：关掉弹框后仍能从横幅看下载进度，
-         不丢「后台还在下」这个信息。 */
+         v1.0.55：这两个视图现在**同属当前事务**，绝不会跨事务错配。 */
       const wantsModal = s.manual === true && (s.phase === "downloading" || s.phase === "ready");
       if (wantsModal) {
         const b = $("bnrUpdate");
-        if (b) b.classList.remove("show");   // 弹框接管提示，横幅让位
+        if (b) b.classList.remove("show");   // 弹框接管提示，横幅让位（事务的另一个视图）
         paintUpdateModal(s);
       } else {
         /* 非手动（自动检查 / 已是最新 / 出错）时，把可能还开着的弹框收掉。
            不能只画横幅就完事：手动那次把弹框打开后，若后续来了个自动事件
-           （manual 为假），弹框会一直挂在屏幕中央——「自动检查静默」就破功了。 */
+           （manual 为假），弹框会一直挂在屏幕中央——「自动检查静默」就破功了。
+           注意：能走到这里的事件必属于当前事务（txid 相等或刚被切换），
+           所以收掉弹框不会误伤「另一个事务」。 */
         closeUpdateModal();
         paintUpdate(s);
       }
