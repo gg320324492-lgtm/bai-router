@@ -112,9 +112,12 @@ const DEFAULTS = {
     upstream: "https://api2-v2.qoder.sh/model/v1",
     relayPort: 15762,
     defaultModel: "lite",
-    // 实测（2026-10，Free 套餐）能被外部 model server 调用的全集。
-    // lite 是服务端别名，实际落到客户端目录里的免费档 qfmodel = Qwen3.8-Flash。
-    availableModels: ["lite", "auto", "performance", "ultimate", "qmodel", "kmodel", "dmodel", "mmodel"],
+    // 实测（2026-10-03）能被外部 model server 调用的全集 = QD_EXTERNAL_OK 去掉服务端别名 lite
+    // 后的那批；lite 是服务端别名，实际落到客户端目录里的免费档 qfmodel = Qwen3.8-Flash。
+    // 全部付费档（price_factor>0）都列在这里，但**默认映射四个档位一律指向 lite（免费）**——
+    // 用户不主动改映射就不会烧积分。ultimate 会被 Qoder 服务端间歇性拒（Bedrock 权限），
+    // 已在 QD_FLAKY 标注，面板下拉里写明，别让人误以为是自己配错了。
+    availableModels: ["lite", "auto", "performance", "ultimate", "qmodel", "kmodel", "dmodel", "mmodel", "gmodel"],
     mapping: defaultMapping("lite", "Qoder Lite"),
     token: "",
     tokenFile: path.join(os.tmpdir(), "qoder-token.json"),
@@ -777,10 +780,73 @@ async function zenReadCatalog() {
 //     ——实测 `lite` 落到通义千问 Qwen3，即客户端里那个免费的 Qwen3.8-Flash。
 // 所以下拉框只放外部真能调通的（QD_EXTERNAL_OK），其余照实列出并标注"仅客户端内可用"，
 // 免得用户选了必然 400 的模型。
+//
+// QD_EXTERNAL_OK 的依据（实测 2026-10-03，用 %TEMP%/qoder-token.json 的 jt- 令牌直连
+// https://api2-v2.qoder.sh/model/v1/chat/completions，每个别名连测 3 次）：
+//   3/3 通过：lite(0×) / qmodel / mmodel / auto / dmodel / kmodel / gmodel / performance
+//   intermittent：ultimate(2×) 首次成功、第二次 All models failed —— 错误细节是
+//     「arn:aws:iam::…:user/bedrock-test is not authorized to perform: bedrock:InvokeModel」，
+//     即 **Qoder 服务端自己的 AWS Bedrock 权限问题**，与本机账号/积分无关。
+//     故仍列入（它多数时候能用），但标注「Qoder 侧偶发失败」，别让用户以为是自己配错了。
+//   被服务端直接拒（invalid_model_error: Unsupported model —— 服务端不认这些名字，非权限问题）：
+//     smodel(8×) / cmodel(4×) / qmodel_38max / gfmodel(0.1×) / dfmodel(0.1×)
+//   efficient(0.3×) → provider_error: All backends failed（后端全挂）
+// 未实测、故**不列**的客户端目录项：qfmodel / qmodel_latest / kmodel_latest
+//   （宁可漏列，也不要给用户一个必然报错的选项）
 const QD_EXTERNAL_OK = new Set([
   "lite", "auto", "ultimate", "performance",
   "qmodel", "kmodel", "dmodel", "mmodel",
+  // gmodel = GLM-5.3，付费档 0.8×（此前漏列，实测 3/3 通过）
+  "gmodel",
 ]);
+// 实测会间歇失败的付费档（Qoder 服务端 Bedrock 权限问题，见上）。下拉里如实标注。
+const QD_FLAKY = new Set(["ultimate"]);
+// 读不到客户端目录（Qoder 没开 / 补丁没生效）时的兜底价格表，取自
+// %TEMP%/qoder-models.json 的 app 数组快照（实测 2026-10-03）。
+// 只有下拉标注用，不参与路由——绝不能让"标注"变成"默认走付费"。
+//
+// ⚠ qmodel / qmodel_38max 有**错峰折扣**（每晚 22:00-08:00 打到 4 折），
+// 所以它们的价格随时钟变：目录里 promotion.before_promotion_price_factor 是原价、
+// price_factor 是当刻折后价。这张静态表记的是快照值，只在读不到目录时兜底；
+// 标注里会带上原价，避免把夜间折后价当成全天价。
+const QD_PRICE_FALLBACK = {
+  lite: 0, auto: 0.5, performance: 1.1, ultimate: 2,
+  qmodel: 0.04, mmodel: 0.2, dmodel: 0.5, kmodel: 0.8, gmodel: 0.8,
+};
+// 错峰折扣：key → 原价（快照 2026-10-03 23:58 UTC+8，���于折后窗口内）
+const QD_PEAK_PRICE = { qmodel: 0.1, qmodel_38max: 0.5 };
+// 目录读不到时也要如实标注价格，否则用户会以为下拉里都是一样的。
+function qdStaticCatalog(S) {
+  const models = [...(S.availableModels || DEFAULTS.qd.availableModels)];
+  const all = models.map((key) => {
+    const pf = QD_PRICE_FALLBACK[key];
+    return {
+      key,
+      name: (key === "lite" ? "Qwen3.8-Flash" : key),
+      free: pf === 0, price: pf ?? null, priceFactor: pf ?? null,
+      peakPrice: QD_PEAK_PRICE[key] != null && pf !== QD_PEAK_PRICE[key] ? QD_PEAK_PRICE[key] : null,
+      paid: typeof pf === "number" && pf > 0,
+      flaky: QD_FLAKY.has(key),
+      external: QD_EXTERNAL_OK.has(key),
+    };
+  });
+  const labels = {};
+  for (const m of all) {
+    if (!m.external) continue;
+    // 与目录路径同一套措辞：错峰折后价要把原价也写出来，别让夜间 4 折被当成全天价
+    const cost = !m.paid ? "免费"
+      : (m.peakPrice != null ? `${m.priceFactor}×积分（原价 ${m.peakPrice}×积分）` : `${m.priceFactor}×积分`);
+    labels[m.key] = [m.name, cost, m.flaky ? "Qoder 侧偶发失败" : ""]
+      .filter(Boolean).join(" · ");
+  }
+  return {
+    ok: true, static: true, count: models.length, models, all, labels,
+    paidCount: all.filter((m) => m.paid).length,
+    freeCount: all.filter((m) => !m.paid).length,
+    note: "尚未读到 Qoder 模型目录（需 Qoder 客户端在运行且补丁已生效），当前显示的是内置默认列表；"
+      + "价格按 2026-10-03 实测快照标注，付费档请在客户端里核对倍率",
+  };
+}
 let qdCatalogCache = { key: null, at: 0, val: null };
 function qdReadCatalog(cfg) {
   const file = (cfg.qd && cfg.qd.modelsFile) || DEFAULTS.qd.modelsFile;
@@ -790,20 +856,37 @@ function qdReadCatalog(cfg) {
     const raw = JSON.parse(readFileSync(file, "utf8"));
     const list = Array.isArray(raw && raw.app) ? raw.app : [];
     if (!list.length) return { ok: false };
-    const all = list.map((m) => ({
-      key: String(m.key || ""),
-      name: String(m.display_name || m.key || ""),
-      free: m.is_free === true || m.price_factor === 0,
-      price: m.price_factor,
-      isDefault: m.is_default === true,
-      reasoning: m.is_reasoning === true,
-      maxInput: m.max_input_tokens,
-      external: QD_EXTERNAL_OK.has(String(m.key || "")),
-    }));
+    const all = list.map((m) => {
+      const key = String(m.key || "");
+      const pf = typeof m.price_factor === "number" ? m.price_factor : null;
+      return {
+        key,
+        name: String(m.display_name || key || ""),
+        free: m.is_free === true || pf === 0,
+        // price_factor 原样透出（面板按它标注花费），paid 与 free 互斥且互为补集——
+        // 免费档显示「免费」，其余一律带倍率，绝不把付费档显示成免费。
+        price: pf,
+        priceFactor: pf,
+        // 错峰折扣：Qoder 每晚 22:00-08:00 给部分模型打到 4 折。此时 price_factor
+        // 是折后价，原价在 promotion.before_promotion_price_factor。一并透出，
+        // 让面板能写「0.04×（原价 0.1×）」而不是把夜间价当全天价。
+        peakPrice: (m.promotion && typeof m.promotion.before_promotion_price_factor === "number")
+          ? m.promotion.before_promotion_price_factor
+          : (QD_PEAK_PRICE[key] != null && pf !== QD_PEAK_PRICE[key] ? QD_PEAK_PRICE[key] : null),
+        promoBadge: (m.promotion && m.promotion.badge && String(m.promotion.badge.zh || m.promotion.badge.en || "")) || "",
+        paid: pf != null && pf > 0,
+        flaky: QD_FLAKY.has(key),
+        isDefault: m.is_default === true,
+        reasoning: m.is_reasoning === true,
+        maxInput: m.max_input_tokens,
+        external: QD_EXTERNAL_OK.has(key),
+      };
+    });
     // `lite` 不在客户端目录里（是服务端别名），单独补进去并注明它就是免费那档
     if (!all.some((m) => m.key === "lite")) {
-      all.unshift({ key: "lite", name: "Qwen3.8-Flash", free: true, price: 0,
-        isDefault: true, reasoning: false, maxInput: null, external: true, alias: true });
+      all.unshift({ key: "lite", name: "Qwen3.8-Flash", free: true, price: 0, priceFactor: 0,
+        paid: false, flaky: false, isDefault: true, reasoning: false, maxInput: null,
+        external: true, alias: true });
     }
     // 下拉框用 key（lite/qmodel/…）对用户毫无意义，换成看得懂的名字。
     // 目录里有的取 display_name；lite/auto/ultimate/performance 这类档位名补一句说明。
@@ -814,21 +897,38 @@ function qdReadCatalog(cfg) {
       performance: "均衡档",
       efficient: "高效档",
     };
+    // 倍率文案。price_factor 是 Qoder 计费的相对倍率：0=免费，0.8=按 0.8 倍扣积分。
+    const factorText = (pf) => (pf != null && pf > 0 ? `${pf}×积分` : "免费");
     const labels = {};
     for (const m of all) {
       if (!m.external) continue;
       const base = m.name || m.key;
-      labels[m.key] = TIER_DESC[m.key] ? `${base} · ${TIER_DESC[m.key]}` : base;
+      const tier = TIER_DESC[m.key] || "";
+      // 正在错峰打折时，把原价也写出来——否则用户会把夜间 4 折当成全天价。
+      const cost = m.free
+        ? "免费"
+        : (m.peakPrice != null && m.peakPrice !== m.priceFactor
+          ? `${factorText(m.priceFactor)}（原价 ${factorText(m.peakPrice)}）`
+          : factorText(m.priceFactor));
+      // 付费档把倍率写进显示名，用户在下拉里一眼看出哪个在烧积分；
+      // ultimate 再��一句实测结论，别让人以为是本机配错了。
+      labels[m.key] = [base, tier, cost, m.flaky ? "Qoder 侧偶发失败" : ""].filter(Boolean).join(" · ");
     }
-    labels.lite = "Qwen3.8-Flash · 免费档";
+    labels.lite = "Qwen3.8-Flash · 免费档 · 免费";
+    const ext = all.filter((m) => m.external);
+    const paidN = ext.filter((m) => m.paid).length;
     const val = {
       ok: true,
       count: all.length,
-      models: all.filter((m) => m.external).map((m) => m.key),
+      models: ext.map((m) => m.key),
       labels,
       all,
-      note: `目录共 ${all.length} 个，其中 ${all.filter((m) => m.external).length} 个可从本中转调用；`
-        + `其余仅限 Qoder 客户端内使用（走 Cosy 签名通道，外部无法调用）。`,
+      freeCount: all.filter((m) => m.free).length,
+      paidCount: paidN,
+      note: `目录共 ${all.length} 个，其中 ${ext.length} 个可从本中转调用`
+        + `（免费 ${ext.length - paidN} 个、付费 ${paidN} 个）；`
+        + `其余仅限 Qoder 客户端内使用（走 Cosy 签名通道，外部无法调用）。`
+        + `付费档按倍率扣积分，默认映射用免费档，不会自动烧积分。`,
     };
     qdCatalogCache = { key: st.mtimeMs, at: Date.now(), val };
     return val;
@@ -1181,10 +1281,41 @@ async function* sseLines(body) {
   if (buf) yield buf;
 }
 
+// 给 promise 加时限（用于「首事件闸门」）。超时方返回 timedOut:true，
+// 故意不取消原 promise——它还挂在响应体上，由调用方负责丢弃。
+function withDeadline(p, ms) {
+  if (!(ms > 0)) return p.then((v) => ({ ...v, timedOut: false }));
+  let t;
+  return Promise.race([
+    p.then((v) => ({ ...v, timedOut: false })),
+    new Promise((r) => { t = setTimeout(() => r({ value: undefined, done: true, timedOut: true }), ms); }),
+  ]).finally(() => clearTimeout(t));
+}
+// 丢掉上游响应体：fetch 来的 body 有 cancel()，directHttp 的 node 流只有 destroy()。
+async function dropBody(r) {
+  try { if (!r || !r.body) return; if (typeof r.body.cancel === "function") await r.body.cancel(); else r.body.destroy(); } catch { }
+}
+
 // OpenAI SSE → Anthropic SSE（clientStream=false 时聚合成单条 Anthropic JSON 响应）
-async function wbPipe(r, res, { model, clientStream, inputJson }) {
+async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
   const inTok = Math.max(1, Math.ceil(JSON.stringify(inputJson || {}).length / 4));
   const msgId = "msg_wb_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const lines = sseLines(r.body)[Symbol.asyncIterator]();
+  let firstVal = null;
+  // ---- 首事件闸门（v1.0.56）----
+  // 实测 Qoder model server 把后端故障塞进 **HTTP 200 的 SSE 里**：
+  // `event: error` + {"code":"provider_error","message":"All backends failed"}。
+  // 若照旧先 writeHead(200)+message_start 再读上游，故障转移看到的就是一个
+  // 漂亮的 200 —— CaptureRes 立刻固化、判为成功，**永远不会转移**，用户只拿到一句
+  // "All backends failed"。这里把「首个有意义的上游事件」提上来当闸门：读到这里
+  // 才知道是正常流还是伪装成 200 的错误，头也就还没发出去，仍可整段丢弃换渠道。
+  const first = timeoutMs > 0 ? await withDeadline(lines.next(), timeoutMs) : await lines.next();
+  if (first.timedOut) {
+    noteRelayError("wb", "timeout", `${wbErrPrefix} 上游 ${Math.round(timeoutMs / 1000)}s 内未发出首个响应块`);
+    await dropBody(r);
+    return wbAnthroError(res, 504, `${wbErrPrefix} 上游 ${Math.round(timeoutMs / 1000)} 秒内没有返回任何内容，已中断本次请求`);
+  }
+  if (!first.done) firstVal = first.value;
   let idx = -1;
   let cur = null;              // "text" | "thinking" | "tool"
   let curToolOi = -1;
@@ -1213,8 +1344,18 @@ async function wbPipe(r, res, { model, clientStream, inputJson }) {
   }
 
   let sseEvent = "";   // 上游 SSE 的 event: 名字（error 等错误就靠它带出来）
-  const bail = (msg, kind) => {
+  // bail(msg, kind, status)：在**头还没发出去**时（首事件闸门之前）把错误交给调用方，
+  // 由 attemptWithFailover 的影子 res 判定要不要转移——这正是 provider_error
+  // （Qoder 后端全挂）能被故障转移兜住的关键。头一旦发出（流式已 message_start），
+  // 就只剩把错误事件交给客户端这一条路（和之前一样）。
+  const bail = (msg, kind, status) => {
     noteRelayError(wbErrPrefix === "WorkBuddy" ? "wb" : "wb", "upstream_sse_error", msg.slice(0, 180));
+    if (!res.headersSent) {
+      // 影子 res：只记状态码与正文，由 attemptWithFailover 决定转移还是落盘
+      res.writeHead(status || 502, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ type: "error", error: { type: kind || "api_error", message: `[${wbErrPrefix}] ${msg}` } }));
+      return true;
+    }
     if (clientStream) {
       emit("error", { type: "error", error: { type: kind || "api_error", message: `[${wbErrPrefix}] ${msg}` } });
       try { res.end(); } catch { }
@@ -1224,7 +1365,9 @@ async function wbPipe(r, res, { model, clientStream, inputJson }) {
     return true;
   };
   try {
-    for await (const raw of sseLines(r.body)) {
+    // 首行（闸门外取到的那条）先走一遍，之后交给迭代器续上
+    const iter = firstVal == null ? lines : (async function* () { yield firstVal; for (;;) { const n = await lines.next(); if (n.done) return; yield n.value; } })();
+    for await (const raw of iter) {
       const line = raw.trimEnd();
       if (!line) continue;
       if (line.startsWith(":")) { emit("ping", { type: "ping" }); continue; } // 心跳
@@ -1251,7 +1394,14 @@ async function wbPipe(r, res, { model, clientStream, inputJson }) {
           const kind = /invalid_model|model.*not|not.*support/i.test(code + em) ? "invalid_request_error"
             : /auth|permission|forbidden/i.test(code + em) ? "permission_error"
             : /rate|quota|too_many/i.test(code + em) ? "rate_limit_error" : "api_error";
-          if (bail(String(em).slice(0, 300), kind)) { try { await r.body.cancel(); } catch { } return; }
+          // 状态码选择：invalid_request_error = 请求本身有问题（换渠道也一样错，**不转移**）；
+          // permission_error 403 / rate_limit_error 429 都可以转移；
+          // 其余（含 provider_error「All backends failed」这类**上游后端挂了**）
+          // 一律给 502，让 shouldFailover 判为"该换一家"，而不是把用户卡死在这一家。
+          const st = kind === "invalid_request_error" ? 400
+            : kind === "permission_error" ? 403
+            : kind === "rate_limit_error" ? 429 : 502;
+          if (bail(String(em).slice(0, 300), kind, st)) { await dropBody(r); return; }
         }
         sseEvent = "";
       }
@@ -1304,6 +1454,13 @@ async function wbPipe(r, res, { model, clientStream, inputJson }) {
     }
     wbAnthroError(res, 502, `上游流中断: ${String(e && e.message || e).slice(0, 200)}`);
     return;
+  }
+
+  // 流跑完了却一个内容块都没有（既没有文本/思考/工具调用，也没有报错事件）：
+  // 实测 Qoder 后端全挂时就是这种"200 + 空流"。当成上游失败(502)，
+  // 让故障转移去下一家，而不是给用户一个空回复。
+  if (idx < 0 && !usage) {
+    if (bail(`${wbErrPrefix} 上游返回了空流（没有任何内容，可能是该模型后端当前不可用）`, "api_error", 502)) return;
   }
 
   closeCur();
@@ -1486,7 +1643,12 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     noteRelayError(p, "upstream_bad", `${NAME} 返回非流式响应（${ct || "无 Content-Type"}）`);
     return wbAnthroError(res, 502, String(`上游返回非 SSE 响应：${upstreamBodyText(txt, 140)}`).slice(0, 200));
   }
-  await wbPipe(r, res, { model: j.model, clientStream: j.stream === true, inputJson: j }); // Anthropic 默认非流式
+  // 首事件闸门的时限：比响应头超时宽（深度思考模型可能几十秒才吐第一个 token），
+  // 但必须有上限——否则「上游连上了却一直不吐字」会永远挂着，转移也等不到。
+  await wbPipe(r, res, {
+    model: j.model, clientStream: j.stream === true, inputJson: j,
+    timeoutMs: Math.max(60000, (isProbe ? 10000 : 30000) * 3),
+  }); // Anthropic 默认非流式
 }
 
 // 中转核心工厂：B.AI(:relayPort) 与 SenseNova(:sn.relayPort) 复用同一套逻辑，只是
@@ -2224,8 +2386,8 @@ const panel = http.createServer(async (req, res) => {
         // 写到了 tokenFile 同级的 qoder-models.json，这里直接读，不必复刻 Cosy 签名。
         const r = qdReadCatalog(c2);
         if (!r.ok) {
-          return json(res, 200, { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true,
-            note: "尚未读到 Qoder 模型目录（需 Qoder 客户端在运行且补丁已生效），当前显示的是内置默认列表" });
+          // 读不到目录也要如实标注价格：下拉里付费档不能看起来和免费档一样。
+          return json(res, 200, qdStaticCatalog(S));
         }
         return json(res, 200, r);
       }

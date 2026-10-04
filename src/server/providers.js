@@ -291,7 +291,7 @@ window.BAI_PROVIDERS = {
     path: "/qd",
     tab: "Qoder",
     h1: "Qoder",
-    sub: "Qoder · Free 套餐",
+    sub: "Qoder · 免费 + 付费档",
     title: "Qoder 路由 · B.AI 路由台",
     accentLabel: "接入",
     primaryBtn: "一键接入 Qoder",
@@ -304,12 +304,12 @@ window.BAI_PROVIDERS = {
       },
       {
         title: "一键接入",
-        desc: "把 Claude Code（终端 + 桌面版）接到 Qoder 账号的 <b>Free 套餐</b>额度。",
+        desc: "把 Claude Code（终端 + 桌面版）接到 Qoder 账号额度。默认四档都走 <b>免费档</b>，不会自动烧积分；要用付费模型就在下方路由表里主动选（下拉里已标出倍率）。",
       },
     ],
     guideEyebrow: "用法",
     guideTitle: "接入 Qoder",
-    hint: null,                               // 同上，模型目录说明在 cards/model-catalog.js
+    hint: "下拉里的模型按 Qoder 的 <span class=\"mono\">price_factor</span> 如实标注：<b>免费</b>不扣积分，其余标注倍率（如 0.8×积分）。默认映射与「恢复默认模型」都只用免费档 <b>lite</b>。<br><b>ultimate</b> 为 Qoder 服务端侧的间歇性故障（其 AWS Bedrock 权限报错，非本机问题），面板下拉里已注明；命中时会由故障转移自动换渠道。",
     settingsTitle: "Qoder 设置",
     settingsAux: "API Key / 上游 / 中转端口",
     settingsEyebrow: "设置",
@@ -332,10 +332,12 @@ window.BAI_PROVIDERS = {
 
     /* ---- v1.0.48 清单化 ---- */
     brands: { lite: "Qoder Lite", auto: "Qoder Auto" },
-    defaultModels: ["lite", "auto"],
+    // 「恢复默认模型」的目标清单：只含免费档 auto（0.5×）之外的东西一律不进来——
+    // 按这个按钮不该让用户开始烧积分。付费档在下拉里可选，但不会被"恢复默认"装上。
+    defaultModels: ["lite"],
     cred: { kind: "file", txtOk: "已就绪", subOk: "随 Qoder 启动自动轮换", txtNone: "未读到", subNone: "请启动 Qoder 桌面端", preview: "jt-…（已就绪）" },
-    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 Qoder 的模型了。",
-    resetModelsMsg: "✔ 已恢复为 Qoder 默认模型：{list}",
+    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 Qoder 的模型了（默认走免费档 lite）。",
+    resetModelsMsg: "✔ 已恢复为 Qoder 默认模型（免费档）：{list}",
     step1Hint: "请先完成第 1 步：启动 Qoder 桌面端并保持运行（令牌会自动写入 %TEMP%/qoder-token.json）。",
     keyMatch: "keyMatchQd",
     shape: "nested",
