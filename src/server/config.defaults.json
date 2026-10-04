@@ -145,7 +145,14 @@
     "defaultModel": "lite",
     "availableModels": [
       "lite",
-      "auto"
+      "auto",
+      "performance",
+      "ultimate",
+      "qmodel",
+      "kmodel",
+      "dmodel",
+      "mmodel",
+      "gmodel"
     ],
     "mapping": {
       "claude-fable-5": {
