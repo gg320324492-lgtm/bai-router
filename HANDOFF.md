@@ -18,7 +18,7 @@
 | 2 | 修 Qoder 中转 Bug A/B | `REFACTOR-CONTRACT-v10.md` | ✅ 完成并复验 |
 | 3 | Zen 500 文案 + WorkBuddy 令牌（v1.0.58） | `REFACTOR-CONTRACT-v11.md` | ✅ 完成并复验 |
 | 4 | **OpenRouter 免费兜底区**（第 6 个提供方） | `REFACTOR-CONTRACT-v13.md` | ✅ 完成并复验 |
-| 5 | 发布 v1.0.58（bump 版本 → 打包 → 推送 → publish） | `docs/evidence/release-checklist-1.0.58.md` | ⏳ **等用户授权**（gh release 不可逆） |
+| 5 | 发布 v1.0.58（bump → 打包 → 推送 → publish） | `docs/evidence/release-checklist-1.0.58.md` | ✅ **已发布** [v1.0.58](https://github.com/gg320324492-lgtm/bai-router/releases/tag/v1.0.58)（2026-10-07，两道闸门全过、latest.yml 带 releaseNotes、快照脱敏复验 C13=0） |
 
 **任务 1–4 全部完成。** 复验方式统一为：隔离实例实测（17xxx 端口）+ 闸门全量 + 回归计数比对基线，**不采信 agent 自述**。
 
