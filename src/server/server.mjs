@@ -14,6 +14,7 @@ import {
   CaptureRes, failoverCooldown, failoverClear, failoverAvailable, failoverSnapshot,
   shouldFailover, FAILOVER_COOLDOWN_MS,
 } from "./failover.mjs";
+import { qpApply, qpRevert, qpStatus } from "./qoder-patch.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -185,6 +186,23 @@ function loadCfg() {
       mapping: { ...DEFAULTS.qd.mapping, ...(qdIn.mapping || {}) },
       availableModels: Array.isArray(qdIn.availableModels) && qdIn.availableModels.length ? qdIn.availableModels : [...DEFAULTS.qd.availableModels],
     };
+    // 令牌/模型文件路径纠正（v1.0.57）：早期 config.defaults.json 把它写死成发布机的
+    // 绝对路径（C:\Users\admin\…\Temp\qoder-token.json）。换一台电脑时这个路径既不属于
+    // 该机的临时目录、也可能根本不存在，导致补丁写的文件与中转读的文件不是同一份，
+    // 面板永远显示「未读到」。这里：空值、或「盘符/用户目录明显不是本机」的路径，
+    // 一律改回本机 os.tmpdir()（与补丁写入位置一致）。
+    const fixQdFile = (v, name) => {
+      const def = path.join(os.tmpdir(), name);
+      if (typeof v !== "string" || !v.trim()) return def;
+      const norm = path.normalize(v.trim());
+      // 已经是本机临时目录下的同名文件 → 尊重用户设置
+      if (norm.toLowerCase() === def.toLowerCase()) return v;
+      // 绝对路径但父目录在本机不存在 → 视为「从别的机器带过来的」，换回本机默认
+      if (path.isAbsolute(norm) && !existsSync(path.dirname(norm))) return def;
+      return v;
+    };
+    merged.qd.tokenFile = fixQdFile(merged.qd.tokenFile, "qoder-token.json");
+    merged.qd.modelsFile = fixQdFile(merged.qd.modelsFile, "qoder-models.json");
     return merged;
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
@@ -958,10 +976,44 @@ function qdEnsureToken(cfg, force) {
       }
     }
   } catch {
-    if (!qdTokCache.token) throw new Error("未找到 Qoder 令牌——请先启动 Qoder 桌面端（补丁会把令牌写到 " + file + "）");
+    if (!qdTokCache.token) {
+      // v1.0.57：区分「补丁没装」与「Qoder 没开」——这是新电脑上最常见的两种失败，
+      // 提示必须不同，否则用户会照着错的方向折腾。
+      let patched = 0;
+      try { patched = qpStatus().patchedCount; } catch { }
+      if (!patched) {
+        throw new Error("未找到 Qoder 令牌——本机的 Qoder worker 还没打补丁。"
+          + "请打开上方「令牌从哪来」卡片，点「一键装补丁」自动完成（无需装 Python）。");
+      }
+      throw new Error("未找到 Qoder 令牌——补丁已装，请启动 Qoder 桌面端并保持运行"
+        + "（令牌会随 Qoder 启动写入 " + file + "）");
+    }
   }
   if (!qdTokCache.token) throw new Error("Qoder 令牌文件为空——请启动 Qoder 桌面端后重试");
   return qdTokCache.token;
+}
+
+// qdPatchInfo：把补丁状态压成面板要用的几个字段（每次 /api/status 都会调，代价是
+// 扫描几个 worker 副本读文件头——最多几 MB，可忽略；但加 3 秒缓存，避免状态轮询过密）。
+let qdPatchCache = { at: 0, val: null };
+function qdPatchInfo() {
+  if (qdPatchCache.val && Date.now() - qdPatchCache.at < 3000) return qdPatchCache.val;
+  let val;
+  try {
+    const s = qpStatus();
+    val = {
+      found: s.found,
+      patched: s.patchedCount,
+      ready: s.found > 0 && s.patchedCount > 0,
+      tokenFresh: s.tokenFresh,
+      tokenAt: s.tokenAt,
+      cn: s.cn,
+    };
+  } catch {
+    val = { found: 0, patched: 0, ready: false, tokenFresh: false, tokenAt: null, cn: 0 };
+  }
+  qdPatchCache = { at: Date.now(), val };
+  return val;
 }
 
 // ---------- 一键捕获 WorkBuddy 令牌（v1.0.33）----------
@@ -1001,14 +1053,53 @@ try {
   const __fs = require("fs");
   const __out = __path_capture;
   const __grab = (txt) => { try { __fs.appendFileSync(__out, String(txt) + String.fromCharCode(10)); } catch (e) {} };
+  // v1.0.58 根因修复：原来要求 Authorization 与 X-Refresh-Token「同时出现」才记录，
+  // 但实测普通业务请求只带 Authorization；X-Refresh-Token 只在令牌续期
+  // （/v2/auth/token/refresh、/account/switch）时才出现，而续期只在令牌过期时才发。
+  // 于是「令牌没过期时点一键获取」永远等不到同时带两个头的请求，必然干等超时（两分半）。
+  // 现在：只要拿到合法 Bearer（含点，像 JWT）就记录；刷新令牌有则一并带上、没有就留空。
   const __pick = (h) => {
     try {
-      const g = (k) => { const v = h && (h[k] || h[String(k).toLowerCase()]); return typeof v === "string" ? v : ""; };
-      const tok = (g("authorization") || g("Authorization")).replace(/^Bearer\\s+/i, "");
+      /* 取头。要同时吃下三种形态（实测漏抓过，故逐一覆盖）：
+         ① 普通对象 {Authorization:"…"}：大小写都可能，故三种拼写都试
+         ② Headers 实例（fetch(url,{headers:new Headers(…)})）——它不是普通对象，
+            h[k] 恒为 undefined，必须走 .get()
+         ③ 数组形式 [["Authorization","…"]]（较少见，Headers 构造器与 fetch 都接受）
+         原先只做 ①，于是「调用方传 Headers 实例」或「头名全小写」时会静默漏抓——
+         用户看到的就是「一键获取令牌一直转圈到超时」。 */
+      const g = (k) => {
+        const K = String(k);
+        try {
+          if (h && typeof h.get === "function") {          // Headers 实例
+            const v = h.get(K) || h.get(K.toLowerCase()) || h.get(K.toUpperCase());
+            if (typeof v === "string" && v) return v;
+          }
+          if (Array.isArray(h)) {                           // [[k,v],…]
+            for (const e of h) {
+              if (!Array.isArray(e)) continue;
+              if (String(e[0]).toLowerCase() === K.toLowerCase()) return String(e[1] == null ? "" : e[1]);
+            }
+            return "";
+          }
+          const v = h && (h[K] || h[K.toLowerCase()] || h[K.toUpperCase()]);
+          return typeof v === "string" ? v : "";
+        } catch (e) { return ""; }
+      };
+      // 注意：这里是模板字面量，正则里的 "\\s" 会被转义掉、变成"字面反斜杠+s"，永远匹配不上空格。
+      // 实测踩过这个坑：钩子抓到的 accessToken 会带上 "Bearer " 前缀，写进 config 后中转就会
+      // 拼出 "Bearer Bearer xxx"。所以这里不用正则，改用字符串切分，避开模板转义陷阱。
+      let tok = (g("authorization") || g("Authorization")).trim();
+      const sp = tok.indexOf(" ");
+      if (sp > 0 && tok.slice(0, sp).toLowerCase() === "bearer") tok = tok.slice(sp + 1).trim();
       const ref = g("x-refresh-token") || g("X-Refresh-Token");
-      const dev = g("X-Device-Token") || g("x-device-token");
-      const uid = g("X-User-Id") || g("x-user-id");
-      if (tok && tok.indexOf(".") > 0 && ref) __grab(JSON.stringify({ accessToken: tok, refreshToken: ref, deviceToken: dev, userId: uid }));
+      const dev = g("x-device-token") || g("X-Device-Token");
+      const uid = g("x-user-id") || g("X-User-Id");
+      if (!tok || tok.indexOf(".") <= 0) return;
+      // 只在「拿到了上一次没有的东西」时才落盘，避免每个请求都追加、文件暴涨。
+      const __key = tok + "|" + (ref || "");
+      if (__key === globalThis.__BAI_LAST_GRAB) return;
+      globalThis.__BAI_LAST_GRAB = __key;
+      __grab(JSON.stringify({ accessToken: tok, refreshToken: ref, deviceToken: dev, userId: uid }));
     } catch (e) {}
   };
   for (const m of ["https", "http"]) {
@@ -1113,11 +1204,13 @@ async function wbCaptureToken(timeoutMs = 150000) {
   // 注入到 shebang 之后（保留首行 #!，Node 才能正常执行）
   const lines = backup.split("\n");
   const patched = lines[0] + "\n" + hook + "\n" + lines.slice(1).join("\n");
-  wbCapState = { active: true, startedAt: Date.now(), error: null, script, backup, wrote: false };
+  wbCapState = { active: true, startedAt: Date.now(), error: null, script, backup, wrote: false, got: "" };
   await fsPromises.writeFile(script, patched, "utf8");
   wbCapState.wrote = true;
   log(`WorkBuddy 令牌捕获：已注入临时钩子（${script}），等待客户端触发…`);
   const deadline = Date.now() + timeoutMs;
+  // 已捕获到的最新一条（accessToken 可能已抓到、刷新令牌还没有）——用于给前端实时进度
+  let seen = null;
   try {
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 1000));
@@ -1125,26 +1218,50 @@ async function wbCaptureToken(timeoutMs = 150000) {
         const raw = (await fsPromises.readFile(outFile, "utf8")).trim().split("\n").filter(Boolean).pop();
         if (raw) {
           const obj = JSON.parse(raw);
-          if (obj.accessToken && obj.refreshToken) {
+          if (obj && obj.accessToken) {
+            seen = obj;
+            wbCapState.got = obj.accessToken;
+            // v1.0.58：不再要求 accessToken 与 refreshToken 同时存在。
+            // 只要抓到合法访问令牌就可以落盘——它才是真正用来打上游的凭证（有效期约一年）。
+            // 刷新令牌的兜底策略（见下），保证「只带 Authorization 的普通请求」也能一次成功。
             const cfg = loadCfg();
             cfg.wb.accessToken = obj.accessToken;
-            cfg.wb.refreshToken = obj.refreshToken;
+            // 刷新令牌：优先用本次抓到的；本次没有（大多数情况：普通业务请求只带 Authorization）
+            // 就保留配置里已有的，避免把一条好用的刷新令牌覆盖成空。两者都没有则留空
+            // （仍可正常用，只是令牌过期后无法自动续期，返回的 hasRefresh/hints 会如实说明）。
+            if (obj.refreshToken) cfg.wb.refreshToken = obj.refreshToken;
             if (obj.deviceToken) cfg.wb.deviceToken = obj.deviceToken;
             if (obj.userId) cfg.wb.userId = obj.userId;
             saveCfg(cfg);
+            const exp = wbTokenExp(obj.accessToken);
+            const hasRefresh = !!cfg.wb.refreshToken;
             // 抓到即还原：不等超时，立刻让 WorkBuddy 的脚本恢复原状
             await wbCaptureRestore();
-            log("WorkBuddy 令牌捕获：成功（钩子已立即还原）");
-            return { ok: true, masked: keyFp(obj.accessToken) };
+            log(`WorkBuddy 令牌捕获：成功（钩子已立即还原）${hasRefresh ? "" : "，未含刷新令牌（将沿用配置里已有的，若无则到期需重新获取）"}`);
+            return {
+              ok: true,
+              masked: keyFp(obj.accessToken),
+              hasRefresh,
+              expiresAt: exp || null,
+              hints: hasRefresh ? [] : ["本次请求未携带刷新令牌（它只在令牌续期时才随请求发出）。访问令牌有效期约一年，到期后需重新点「一键获取令牌」。"],
+            };
           }
         }
       } catch { /* 文件还没生成/还没写完整，继续等 */ }
     }
-    throw new Error("等待超时：请在 WorkBuddy 客户端里随便发一条消息（它会拉起内部 CLI，钩子即可捕获），然后重试");
+    // 超时：按当前卡在哪一步给出如实提示（实测「发一条消息」只走 Authorization-only 路径，
+    // 光靠发消息拿不到刷新令牌，这里不再让用户误以为是没发消息）。
+    if (seen && seen.accessToken) {
+      throw new Error("等待超时：已捕获到访问令牌，但未能写入配置。请重试「一键获取令牌」。");
+    }
+    throw new Error("等待超时：未捕获到任何令牌。请确认 WorkBuddy 客户端已打开并已登录，"
+      + "然后在里面随便发一条消息或打开一个对话（客户端会拉起内部 CLI 并带上 Authorization 头），"
+      + "再点一次「一键获取令牌」。若仍失败，可展开下方「手动填写令牌」作为备用方式。");
   } finally {
     await wbCaptureRestore();
     await fsPromises.rm(outFile, { force: true }).catch(() => { });
     wbCapState.active = false;
+    wbCapState.got = "";
   }
 }
 
@@ -2258,6 +2375,9 @@ async function statusPayload() {
       useProxy: cfg.qd?.useProxy === true,
       // 令牌是轮换的 jobToken，只有"当前有没有读到"这一态有意义（无到期时间可报）
       token: { configured: !!qdTok, tokenFile: cfg.qd?.tokenFile || DEFAULTS.qd.tokenFile },
+      // v1.0.57：worker 补丁是否已装。新电脑上没装补丁 = 没令牌 = 面板显示「未读到」，
+      // 前端据此把「请启动 Qoder」换成「点这里一键装补丁」——这才是用户真正能做的动作。
+      patch: qdPatchInfo(),
     },
     wb: {
       relay: wb.relay, relayLast: wb.relayLast, upstream: wb.upstream, recent: wb.recent,
@@ -2368,7 +2488,44 @@ const panel = http.createServer(async (req, res) => {
       }
     }
     if (req.method === "GET" && u.pathname === "/api/wb/capture/status") {
-      return json(res, 200, { active: wbCapState.active, startedAt: wbCapState.startedAt, elapsedMs: wbCapState.active ? Date.now() - wbCapState.startedAt : 0 });
+      // v1.0.58：附带 gotAccessToken（是否已抓到访问令牌），前端可据此给实时反馈：
+      // 「已捕获到访问令牌」比一律转圈等待体验好得多。
+      return json(res, 200, {
+        active: wbCapState.active,
+        startedAt: wbCapState.startedAt,
+        elapsedMs: wbCapState.active ? Date.now() - wbCapState.startedAt : 0,
+        gotAccessToken: !!(wbCapState.active && wbCapState.got),
+      });
+    }
+
+    // v1.0.57: Qoder worker 补丁——一键装/还原/查状（Node 内置实现，不需要用户装 Python）。
+    // 背景见 qoder-patch.mjs 顶部注释：令牌只存在于 worker 进程内存，磁盘上没有明文持久化，
+    // 出网流量里也没有 refresh_token，所以「运行时打补丁」是唯一可行方案。
+    // 这三条 API 把原来「qoder-patch/patch_worker.py + 手装 Python + 每次升级重跑」
+    // 收进面板一个按钮里，新电脑开箱即用。
+    if (req.method === "GET" && u.pathname === "/api/qd/patch/status") {
+      try { return json(res, 200, { ok: true, ...qpStatus() }); }
+      catch (e) { return json(res, 200, { ok: false, error: String((e && e.message) || e) }); }
+    }
+    if (req.method === "POST" && u.pathname === "/api/qd/patch/apply") {
+      try {
+        const r = qpApply();
+        log("Qoder 补丁 apply:", JSON.stringify(r.results.map((x) => x.ver + "=" + x.state)));
+        // 补丁文件改动后，已缓存的令牌状态要重读一次
+        try { qdEnsureToken(loadCfg(), true); } catch { }
+        return json(res, 200, { ok: r.fail === 0, ...r });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: String((e && e.message) || e) });
+      }
+    }
+    if (req.method === "POST" && u.pathname === "/api/qd/patch/revert") {
+      try {
+        const r = qpRevert();
+        log("Qoder 补丁 revert:", r.reverted + "/" + r.total);
+        return json(res, 200, { ok: true, ...r });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: String((e && e.message) || e) });
+      }
     }
 
     // v1.0.19: 拉取上游真实模型目录。模型会腐烂/新增（实测 mimo-v2.5 目录里有但实际 503），

@@ -299,8 +299,8 @@ window.BAI_PROVIDERS = {
     relayHint: ":15762",
     guide: [
       {
-        title: "启动 Qoder 桌面端",
-        desc: "登录 Qoder 桌面端并保持运行。补丁会在它的 worker 里挂一个钩子，把当前 <span class=\"mono\">jt-…</span> 令牌实时写到 <span class=\"mono\">%TEMP%/qoder-token.json</span>，本中转每次请求现读——<b>无需任何手动粘贴</b>。令牌每次 Qoder 启动会轮换，中转自动跟随。",
+        title: "装补丁并启动 Qoder 桌面端",
+        desc: "新电脑先展开下方「令牌从哪来」卡片，点<b>「一键装补丁」</b>（路由台内置，无需装 Python）；然后登录 Qoder 桌面端并保持运行。补丁会在它的 worker 里挂一个钩子，把当前 <span class=\"mono\">jt-…</span> 令牌实时写到 <span class=\"mono\">%TEMP%/qoder-token.json</span>，本中转每次请求现读——<b>无需任何手动粘贴</b>。令牌每次 Qoder 启动会轮换，中转自动跟随。",
       },
       {
         title: "一键接入",
@@ -335,10 +335,10 @@ window.BAI_PROVIDERS = {
     // 「恢复默认模型」的目标清单：只含免费档 auto（0.5×）之外的东西一律不进来——
     // 按这个按钮不该让用户开始烧积分。付费档在下拉里可选，但不会被"恢复默认"装上。
     defaultModels: ["lite"],
-    cred: { kind: "file", txtOk: "已就绪", subOk: "随 Qoder 启动自动轮换", txtNone: "未读到", subNone: "请启动 Qoder 桌面端", preview: "jt-…（已就绪）" },
+    cred: { kind: "file", txtOk: "已就绪", subOk: "随 Qoder 启动自动轮换", txtNone: "未读到", subNone: "未装补丁或 Qoder 未启动", preview: "jt-…（已就绪）" },
     applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 Qoder 的模型了（默认走免费档 lite）。",
     resetModelsMsg: "✔ 已恢复为 Qoder 默认模型（免费档）：{list}",
-    step1Hint: "请先完成第 1 步：启动 Qoder 桌面端并保持运行（令牌会自动写入 %TEMP%/qoder-token.json）。",
+    step1Hint: "请先完成第 1 步：在「令牌从哪来」卡片点「一键装补丁」，再启动 Qoder 桌面端并保持运行（令牌会自动写入 %TEMP%/qoder-token.json）。",
     keyMatch: "keyMatchQd",
     shape: "nested",
     sys: { tokenView: true },

@@ -95,12 +95,14 @@ window.BAI_CARDS["token-capture"] = {
       }
     }
 
-    /* ---------- 「一键获取令牌」的等待面板（逐字；原来长在两步引导卡里） ---------- */
-    let capTimer = null, capTick = 0;
+    /* ---------- 「一键获取令牌」的等待面板 ---------- */
+    // v1.0.58：文案更如实——实测普通业务请求只带 Authorization（够写令牌了），
+    // X-Refresh-Token 只在续期时出现；不再让用户误以为「发消息」是唯一/关键动作。
+    let capTimer = null, capPoll = null, capTick = 0;
     const CAP_TIPS = [
       "正在等待 WorkBuddy 触发…",
-      "如果 10 秒内没反应，请打开 WorkBuddy 客户端随便发一条消息",
-      "钩子已就位，WorkBuddy 一跑起来就会自动抓到令牌",
+      "如果 10 秒内没反应，请在 WorkBuddy 客户端里打开一个对话，或随便发一条消息",
+      "钩子已就位，WorkBuddy 一发起带鉴权的请求就会自动抓到访问令牌",
       "仍在等待中…（最长 2 分 30 秒，可随时关闭页面重试）",
     ];
     function ensureProgress() {
@@ -124,6 +126,7 @@ window.BAI_CARDS["token-capture"] = {
       const box = $("captureProgress");
       box.style.display = on ? "flex" : "none";
       clearInterval(capTimer);
+      clearInterval(capPoll);
       if (!on) return;
       capTick = 0;
       $("pTitle").textContent = CAP_TIPS[0];
@@ -132,6 +135,16 @@ window.BAI_CARDS["token-capture"] = {
         capTick = Math.min(capTick + 1, CAP_TIPS.length - 1);
         $("pTitle").textContent = CAP_TIPS[capTick];
       }, 12000);
+      // 轮询后端进度：一旦抓到访问令牌就立刻如实反馈（不再一律转圈到超时）
+      capPoll = setInterval(async () => {
+        try {
+          const s = await api("/api/wb/capture/status");
+          if (s && s.gotAccessToken) {
+            $("pTitle").textContent = "已捕获到访问令牌，正在写入配置…";
+            $("pDesc").textContent = "刷新令牌只在令牌到期续期时才会出现；没有它也能正常使用，到期后重新获取即可。";
+          }
+        } catch { /* 轮询失败不影响主流程 */ }
+      }, 2000);
     }
 
     /* ---------- 手动令牌卡折叠（逐字；源页不记忆选择） ---------- */
@@ -183,7 +196,13 @@ window.BAI_CARDS["token-capture"] = {
       try {
         const r = await api("/api/wb/capture", { method: "POST" });
         if (r.ok) {
-          ctx.showResult($("applyResult"), "✔ 令牌获取成功（" + (r.masked || "") + "），已自动填入并保存。\n接下来点第 2 步「一键接入 WorkBuddy」即可。", true);
+          let msg = "✔ 令牌获取成功（" + (r.masked || "") + "），已自动填入并保存。";
+          if (r.hasRefresh === false) {
+            msg += "\n注意：本次未捕获到刷新令牌（它只在令牌续期时才随请求发出）。";
+            msg += "访问令牌有效期约一年，到期后重新点「一键获取令牌」即可。";
+          }
+          msg += "\n接下来点第 2 步「一键接入 WorkBuddy」即可。";
+          ctx.showResult($("applyResult"), msg, true);
           ctx.showInfo("令牌已获取", "第 1 步完成，接下来点「一键接入 WorkBuddy」。");
         } else {
           ctx.showResult($("applyResult"), "✘ 获取失败：" + r.error + "\n可展开下方「手动填写令牌」作为备用方式。", false);
