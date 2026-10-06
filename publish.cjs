@@ -53,20 +53,33 @@ try {
       const cur3 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
       if (cur3.zen) def.zen = { ...cur3.zen, apiKey: "" };
     }
+    // or（OpenRouter）块：三把 API Key 绝不进发布机快照——快照随安装包发给所有机器，
+    // key 进去等于公开泄露（v1.0.58 加第 6 家时补上；本机没配过时从仓库 defaults 继承结构、keys 仍清空）。
+    if (def.or) { def.or = { ...def.or, keys: [] }; }
+    else {
+      const curOr = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
+      if (curOr.or) def.or = { ...curOr.or, keys: [] };
+    }
     // failover（自动故障转移）：本机配置通常没有这个块（默认关闭），而快照是整体拷贝
     // 本机 config 去覆盖 defaults.json 的——不显式保留的话，每次发布都会把它从随包快照里
-    // 冲掉。chain 顺带收敛到已知提供方。
+    // 冲掉。chain 顺带收敛到已知提供方（or 与 loadCfg 语义一致：兜底恒在末尾）。
     {
       const curFo = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
       const srcFo = def.failover || curFo.failover;
-      if (srcFo) def.failover = { ...srcFo, chain: (srcFo.chain || []).filter((x) => ["bai", "sn", "wb", "zen", "qd"].includes(x)) };
+      if (srcFo) {
+        const chain = (srcFo.chain || []).filter((x) => ["bai", "sn", "wb", "zen", "qd", "or"].includes(x));
+        if (chain.length && !chain.includes("or")) chain.push("or");
+        def.failover = { ...srcFo, chain };
+      }
     }
     // qd（Qoder）块：token 是手动兜底用的 jt- jobToken，绝不进快照
     // （正常路径下它恒为空——真实令牌由 worker 补丁写在 %TEMP%\qoder-token.json，不落 config）
-    if (def.qd) { def.qd = { ...def.qd, token: "" }; }
+    // tokenFile/modelsFile 是发布机的 %TEMP% 绝对路径，原样进快照会被 C13 闸门拦下；
+    // 清空即可——运行期 fixQdFile() 会把空值/异机路径自愈回本机 os.tmpdir()。
+    if (def.qd) { def.qd = { ...def.qd, token: "", tokenFile: "", modelsFile: "" }; }
     else {
       const cur4 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
-      if (cur4.qd) def.qd = { ...cur4.qd, token: "" };
+      if (cur4.qd) def.qd = { ...cur4.qd, token: "", tokenFile: "", modelsFile: "" };
     }
     fs.writeFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), JSON.stringify(def, null, 2) + "\n");
     console.log(`» 默认快照已同步发布机: ${def.availableModels.length} 个模型${def.sn ? " + SenseNova " + def.sn.availableModels.length + " 个" : ""}`);

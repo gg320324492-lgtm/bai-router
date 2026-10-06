@@ -4,14 +4,16 @@
 // 启动方式任意：若缺 NODE_USE_ENV_PROXY 环境变量会自动以正确环境重启自己。
 import http from "node:http";
 import https from "node:https";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync, createWriteStream } from "node:fs";
+import net from "node:net";
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync, createWriteStream, readdirSync, rmSync } from "node:fs";
 import { promises as fsPromises } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
 import os from "node:os";
 import {
-  CaptureRes, failoverCooldown, failoverClear, failoverAvailable, failoverSnapshot,
+  CaptureRes, failoverCooldown, failoverClear, failoverAvailable, failoverSnapshot, failoverQuotaBlocked,
   shouldFailover, FAILOVER_COOLDOWN_MS,
 } from "./failover.mjs";
 import { qpApply, qpRevert, qpStatus } from "./qoder-patch.mjs";
@@ -100,7 +102,8 @@ const DEFAULTS = {
   failover: {
     enabled: false,
     // 转移顺序（当前提供方永远排第一，手动选的才是首选）。未配置凭据的会被自动跳过。
-    chain: ["qd", "bai", "sn", "zen", "wb"],
+    // or（OpenRouter）**永远排最后**：用户原话「没有任何模型可用时的兜底」。
+    chain: ["qd", "bai", "sn", "zen", "wb", "or"],
   },
 
   // Qoder（qoder.com 桌面端附带的 Free 套餐）—— 第五个可路由提供方。
@@ -148,6 +151,45 @@ const DEFAULTS = {
     userId: "",
     useProxy: false, // www.workbuddy.ai 直连即可；仅当直连被拦时开启
   },
+
+  // OpenRouter（v1.0.59）—— 第六个可路由提供方，**免费兜底区**（用户原话：没有任何
+  // 模型可用时的兜底）。上游只讲 OpenAI 协议，复用通用协议桥；端口 15772。
+  // 与前五家的三处不同：
+  //  ① 凭据是 `keys[]`（最多 3 把，轮换用），不是单个 apiKey——明文只落 config.json，
+  //     绝不进 config.defaults.json / providers.js / HANDOFF.md（安全红线）。
+  //  ② 模型目录按 pricing 全 0 实测筛（不能只看 :free 后缀），见 orRefreshFreeModels。
+  //  ③ 429 有两种 limit_source，必须分流换模型 / 换 key —— 见 orAdvance()。
+  or: {
+    upstream: "https://openrouter.ai/api/v1",
+    relayPort: 15772,
+    defaultModel: "openrouter/free",
+    // 发布机种子（实测 2026-10-07：466 个模型中 18 个文本类免费模型；
+    // 另两个 google/lyria-* 虽 pricing 全 0 但是音乐模型，不进对话下拉）。
+    // 面板「刷新模型列表」会按 pricing 重筛并覆盖这份列表。
+    availableModels: [
+      "openrouter/free",
+      "inclusionai/ling-3.1-flash",
+      "apodex/apodex-1.1-mini:free",
+      "inclusionai/ling-3.0-flash-sante:free",
+      "dots-studio/dots-3-note-preview:free",
+      "liquid/lfm-2.5-2.6b:free",
+      "nvidia/nemotron-3.5-lightning:free",
+      "thinkingmachines/inkling-small:free",
+      "poolside/laguna-s-2.1:free",
+      "thinkingmachines/inkling:free",
+      "poolside/laguna-xs-2.1:free",
+      "cohere/north-mini-code:free",
+      "nvidia/nemotron-3.5-content-safety:free",
+      "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+      "google/gemma-4-26b-a4b-it:free",
+      "google/gemma-4-31b-it:free",
+      "nvidia/nemotron-3-super-120b-a12b:free",
+    ],
+    mapping: defaultMapping("openrouter/free", "OpenRouter Free"),
+    keys: [],        // 最多 3 把 sk-or-v1…；本机 config.json 专属，种子里恒为空
+    useProxy: false, // 实测 openrouter.ai 直连可达；被墙时在面板勾「走本机代理」
+  },
 };
 function loadCfg() {
   try {
@@ -179,6 +221,21 @@ function loadCfg() {
     if (!Array.isArray(merged.failover.chain) || !merged.failover.chain.length) {
       merged.failover.chain = [...DEFAULTS.failover.chain];
     }
+    // or（OpenRouter 兜底）**只追加、不重排**：存量 config.json 的 chain 是五家时代写的，
+    // 没有 or。这里在末尾补一个（已有就不动），既不改变用户排好的顺序，也不破坏
+    // ["qd","bai","sn","zen","wb"] 这份现值。注意：or 未配置 key 时会被自动跳过，
+    // 追加它对存量行为零影响。
+    if (Array.isArray(merged.failover.chain) && !merged.failover.chain.includes("or")) {
+      merged.failover.chain = [...merged.failover.chain, "or"];
+    }
+    // or 深合并（同上：旧 config.json 没有 or 块时整块补默认）
+    const orIn = c.or || {};
+    merged.or = {
+      ...DEFAULTS.or, ...orIn,
+      mapping: { ...DEFAULTS.or.mapping, ...(orIn.mapping || {}) },
+      availableModels: Array.isArray(orIn.availableModels) && orIn.availableModels.length ? orIn.availableModels : [...DEFAULTS.or.availableModels],
+      keys: Array.isArray(orIn.keys) ? orIn.keys.filter((k) => typeof k === "string" && k.trim()) : [],
+    };
     // qd 深合并（同上）
     const qdIn = c.qd || {};
     merged.qd = {
@@ -206,7 +263,7 @@ function loadCfg() {
     return merged;
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
-    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] }, failover: { ...DEFAULTS.failover, chain: [...DEFAULTS.failover.chain] } };
+    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] }, or: { ...DEFAULTS.or, mapping: { ...DEFAULTS.or.mapping }, availableModels: [...DEFAULTS.or.availableModels], keys: [] }, failover: { ...DEFAULTS.failover, chain: [...DEFAULTS.failover.chain] } };
   }
 }
 function saveCfg(cfg) {
@@ -321,6 +378,10 @@ function computeNoProxy(cfg) {
   add(hostOf(cfg.sn?.upstream || DEFAULTS.sn.upstream), cfg.sn?.useProxy === true);
   add(hostOf(cfg.zen?.upstream || DEFAULTS.zen.upstream), cfg.zen?.useProxy === true);
   add(hostOf(cfg.qd?.upstream || DEFAULTS.qd.upstream), cfg.qd?.useProxy === true);
+  // OpenRouter（第 6 家）：与上面四行**逐字同构**，且必须与 src/main.js 的
+  // addNoProxyHost(cfg.or?.upstream || "https://openrouter.ai/api/v1", cfg.or?.useProxy)
+  // 同序同条件——两边不对称 = NO_PROXY 漂移 = 自重启被看门狗计成崩溃（历史事故）。
+  add(hostOf(cfg.or?.upstream || DEFAULTS.or.upstream), cfg.or?.useProxy === true);
   return list.join(",");
 }
 const cfg0 = loadCfg();
@@ -459,9 +520,14 @@ function onActivated() {
         if (def.qd && Array.isArray(def.qd.availableModels) && def.qd.availableModels.length) {
           cur.qd.availableModels = [...new Set([...(cur.qd.availableModels || []), ...def.qd.availableModels])];
         }
+        // OpenRouter 免费目录随版本进位推到存量机器（同样只增不删）
+        if (def.or && Array.isArray(def.or.availableModels) && def.or.availableModels.length) {
+          if (!cur.or) cur.or = { ...DEFAULTS.or };
+          cur.or.availableModels = [...new Set([...(cur.or.availableModels || []), ...def.or.availableModels])];
+        }
         cur._modelsSynced = APP_VERSION;
         saveCfg(cur);
-        log(`可选模型已同步发布机（${merged.length} 个 + SenseNova ${cur.sn.availableModels.length} 个 + WorkBuddy ${cur.wb.availableModels.length} 个 + Qoder ${cur.qd.availableModels.length} 个）`);
+        log(`可选模型已同步发布机（${merged.length} 个 + SenseNova ${cur.sn.availableModels.length} 个 + WorkBuddy ${cur.wb.availableModels.length} 个 + Qoder ${cur.qd.availableModels.length} 个 + OpenRouter ${((cur.or && cur.or.availableModels) || []).length} 个）`);
       }
     }
   } catch (e) { log("模型同步跳过: " + e.message); }
@@ -491,6 +557,7 @@ const recentCallsSn = [];
 const recentCallsWb = [];
 const recentCallsZen = [];
 const recentCallsQd = [];
+const recentCallsOr = [];   // OpenRouter（第 6 家）
 function activeTier(store) {
   // 最近 30 分钟内被"真实会话"用过的档位；没有观察则返回 null（不再默认猜 Haiku）
   if (store.length && Date.now() - store[0].at < 30 * 60000) return store[0].tier;
@@ -510,6 +577,7 @@ const relayErrors = {
   wb: { kind: null, message: null, at: null },
   zen: { kind: null, message: null, at: null },
   qd: { kind: null, message: null, at: null },
+  or: { kind: null, message: null, at: null },
 };
 function noteRelayError(p, kind, message) {
   const slot = relayErrors[p] || relayErrors.bai;
@@ -1126,6 +1194,163 @@ try {
 `;
 let wbCapState = { active: false, startedAt: null, error: null };
 
+// ---------- 备份落盘 + 异常退出自愈（v1.0.58 附带修复） ----------
+// 隐患：捕获中途中转被 taskkill /F → finally 里的还原不跑 → 用户的 WorkBuddy CLI
+// 脚本永久卡在打补丁状态，而备份只在内存 wbCapState.backup 里，进程死了就没了
+// （真实发生过，逆回原状花了 5 次尝试）。原文件基准：11407 字节，md5 d3d1378b8efccc9dba2af9061cb3508d。
+// 修法：注入前把干净备份**写到磁盘临时文件**；下次启动发现脚本还带钩子就用它还原。
+const WB_BACKUP_FILE = path.join(os.tmpdir(), "bai-router-wb-codebuddy.bak.json");
+function wbMd5(s) { return createHash("md5").update(Buffer.from(String(s), "utf8")).digest("hex"); }
+function wbCaptureSelfHeal() {
+  try {
+    if (!existsSync(WB_BACKUP_FILE)) return;
+    const meta = JSON.parse(readFileSync(WB_BACKUP_FILE, "utf8"));
+    if (!meta || typeof meta.script !== "string" || typeof meta.content !== "string") {
+      rmSync(WB_BACKUP_FILE, { force: true }); return;
+    }
+    if (existsSync(meta.script)) {
+      const cur = readFileSync(meta.script, "utf8");
+      if (cur.includes("BAI-CAPTURE-HOOK")) {
+        writeFileSync(meta.script, meta.content, "utf8");
+        log(`WorkBuddy 令牌捕获：上次捕获异常退出，检测到脚本仍带钩子，已从磁盘备份自愈还原：${meta.script}`);
+      }
+    }
+    rmSync(WB_BACKUP_FILE, { force: true });
+  } catch (e) { log("WorkBuddy 令牌捕获：启动自愈检查失败 " + e.message); }
+}
+
+// ---------- 注入后踢「常驻会话通道」（v1.0.58 主任务） ----------
+// 根因：WorkBuddy 聊天出网走的是 sidecar 管的一个**长寿** CLI 进程
+// （sessionId 前缀 __workbuddy_cli_host__，即 codebuddy --serve 的 host runtime）。
+// 它启动时把 cli/bin/codebuddy 读进内存就不再重读——注入钩子后，只要它还活着，
+// 钩子永远不会被加载，捕获必然干等 150 秒超时（用户实测现象）。
+// 处置：注入之后，通过 sidecar 控制命名管道发 session.kill，**只杀这个常驻会话**
+// （用户开的终端 PTY 是 sidecar 的其他 session，不动；更绝不碰 WorkBuddyAI.exe 主进程）。
+// 主进程下次 getHostEndpoint 探测到端点没了会自动重建 → 新 CLI 进程读到带钩子的脚本。
+//
+// 踢的时机判断（契约要求说明）：**只要捕获在跑就踢，不做「有活跃会话就不踢」的条件**——
+// 常驻会话在 WorkBuddy 打开期间永远存在（它本身就是 session），按「有会话就跳过」
+// 等于永不生效、修复变死代码；而用户点「一键获取令牌」本来就是要动 WorkBuddy 的
+// 维护动作，代价只是正在流式输出的那条回复被打断一次（对话历史在客户端，不丢）。
+// 终端里跑着长任务的场景无法从这里体面地探测，故 phaseText 里如实告知已重启。
+const WB_HOST_SESSION_PREFIX = "__workbuddy_cli_host__";
+// 与 WorkBuddy 包内 process-cpu-sampler.js 的 sidecarRuntimeDir()/instanceToken() 同算法：
+//   %TEMP%/<base>/<sha1(configDir).slice(0,12)>/sidecar.pid，Windows 下 base="wb"（无 uid）
+function wbSidecarPidCandidates() {
+  const out = [];
+  const tmp = os.tmpdir();
+  const cfgDir = (process.env.WORKBUDDY_CONFIG_DIR || "").trim()
+    || (process.env.CODEBUDDY_CONFIG_DIR || "").trim()
+    || path.join(os.homedir(), ".workbuddy");
+  const token = createHash("sha1").update(cfgDir).digest("hex").slice(0, 12);
+  out.push(path.join(tmp, "wb", token, "sidecar.pid"));
+  return out;
+}
+async function wbSidecarPidFiles() {
+  const out = [];
+  const push = (p) => { if (p && !out.includes(p) && existsSync(p)) out.push(p); };
+  for (const p of wbSidecarPidCandidates()) push(p);
+  // 兜底扫描：WorkBuddy 进程的 WORKBUDDY_CONFIG_DIR 可能与本进程不同（算出的 token 对不上），
+  // 直接扫 %TEMP%/wb*/ 下的 sidecar.pid。只认这个固定文件名，不碰别的。
+  // 注意：精确路径可能留下**过期** PID 文件（进程已死），所以这里收集全部候选，
+  // 由调用方按「进程还活着」挑，而不是见到第一个存在就用（否则会挡住扫描到的活侧车）。
+  try {
+    for (const name of readdirSync(os.tmpdir())) {
+      if (!/^wb$|^wb-[0-9a-f]{4,}$/.test(name)) continue;
+      const dir = path.join(os.tmpdir(), name);
+      try {
+        for (const sub of readdirSync(dir)) push(path.join(dir, sub, "sidecar.pid"));
+      } catch { }
+    }
+  } catch { }
+  return out;
+}
+// 控制管道 JSON-RPC：换行分隔的单条请求/响应（与 WorkBuddy 自带 requestRemoteShutdown 同款）
+function wbSidecarRpc(pipePath, method, params, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(pipePath);
+    let buf = "", settled = false;
+    const timer = setTimeout(() => { settled = true; try { sock.destroy(); } catch { } reject(new Error(`sidecar RPC 超时: ${method}`)); }, timeoutMs);
+    const fail = (e) => { if (settled) return; settled = true; clearTimeout(timer); try { sock.destroy(); } catch { } reject(e); };
+    sock.on("connect", () => {
+      try { sock.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params === undefined ? undefined : params }) + "\n"); }
+      catch (e) { fail(e); }
+    });
+    sock.on("data", (d) => {
+      buf += d.toString("utf8");
+      const i = buf.indexOf("\n");
+      if (i < 0) return;
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      try { sock.destroy(); } catch { }
+      let msg; try { msg = JSON.parse(buf.slice(0, i)); } catch (e) { reject(e); return; }
+      if (msg.error) reject(new Error(msg.error.message || "sidecar RPC 错误")); else resolve(msg.result);
+    });
+    sock.on("error", (e) => fail(new Error(`连接 sidecar 控制管道失败: ${e.message}`)));
+    sock.on("close", () => fail(new Error("sidecar 控制管道连接被关闭")));
+  });
+}
+// 返回 {action, detail, killed?, sessions?}：
+//   killed       —— 已杀常驻会话（正常路径）
+//   no_sidecar   —— WorkBuddy 后台没在跑（没 PID 文件 / 进程已死）
+//   no_host      —— 后台在跑但没有常驻会话（下次发消息会自动新建，钩子届时就会加载）
+//   pipe_fail    —— 管道连上了但 RPC 失败（**不杀任何进程**，如实报告）
+//   sidecar_killed —— 管道连不上，兜底只杀 PID 文件里那个 sidecar 进程（绝不碰主进程）
+async function wbKickHostSession() {
+  // 在全部候选 PID 文件里挑第一个「进程确实活着」的——精确路径可能残留过期 PID 文件，
+  // 见到存在就用会把扫描到的真正活侧车挡在后面（多实例/多 env 场景实测过这个坑）。
+  const pidFiles = await wbSidecarPidFiles();
+  let info = null, pidPath = null;
+  for (const p of pidFiles) {
+    let j = null;
+    try { j = JSON.parse(readFileSync(p, "utf8")); } catch { continue; }
+    if (!j || !j.pid) continue;
+    try {
+      process.kill(j.pid, 0);
+      info = j; pidPath = p; break;               // 活着
+    } catch (e) {
+      if (e && e.code === "ESRCH") continue;       // 过期残留 → 下一个候选
+      info = j; pidPath = p; break;                // EPERM 等：进程在，只是不归本用户
+    }
+  }
+  if (!info) {
+    return {
+      action: "no_sidecar",
+      detail: pidFiles.length ? "WorkBuddy 后台（sidecar）PID 文件均为过期残留（进程已不在）" : "WorkBuddy 后台（sidecar）未在运行",
+    };
+  }
+  // instanceToken 从 PID 文件所在目录名取，和 WorkBuddy 自己拼管道名的方式一致
+  const inst = path.basename(path.dirname(pidPath));
+  const uuid = typeof info.controlPipeUuid === "string" && info.controlPipeUuid ? info.controlPipeUuid : "";
+  const pipePath = `\\\\.\\pipe\\workbuddy-${inst}-sidecar-control${uuid ? "-" + uuid : ""}`;
+  try {
+    const list = await wbSidecarRpc(pipePath, "session.list", null, 3000);
+    const arr = Array.isArray(list) ? list : [];
+    const hosts = arr.filter((s) => s && (s.sessionId === WB_HOST_SESSION_PREFIX || String(s.sessionId).startsWith(WB_HOST_SESSION_PREFIX + "-")));
+    if (!hosts.length) {
+      return { action: "no_host", detail: `WorkBuddy 后台在运行，但没有常驻会话通道（共 ${arr.length} 个会话）。直接发一条消息即可，无需重启`, sessions: arr.length };
+    }
+    let killed = 0, lastErr = "";
+    for (const h of hosts) {
+      try { await wbSidecarRpc(pipePath, "session.kill", { sessionId: h.sessionId }, 3000); killed++; }
+      catch (e) { lastErr = e.message; }
+    }
+    if (killed > 0) {
+      return { action: "killed", killed, sessions: arr.length, detail: `已重启 WorkBuddy 的常驻会话通道（${killed}/${hosts.length} 个旧 CLI 进程已终止，其余 ${arr.length - hosts.length} 个用户会话未动）。请在 WorkBuddy 里新建一个对话或发一条消息` };
+    }
+    return { action: "pipe_fail", detail: `常驻会话终止失败：${lastErr || "未知错误"}（未杀任何进程）`, sessions: arr.length };
+  } catch (e) {
+    // 管道连不上/超时：兜底只杀 sidecar 进程本身（PID 来自它自己的文件，且只杀这一个 PID）。
+    // 主进程下次用到时会重建 sidecar → 重建常驻会话 → 新进程读到钩子。
+    try {
+      process.kill(info.pid);
+      return { action: "sidecar_killed", detail: `控制管道无响应（${e.message}），已直接终止 sidecar 进程 ${info.pid}（仅此一个 PID；下次发消息时 WorkBuddy 会自动重建）` };
+    } catch (e2) {
+      return { action: "pipe_fail", detail: `无法触达 sidecar：${e.message}；终止也失败：${e2.message}（未杀任何进程）` };
+    }
+  }
+}
+
 // 定位 WorkBuddy 的 CLI 启动脚本：① 注册表安装信息（最准，任意盘）→ ② 候选目录 → ③ 同级目录扫描
 function findWbCliScript() {
   const tryPath = async (base, rel) => {
@@ -1200,14 +1425,38 @@ async function wbCaptureToken(timeoutMs = 150000) {
     await fsPromises.writeFile(script, original.replace(/[\s\S]*?BAI-CAPTURE-HOOK[\s\S]*?\/BAI-CAPTURE-HOOK ===[\r\n]*/, ""), "utf8");
   }
   const backup = await fsPromises.readFile(script, "utf8");
+  // 备份落盘（v1.0.58）：内存备份会随进程被强杀而消失，磁盘备份留给下次启动自愈还原
+  try {
+    writeFileSync(WB_BACKUP_FILE, JSON.stringify({
+      script, md5: wbMd5(backup), savedAt: new Date().toISOString(), content: backup,
+    }), "utf8");
+  } catch (e) { log("WorkBuddy 令牌捕获：磁盘备份写入失败（本次内存备份仍有效）：" + e.message); }
   const hook = WB_CAPTURE_HOOK.replace("__path_capture", JSON.stringify(outFile));
   // 注入到 shebang 之后（保留首行 #!，Node 才能正常执行）
   const lines = backup.split("\n");
   const patched = lines[0] + "\n" + hook + "\n" + lines.slice(1).join("\n");
-  wbCapState = { active: true, startedAt: Date.now(), error: null, script, backup, wrote: false, got: "" };
+  wbCapState = {
+    active: true, startedAt: Date.now(), error: null, script, backup, wrote: false, got: "",
+    phase: "injecting", phaseText: "正在注入临时钩子…", kick: null,
+  };
   await fsPromises.writeFile(script, patched, "utf8");
   wbCapState.wrote = true;
+  wbCapState.phase = "injected";
+  wbCapState.phaseText = "钩子已注入，正在重启 WorkBuddy 的常驻会话通道…";
   log(`WorkBuddy 令牌捕获：已注入临时钩子（${script}），等待客户端触发…`);
+  // 踢侧车必须在注入**之后**：被重启拉起的新 CLI 进程才会读到带钩子的脚本
+  try {
+    const k = await wbKickHostSession();
+    wbCapState.kick = k;
+    wbCapState.phase = "waiting";
+    wbCapState.phaseText = `${k.detail}。之后带鉴权的请求一出现就会被自动抓取（最长等 ${Math.round(timeoutMs / 1000)} 秒）`;
+    log(`WorkBuddy 令牌捕获：踢侧车 → ${k.action}：${k.detail}`);
+  } catch (e) {
+    wbCapState.kick = { action: "error", detail: String(e.message || e) };
+    wbCapState.phase = "waiting";
+    wbCapState.phaseText = `后台重启未执行（${e.message}）。若 WorkBuddy 已开着，钩子要等它的进程下次重启才会被加载`;
+    log("WorkBuddy 令牌捕获：踢侧车异常 " + e.message);
+  }
   const deadline = Date.now() + timeoutMs;
   // 已捕获到的最新一条（accessToken 可能已抓到、刷新令牌还没有）——用于给前端实时进度
   let seen = null;
@@ -1221,6 +1470,8 @@ async function wbCaptureToken(timeoutMs = 150000) {
           if (obj && obj.accessToken) {
             seen = obj;
             wbCapState.got = obj.accessToken;
+            wbCapState.phase = "got";
+            wbCapState.phaseText = "已捕获到访问令牌，正在写入配置…";
             // v1.0.58：不再要求 accessToken 与 refreshToken 同时存在。
             // 只要抓到合法访问令牌就可以落盘——它才是真正用来打上游的凭证（有效期约一年）。
             // 刷新令牌的兜底策略（见下），保证「只带 Authorization 的普通请求」也能一次成功。
@@ -1249,17 +1500,37 @@ async function wbCaptureToken(timeoutMs = 150000) {
         }
       } catch { /* 文件还没生成/还没写完整，继续等 */ }
     }
-    // 超时：按当前卡在哪一步给出如实提示（实测「发一条消息」只走 Authorization-only 路径，
-    // 光靠发消息拿不到刷新令牌，这里不再让用户误以为是没发消息）。
+    // 超时：如实说明卡在哪一步（按踢侧车的实际结果分类，别再只说「请发一条消息」——
+    // 实测证明钩子没被加载时光发消息也没用，怎么等都是白等）。
     if (seen && seen.accessToken) {
       throw new Error("等待超时：已捕获到访问令牌，但未能写入配置。请重试「一键获取令牌」。");
     }
-    throw new Error("等待超时：未捕获到任何令牌。请确认 WorkBuddy 客户端已打开并已登录，"
-      + "然后在里面随便发一条消息或打开一个对话（客户端会拉起内部 CLI 并带上 Authorization 头），"
-      + "再点一次「一键获取令牌」。若仍失败，可展开下方「手动填写令牌」作为备用方式。");
+    const kact = (wbCapState.kick && wbCapState.kick.action) || "unknown";
+    const secs = Math.round(timeoutMs / 1000);
+    let hint;
+    if (kact === "killed" || kact === "sidecar_killed") {
+      hint = `已重启 WorkBuddy 后台（旧的常驻 CLI 进程已终止），但这 ${secs} 秒内没有任何进程发起带 Authorization 的请求。请确认 WorkBuddy 客户端已打开并登录，然后新建一个对话或发一条消息（重启后的进程会自动加载钩子），再重试。`;
+    } else if (kact === "no_sidecar") {
+      hint = "WorkBuddy 客户端似乎没有在运行。钩子已注入：启动 WorkBuddy 并登录后随便发一条消息即可被自动抓取，再重试。";
+    } else if (kact === "no_host") {
+      hint = "WorkBuddy 后台在运行但还没有常驻会话通道——直接在客户端里发一条消息（会自动新建带钩子的进程）；若已发过消息仍失败，请重试一次。";
+    } else if (kact === "pipe_fail" || kact === "error") {
+      hint = `WorkBuddy 后台重启失败（${(wbCapState.kick && wbCapState.kick.detail) || "未知原因"}），钩子可能尚未被任何进程加载。可关闭并重新打开 WorkBuddy 客户端后重试。`;
+    } else {
+      hint = "请确认 WorkBuddy 客户端已打开并已登录，然后在里面随便发一条消息或新建一个对话（客户端会拉起内部 CLI 并带上 Authorization 头），再点一次「一键获取令牌」。";
+    }
+    throw new Error(`等待超时（${secs} 秒）：未捕获到任何令牌。${hint}若仍失败，可展开下方「手动填写令牌」作为备用方式。`);
   } finally {
     await wbCaptureRestore();
     await fsPromises.rm(outFile, { force: true }).catch(() => { });
+    // 磁盘备份：确认脚本已干净才删；还原失败就留着，下次启动 wbCaptureSelfHeal() 自愈
+    try {
+      if (existsSync(script) && !readFileSync(script, "utf8").includes("BAI-CAPTURE-HOOK")) {
+        rmSync(WB_BACKUP_FILE, { force: true });
+      } else if (existsSync(WB_BACKUP_FILE)) {
+        log("WorkBuddy 令牌捕获：还原后脚本仍带钩子，保留磁盘备份等待下次启动自愈");
+      }
+    } catch { }
     wbCapState.active = false;
     wbCapState.got = "";
   }
@@ -1375,6 +1646,10 @@ function wbToOpenAI(j) {
 // WorkBuddy——否则 Zen/Qoder 的报错会顶着 "[WorkBuddy]" 出现在用户面前。
 let wbErrPrefix = "WorkBuddy";
 function setErrProvider(name) { wbErrPrefix = name; }
+// 提供方 → 展示名（中转端口自己答错时用：全局 wbErrPrefix 是别的请求留下的，
+// 不重设会把 [Qoder] 的错误挂上 [WorkBuddy] 之类的前缀）
+const RELAY_LABELS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen", qd: "Qoder", or: "OpenRouter" };
+function relayLabel(p) { return RELAY_LABELS[p] || p; }
 function wbAnthroError(res, status, msg) {
   if (res.headersSent || res.writableEnded) { try { res.end(); } catch { } return; }
   const s = Number(status) >= 400 && Number(status) < 600 ? Number(status) : 502;
@@ -1606,13 +1881,275 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
 // 一次 WorkBuddy 调用的完整生命周期：拿令牌 → 翻译 → 上游（401 自动续期重试 / 探测 429 退避）→ 翻流回来
 // 通用 OpenAI 上游桥：p="wb"（WorkBuddy，需 JWT + WorkBuddy 专头 + 令牌续期）、
 // p="zen"（OpenCode Zen，Bearer API Key + 标准头）。请求翻译与响应回译完全共用。
+// 上游错误诊断体落盘：固定文件名覆盖写（只留最近一份），并做单份大小上限。
+// 翻译后的请求体实测到过 1.3MB，不设上限会把数据目录写爆；超限时截断并注明原始长度。
+const DUMP_MAX_BYTES = 2 * 1024 * 1024; // 2MB（契约建议值：单份上限，覆盖写所以总量有界）
+function dumpUpstreamBody(name, text) {
+  try {
+    const buf = Buffer.from(String(text == null ? "" : text), "utf8");
+    if (buf.length > DUMP_MAX_BYTES) {
+      writeFileSync(path.join(DATA_DIR, name),
+        Buffer.concat([buf.subarray(0, DUMP_MAX_BYTES),
+          Buffer.from(`\n/* 已截断：原始 ${buf.length} 字节，仅保留前 ${DUMP_MAX_BYTES} 字节 */`, "utf8")]));
+    } else {
+      writeFileSync(path.join(DATA_DIR, name), buf);
+    }
+  } catch { }
+}
+
+/* ===================== OpenRouter 免费兜底区：两层轮换（v1.0.59） =====================
+ * 实测证据：docs/evidence/openrouter-free-tier-2026-10-07.md。OpenRouter 的 429 有
+ * **两种 limit_source，处理方式相反**（做错整个轮换就白做）：
+ *   upstream_provider_shared_pool  模型级：该模型上游池子满   → **换模型**（同 key 下一个）
+ *   openrouter_free_tier_daily     账号级：免费模型 50 次/天  → **换 key**（1→2→3→1）
+ * 换遍模型仍不行 → 也换 key（契约：「换遍了都不行 / 或遇 daily → 换下一个 key」）；
+ * 三把 key 全在冷却 → **如实失败**，文案带 X-RateLimit-Reset 的重置时间。
+ *
+ * 冷却复用 failover.mjs 的 failoverCooldown(..., {quota:true}) 语义（30 分钟长冷却，
+ * 让入口也让位），但**不改 failover.mjs 的导出**；(key, model) 的轮换状态全在本段维护。
+ * ===================================================================================== */
+const OR_KEYS_MAX = 3;
+const orState = {
+  keyIdx: 0,              // 当前 key 在 cfg.or.keys 里的下标
+  modelIdx: 0,            // 当前模型在免费目录里的下标
+  keyCool: new Map(),     // keyIdx → epoch ms（该 key 每日额度冷却到期）
+  modelCool: new Map(),   // modelId → epoch ms（该模型共享池冷却到期）
+  lastLimitSource: null,  // 最近一次 429 的 limit_source（面板显示）
+  lastResetAt: null,      // 最近一次 429 的 X-RateLimit-Reset（epoch ms）
+  lastSwitch: null,       // {at, kind, ...} 最近一次轮换（面板显示）
+};
+const orKeys = (cfg) => (((cfg && cfg.or && cfg.or.keys) || DEFAULTS.or.keys).filter((k) => typeof k === "string" && k.trim()));
+const orActiveKey = (cfg) => { const ks = orKeys(cfg); if (!ks.length) return ""; return ks[Math.min(orState.keyIdx, ks.length - 1)]; };
+function orModelList(cfg) {
+  const m = cfg && cfg.or && cfg.or.availableModels;
+  return Array.isArray(m) && m.length ? m : [...DEFAULTS.or.availableModels];
+}
+const orCoolLeft = (map, id, now) => Math.max(0, (map.get(id) || 0) - now);
+function orNextResetAt() {
+  let t = orState.lastResetAt || 0;
+  for (const v of orState.keyCool.values()) if (v > t) t = v;
+  for (const v of orState.modelCool.values()) if (v > t) t = v;
+  return t || null;
+}
+
+/* 解析 OpenRouter 的 429 响应体 → {limitSource, resetAt, message}，认不出返回 null。
+ * limit_source 优先取 metadata.limit_source；缺失时只按 message 猜「每日额度」这一种，
+ * 猜不出就如实返回 null —— 轮换方向错了比不轮换更糟。 */
+function orParse429(txt, resHeaders) {
+  let j = null;
+  try { j = JSON.parse(String(txt || "")); } catch { j = null; }
+  const md = (j && j.error && j.error.metadata) || {};
+  const hdrs = md.headers || {};
+  let reset = Number(hdrs["X-RateLimit-Reset"]
+    || (resHeaders && typeof resHeaders.get === "function" ? resHeaders.get("x-ratelimit-reset") : 0) || 0);
+  // X-RateLimit-Reset 是 **epoch 毫秒**（实测 1791331200000）；若上游给了秒级值则换算
+  if (reset > 0 && reset < 1e12) reset *= 1000;
+  const msg = String((j && j.error && j.error.message) || "");
+  let src = String(md.limit_source || "");
+  if (!/^(openrouter_free_tier_daily|upstream_provider_shared_pool)$/.test(src)) {
+    if (/free-models-per-day|free[- ]models[- ]per[- ]day/i.test(msg)) src = "openrouter_free_tier_daily";
+    else return null;   // 未知类型的 429：不轮换，走通用 429 分支如实返回
+  }
+  return { limitSource: src, resetAt: reset || null, message: msg.slice(0, 240) };
+}
+
+/* 两层轮换的决策：给定这次 429 的 limit_source，返回下一个该试的 (key, model)。
+ * 返回 {ok:true, keyIdx, key, model} 或 {ok:false, reason, resetAt}（三把 key 全在冷却）。 */
+function orAdvance(cfg, info) {
+  const keys = orKeys(cfg);
+  const models = orModelList(cfg);
+  const now = Date.now();
+  orState.lastLimitSource = info.limitSource;
+  if (info.resetAt) orState.lastResetAt = info.resetAt;
+  if (!keys.length) return { ok: false, reason: "no_key", resetAt: null };
+  if (orState.keyIdx >= keys.length) orState.keyIdx = 0;
+
+  if (info.limitSource === "upstream_provider_shared_pool") {
+    // ① 模型级：冷却当前模型，挑同 key 下一个没冷却的免费模型
+    const cur = models[orState.modelIdx] || "(未知)";
+    orState.modelCool.set(cur, info.resetAt || now + 5 * 60000);
+    for (let i = 1; i <= models.length; i++) {
+      const j = (orState.modelIdx + i) % models.length;
+      if (!orCoolLeft(orState.modelCool, models[j], now)) {
+        orState.modelIdx = j;
+        orState.lastSwitch = { at: new Date().toISOString(), kind: "model", from: cur, to: models[j], keyNo: orState.keyIdx + 1 };
+        return { ok: true, keyIdx: orState.keyIdx, key: keys[orState.keyIdx], model: models[j] };
+      }
+    }
+    // 免费模型全被占满 → 按契约换 key
+    return orAdvanceKey(cfg, info, "免费模型已换遍，改换 key");
+  }
+  // ② 账号级每日额度：换模型没用，直接换 key
+  return orAdvanceKey(cfg, info, "该 key 的每日免费额度已用尽");
+}
+function orAdvanceKey(cfg, info, why) {
+  const keys = orKeys(cfg);
+  const models = orModelList(cfg);
+  const now = Date.now();
+  if (!keys.length) return { ok: false, reason: "no_key", resetAt: null };
+  if (orState.keyIdx >= keys.length) orState.keyIdx = 0;
+  orState.keyCool.set(orState.keyIdx, info.resetAt || now + 60 * 60000);
+  for (let i = 1; i <= keys.length; i++) {
+    const j = (orState.keyIdx + i) % keys.length;
+    if (!orCoolLeft(orState.keyCool, j, now)) {
+      const from = orState.keyIdx;
+      orState.keyIdx = j;
+      orState.lastSwitch = { at: new Date().toISOString(), kind: "key", from: from + 1, to: j + 1, why, model: models[orState.modelIdx] || null };
+      return { ok: true, keyIdx: j, key: keys[j], model: models[orState.modelIdx] || null };
+    }
+  }
+  return { ok: false, reason: "all_keys_cooling", resetAt: orNextResetAt() };
+}
+
+/* 每次请求开始时挑当前候选：key 要避开每日冷却，模型在 wantModel（映射解析结果）
+ * 被冷却时退到下一个没冷却的。返回 {ok:false} 表示三把 key 全在冷却 / 一个模型都不剩。 */
+function orPick(cfg, wantModel) {
+  const keys = orKeys(cfg);
+  const models = orModelList(cfg);
+  const now = Date.now();
+  if (!keys.length) return { ok: false, reason: "no_key" };
+  if (orState.keyIdx >= keys.length) orState.keyIdx = 0;
+  if (orCoolLeft(orState.keyCool, orState.keyIdx, now)) {
+    let found = -1;
+    for (let i = 1; i <= keys.length; i++) {
+      const j = (orState.keyIdx + i) % keys.length;
+      if (!orCoolLeft(orState.keyCool, j, now)) { found = j; break; }
+    }
+    if (found < 0) return { ok: false, reason: "all_keys_cooling", resetAt: orNextResetAt() };
+    orState.keyIdx = found;
+  }
+  let model = wantModel || null;
+  if (model && orCoolLeft(orState.modelCool, model, now)) model = null;
+  if (!model || !models.includes(model)) {
+    let found = -1;
+    const start = models.length ? orState.modelIdx % models.length : 0;
+    for (let i = 0; i < models.length; i++) {
+      const j = (start + i) % models.length;
+      if (!orCoolLeft(orState.modelCool, models[j], now)) { found = j; break; }
+    }
+    // 一个都没冷却的模型都挑不出来 → 退回首选模型照打（模型冷却只是启发式，
+    // 真打不通上游还会 429 再轮）；**只有 key 全冷却才判定为失败**（账号级是硬额度）。
+    if (found >= 0) { orState.modelIdx = found; model = models[found]; }
+    else model = wantModel || models[0] || null;
+  } else {
+    const at = models.indexOf(model);
+    if (at >= 0) orState.modelIdx = at;
+  }
+  if (!model) return { ok: false, reason: "no_model" };
+  return { ok: true, keyIdx: orState.keyIdx, key: keys[orState.keyIdx], model };
+}
+
+/* GET /api/v1/models 后按 pricing 全 0 筛免费模型（**不能只看 :free 后缀**）。
+ * 音乐/图像类模型（output_modalities 不含 text）排除，免得下拉里出现点了必失败的项。 */
+async function orFetchFreeModels(cfg) {
+  const base = ((cfg && cfg.or && cfg.or.upstream) || DEFAULTS.or.upstream).replace(/\/+$/, "");
+  const key = orActiveKey(cfg) || orKeys(cfg)[0] || "";
+  const r = await fetch(base + "/models", {
+    headers: key ? { authorization: `Bearer ${key}` } : {},
+    signal: AbortSignal.timeout(15000),
+  });
+  const j = await readProbeJson(r);
+  const all = Array.isArray(j.data) ? j.data : [];
+  const free = all.filter((m) => {
+    const pr = m && m.pricing;
+    if (!pr) return false;
+    // 实测取值是字符串 "0"；用 Number() 兼容 "0.000000" 之类的写法
+    if (Number(pr.prompt) !== 0 || Number(pr.completion) !== 0) return false;
+    const outs = m.output_modalities;
+    return !Array.isArray(outs) || outs.includes("text");
+  });
+  const ids = [...new Set(free.map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))];
+  if (!ids.length) throw new Error("OpenRouter 目录里一个 pricing 全 0 的模型都没筛出来（上游结构可能变了）");
+  return { ids, total: all.length };
+}
+
+/* GET /api/v1/auth/key 的额度真相：面板显示 free_model_daily_requests 剩余次数。
+ * 结果按 key 指纹缓存 60 秒——面板 5 秒一轮询，不能每轮都打上游。 */
+let orQuotaCache = { at: 0, fp: null, data: null };
+async function orFetchQuota(cfg, force) {
+  const key = orActiveKey(cfg);
+  if (!key) return null;
+  const fp = keyFp(key);
+  const now = Date.now();
+  if (!force && orQuotaCache.data && orQuotaCache.fp === fp && now - orQuotaCache.at < 60000) return orQuotaCache.data;
+  const base = ((cfg && cfg.or && cfg.or.upstream) || DEFAULTS.or.upstream).replace(/\/+$/, "");
+  try {
+    // 走 fetch：useProxy=false 时 openrouter.ai 在 NO_PROXY 里（直连），=true 时代理出海，
+    // 两种情况都由启动期的 NO_PROXY 决定，与中转的直连语义一致。
+    const r = await fetch(base + "/auth/key", {
+      headers: { authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(12000),
+    });
+    const txt = await readAllBody(r);
+    if (r.status >= 400) throw new Error(`HTTP ${r.status} ${String(txt).slice(0, 120)}`);
+    const j = JSON.parse(txt);
+    const data = {
+      isFreeTier: j.is_free_tier === true,
+      usage: typeof j.usage === "number" ? j.usage : null,
+      daily: (j.free_model_daily_requests && typeof j.free_model_daily_requests === "object") ? {
+        used: j.free_model_daily_requests.used,
+        limit: j.free_model_daily_requests.limit,
+        remaining: j.free_model_daily_requests.remaining,
+      } : null,
+      at: new Date().toISOString(),
+    };
+    orQuotaCache = { at: now, fp, data };
+    return data;
+  } catch (e) {
+    if (orQuotaCache.fp === fp && orQuotaCache.data) return { ...orQuotaCache.data, stale: true, error: String(e.message).slice(0, 120) };
+    return { error: String((e && e.message) || e).slice(0, 160), at: new Date().toISOString() };
+  }
+}
+
+/* 额度快照：给 /api/status 用——**不 await**，缓存过期时后台刷一份，本轮先回旧值。
+ * 否则上游慢一次，整块状态面板（5 秒一轮询）就跟着卡 12 秒。 */
+let orQuotaPending = null;
+function orQuotaSnapshot(cfg) {
+  const fresh = orQuotaCache.data && Date.now() - orQuotaCache.at < 60000;
+  if (!fresh && !orQuotaPending) {
+    orQuotaPending = orFetchQuota(cfg, false).finally(() => { orQuotaPending = null; });
+  }
+  return orQuotaCache.data || null;
+}
+
+/* 面板「OpenRouter 免费流水区」用的状态快照（只出指纹，绝不回显 key 明文）。 */async function orStatusPayload(cfg, opts) {
+  const keys = orKeys(cfg);
+  const models = orModelList(cfg);
+  const now = Date.now();
+  const quota = (opts && opts.quota === false) ? null : await orFetchQuota(cfg, !!(opts && opts.refresh));
+  return {
+    keyCount: keys.length,
+    keys: keys.map((k, i) => ({
+      no: i + 1,
+      fp: keyFp(k),
+      active: i === Math.min(orState.keyIdx, Math.max(0, keys.length - 1)),
+      coolingUntil: orCoolLeft(orState.keyCool, i, now) ? new Date((orState.keyCool.get(i) || 0)).toISOString() : null,
+    })),
+    activeKeyNo: keys.length ? Math.min(orState.keyIdx, keys.length - 1) + 1 : null,
+    activeModel: models[Math.min(orState.modelIdx, Math.max(0, models.length - 1))] || null,
+    modelCount: models.length,
+    models: models,
+    cooledModels: [...orState.modelCool.entries()]
+      .filter(([, t]) => t > now).map(([m, t]) => ({ model: m, until: new Date(t).toISOString() })),
+    limitSource: orState.lastLimitSource,
+    lastResetAt: orState.lastResetAt ? new Date(orState.lastResetAt).toISOString() : null,
+    resetCountdownMs: Math.max(0, (orNextResetAt() || 0) - now),
+    lastSwitch: orState.lastSwitch,
+    quota,
+  };
+}
+
 async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
-  const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : "WorkBuddy";
+  const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : p === "or" ? "OpenRouter" : "WorkBuddy";
   setErrProvider(NAME);
   let token;
   if (p === "zen") {
     token = (cfg.zen && cfg.zen.apiKey) || "";
     if (!token) { noteRelayError(p, "auth", "未配置 OpenCode Zen API Key"); return wbAnthroError(res, 401, "未配置 OpenCode Zen API Key——请到「OpenCode Zen」页填写"); }
+  } else if (p === "or") {
+    // 凭据是轮换区：当前候选 key 由 orPick() 定（见下面的两层轮换）
+    token = orActiveKey(cfg);
+    if (!token) { noteRelayError(p, "auth", "未配置 OpenRouter API Key"); return wbAnthroError(res, 401, "未配置 OpenRouter API Key——请到「OpenRouter」页的「免费流水区」填 sk-or-v1 密钥（最多 3 把）"); }
   } else if (p === "qd") {
     try { token = qdEnsureToken(cfg); }
     catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
@@ -1622,12 +2159,21 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   }
 
   const ob = wbToOpenAI(j);
-  const base = (S.upstream || (p === "zen" ? DEFAULTS.zen.upstream : p === "qd" ? DEFAULTS.qd.upstream : DEFAULTS.wb.upstream)).replace(/\/+$/, "");
+  const base = (S.upstream || (p === "zen" ? DEFAULTS.zen.upstream : p === "qd" ? DEFAULTS.qd.upstream : p === "or" ? DEFAULTS.or.upstream : DEFAULTS.wb.upstream)).replace(/\/+$/, "");
   const url = p === "wb" ? base + "/v2/chat/completions" : base + "/chat/completions";
   const mkHeaders = (tok) => {
     if (p === "zen") {
       return {
         "content-type": "application/json",
+        authorization: `Bearer ${tok}`,
+        "user-agent": `B.AI-Router/${APP_VERSION}`,
+      };
+    }
+    if (p === "or") {
+      // OpenRouter：标准 Bearer + SSE。HTTP-Referer/X-Title 只是统计用，可省。
+      return {
+        "content-type": "application/json",
+        accept: "text/event-stream",
         authorization: `Bearer ${tok}`,
         "user-agent": `B.AI-Router/${APP_VERSION}`,
       };
@@ -1654,7 +2200,7 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     h["x-domain"] = hostOf(base) || "www.workbuddy.ai";
     return h;
   };
-  const bodyStr = JSON.stringify(ob);
+  let bodyStr = JSON.stringify(ob);   // OpenRouter 轮换会改写 model，故为 let
   const doCall = (tok) => useProxy
     ? fetch(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, signal: AbortSignal.timeout(isProbe ? 10000 : 30000) })
     : directHttp(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, timeoutMs: isProbe ? 10000 : 30000 });
@@ -1664,9 +2210,44 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   // 放进 try 里就成了块级作用域，那边引用不到（报 "is not defined"）。
   let consumed400 = "";
   let consumedBodyHint = "";
+  let orStop = false;      // OpenRouter：两层轮换已判定「三把 key 全在冷却」→ 不许再重试
 
   try {
+    // ---- OpenRouter（v1.0.59）：先挑当前候选 (key, model)，再打第一个请求 ----
+    if (p === "or") {
+      const pick = orPick(cfg, ob.model);
+      if (!pick.ok) {
+        const resetAt = orNextResetAt();
+        const when = resetAt ? new Date(resetAt).toLocaleString("zh-CN", { hour12: false }) : "（未取得重置时间）";
+        const msg = pick.reason === "no_key"
+          ? "未配置 OpenRouter API Key——请到「OpenRouter」页的「免费流水区」填 sk-or-v1 密钥（最多 3 把）"
+          : `${orKeys(cfg).length} 个 key 的每日免费额度都用完了（limit_source=openrouter_free_tier_daily），X-RateLimit-Reset 是 ${when}（epoch 毫秒），到点后自动轮回来，无需手动操作`;
+        noteRelayError(p, "rate_limit_quota", msg);
+        failoverCooldown(p, msg, { quota: true });   // 额度冷却语义：让入口也让位（failover.mjs 有闸）
+        return wbAnthroError(res, 429, msg);
+      }
+      token = pick.key;
+      if (pick.model && pick.model !== ob.model) { ob.model = pick.model; bodyStr = JSON.stringify(ob); }
+    }
     r = await doCall(token);
+    // ---- OpenRouter 两层轮换：429 分流后立刻换 (key, model) 重试 ----
+    // 换模型（upstream_provider_shared_pool）/ 换 key（openrouter_free_tier_daily）由 orAdvance 决策；
+    // 认不出 limit_source 的 429 直接 break，交通用分支如实返回（轮换方向错了比不轮换更糟）。
+    if (p === "or") {
+      const cap = Math.min(10, orModelList(cfg).length + orKeys(cfg).length + 2);
+      for (let step = 0; step < cap && r.status === 429; step++) {
+        const peek = await readAllBody(r).catch(() => "");
+        consumedBodyHint = peek;
+        const info = orParse429(peek, r.headers);
+        if (!info) { orStop = true; break; }
+        const next = orAdvance(cfg, info);
+        if (!next.ok) { orStop = true; break; }
+        token = next.key;
+        if (next.model) { ob.model = next.model; bodyStr = JSON.stringify(ob); }
+        log(`OpenRouter 429 两层轮换（limit_source=${info.limitSource}）→ key#${next.keyIdx + 1} / ${ob.model}`);
+        r = await doCall(token);
+      }
+    }
     // 令牌失效（401/403）→ WorkBuddy 侧可续期并重试一次；Zen 侧 key 失效直接报错；
     // Qoder 侧强制绕过 mtime 缓存重读令牌文件再试一次（Qoder 可能刚轮换过令牌）
     if ((r.status === 401 || r.status === 403) && p === "wb" && cfg.wb.refreshToken) {
@@ -1682,8 +2263,13 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
       } catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
     }
     // 探测级小请求遇 429：静默退避重试（与 B.AI/SenseNova 行为一致）
-    for (let a = 0; r.status === 429 && isProbe && a < 3; a++) {
-      await readAllBody(r).catch(() => "");
+    // OpenRouter 已在上面的两层轮换里重试过（orStop=额度耗尽/429 认不出），这里不再白打上游——
+    // 每天只有 50 次免费额度，退避重试等于拿额度换一次多余的往返。
+    for (let a = 0; r.status === 429 && isProbe && !orStop && a < 3; a++) {
+      const peek = await readAllBody(r).catch(() => "");
+      // FreeUsageLimitError = 免费额度用尽，是**持续性**的：退避再多次也还是 429，
+      // 白打三次上游还把探测拖慢 2 秒。记下响应体直接跳出（下面归因要读它）。
+      if (peek.includes("FreeUsageLimitError")) { consumedBodyHint = peek; break; }
       await new Promise((rr) => setTimeout(rr, 400 * (a + 1)));
       r = await doCall(token);
     }
@@ -1726,9 +2312,29 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     // 归因：Zen 的几种典型拒绝各有明确含义，直接翻译成人话，别让用户对着裸错误码猜。
     let why = "";
     if (p === "zen") {
-      if (r.status === 429 || (r.status === 500 && /internal server error/i.test(txt))) {
-        why = " —— OpenCode Zen 限流很严（连发几次探测就会被顶掉）。等 30 秒左右再试，或只测当前档位别勾「测全部四档」。";
-        noteRelayError(p, "rate_limit", `${NAME} 触发上游限流`);
+      // v1.0.58-T0：500 拆出**独立分支**（原先 500 和 429 挤在同一个外层 if，
+      // 上游自己 500 会落到 429 的「限流、等 30 秒」文案上，误导用户白等）。
+      if (r.status === 500) {
+        why = " —— OpenCode Zen 上游自身故障（HTTP 500，典型响应体 internal server error）：不是你的配置问题，也不是限流，等 30 秒再试通常没有用。故障转移会自动改走其他渠道；持续出现时稍后再试或查看 Zen 服务状态。";
+        noteRelayError(p, "upstream_500", `${NAME} 上游自身故障（HTTP 500 internal server error）`);
+        // 冷却策略：500 是上游**瞬时**故障，走 attemptWithFailover 默认的 90 秒短冷却、
+        // 保持 quota:false——下次请求很可能就好了。30 分钟长冷却是给「额度用尽」
+        // （FreeUsageLimitError，等多久都没用）那类持续性失败留的，500 不该占用；
+        // 也正因如此这里**不**调 failoverCooldown，让它走通用路径。
+      } else if (r.status === 429) {
+        // 同样是 429，两种含义完全相反，必须按上游错误体的 error.type 分开（v1.0.58）：
+        //   FreeUsageLimitError = 这个 key 的免费额度用完了，**持续性**，等多久都不会恢复；
+        //   没有该 type         = 真·瞬时限流（连发几次探测被顶掉），等 30 秒会好。
+        // 实测真实响应体：{"type":"error","error":{"type":"FreeUsageLimitError", …}}
+        if (/FreeUsageLimitError/.test(txt)) {
+          why = " —— 这个 API Key 的 OpenCode Zen 免费额度已用尽（上游返回 FreeUsageLimitError），不是瞬时限流：等多久都不会恢复，官方也未公布重置时间。可换/重置 API Key；或开启自动故障转移，让请求改走 Qoder / B.AI 等其他渠道。";
+          noteRelayError(p, "rate_limit_quota", `${NAME} 免费额度已用尽（FreeUsageLimitError）`);
+          // 额度用尽走长冷却（30 分钟），并让**入口提供方也让位**——见 attemptWithFailover。
+          failoverCooldown(p, `${NAME} 免费额度已用尽（FreeUsageLimitError）`, { quota: true });
+        } else {
+          why = " —— OpenCode Zen 限流很严（连发几次探测就会被顶掉）。等 30 秒左右再试，或只测当前档位别勾「测全部四档」。";
+          noteRelayError(p, "rate_limit", `${NAME} 触发上游限流`);
+        }
       } else if (r.status === 403 && /FreeTierError|only be used from within/i.test(txt)) {
         why = " —— 这是 Zen 的免费档，官方限定只能在 OpenCode 客户端内用（服务端返回 FreeTierError），外部无法调用。换 space-bunny-free，或用付费额度。";
         noteRelayError(p, "upstream_403", `${NAME} 免费档限客户端内使用`);
@@ -1744,13 +2350,41 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
       } else {
         noteRelayError(p, r.status === 429 ? "rate_limit" : `upstream_${r.status}`, `${NAME} 上游 HTTP ${r.status}`);
       }
+    } else if (p === "or") {
+      // OpenRouter：429 的两种 limit_source 已在上面的轮换里分流处理过，走到这里说明
+      // 「换遍了仍被拒」或「三把 key 全在每日冷却」——如实把轮换过程与重置时间摊开，
+      // 不要只丢一句 429 让用户以为是自己配错了。
+      if (r.status === 429) {
+        const resetAt = orNextResetAt();
+        const when = resetAt ? new Date(resetAt).toLocaleString("zh-CN", { hour12: false }) : "上游未给出重置时间";
+        const src = orState.lastLimitSource || "(未识别)";
+        const sw = orState.lastSwitch;
+        const swTxt = sw
+          ? (sw.kind === "key" ? `第 ${sw.from} 把 key → 第 ${sw.to} 把 key` : `模型 ${sw.from} → ${sw.to}`)
+          : "无";
+        why = ` —— OpenRouter 免费区两层轮换已跑完仍被限流（limit_source=${src}，最近一次轮换：${swTxt}）。X-RateLimit-Reset 是 ${when}（到点自动轮回来）；想提额可在面板再填一把 key 分摊每日 50 次，或充 10 美元把每日额度提到 1000 次。`;
+        noteRelayError(p, "rate_limit_quota", `OpenRouter 免费额度用尽（limit_source=${src}）`);
+        failoverCooldown(p, `OpenRouter 免费额度用尽（${src}）`, { quota: true });
+      } else {
+        noteRelayError(p, `upstream_${r.status}`, `${NAME} 上游 HTTP ${r.status}`);
+      }
     } else {
       noteRelayError(p, r.status === 429 ? "rate_limit" : `upstream_${r.status}`, `${NAME} 上游 HTTP ${r.status}`);
     }
+    // 关键上下文（4xx/5xx 共用）：Qoder 的 500 只看 system 首行根本不够——必须带上
+    // model / max_tokens / stream / messages 条数，下次一眼能看出是不是翻译层写错了参数。
+    const ctx = `model=${ob && ob.model != null ? ob.model : "-"} max_tokens=${ob && ob.max_tokens != null ? ob.max_tokens : "-"} stream=${ob && ob.stream != null ? ob.stream : "-"} messages=${ob && Array.isArray(ob.messages) ? ob.messages.length : 0}｜system 首行：${String((ob.messages && ob.messages[0] && ob.messages[0].content) || "").split("\n")[0].slice(0, 120)}`;
     // 4xx 诊断：把被拒的翻译后请求体落一份，便于定位上游新增的校验/指纹规则
     if (r.status >= 400 && r.status < 500) {
-      try { writeFileSync(path.join(DATA_DIR, "wb-last-4xx.json"), bodyStr); } catch { }
-      log(`${NAME} 上游 ${r.status} 拒绝了请求，翻译后请求体已存 wb-last-4xx.json：${String(msg).slice(0, 160)}｜system 首行：${String((ob.messages && ob.messages[0] && ob.messages[0].content) || "").split("\n")[0].slice(0, 120)}`);
+      dumpUpstreamBody("wb-last-4xx.json", bodyStr);
+      log(`${NAME} 上游 ${r.status} 拒绝了请求（4xx=请求被上游否决），翻译后请求体已存 wb-last-4xx.json：${String(msg).slice(0, 160)}｜${ctx}`);
+    }
+    // 5xx 诊断（Bug A）：500 是「上游自己出错」而不是「请求被否决」，措辞分开，
+    // 否则 Qoder 的 internal server error 会被误读成校验/指纹问题。另存 wb-last-5xx.json，
+    // 不覆盖 4xx 存证（同一次运行里两者都可能各发生多次，都要留着对照）。
+    else if (r.status >= 500) {
+      dumpUpstreamBody("wb-last-5xx.json", bodyStr);
+      log(`${NAME} 上游 ${r.status} 服务端错误（5xx=上游自身故障），翻译后请求体已存 wb-last-5xx.json：${String(msg).slice(0, 160)}｜${ctx}`);
     }
     return wbAnthroError(res, r.status, String(msg).slice(0, 300) + why);
   }
@@ -1795,7 +2429,12 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     return { body: Buffer.from(JSON.stringify({ ...rewritten, model: m })), rewritten: { ...rewritten, model: m } };
   };
   for (const provider of chain) {
-    if (provider !== fo.provider && !failoverAvailable(provider)) { tries.push({ provider, skipped: "冷却中" }); continue; }
+    const isEntry = provider === fo.provider;
+    // 额度用尽（非瞬时）时**入口也退到后面**：瞬时冷却期间入口仍然永远第一
+    // （手动选的就是首选，90 秒的抖动不该改变用户的选择）；但额度用尽等多久都没用，
+    // 继续把它排第一只是让每条请求都先白撞一次死渠道。冷却到期后自动回到第一。
+    if (isEntry && failoverQuotaBlocked(provider)) { tries.push({ provider, skipped: "额度冷却中" }); continue; }
+    if (!isEntry && !failoverAvailable(provider)) { tries.push({ provider, skipped: "冷却中" }); continue; }
     // 目标渠道必须已配置凭据，否则跳（避免拿一个必然 401 的渠道去试）
     if (!providerConfigured(provider, cfg)) { tries.push({ provider, skipped: "未配置" }); continue; }
     const target = provider === fo.provider ? fo : relaySpec(provider, cfg);
@@ -1831,8 +2470,19 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
         `${target.label} 返回 ${status || "网络错误"}，此错误重试其他渠道也不会好转：${describeError(cap)}`);
     }
     lastErr = describeError(cap) || `HTTP ${status}`;
-    failoverCooldown(provider, lastErr);
-    noteRelayError(provider, "failover", `转移走（HTTP ${status}）：${String(lastErr).slice(0, 120)}`);
+    failoverCooldown(provider, lastErr); // 若刚才那次是额度用尽，这里不会把它降级成 90 秒（failover.mjs 有闸）
+    // 刚试过的渠道若已被标成「额度用尽」，转移日志也要带上这个标签——
+    // 否则状态面板只剩一个笼统的 failover，分不出"额度没了"和"抖了一下"。
+    const quotaNow = failoverQuotaBlocked(provider);
+    // T0（v1.0.58）：openaiExchange 刚在这次尝试里归因出的 upstream_NNN（如 Zen 500 →
+    // upstream_500）要保留下来，别被笼统的 "failover" 覆盖——「未转移」分支（上面的 400）
+    // 本来就不覆盖具体 kind，两个分支行为应当一致。判定用 at 新鲜度（本请求内刚写过），
+    // 避免捡到上一条请求的陈旧 kind；quota 分支优先级不变（failover_quota 语义不动）。
+    const prevKind = (relayErrors[provider] && relayErrors[provider].kind) || "";
+    const prevAt = relayErrors[provider] && relayErrors[provider].at ? new Date(relayErrors[provider].at).getTime() : 0;
+    const keepKind = !quotaNow && /^upstream_\d+$/.test(prevKind) && Date.now() - prevAt < 60000;
+    noteRelayError(provider, quotaNow ? "failover_quota" : (keepKind ? prevKind : "failover"),
+      `转移走（HTTP ${status}${quotaNow ? "，额度用尽" : ""}）：${String(lastErr).slice(0, 120)}`);
   }
   noteFailoverEvent(fo.provider, tries);
   return wbAnthroError(res, 502,
@@ -1874,6 +2524,7 @@ function providerConfigured(provider, cfg) {
   if (provider === "sn") return !!cfg.sn?.apiKey;
   if (provider === "wb") return !!cfg.wb?.accessToken;
   if (provider === "zen") return !!cfg.zen?.apiKey;
+  if (provider === "or") return orKeys(cfg).length > 0;   // 轮换区：至少 1 把 key 就算配置好
   if (provider === "qd") { try { qdEnsureToken(cfg); return true; } catch { return false; } }
   return false;
 }
@@ -1885,6 +2536,7 @@ function relaySpec(provider, cfg) {
     wb: ["WorkBuddy", () => cfg.wb?.useProxy === true, { openai: true }],
     zen: ["OpenCode Zen", () => cfg.zen?.useProxy === true, { openai: true }],
     qd: ["Qoder", () => cfg.qd?.useProxy === true, { openai: true }],
+    or: ["OpenRouter", () => cfg.or?.useProxy === true, { openai: true }],
   }[provider];
   if (!meta) return null;
   return { provider, label: meta[0], useProxy: meta[1], opts: meta[2], S: sliceOf(cfg, provider) };
@@ -1895,6 +2547,25 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", async () => {
+      // 准入门（Bug B）：openai 桥（wb/zen/qd）只承接「POST + /v1/*」的模型调用。
+      // 以前这里对任何 path/method 都往下走模型调用逻辑：GET 没有 body → rewritten 为 null
+      // → handleUpstream 里那句 400「请求体必须是 Anthropic messages JSON」把 /api/ping
+      // 这类探测也当成坏请求体答了。真正的病根是「这压根不是一次模型调用」。
+      // 注意：必须在 body 收完（本回调内）再应答——req.on("data") 已经在收集，
+      // 提前 return 而不 res.end() 会让 socket 一直挂着。
+      // 只门 openai 桥：bAI/SenseNova 是原样透传中转，非 /v1/ 路径交给上游自己答，保持原行为。
+      if (opts.openai) {
+        const pathOnly = String(req.url || "").split("?")[0];
+        setErrProvider(relayLabel(p));
+        if (!pathOnly.startsWith("/v1/")) {
+          // 面板的 /api/* 注册在面板端口那个 server 上，中转端口本来就不服务它们
+          return wbAnthroError(res, 404, `中转端口只承接 /v1/* 模型调用，不提供 ${pathOnly || "/"}（面板接口请走面板端口）`);
+        }
+        if (req.method !== "POST") {
+          try { res.setHeader("Allow", "POST"); } catch { }
+          return wbAnthroError(res, 405, `${req.method} 不是模型调用——本中转只接受 POST /v1/*`);
+        }
+      }
       const cfg = loadCfg(); // 每请求实时读：映射改完立即生效，无需重启
       const S = getSlice(cfg); // {upstream, mapping, defaultModel, availableModels}
       const sliceCfg = { mapping: S.mapping, availableModels: S.availableModels, defaultModel: S.defaultModel };
@@ -1944,7 +2615,19 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
         // WorkBuddy（fo.opts.openai）：上游只讲 OpenAI 且仅流式——独立协议桥处理，
         // 请求（Anthropic→OpenAI）与响应（OpenAI SSE→Anthropic SSE）都在桥内翻译。
         if (fo.opts.openai) {
-          if (!rewritten) return wbAnthroError(res, 400, "请求体必须是 Anthropic messages JSON");
+          // rewritten=null = 确实是一次模型调用（GET/非 /v1/ 已在 makeRelay 准入门被 404/405 挡掉），
+          // 但 body 没解析出 JSON。文案必须如实说明**实际收到了什么**——
+          // 「请求体为空」「Content-Type 不是 JSON」「JSON 解析失败」三件事以前共用一句话。
+          if (!rewritten) {
+            const ctv = String(req.headers["content-type"] || "(未带 Content-Type)");
+            const len = body && body.length ? body.length : 0;
+            const raw = len ? body.toString("utf8").replace(/\s+/g, " ").slice(0, 80) : "(空)";
+            const why = !len ? "请求体为空"
+              : !ctv.toLowerCase().includes("json") ? "Content-Type 不是 JSON"
+              : "body 不是合法 JSON";
+            setErrProvider(relayLabel(fo.provider));
+            return wbAnthroError(res, 400, `请求体无法解析为 Anthropic messages JSON：${why}｜Content-Type=${ctv}｜长度=${len} 字节｜前 80 字节=${raw}`);
+          }
           try {
             await openaiExchange(fo.provider, { cfg, S: fo.S, j: rewritten, isProbe, res, useProxy: fo.useProxy(cfg) });
           } catch (e) {
@@ -2015,6 +2698,9 @@ const wbRelay = makeRelay("wb", recentCallsWb, (cfg) => ({ upstream: cfg.wb.upst
 const zenRelay = makeRelay("zen", recentCallsZen, (cfg) => ({ upstream: cfg.zen.upstream, mapping: cfg.zen.mapping, defaultModel: cfg.zen.defaultModel, availableModels: cfg.zen.availableModels }), (cfg) => cfg.zen.useProxy === true, { openai: true });
 // Qoder：OpenAI 协议，复用同一套桥。认证是轮换的 jt- jobToken（每次请求现读令牌文件），无静态密钥
 const qdRelay = makeRelay("qd", recentCallsQd, (cfg) => ({ upstream: cfg.qd.upstream, mapping: cfg.qd.mapping, defaultModel: cfg.qd.defaultModel, availableModels: cfg.qd.availableModels }), (cfg) => cfg.qd.useProxy === true, { openai: true });
+// OpenRouter（第 6 家）：OpenAI 协议 + 通用桥；凭据是 keys[] 轮换区，由 openaiExchange 内的
+// orPick/orAdvance 每请求现选（这里传的 slice 只提供 upstream/mapping/availableModels）。
+const orRelay = makeRelay("or", recentCallsOr, (cfg) => ({ upstream: cfg.or.upstream, mapping: cfg.or.mapping, defaultModel: cfg.or.defaultModel, availableModels: cfg.or.availableModels }), (cfg) => cfg.or.useProxy === true, { openai: true });
 
 // ---------- 文件级操作 ----------
 function readJson(file) {
@@ -2076,6 +2762,17 @@ function sliceOf(cfg, p) {
       useProxy: w.useProxy === true,
     };
   }
+  if (p === "or") {
+    const o = cfg.or || {};
+    return {
+      // key = 轮换区里当前这把（供指纹展示 / 接线比对 / /api/test 的 Bearer）。
+      // 绝不回显明文：面板只看 keyFp。
+      p: "or", zh: "OpenRouter", key: orActiveKey(cfg), upstream: o.upstream || DEFAULTS.or.upstream,
+      relayPort: o.relayPort || DEFAULTS.or.relayPort, defaultModel: o.defaultModel || DEFAULTS.or.defaultModel,
+      availableModels: o.availableModels || [...DEFAULTS.or.availableModels], mapping: o.mapping || { ...DEFAULTS.or.mapping },
+      useProxy: o.useProxy === true,
+    };
+  }
   return {
     p: "bai", zh: "B.AI", key: cfg.apiKey || "", upstream: cfg.upstream || DEFAULTS.upstream,
     relayPort: cfg.relayPort || DEFAULTS.relayPort, defaultModel: cfg.defaultModel || DEFAULTS.defaultModel,
@@ -2083,13 +2780,13 @@ function sliceOf(cfg, p) {
     useProxy: true,
   };
 }
-const PROVIDERS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen", qd: "Qoder" };
-const isOurs = (mode) => mode === "bai" || mode === "sn" || mode === "wb" || mode === "zen" || mode === "qd";
+const PROVIDERS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen", qd: "Qoder", or: "OpenRouter" };
+const isOurs = (mode) => mode === "bai" || mode === "sn" || mode === "wb" || mode === "zen" || mode === "qd" || mode === "or";
 function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
 
 // CLI 的 ANTHROPIC_BASE_URL 恒为提供方上游本体（B.AI=api.b.ai、sn=token.sensenova.cn），不经本地中转；
 // 只有桌面版走 127.0.0.1:<relay>。故两者用不同的判据。
-function cliMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey) {
+function cliMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey, orKey) {
   try {
     const s = readJson(SETTINGS);
     const u = s?.env?.ANTHROPIC_BASE_URL || "";
@@ -2101,6 +2798,7 @@ function cliMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey) {
     if (zenKey != null) r.keyMatchZen = key === zenKey;
     if (wbKey != null) r.keyMatchWb = key === wbKey;
     if (qdKey != null) r.keyMatchQd = key === qdKey;
+    if (orKey != null) r.keyMatchOr = key === orKey;
     const bh = hostOf(c.upstream || DEFAULTS.upstream), sh = hostOf(c.sn?.upstream || DEFAULTS.sn.upstream);
     if (bh && u.includes(bh)) return { mode: "bai", ...r };
     if (sh && u.includes(sh)) return { mode: "sn", ...r };
@@ -2109,13 +2807,15 @@ function cliMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey) {
     if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
     // Qoder 同理走本地协议桥；令牌会轮换，故只按端口判据，不做 key 匹配
     if (u.includes(`:${c.qd?.relayPort || DEFAULTS.qd.relayPort}`)) return { mode: "qd", ...r };
+    // OpenRouter 同理走本地协议桥（OpenAI 协议 → 桥翻译）
+    if (u.includes(`:${c.or?.relayPort || DEFAULTS.or.relayPort}`)) return { mode: "or", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
     return { mode: "unknown", baseUrl: "" };
   }
 }
-function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey) {
+function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey, orKey) {
   try {
     const f = desktopConfigFile();
     if (!f || !existsSync(f)) return { mode: "unknown", baseUrl: "" };
@@ -2129,12 +2829,14 @@ function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey) {
     if (zenKey != null) r.keyMatchZen = key === zenKey;
     if (wbKey != null) r.keyMatchWb = key === wbKey;
     if (qdKey != null) r.keyMatchQd = key === qdKey;
+    if (orKey != null) r.keyMatchOr = key === orKey;
     if (u.includes(`:${c.relayPort || DEFAULTS.relayPort}`)) return { mode: "bai", ...r };
     if (u.includes(`:${c.sn?.relayPort || DEFAULTS.sn.relayPort}`)) return { mode: "sn", ...r };
     if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
     if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
     // Qoder 同理走本地协议桥；令牌会轮换，故只按端口判据，不做 key 匹配
     if (u.includes(`:${c.qd?.relayPort || DEFAULTS.qd.relayPort}`)) return { mode: "qd", ...r };
+    if (u.includes(`:${c.or?.relayPort || DEFAULTS.or.relayPort}`)) return { mode: "or", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
   } catch {
@@ -2171,8 +2873,8 @@ function applyToCli(S) {
   const e = s.env;
   e.ANTHROPIC_AUTH_TOKEN = S.key || "wb-local";
   // B.AI 的 CLI 直连上游（靠 proxy env 出海）；SenseNova 境内直连；
-  // WorkBuddy / Qoder 必须走本地协议桥（CLI 是 Anthropic 协议，上游只讲 OpenAI）
-  e.ANTHROPIC_BASE_URL = (S.p === "wb" || S.p === "qd") ? `http://127.0.0.1:${S.relayPort}` : S.upstream;
+  // WorkBuddy / Qoder / OpenRouter 必须走本地协议桥（CLI 是 Anthropic 协议，上游只讲 OpenAI）
+  e.ANTHROPIC_BASE_URL = (S.p === "wb" || S.p === "qd" || S.p === "or") ? `http://127.0.0.1:${S.relayPort}` : S.upstream;
   e.ANTHROPIC_MODEL = S.mapping["claude-haiku-4-5"]?.target || S.defaultModel;
   for (const t of TIERS) {
     e[t.envKey] = S.mapping[t.key]?.target || S.defaultModel;
@@ -2181,7 +2883,9 @@ function applyToCli(S) {
   e.API_TIMEOUT_MS = e.API_TIMEOUT_MS || "3000000";
   e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
   e.NODE_USE_ENV_PROXY = "1";
-  if (S.p === "bai") {
+  if (S.p === "bai" || S.p === "or") {
+    // 出海渠道（B.AI / OpenRouter）：CLI 直连上游时靠 proxy env 出海。
+    // OpenRouter 走的是本地桥（127.0.0.1），但桥自己出海仍要代理——env 留着没坏处。
     e.HTTPS_PROXY = loadCfg().proxy;
     e.HTTP_PROXY = loadCfg().proxy;
   } else {
@@ -2351,9 +3055,13 @@ async function statusPayload() {
   const wb = providerStatus(cfg, "wb", recentCallsWb);
   const zen = providerStatus(cfg, "zen", recentCallsZen);
   const qd = providerStatus(cfg, "qd", recentCallsQd);
+  const orm = providerStatus(cfg, "or", recentCallsOr);
   let qdTok = null;
   try { qdTok = qdEnsureToken(cfg); } catch { }
   const wbExp = wbTokenExp(cfg.wb?.accessToken);
+  // OpenRouter 的额度真相（/auth/key）：面板轮询走 60 秒缓存，不打上游
+  const orQuota = orQuotaSnapshot(cfg);
+  const orKeysNow = orKeys(cfg);
   return {
     now: new Date().toISOString(),
     service: { up: true, uptimeSec: Math.floor((Date.now() - BOOT) / 1000), pid: process.pid },
@@ -2364,8 +3072,8 @@ async function statusPayload() {
     ccswitch: { running: ccswitch },
     // 接线状态（两端各自归属哪个提供方）。keyMatch=对 B.AI key 的匹配，
     // keyMatchSn/keyMatchWb 分别是对 SenseNova / WorkBuddy 凭据的匹配——各页各取各的对比对象。
-    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey, cfg.qd?.token || "qd-local"),
-    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey, cfg.qd?.token || "qd-local"),
+    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey, cfg.qd?.token || "qd-local", orActiveKey(cfg)),
+    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey, cfg.qd?.token || "qd-local", orActiveKey(cfg)),
     // B.AI 灯/接线沿用旧字段名，SenseNova 灯挂 sn 下，WorkBuddy 灯挂 wb 下
     relay: bai.relay, relayLast: bai.relayLast, upstream: bai.upstream, recent: bai.recent,
     sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, useProxy: cfg.sn?.useProxy === true },
@@ -2390,6 +3098,37 @@ async function statusPayload() {
         hasRefresh: !!cfg.wb?.refreshToken,
       },
     },
+    // OpenRouter（第 6 家）：三盏灯 + 两层轮换状态 + 额度真相（「免费流水区」卡读这里）
+    or: {
+      relay: orm.relay, relayLast: orm.relayLast, upstream: orm.upstream, recent: orm.recent,
+      useProxy: cfg.or?.useProxy === true,
+      // 只回显指纹（keyFp），明文永不进 /api/status
+      token: {
+        configured: orKeysNow.length > 0,
+        keyCount: orKeysNow.length,
+        keys: orKeysNow.map((k, i) => ({
+          no: i + 1, fp: keyFp(k),
+          active: i === Math.min(orState.keyIdx, Math.max(0, orKeysNow.length - 1)),
+          coolingUntil: orCoolLeft(orState.keyCool, i, Date.now()) ? new Date(orState.keyCool.get(i)).toISOString() : null,
+        })),
+      },
+      rotation: (() => {
+        const models = orModelList(cfg);
+        const now = Date.now();
+        return {
+          activeKeyNo: orKeysNow.length ? Math.min(orState.keyIdx, orKeysNow.length - 1) + 1 : null,
+          activeModel: models[Math.min(orState.modelIdx, Math.max(0, models.length - 1))] || null,
+          modelCount: models.length,
+          cooledModels: [...orState.modelCool.entries()].filter(([, t]) => t > now)
+            .map(([m, t]) => ({ model: m, until: new Date(t).toISOString() })),
+          limitSource: orState.lastLimitSource,
+          lastResetAt: orState.lastResetAt ? new Date(orState.lastResetAt).toISOString() : null,
+          resetCountdownMs: Math.max(0, (orNextResetAt() || 0) - now),
+          lastSwitch: orState.lastSwitch,
+        };
+      })(),
+      quota: orQuota,
+    },
   };
 }
 
@@ -2399,6 +3138,7 @@ const lastTest = {
   wb: { ok: null, model: null, ms: null, error: null, at: null },
   zen: { ok: null, model: null, ms: null, error: null, at: null },
   qd: { ok: null, model: null, ms: null, error: null, at: null },
+  or: { ok: null, model: null, ms: null, error: null, at: null },
 };
 
 const panel = http.createServer(async (req, res) => {
@@ -2436,17 +3176,18 @@ const panel = http.createServer(async (req, res) => {
       "/workbuddy": "/wb", "/wb.html": "/wb",
       "/opencode": "/zen", "/zen.html": "/zen",
       "/qoder": "/qd", "/qd.html": "/qd",
+      "/openrouter": "/or", "/or.html": "/or",
     };
     if (req.method === "GET" && PROVIDER_ALIAS[u.pathname]) {
       res.writeHead(302, { location: PROVIDER_ALIAS[u.pathname], "cache-control": "no-store" });
       return res.end();
     }
-    // 只认五个规范路径。这里写成显式比较而非数组 includes，是为了让
+    // 只认六个规范路径。这里写成显式比较而非数组 includes，是为了让
     // scripts/check-manifest.cjs 的 C1（清单 path 必须在服务端有对应分支）与
     // C10（渲染模板的路径必须有清单 path 匹配）能用字面量 grep 判断。
     if (req.method === "GET" && (
       u.pathname === "/" || u.pathname === "/sn" || u.pathname === "/wb" ||
-      u.pathname === "/zen" || u.pathname === "/qd"
+      u.pathname === "/zen" || u.pathname === "/qd" || u.pathname === "/or"
     )) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "provider.html")));
@@ -2488,13 +3229,16 @@ const panel = http.createServer(async (req, res) => {
       }
     }
     if (req.method === "GET" && u.pathname === "/api/wb/capture/status") {
-      // v1.0.58：附带 gotAccessToken（是否已抓到访问令牌），前端可据此给实时反馈：
-      // 「已捕获到访问令牌」比一律转圈等待体验好得多。
+      // v1.0.58：附带实时进度（phase/phaseText/kick）——前端如实显示「钩子注入了没、
+      // 踢侧车结果、还差什么」，超时文案也由后端按卡点分类生成，不再一律转圈。
       return json(res, 200, {
         active: wbCapState.active,
         startedAt: wbCapState.startedAt,
         elapsedMs: wbCapState.active ? Date.now() - wbCapState.startedAt : 0,
         gotAccessToken: !!(wbCapState.active && wbCapState.got),
+        phase: wbCapState.phase || null,
+        phaseText: wbCapState.phaseText || null,
+        kick: wbCapState.kick || null,
       });
     }
 
@@ -2533,11 +3277,25 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.28: ?p=sn 时从 SenseNova 拉（境内直连，不走代理）；只保留可对话模型（output 含 text）。
     if (req.method === "GET" && u.pathname === "/api/models") {
       const pRaw = u.searchParams.get("p");
-      const p = pRaw === "sn" ? "sn" : pRaw === "wb" ? "wb" : pRaw === "zen" ? "zen" : pRaw === "qd" ? "qd" : "bai";
+      const p = pRaw === "sn" ? "sn" : pRaw === "wb" ? "wb" : pRaw === "zen" ? "zen" : pRaw === "qd" ? "qd" : pRaw === "or" ? "or" : "bai";
       const c2 = loadCfg();
       const S = sliceOf(c2, p);
       // WorkBuddy 没有公开的模型目录接口（模型清单随客户端 product config 下发），
       // 返回当前可选列表即可——三款免费模型由发布机默认随版本推送
+      if (p === "or") {
+        // OpenRouter 公开目录（无需鉴权也能拉，带 key 更稳）：按 pricing 全 0 筛免费模型。
+        // 判据是 pricing 而**不是 `:free` 后缀**——实测 inclusionai/ling-3.1-flash 没有后缀
+        // 但 pricing 全 0（466 个模型里 20 个免费，其中 2 个是音乐模型、已按 output_modalities 剔除）。
+        try {
+          const r = await orFetchFreeModels(c2);
+          return json(res, 200, {
+            ok: true, count: r.ids.length, models: r.ids, freeCount: r.ids.length,
+            note: `OpenRouter 公开目录共 ${r.total} 个模型，按 pricing.prompt/completion 全为 0 筛出 ${r.ids.length} 个免费文本模型（:free 后缀不是判据）。`,
+          });
+        } catch (e) {
+          return json(res, 400, { error: "拉取 OpenRouter 免费模型目录失败：" + String((e && e.message) || e).slice(0, 160) });
+        }
+      }
       if (p === "qd") {
         // Qoder 的目录没有公开接口，但 worker 拉回后在本地解密再 parse——补丁把那份明文
         // 写到了 tokenFile 同级的 qoder-models.json，这里直接读，不必复刻 Cosy 签名。
@@ -2613,6 +3371,60 @@ const panel = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && u.pathname === "/api/status") return json(res, 200, await statusPayload());
 
+    // ---------- OpenRouter（第 6 家）专属接口：三把 key 的轮换区 + 额度真相 + 免费目录 ----------
+    // 安全红线：key 明文只写 %APPDATA%\bai-router\config.json（本机、已 gitignore），
+    // 绝不进 config.defaults.json / providers.js / HANDOFF.md；任何返回值都只给 keyFp 指纹。
+    if (req.method === "GET" && u.pathname === "/api/or/status") {
+      try {
+        const payload = await orStatusPayload(loadCfg(), { refresh: u.searchParams.get("refresh") === "1" });
+        return json(res, 200, { ok: true, ...payload });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: String((e && e.message) || e).slice(0, 160) });
+      }
+    }
+    if (req.method === "POST" && u.pathname === "/api/or/keys") {
+      // body.keys：最多 3 把，空串/缺项 = 该格留空（即删除）。
+      try {
+        const b = await readBody(req);
+        const raw = Array.isArray(b.keys) ? b.keys : [];
+        if (raw.length > OR_KEYS_MAX) return json(res, 400, { error: `最多 ${OR_KEYS_MAX} 把 key` });
+        const cleaned = [];
+        for (const k of raw) {
+          const v = String(k == null ? "" : k).trim();
+          if (!v) continue;
+          if (!/^sk-or-/.test(v)) return json(res, 400, { error: "OpenRouter 的 key 应以 sk-or- 开头（形如 sk-or-v1…）" });
+          if (!cleaned.includes(v)) cleaned.push(v);
+        }
+        const cfg = loadCfg();
+        if (!cfg.or) cfg.or = { ...DEFAULTS.or };
+        cfg.or.keys = cleaned;
+        // key 集合变了：轮换状态按新下标重置，别把上一把的每日冷却安到另一把头上
+        orState.keyIdx = 0;
+        orState.keyCool.clear();
+        orQuotaCache = { at: 0, fp: null, data: null };
+        saveCfg(cfg);
+        failoverClear("or");   // 凭据换了，清掉可能残留的额度冷却，让新 key 立刻可用
+        log(`OpenRouter key 区已更新：${cleaned.length} 把（仅存本机 config.json，返回值只含指纹）`);
+        return json(res, 200, { ok: true, keys: cleaned.map((k, i) => ({ no: i + 1, fp: keyFp(k) })) });
+      } catch (e) {
+        return json(res, 400, { error: String((e && e.message) || e) });
+      }
+    }
+    if (req.method === "POST" && u.pathname === "/api/or/refresh") {
+      // 手动刷新：按 pricing 重筛免费模型目录（写回 availableModels）+ 强制重查额度
+      try {
+        const cfg = loadCfg();
+        const r = await orFetchFreeModels(cfg);
+        if (!cfg.or) cfg.or = { ...DEFAULTS.or };
+        cfg.or.availableModels = r.ids;
+        saveCfg(cfg);
+        const quota = await orFetchQuota(cfg, true);
+        return json(res, 200, { ok: true, count: r.ids.length, total: r.total, models: r.ids, quota });
+      } catch (e) {
+        return json(res, 400, { error: String((e && e.message) || e).slice(0, 200) });
+      }
+    }
+
     if (req.method === "POST" && u.pathname === "/api/proxy-detect") {
       const found = await detectWorkingProxy();
       let applied = false;
@@ -2634,13 +3446,14 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/config") {
       const b = await readBody(req);
       const cfg = loadCfg();
-      const P = ["sn", "zen", "qd"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
-      const sub = P === "sn" ? cfg.sn : P === "wb" ? cfg.wb : P === "zen" ? cfg.zen : P === "qd" ? cfg.qd : cfg; // 共用字段（mapping/upstream/…）落点
+      const P = ["sn", "zen", "qd", "or"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
+      const sub = P === "sn" ? cfg.sn : P === "wb" ? cfg.wb : P === "zen" ? cfg.zen : P === "qd" ? cfg.qd : P === "or" ? (cfg.or || (cfg.or = { ...DEFAULTS.or })) : cfg; // 共用字段（mapping/upstream/…）落点
       // —— API Key（仅 B.AI / SenseNova）——
       if (typeof b.apiKey === "string" && b.apiKey.trim()) {
         const k = b.apiKey.trim();
         // zen 的 key 是 oc_sk_ 开头（OpenCode Zen），其余提供方是 sk- 前缀
         if (P === "zen") { cfg.zen.apiKey = k; }
+        else if (P === "or") { /* OpenRouter 是三把 key 的轮换区，只走 POST /api/or/keys，这里不收单个 key */ }
         else {
           if (!k.startsWith("sk-")) return json(res, 400, { error: "API Key 应以 sk- 开头" });
           if (P === "sn") cfg.sn.apiKey = k; else if (P === "bai") cfg.apiKey = k;
@@ -2650,7 +3463,7 @@ const panel = http.createServer(async (req, res) => {
       if (P === "bai" && b.failover) {
         if (typeof b.failover.enabled === "boolean") cfg.failover = { ...(cfg.failover || {}), enabled: b.failover.enabled };
         if (Array.isArray(b.failover.chain)) {
-          cfg.failover = { ...(cfg.failover || {}), chain: b.failover.chain.filter((x) => ["bai","sn","wb","zen","qd"].includes(x)) };
+          cfg.failover = { ...(cfg.failover || {}), chain: b.failover.chain.filter((x) => ["bai","sn","wb","zen","qd","or"].includes(x)) };
         }
       }
       // —— Qoder 令牌（一般不用填：正常由 worker 补丁写入 tokenFile，此处仅手动兜底）——
@@ -2738,7 +3551,7 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.28: 一键接线按提供方分流；恢复（接回 CC Switch）在 /api/restore 里保持原样
     if (req.method === "POST" && u.pathname === "/api/apply") {
       const b = await readBody(req);
-      const P = ["sn", "zen", "qd"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
+      const P = ["sn", "zen", "qd", "or"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
       const cfg = loadCfg();
       const S = sliceOf(cfg, P);
       const name = PROVIDERS[P];
@@ -2746,7 +3559,9 @@ const panel = http.createServer(async (req, res) => {
         return json(res, 400, {
           error: P === "wb"
             ? "请先在「WorkBuddy」页粘贴访问令牌（JWT）——捕获方法见该页说明"
-            : `请先在「${name}」路由表里填写 API Key`,
+            : P === "or"
+              ? "请先在「OpenRouter」页的「免费流水区」填入至少 1 个 sk-or-v1 API Key（最多 3 把）"
+              : `请先在「${name}」路由表里填写 API Key`,
         });
       }
       // Qoder 的 key 是稳定占位符（令牌会轮换、不落 config），故单独校验令牌是否真的读得到
@@ -2770,6 +3585,7 @@ const panel = http.createServer(async (req, res) => {
       if (P === "wb") warns.push("WorkBuddy 三款免费模型由 WorkBuddy 客户端账号提供（0 积分不限量）；令牌过期会自动用刷新令牌续期，无需重新接线");
       if (P === "zen") warns.push("OpenCode Zen 的免费额度多数限客户端内使用，实测仅 space-bunny-free 可外部调用；购买 Go 订阅后可解锁 Go 通道的 30 个模型");
       if (P === "qd") warns.push("Qoder 走账号的 Free 套餐额度；令牌每次 Qoder 启动会轮换，中转会自动跟随——但 Qoder 客户端必须保持运行，否则中转读不到令牌");
+      if (P === "or") warns.push("OpenRouter 免费区：免费模型 50 次/天/把 key，用尽自动换模型、再换 key（最多 3 把）；重置时间看 X-RateLimit-Reset，面板显示倒计时与剩余次数");
       log(`一键切到 ${name}: cli=${doCli} desktop=${doDesk}`);
       return json(res, 200, { ok: true, provider: P, warnings: warns, snapshot: "已自动快照切换前的配置（可用于一键恢复）" });
     }
@@ -2787,9 +3603,9 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/test") {
       const cfg = loadCfg();
       const b = await readBody(req).catch(() => ({}));
-      const P = ["sn", "zen", "qd"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
+      const P = ["sn", "zen", "qd", "or"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
       const S = sliceOf(cfg, P);
-      const store = P === "sn" ? recentCallsSn : P === "wb" ? recentCallsWb : P === "zen" ? recentCallsZen : P === "qd" ? recentCallsQd : recentCallsBai;
+      const store = P === "sn" ? recentCallsSn : P === "wb" ? recentCallsWb : P === "zen" ? recentCallsZen : P === "qd" ? recentCallsQd : P === "or" ? recentCallsOr : recentCallsBai;
       const active = b.all ? null : activeTier(store);
       const targets = active ? [active] : TIERS.map((t) => t.key);
       const tierInfo = (key) => {
@@ -2983,7 +3799,7 @@ function listenWithRetry(srv, port, name) {
     if (e.code !== "EADDRINUSE") { log(`${name} 端口错误: ${e.message}`); process.exit(1); }
     if (attempts === 1) log(`${name} 端口 :${port} 暂被占用（多为重启交接），每 600ms 重试，最多 15 秒`);
     let peerHealthy = false;
-    if (!relay.listening && !snRelay.listening && !wbRelay.listening && !zenRelay.listening && !qdRelay.listening && !panel.listening) {
+    if (!relay.listening && !snRelay.listening && !wbRelay.listening && !zenRelay.listening && !qdRelay.listening && !orRelay.listening && !panel.listening) {
       try {
         const pr = await fetch(`http://127.0.0.1:${cfg0.panelPort}/api/ping`, { signal: AbortSignal.timeout(1200) });
         peerHealthy = pr.ok;
@@ -3013,10 +3829,14 @@ function listenWithRetry(srv, port, name) {
   start();
 }
 listenWithRetry(relay, cfg0.relayPort, "中转");
+// v1.0.58：上次捕获若中途被强杀（finally 没跑到），WorkBuddy 的 CLI 脚本会留在
+// 打补丁状态——磁盘备份还在就立刻自愈还原（脚本里已无钩子则只清理备份文件）。
+wbCaptureSelfHeal();
 listenWithRetry(snRelay, cfg0.sn.relayPort, "SenseNova中转");
 listenWithRetry(wbRelay, cfg0.wb.relayPort, "WorkBuddy中转");
 listenWithRetry(zenRelay, cfg0.zen.relayPort, "OpenCodeZen中转");
 listenWithRetry(qdRelay, cfg0.qd.relayPort, "Qoder中转");
+listenWithRetry(orRelay, cfg0.or.relayPort, "OpenRouter中转");
 listenWithRetry(panel, cfg0.panelPort, "面板");
 // 成功绑定中转端口 = 本实例成为唯一的活跃服务者，此时才允许合并配置/跑周期探测
 relay.once("listening", () => setTimeout(onActivated, 300));

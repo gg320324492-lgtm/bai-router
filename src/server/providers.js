@@ -87,6 +87,7 @@ window.BAI_PROVIDERS = {
       wb: "有一端当前接在 WorkBuddy 上（见顶部「WorkBuddy」页）。点本页「{btn}」可把它换回来；各提供方映射互相独立，切换只动接线不动对方配置。",
       zen: "有一端当前接在 OpenCode Zen 上（见顶部「OpenCode Zen」页）。点本页「{btn}」可把它换回来；各提供方映射互相独立，切换只动接线不动对方配置。",
       qd: "有一端当前接在 Qoder 上（见顶部「Qoder」页）。点本页「{btn}」可把它换回来；各提供方映射互相独立，切换只动接线不动对方配置。",
+      or: "有一端当前接在 OpenRouter 上（见顶部「OpenRouter」页）。点本页「{btn}」可把它换回来；各提供方映射互相独立，切换只动接线不动对方配置。",
       ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 B.AI 突然失效，回到这里点「{btn}」一键恢复即可。",
       keyMismatch: "⚠ 有客户端正在用的密钥和面板里填的不一致——中转是按请求自带 key 计费的，面板改了 key 不会自动更新已接线的客户端。请重开对应终端/桌面版，或重新点「{btn}」。",
       ccBoth: "检测到配置在 CC Switch 手里。点「{btn}」切换；想用 CC Switch 就保持现状。",
@@ -350,5 +351,94 @@ window.BAI_PROVIDERS = {
     },
     // 别从灯名反推简称：「本地中转」会反推成「本地」、「Zen 中转」会丢掉「OpenCode」。
     shortName: "Qoder",
+  },
+
+  /* ================= OpenRouter（/or）—— 免费兜底区（第 6 个提供方） =================
+   * 定位（用户原话）：「没有任何模型可用时的兜底」——所以在故障转移链里排最后。
+   * 与前五家的差别：凭据是**最多三个 key 的轮换区**，模型是**按 pricing 全 0 筛出来的
+   * 免费目录**；429 分两种（limit_source），分别换模型 / 换 key。这些逻辑在 server.mjs，
+   * 本条目只管这一页显示什么。 */
+  or: {
+    key: "or",
+    path: "/or",
+    tab: "OpenRouter",
+    h1: "OpenRouter 免费流水区",
+    sub: "OR · 免费模型",
+    title: "OpenRouter 路由 · B.AI 路由台",
+    accentLabel: "接入",
+    primaryBtn: "一键接入 OpenRouter",
+    targetName: "OpenRouter 模型",
+    relayHint: ":15772",
+    guide: [
+      {
+        title: "填写 OpenRouter API Key",
+        desc: "在 <b>openrouter.ai/keys</b> 生成 API Key（形如 <span class=\"mono\">sk-or-v1…</span>），最多可填 <b>3 个</b>——三把 key 在下方「OpenRouter 免费流水区」里保存，页面只显示指纹、不回显明文。",
+      },
+      {
+        title: "一键接入",
+        desc: "把 Claude Code（终端 + 档位映射都指向免费模型）接到 OpenRouter 免费流水区；免费额度用尽时自动换模型、再用尽换 key。",
+      },
+    ],
+    guideEyebrow: "用法",
+    guideTitle: "接入 OpenRouter 免费兜底",
+    hint: "下拉里的模型按 OpenRouter 的 <span class=\"mono\">pricing.prompt/completion 全为 0</span> 实测筛出（<b>不能只看 <span class=\"mono\">:free</span> 后缀</b>——inclusionai/ling-3.1-flash 没有后缀但免费）。四档默认指向 <b>openrouter/free</b>（自动路由到当前可用的免费模型）；模型级限流会自动换下一个免费模型，账号级 50 次/天用尽会自动换下一把 key。",
+    settingsTitle: "OpenRouter 设置",
+    settingsAux: "上游 / 中转端口 / 通道",
+    settingsEyebrow: "设置",
+    foldKey: "bai.orsec3",
+    lamps: ["relay", "upstream", "cred"],
+    lampNames: {
+      relay: "OpenRouter 中转",
+      upstream: "OpenRouter 上游",
+      cred: "API Key",
+    },
+    lampSubs: { relay: ":15772 → 协议桥 → 上游", cred: "sk-or-v1… 密钥" },
+    extraCards: ["or-rotation"],
+    footNote: "OpenRouter 与 B.AI/SenseNova/WorkBuddy/Zen/Qoder 各自独立配置，共用同一个路由台服务",
+    footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
+    cardEyebrow: "状态",
+    routeEyebrow: "模型",
+    routeTitle: "路由表 · 模型映射",
+    routeKey: null,                           // 密钥填在「免费流水区」卡里（三个 key 的轮换区）
+    wireHint: "接通后：终端 CLI 与桌面版都指向本地协议桥 <span id=\"hintRelayPort\">:15772</span>（CLI 讲 Anthropic 协议、OpenRouter 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。",
+
+    /* ---- v1.0.48 清单化字段（C12 强制） ---- */
+    // brand 表用于路由表里把模型 id 显示成人话（openrouter/free → Openrouter Free…）
+    brands: { openrouter: "OpenRouter", inclusionai: "InclusionAI", nvidia: "NVIDIA", google: "Google", cohere: "Cohere", thinkingmachines: "Thinking Machines", poolside: "Poolside", dots: "Dots", liquid: "Liquid", apodex: "Apodex" },
+    defaultModels: [
+      "openrouter/free",
+      "inclusionai/ling-3.1-flash",
+      "apodex/apodex-1.1-mini:free",
+      "inclusionai/ling-3.0-flash-sante:free",
+      "dots-studio/dots-3-note-preview:free",
+      "liquid/lfm-2.5-2.6b:free",
+      "nvidia/nemotron-3.5-lightning:free",
+      "thinkingmachines/inkling-small:free",
+      "poolside/laguna-s-2.1:free",
+      "thinkingmachines/inkling:free",
+      "poolside/laguna-xs-2.1:free",
+      "cohere/north-mini-code:free",
+      "nvidia/nemotron-3.5-content-safety:free",
+      "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+      "google/gemma-4-26b-a4b-it:free",
+      "google/gemma-4-31b-it:free",
+      "nvidia/nemotron-3-super-120b-a12b:free",
+    ],
+    cred: { txtOk: "已配置", subOk: "在下方「免费流水区」管理 3 把 key", txtNone: "未配置", subNone: "在下方「免费流水区」粘贴 sk-or-v1 密钥（最多 3 把）" },
+    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 OpenRouter 的免费模型了（四档默认都指向 openrouter/free）。",
+    resetModelsMsg: "✔ 已恢复为发布机默认的 OpenRouter 免费模型：{list}",
+    step1Hint: "请先完成第 1 步：在下方「OpenRouter 免费流水区」里填入至少 1 个 API Key 并保存。",
+    keyMatch: "keyMatchOr",
+    shape: "nested",
+    sys: { modelsRefresh: true },             // 「刷新模型列表」→ /api/models?p=or 按 pricing 重筛免费目录
+    modelsEndpoint: null,
+    settingsLabels: { relayPort: "OpenRouter 中转端口" },
+    notices: {
+      stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
+      ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 OpenRouter 突然失效，回到这里点「{btn}」恢复。",
+    },
+    // 别从灯名反推简称：「本地中转」会反推成「本地」、「Zen 中转」会丢掉「OpenCode」。
+    shortName: "OpenRouter",
   },
 };

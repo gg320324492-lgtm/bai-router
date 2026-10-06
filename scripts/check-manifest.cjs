@@ -714,6 +714,87 @@ setCheck("C12");
 }
 
 /* ============================================================================
+ * C13 种子配置不得带本机环境（发布陷阱）
+ *
+ *   config.defaults.json 是**随包的种子**：新机器首次启动时 DATA_DIR 下没有
+ *   config.json，server.mjs 就把它当默认值读（server.mjs:29 的 seed 回退）。
+ *   所以它一旦带上**本机的绝对路径 / 用户名**，就会随包发出去，所有新装机器
+ *   都读到一条指向「发布机」的死路径。
+ *
+ *   实际踩过：qd.tokenFile 被写成 'C:\Users\admin\AppData\Local\Temp\qoder-token.json'
+ *   （2026-10-06 实测发现）。幸而 server.mjs 的 fixQdFile() 读 config.json 时会自愈
+ *   （父目录不存在就换回本机 os.tmpdir()），但那只是**运行期补丁、只覆盖 qd 两个字段**；
+ *   别的字段（relayPort / upstream / wb.accessToken…）写脏了没人兜。
+ *   所以这里在**构建期**拦一道。
+ *
+ *   判据：JSON 的字符串值里不得出现
+ *     ① Windows 盘符绝对路径（X:\ 或 X:/）
+ *     ② UNC 路径（\\server\share）
+ *     ③ /Users/<name> 或 /home/<name>（macOS / Linux 家目录）
+ *   合法的相对文件名（'qoder-token.json'）与空串都不受影响。
+ * ==========================================================================*/
+setCheck("C13");
+{
+  let raw = null;
+  try {
+    raw = fs.readFileSync(F.defaults, "utf8");
+  } catch (e) {
+    err(`config.defaults.json 读不到：${e.message}`);
+  }
+  if (raw !== null) {
+    // 只在**字符串值**里找，避免把 JSON 结构本身误判
+    const ABS_PATTERNS = [
+      { rx: /^[A-Za-z]:[\\/]/, what: "Windows drive-absolute path" },
+      { rx: /^\\\\[^\\]/, what: "UNC path" },
+      { rx: /^\/(?:Users|home)\//i, what: "macOS/Linux home path" },
+      { rx: /[A-Za-z]:[\\/](?:Users|Program Files|Windows|Temp)[\\/]/i, what: "machine-specific path fragment" },
+    ];
+    let hits = 0;
+    const walk = (node, trail) => {
+      if (typeof node === "string") {
+        for (const p of ABS_PATTERNS) {
+          if (p.rx.test(node)) {
+            err(`${trail || "(root)"}: seed config carries a machine-specific path (${p.what}) -- "${show(node)}". config.defaults.json ships inside the installer, so a hard-coded path makes every fresh machine read the publisher's path. Use "" or a bare filename`);
+            hits++;
+            break;
+          }
+        }
+        return;
+      }
+      if (Array.isArray(node)) { node.forEach((v, i) => walk(v, `${trail}[${i}]`)); return; }
+      if (node && typeof node === "object") {
+        for (const k of Object.keys(node)) walk(node[k], trail ? `${trail}.${k}` : k);
+      }
+    };
+    try {
+      walk(JSON.parse(raw), "");
+    } catch (e) {
+      err(`config.defaults.json 不是合法 JSON：${e.message}`);
+    }
+    // 同类陷阱的另一个入口：字符串里直接出现本机用户名（多半是被拼进路径或标识）
+    const uname = process.env.USERNAME || "";
+    if (uname && uname.length >= 3) {
+      const lower = uname.toLowerCase();
+      const walkUser = (node, trail) => {
+        if (typeof node === "string") {
+          if (node.toLowerCase().includes(lower)) {
+            err(`${trail || "(root)"}: seed config mentions the build machine's username "${uname}" -- "${show(node)}". It will mis-bind on every other machine`);
+            hits++;
+          }
+          return;
+        }
+        if (Array.isArray(node)) { node.forEach((v, i) => walkUser(v, `${trail}[${i}]`)); return; }
+        if (node && typeof node === "object") {
+          for (const k of Object.keys(node)) walkUser(node[k], trail ? `${trail}.${k}` : k);
+        }
+      };
+      try { walkUser(JSON.parse(raw), ""); } catch { /* JSON 错误上面已报过，不重复 */ }
+    }
+    if (!hits) ok("config.defaults.json carries no machine-specific paths or usernames");
+  }
+}
+
+/* ============================================================================
  * 打印
  * ==========================================================================*/
 
@@ -730,8 +811,9 @@ const CHECK_TITLES = {
   C10: "every server route that renders the template has a matching manifest path",
   C11: "panel-common.js must not hard-code provider names",
   C12: "renderer-critical manifest fields present for every provider",
+  C13: "seed config must not carry machine-specific paths/usernames",
 };
-const ORDER = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12"];
+const ORDER = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13"];
 
 console.log("check-manifest -- provider panel manifest/template consistency gate");
 console.log("root: " + ROOT);

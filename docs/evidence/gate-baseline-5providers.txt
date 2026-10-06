@@ -1,0 +1,77 @@
+check-manifest -- provider panel manifest/template consistency gate
+root: C:\Users\admin\Desktop\新建文件夹\bai-router
+(non-ASCII characters are printed as '?' -- the Windows console is GBK; read the source file for exact text)
+
+[C1] manifest completeness + key/path vs server.mjs routes  (0 error, 0 warn)
+  ok   5 providers, 13 required fields each; key/path agree with each other and with server.mjs routes
+
+[C2] guide structure  (0 error, 0 warn)
+  -    bai: guide is [] (no guide card on this page -- allowed; panel-common.js hides the card)
+  -    sn: guide is [] (no guide card on this page -- allowed; panel-common.js hides the card)
+  ok   wb: guide has 2 steps, both with title+desc
+  ok   zen: guide has 2 steps, both with title+desc
+  ok   qd: guide has 2 steps, both with title+desc
+
+[C3] notices structure + {btn} placeholder  (0 error, 0 warn)
+  ok   bai: notices.stale + notices.ccSwitch present, {btn} -> "?? B.AI" resolves cleanly
+  ok   sn: notices.stale + notices.ccSwitch present, {btn} -> "?? SenseNova" resolves cleanly
+  ok   wb: notices.stale + notices.ccSwitch present, {btn} -> "???? WorkBuddy" resolves cleanly
+  ok   zen: notices.stale + notices.ccSwitch present, {btn} -> "???? OpenCode Zen" resolves cleanly
+  ok   qd: notices.stale + notices.ccSwitch present, {btn} -> "???? Qoder" resolves cleanly
+
+[C4] contract ids in provider.html (exactly once each)  (0 error, 0 warn)
+  ok   52 contract ids, each exactly once in provider.html
+
+[C5] reverse check: no dangling id reference ($ / onClick / applyText / has)  (0 error, 0 warn)
+  ok   every id reference in panel-common.js / provider.html resolves (264 scanned, 1 guarded by a "querySelector || $()" fallback)
+
+[C6] card slot contract (cards/*.js export mount)  (0 error, 0 warn)
+  ok   cards/failover.js: exports window.BAI_CARDS["failover"].mount
+  ok   cards/model-catalog.js: exports window.BAI_CARDS["model-catalog"].mount
+  ok   cards/token-capture.js: exports window.BAI_CARDS["token-capture"].mount
+
+[C7] palette: html[data-provider] blocks vs manifest keys  (0 error, 0 warn)
+  ok   html[data-provider="bai"] (dark + light) present
+  ok   html[data-provider="sn"] (dark + light) present
+  ok   html[data-provider="wb"] (dark + light) present
+  ok   html[data-provider="zen"] (dark + light) present
+  ok   html[data-provider="qd"] (dark + light) present
+  ok   palette blocks match manifest keys exactly: bai, sn, wb, zen, qd
+
+[C8] model list available for every provider  (0 error, 0 warn)
+  ok   bai: defaultModels from providers.js (0: ); model list also from providers.js:defaultModels + config.defaults.json:availableModels
+  ok   sn: defaultModels from providers.js (0: ); model list also from providers.js:defaultModels + config.defaults.json:sn.availableModels
+  ok   wb: defaultModels from providers.js (3: deepseek-v4.1-flash,hy4-preview-f,hy3); model list also from providers.js:defaultModels + config.defaults.json:wb.availableModels
+  ok   zen: defaultModels from providers.js (1: space-bunny-free); model list also from providers.js:defaultModels + config.defaults.json:zen.availableModels
+  ok   qd: defaultModels from providers.js (1: lite); model list also from providers.js:defaultModels + config.defaults.json:qd.availableModels
+
+[C9] nav tabs vs manifest keys/paths  (0 error, 0 warn)
+  ok   nav tabs match manifest keys and hrefs: bai, sn, wb, zen, qd
+
+[C10] every server route that renders the template has a matching manifest path  (0 error, 0 warn)
+  ok   alias "/index.html" -> "/" (has manifest path)
+  ok   alias "/ui.html" -> "/" (has manifest path)
+  ok   alias "/sensenova" -> "/sn" (has manifest path)
+  ok   alias "/sn.html" -> "/sn" (has manifest path)
+  ok   alias "/workbuddy" -> "/wb" (has manifest path)
+  ok   alias "/wb.html" -> "/wb" (has manifest path)
+  ok   alias "/opencode" -> "/zen" (has manifest path)
+  ok   alias "/zen.html" -> "/zen" (has manifest path)
+  ok   alias "/qoder" -> "/qd" (has manifest path)
+  ok   alias "/qd.html" -> "/qd" (has manifest path)
+
+[C11] panel-common.js must not hard-code provider names  (0 error, 0 warn)
+  ok   panel-common.js contains no provider-name equality test / literal index / name array (comments excluded; cards/*.js out of scope)
+
+[C12] renderer-critical manifest fields present for every provider  (0 error, 0 warn)
+  ok   bai: shape/keyMatch/sys/brands/defaultModels/settingsLabels all present
+  ok   sn: shape/keyMatch/sys/brands/defaultModels/settingsLabels all present
+  ok   wb: shape/keyMatch/sys/brands/defaultModels/settingsLabels all present
+  ok   zen: shape/keyMatch/sys/brands/defaultModels/settingsLabels all present
+  ok   qd: shape/keyMatch/sys/brands/defaultModels/settingsLabels all present
+
+[C13] seed config must not carry machine-specific paths/usernames  (0 error, 0 warn)
+  ok   config.defaults.json carries no machine-specific paths or usernames
+
+--- 0 error(s), 0 warn(s) ---
+check-manifest OK -- manifest, template, cards and palette agree.
