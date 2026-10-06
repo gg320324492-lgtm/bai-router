@@ -140,39 +140,6 @@
       "or"
     ]
   },
-  "or": {
-    "upstream": "https://openrouter.ai/api/v1",
-    "relayPort": 15772,
-    "defaultModel": "openrouter/free",
-    "availableModels": [
-      "openrouter/free",
-      "inclusionai/ling-3.1-flash",
-      "apodex/apodex-1.1-mini:free",
-      "inclusionai/ling-3.0-flash-sante:free",
-      "dots-studio/dots-3-note-preview:free",
-      "liquid/lfm-2.5-2.6b:free",
-      "nvidia/nemotron-3.5-lightning:free",
-      "thinkingmachines/inkling-small:free",
-      "poolside/laguna-s-2.1:free",
-      "thinkingmachines/inkling:free",
-      "poolside/laguna-xs-2.1:free",
-      "cohere/north-mini-code:free",
-      "nvidia/nemotron-3.5-content-safety:free",
-      "nvidia/nemotron-3-ultra-550b-a55b:free",
-      "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-      "google/gemma-4-26b-a4b-it:free",
-      "google/gemma-4-31b-it:free",
-      "nvidia/nemotron-3-super-120b-a12b:free"
-    ],
-    "mapping": {
-      "claude-fable-5": { "target": "openrouter/free", "label": "OpenRouter Free" },
-      "claude-sonnet-5": { "target": "openrouter/free", "label": "OpenRouter Free" },
-      "claude-opus-5": { "target": "openrouter/free", "label": "OpenRouter Free" },
-      "claude-haiku-4-5": { "target": "openrouter/free", "label": "OpenRouter Free" }
-    },
-    "keys": [],
-    "useProxy": false
-  },
   "qd": {
     "upstream": "https://api2-v2.qoder.sh/model/v1",
     "relayPort": 15762,
@@ -235,6 +202,51 @@
     "refreshToken": "",
     "deviceToken": "",
     "userId": "91a1b55c-54b8-4257-81b5-59263f1029e5",
+    "useProxy": false
+  },
+  "or": {
+    "upstream": "https://openrouter.ai/api/v1",
+    "relayPort": 15772,
+    "defaultModel": "openrouter/free",
+    "availableModels": [
+      "openrouter/free",
+      "inclusionai/ling-3.1-flash",
+      "apodex/apodex-1.1-mini:free",
+      "inclusionai/ling-3.0-flash-sante:free",
+      "dots-studio/dots-3-note-preview:free",
+      "liquid/lfm-2.5-2.6b:free",
+      "nvidia/nemotron-3.5-lightning:free",
+      "thinkingmachines/inkling-small:free",
+      "poolside/laguna-s-2.1:free",
+      "thinkingmachines/inkling:free",
+      "poolside/laguna-xs-2.1:free",
+      "cohere/north-mini-code:free",
+      "nvidia/nemotron-3.5-content-safety:free",
+      "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+      "google/gemma-4-26b-a4b-it:free",
+      "google/gemma-4-31b-it:free",
+      "nvidia/nemotron-3-super-120b-a12b:free"
+    ],
+    "mapping": {
+      "claude-fable-5": {
+        "target": "openrouter/free",
+        "label": "OpenRouter Free"
+      },
+      "claude-sonnet-5": {
+        "target": "openrouter/free",
+        "label": "OpenRouter Free"
+      },
+      "claude-opus-5": {
+        "target": "openrouter/free",
+        "label": "OpenRouter Free"
+      },
+      "claude-haiku-4-5": {
+        "target": "openrouter/free",
+        "label": "OpenRouter Free"
+      }
+    },
+    "keys": [],
     "useProxy": false
   }
 }
