@@ -22,7 +22,7 @@ const list = execSync(`npx --yes @electron/asar l "${asar}"`, { cwd: ROOT, stdio
   .filter(Boolean);
 
 const missAsar = ["src/main.js", "src/preload.js", "src/install-consistency.js"].filter((f) => !list.includes(f));
-const missSrv = ["provider.html", "providers.js", "panel-common.css", "panel-common.js", "failover.mjs"]
+const missSrv = ["provider.html", "providers.js", "panel-common.css", "panel-common.js", "failover.mjs", "qoder-patch.mjs"]
   .filter((x) => !fs.existsSync(path.join(srv, x)));
 const missCards = ["failover.js", "model-catalog.js", "token-capture.js"]
   .filter((x) => !fs.existsSync(path.join(srv, "cards", x)));

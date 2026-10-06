@@ -145,14 +145,7 @@
     "defaultModel": "lite",
     "availableModels": [
       "lite",
-      "auto",
-      "performance",
-      "ultimate",
-      "qmodel",
-      "kmodel",
-      "dmodel",
-      "mmodel",
-      "gmodel"
+      "auto"
     ],
     "mapping": {
       "claude-fable-5": {
@@ -173,8 +166,8 @@
       }
     },
     "token": "",
-    "tokenFile": "C:\\Users\\admin\\AppData\\Local\\Temp\\qoder-token.json",
-    "modelsFile": "C:\\Users\\admin\\AppData\\Local\\Temp\\qoder-models.json",
+    "tokenFile": "",
+    "modelsFile": "",
     "useProxy": false
   },
   "wb": {

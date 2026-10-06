@@ -22,14 +22,14 @@ window.BAI_CARDS["model-catalog"] = {
     const PROVIDER = ctx.PROVIDER || "zen";
     const QD = PROVIDER === "qd";
 
-    /* ---------- markup（原样，未改一个字） ---------- */
+    /* ---------- markup（v1.0.57：新增「一键装补丁」，消掉新电脑装 Python 的负担） ---------- */
     if (QD) {
       slot.insertAdjacentHTML("beforeend", `
-        <!-- 令牌（Qoder 无需手动填写，这里只做状态说明） -->
+        <!-- 令牌（Qoder 无需手动填写，这里只做状态说明 + 一键装补丁） -->
         <div class="card foldable collapsed" id="cardTok">
           <div class="head" id="headTok">
             <span class="eyebrow">令牌</span><span class="title">令牌从哪来</span>
-            <span class="aux">正常无需任何操作</span>
+            <span class="aux">新电脑点一次「装补丁」即可</span>
           </div>
           <div class="body">
             <div class="tokstat" id="tokStat">正在读取令牌状态…</div>
@@ -39,14 +39,23 @@ window.BAI_CARDS["model-catalog"] = {
               也不会写进 Claude 的 settings.json——中转每次请求现读，Qoder 换令牌后无需重启中转即自动跟随。
             </div>
             <div class="hint" style="margin-top:8px">
-              来源是 <span class="mono">qoder-patch/patch_worker.py</span>：它给 Qoder 的 agent worker
-              （<span class="mono">resources/app.asar.unpacked/…/dist/_worker/qoder-worker-runtime.obf.mjs</span>）
-              打了一个小补丁，在每次带鉴权的出站请求上把当前令牌覆盖写入
-              <span class="mono">%TEMP%/qoder-token.json</span>。
+              令牌只存在于 Qoder 的 worker 进程内存里（磁盘上没有任何明文副本），所以要在它每次带鉴权的出站请求上
+              顺手落盘到 <span class="mono">%TEMP%/qoder-token.json</span>。这一步由下面这个补丁完成——
+              <b>已内置在本路由台里，不需要装 Python</b>。
             </div>
-            <div class="hint" style="margin-top:8px">
+
+            <div class="patchrow" id="qdPatchRow" style="margin-top:12px">
+              <div class="tokstat" id="qdPatchStat">正在检查本机 Qoder 安装…</div>
+              <div class="saverow" style="margin-top:8px">
+                <button class="btn-main" id="btnQdPatch" type="button" style="padding:8px 20px">一键装补丁（自动检测 Qoder 安装位置）</button>
+                <button class="btn-sm" id="btnQdRevert" type="button" style="margin-left:8px">还原 Qoder 客户端</button>
+              </div>
+              <div class="result" id="qdPatchResult"></div>
+            </div>
+
+            <div class="hint" style="margin-top:12px">
               <b>前提：Qoder 桌面端必须保持运行</b>。关掉它就不会再刷新令牌文件，中转会读到上一次的旧令牌并返回 401。
-              如需彻底还原客户端，执行 <span class="mono">python patch_worker.py revert</span>。
+              Qoder 升级后会新增版本目录、补丁失效——回到这里再点一次「一键装补丁」即可（会自动发现所有版本）。
             </div>
           </div>
         </div>
@@ -170,13 +179,64 @@ window.BAI_CARDS["model-catalog"] = {
 
     function renderKeyInfo(status) {
       const stat = $("tokStat");
-      const t = ((status && status.qd) || {}).token || {};
+      const qdS = (status && status.qd) || {};
+      const t = qdS.token || {};
+      const p = qdS.patch || {};
       if (stat) {
         stat.innerHTML = t.configured
           ? '<span style="color:var(--ok)">✔ 已读到令牌</span>　<span class="mono">' + (t.tokenFile || "") + '</span>'
           + '<br><span>令牌每次 Qoder 启动会轮换，中转按此文件现读，无需重启</span>'
-          : '<span style="color:var(--err)">✘ 未读到令牌</span>　请启动 Qoder 桌面端（补丁会自动写入令牌文件）';
+          : '<span style="color:var(--err)">✘ 未读到令牌</span>　' + (p.ready
+            ? "补丁已装 —— 请启动 Qoder 桌面端并保持运行"
+            : '<b>本机还没装补丁</b> —— 点下方「一键装补丁」（第 1 步）');
       }
+      // 补丁状态行（新电脑上最关键的诊断：到底是补丁没装，还是 Qoder 没开）
+      const ps = $("qdPatchStat");
+      if (ps) {
+        const bits = [];
+        if (!p.found) {
+          bits.push('<span style="color:var(--err)">✘ 没找到 Qoder 安装目录</span>　请确认已装 Qoder 桌面端（国际版）');
+        } else {
+          bits.push(p.ready
+            ? '<span style="color:var(--ok)">✔ 补丁已装</span>　' + p.patched + "/" + p.found + " 个 worker 副本"
+            : '<span style="color:var(--err)">✘ 补丁未装</span>　发现 ' + p.found + " 个 worker 副本");
+          bits.push(p.tokenFresh
+            ? '<span>令牌文件新鲜（Qoder 正在刷新）</span>'
+            : '<span style="color:var(--dim)">令牌文件未刷新 —— Qoder 没开或没发请求</span>');
+        }
+        if (p.cn) bits.push('<span style="color:var(--dim)">另有国内版 Qoder CN ' + p.cn + ' 份，有意跳过</span>');
+        ps.innerHTML = bits.join("<br>");
+      }
+    }
+
+    /* ---------- 一键装/还原补丁（v1.0.57） ---------- */
+    // 新电脑上用户唯一需要做的事：点一下。服务端 qoder-patch.mjs 会用 Node 自己
+    // 扫描所有 Qoder 安装目录、打补丁，不需要用户装 Python、也不需要指定路径。
+    const api = ctx.api;
+    const runPatch = (btn, url, okMsg) => {
+      if (typeof ctx.withBusy === "function") {
+        ctx.withBusy(btn, async () => {
+          const r = await api(url, { method: "POST" });
+          const box = $("qdPatchResult");
+          if (r && r.ok) {
+            let msg = okMsg;
+            if (r.results && r.results.length) {
+              msg += "（" + r.results.map((x) => x.ver + " " + x.state).join("、") + "）";
+            }
+            if (box) { box.className = "result ok"; box.textContent = "✔ " + msg; }
+            if (typeof ctx.showInfo === "function") ctx.showInfo("Qoder 补丁", "完成。请确认 Qoder 桌面端正在运行。");
+          } else {
+            const err = (r && (r.error || (r.results || []).map((x) => x.ver + ":" + (x.note || x.state)).join(" "))) || "未知错误";
+            if (box) { box.className = "result err"; box.textContent = "✘ " + err; }
+          }
+          if (typeof ctx.poll === "function") ctx.poll();
+        });
+      }
+    };
+    if (QD) {
+      const bp = $("btnQdPatch"), br = $("btnQdRevert");
+      if (bp) bp.addEventListener("click", () => runPatch(bp, "/api/qd/patch/apply", "补丁已装到所有 Qoder 版本"));
+      if (br) br.addEventListener("click", () => runPatch(br, "/api/qd/patch/revert", "已还原 Qoder 客户端（补丁移除）"));
     }
 
     // 目录刷新：服务端按 mtime 缓存 30 分钟，代价可忽略，所以每轮轮询都可以刷。
