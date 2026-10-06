@@ -165,6 +165,10 @@ function spawnServer() {
   addNoProxyHost(cfg.sn?.upstream || "https://token.sensenova.cn", cfg.sn?.useProxy);
   addNoProxyHost(cfg.zen?.upstream || "https://opencode.ai/zen/v1", cfg.zen?.useProxy);
   addNoProxyHost(cfg.qd?.upstream || "https://api2-v2.qoder.sh/model/v1", cfg.qd?.useProxy);
+  // OpenRouter（第 6 家，v1.0.59）：与 server.mjs 的 computeNoProxy 最后一行**逐字同构**
+  // （同上游默认值、同 useProxy 判据、同为末位追加）。任一侧漏改 → NO_PROXY 漂移 →
+  // server 自检重启 exit(0) → 下面的看门狗计成崩溃 → 无限重启（v1.0.37 加 zen 真实发生过）。
+  addNoProxyHost(cfg.or?.upstream || "https://openrouter.ai/api/v1", cfg.or?.useProxy);
   const env = {
     ...process.env,
     NODE_USE_ENV_PROXY: "1",

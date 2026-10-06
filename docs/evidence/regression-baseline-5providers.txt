@@ -1,0 +1,24 @@
+# 回归基线 —— 加第 6 家(OpenRouter)之前抓取（2026-10-07）
+
+## B 节：前三个任务的关键代码计数（加第6家后必须 >= 这些值）
+```
+FreeUsageLimitError  = 9
+rate_limit_quota     = 1
+upstream_500         = 2
+dumpUpstreamBody     = 3
+中转端口只承接       = 1
+wbCaptureSelfHeal    = 3
+failoverQuotaBlocked = 1
+```
+
+## C1/C7/C9：必须发生变化的输出
+```
+  ok   5 providers, 13 required fields each; key/path agree with each other and with server.mjs routes
+[C7] palette: html[data-provider] blocks vs manifest keys  (0 error, 0 warn)
+  ok   html[data-provider="bai"] (dark + light) present
+  ok   html[data-provider="sn"] (dark + light) present
+  ok   html[data-provider="wb"] (dark + light) present
+  ok   html[data-provider="zen"] (dark + light) present
+  ok   html[data-provider="qd"] (dark + light) present
+  ok   nav tabs match manifest keys and hrefs: bai, sn, wb, zen, qd
+```

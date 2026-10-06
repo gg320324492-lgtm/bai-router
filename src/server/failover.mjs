@@ -18,12 +18,39 @@ import { Writable } from "node:stream";
 // 转移就变成了"更慢的失败"。冷却期让一次故障只付一次超时代价。
 export const FAILOVER_COOLDOWN_MS = 90 * 1000;
 
-const failoverState = new Map(); // provider -> { until, lastErr }
+// 「额度用尽」是另一种失败：它不是抖动，等多久都不会自己好（实测 OpenCode Zen 的
+// FreeUsageLimitError 连打全 429，官方也未公布免费额度重置时间）。这种失败给 90 秒
+// 冷却毫无意义——冷却一过下条请求又原样撞上去。这里单独给一档长冷却：
+// 取 30 分钟是权衡：①短于任何合理的额度重置周期之外还要"能自愈"——官方真重置了，
+// 最多半小时后自动恢复，用户不用手动清冷却；②半小时才探一次，撞死渠道的代价可忽略。
+// 注意：**不要**为了个例去改上面那个全局 90 秒——那影响所有渠道的瞬时失败。
+export const FAILOVER_QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
+
+const failoverState = new Map(); // provider -> { until, lastErr, quota }
 
 // 注意：本模块不引用 server.mjs 的 noteRelayError——那是另一个模块的函数，
 // 跨模块直接调用会 ReferenceError（v1.0.43 初版踩过）。日志由调用方记。
-export function failoverCooldown(p, err) {
-  failoverState.set(p, { until: Date.now() + FAILOVER_COOLDOWN_MS, lastErr: String(err || "").slice(0, 160) });
+// opts.quota = true 表示这次失败是「额度用尽」（非瞬时），冷却按 FAILOVER_QUOTA_COOLDOWN_MS 算；
+// 不传 opts 的老调用行为完全不变（仍 90 秒）。
+export function failoverCooldown(p, err, opts) {
+  const quota = !!(opts && opts.quota);
+  const prev = failoverState.get(p);
+  // 不允许把「额度用尽」的长冷却降级成短冷却：额度冷却窗口内若又来一次别的失败
+  // （网络异常、超时…），把它冲成 90 秒等于立刻放行，下条请求又去撞已知没额度的渠道。
+  if (!quota && prev && prev.quota && prev.until > Date.now()) return;
+  failoverState.set(p, {
+    until: Date.now() + (quota ? FAILOVER_QUOTA_COOLDOWN_MS : FAILOVER_COOLDOWN_MS),
+    lastErr: String(err || "").slice(0, 160),
+    quota,
+  });
+}
+
+// 是否正处在「额度用尽」冷却中。与 failoverAvailable 分开导出，是因为两种冷却对
+// **入口提供方**的语义不同：瞬时冷却期间入口照样优先（手动选的就是首选），
+// 只有额度这种"等也没用"的失败才让入口也退到后面——见 server.mjs 的 attemptWithFailover。
+export function failoverQuotaBlocked(p) {
+  const s = failoverState.get(p);
+  return !!(s && s.quota && s.until > Date.now());
 }
 
 export function failoverAvailable(p) {
@@ -40,7 +67,7 @@ export function failoverClear(p) {
 export function failoverSnapshot() {
   const out = {};
   for (const [p, s] of failoverState) {
-    if (s.until > Date.now()) out[p] = { cooldownLeftSec: Math.ceil((s.until - Date.now()) / 1000), lastErr: s.lastErr };
+    if (s.until > Date.now()) out[p] = { cooldownLeftSec: Math.ceil((s.until - Date.now()) / 1000), lastErr: s.lastErr, quota: !!s.quota };
   }
   return out;
 }

@@ -74,6 +74,15 @@ html[data-provider="qd"] {
   --on-accent: #0d2b33;
   --accent: #3fa8c4; --accent-soft: rgba(63, 168, 196, .14); --accent-rgb: 63, 168, 196;
 }
+/* OpenRouter（第 6 家）：靛蓝强调色，与前五家（琥珀/青绿/紫/青/青）都不撞。
+   按本节规律给满 13 个变量（12 个 + --accent-rgb），暗色与下面的浅色各一份。 */
+html[data-provider="or"] {
+  --bg: #14161c; --panel: #1b1e26; --panel2: #21242e; --line: #2c3140;
+  --ink: #e5e8f0; --dim: #8b91a3;
+  --banner-bg: #22252f; --scroll-thumb: #333848; --scroll-thumb-h: #454b5e;
+  --on-accent: #0b1226;
+  --accent: #4d6bfe; --accent-soft: rgba(77, 107, 254, .14); --accent-rgb: 77, 107, 254;
+}
 
 /* ============================================================================
    3. 浅色主题（右上角按钮切换 html[data-theme]，默认暗色）
@@ -130,6 +139,13 @@ html[data-theme="light"][data-provider="qd"] {
   --scroll-thumb: #cfe0e5; --scroll-thumb-h: #b3c9d2;
   --accent: #2b7f96; --accent-soft: rgba(43, 127, 150, .12); --accent-rgb: 43, 127, 150;
   --ink: #1e2c33; --dim: #61757e;
+}
+html[data-theme="light"][data-provider="or"] {
+  --bg: #f4f6fb; --panel2: #ebeef7; --line: #d6dcef;
+  --led-off: #c2c7d4;
+  --scroll-thumb: #c4cade; --scroll-thumb-h: #a6aecb;
+  --accent: #3550d8; --accent-soft: rgba(53, 80, 216, .12); --accent-rgb: 53, 80, 216;
+  --ink: #1f2430; --dim: #646b7d;
 }
 
 /* ============================================================================

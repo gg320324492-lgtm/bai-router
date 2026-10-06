@@ -135,13 +135,17 @@ window.BAI_CARDS["token-capture"] = {
         capTick = Math.min(capTick + 1, CAP_TIPS.length - 1);
         $("pTitle").textContent = CAP_TIPS[capTick];
       }, 12000);
-      // 轮询后端进度：一旦抓到访问令牌就立刻如实反馈（不再一律转圈到超时）
+      // 轮询后端进度：如实反馈当前卡在哪一步（钩子注入没、踢侧车结果、抓到令牌没）
       capPoll = setInterval(async () => {
         try {
           const s = await api("/api/wb/capture/status");
           if (s && s.gotAccessToken) {
             $("pTitle").textContent = "已捕获到访问令牌，正在写入配置…";
             $("pDesc").textContent = "刷新令牌只在令牌到期续期时才会出现；没有它也能正常使用，到期后重新获取即可。";
+          } else if (s && s.active && s.phaseText) {
+            // 后端给的阶段文案（含踢侧车结果）优先于通用提示；附上已等待秒数
+            const secs = Math.round((s.elapsedMs || 0) / 1000);
+            $("pDesc").textContent = s.phaseText + `（已等待 ${secs} 秒，最长 150 秒）`;
           }
         } catch { /* 轮询失败不影响主流程 */ }
       }, 2000);
