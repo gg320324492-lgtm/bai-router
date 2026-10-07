@@ -191,6 +191,98 @@ const DEFAULTS = {
     useProxy: false, // 实测 openrouter.ai 直连可达；被墙时在面板勾「走本机代理」
   },
 };
+
+// ---------- WorkBuddy 版别检测（v1.0.59）：按登录域名自动选上游 ----------
+// WorkBuddy 分两版，令牌**不通用**——国内版令牌打国际端点必然 401：
+//   国际版 workbuddy-desktop-ai → 登录域名 www.workbuddy.ai → 上游 https://www.workbuddy.ai
+//   国内版 workbuddy-desktop    → 登录域名 www.workbuddy.cn → 上游 https://www.workbuddy.cn
+// 判定依据（bundle 逆向）：客户端读 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\
+// <authentication.id>.info 的 auth.domain。本机只**读**该目录判版，绝不写（契约硬约束）；
+// 注意 accessToken 落盘是 {$wbEncrypted:1, envelope:…} 加密信封，读盘取明文此路不通，
+// 令牌仍走注入捕获——这里只取 domain 判版，不碰任何令牌字段。
+const WB_UPSTREAM_INTL = "https://www.workbuddy.ai"; // 国际版默认（= DEFAULTS.wb.upstream，两处同步）
+const WB_UPSTREAM_CN = "https://www.workbuddy.cn";    // 国内版默认
+const WB_AUTH_IDS = ["workbuddy-desktop-ai", "workbuddy-desktop"]; // 两版 authentication.id
+
+// auth 目录（可注入）：测试用 BAI_WB_AUTH_DIR 指向临时伪造目录即可做双向版别验证，
+// 真实 auth 目录永远只读。
+function wbAuthDir() {
+  const inject = String(process.env.BAI_WB_AUTH_DIR || "").trim();
+  if (inject) return inject;
+  const local = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  return path.join(local, "CodeBuddyExtension", "Data", "Public", "auth");
+}
+
+// 纯函数：登录域名 → 版别。语义对齐 product.json 的 external/internalDomain 分流：
+//   *.workbuddy.ai（含 www.workbuddy.ai）→ "intl"；
+//   其余非空域名（www.workbuddy.cn、copilot.tencent.com 等 internalDomain）→ "cn"；
+//   空/缺失/读不出 → null（读不到登录态时不做任何上游翻转）。
+function wbEditionOfDomain(domain) {
+  const raw = String(domain == null ? "" : domain).trim().toLowerCase();
+  if (!raw) return null;
+  let host = "";
+  try { host = new URL(raw.includes("://") ? raw : "https://" + raw).hostname; }
+  catch { host = raw.split("/")[0].split(":")[0]; }
+  host = host.replace(/\.+$/, "");
+  if (!host) return null;
+  return host === "workbuddy.ai" || host.endsWith(".workbuddy.ai") ? "intl" : "cn";
+}
+
+// 纯函数：读指定 auth 目录里「活跃」的登录文件（两版 id 都试）。
+// 只认精确文件名 <id>.info——`*.logged-out`（已登出）与 `<id>.<ISO时间戳>….info`
+// （历史快照，本机实测各有其例）一律排除；两版同时活跃时取 mtime 更新的那个（谁在用听谁的）。
+// 返回 { id, file, domain } 或 null；文件损坏时顺位试下一个，都坏则 null。
+function wbReadAuthDomain(authDir) {
+  if (!authDir) return null;
+  let names;
+  try { names = readdirSync(authDir); } catch { return null; }
+  const cands = [];
+  for (const id of WB_AUTH_IDS) {
+    const base = id + ".info";
+    if (!names.includes(base)) continue;
+    const f = path.join(authDir, base);
+    try { cands.push({ id, f, mtime: statSync(f).mtimeMs }); } catch { /* 读不到就跳过 */ }
+  }
+  if (!cands.length) return null;
+  cands.sort((a, b) => b.mtime - a.mtime);
+  for (const c of cands) {
+    try {
+      const j = JSON.parse(readFileSync(c.f, "utf8"));
+      const d = j && j.auth && typeof j.auth.domain === "string" ? j.auth.domain.trim() : "";
+      return { id: c.id, file: c.f, domain: d || null };
+    } catch { /* 这份坏了就试下一份 */ }
+  }
+  return null;
+}
+
+// 版别检测入口（带 1.5s 进程内缓存：loadCfg 每请求都走到这里，别为判版反复打磁盘）
+let wbAuthCache = { at: 0, dir: null, res: null };
+function wbDetectAuth(authDir) {
+  const dir = authDir || wbAuthDir();
+  const now = Date.now();
+  if (wbAuthCache.res && wbAuthCache.dir === dir && now - wbAuthCache.at < 1500) return wbAuthCache.res;
+  const hit = wbReadAuthDomain(dir);
+  const res = {
+    authDir: dir,
+    file: hit ? hit.file : null,
+    domain: hit ? hit.domain : null,
+    edition: hit && hit.domain ? wbEditionOfDomain(hit.domain) : null, // "cn" | "intl" | null
+  };
+  wbAuthCache = { at: now, dir, res };
+  return res;
+}
+
+// 自愈覆盖（供 loadCfg 的两条返回路径共用）：**仅当当前 upstream 恰好等于另一版的默认值**
+// 才翻转——用户显式改成过别的地址（自建中转等）一律不碰，与 fixQdFile「尊重用户设置」
+// 同一哲学。只改内存里的合并结果，不主动回写 config.json；判不出版别（null）时保持原值。
+function wbHealUpstream(w) {
+  if (!w || typeof w !== "object") return w;
+  const ed = wbDetectAuth().edition;
+  if (ed === "cn" && w.upstream === WB_UPSTREAM_INTL) w.upstream = WB_UPSTREAM_CN;
+  else if (ed === "intl" && w.upstream === WB_UPSTREAM_CN) w.upstream = WB_UPSTREAM_INTL;
+  return w;
+}
+
 function loadCfg() {
   try {
     const c = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
@@ -260,10 +352,14 @@ function loadCfg() {
     };
     merged.qd.tokenFile = fixQdFile(merged.qd.tokenFile, "qoder-token.json");
     merged.qd.modelsFile = fixQdFile(merged.qd.modelsFile, "qoder-models.json");
+    // 版别自愈（v1.0.59）：按登录域名把 wb.upstream 拨到对应版别的默认端点
+    wbHealUpstream(merged.wb);
     return merged;
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
-    return { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] }, or: { ...DEFAULTS.or, mapping: { ...DEFAULTS.or.mapping }, availableModels: [...DEFAULTS.or.availableModels], keys: [] }, failover: { ...DEFAULTS.failover, chain: [...DEFAULTS.failover.chain] } };
+    const fallback = { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] }, or: { ...DEFAULTS.or, mapping: { ...DEFAULTS.or.mapping }, availableModels: [...DEFAULTS.or.availableModels], keys: [] }, failover: { ...DEFAULTS.failover, chain: [...DEFAULTS.failover.chain] } };
+    wbHealUpstream(fallback.wb);
+    return fallback;
   }
 }
 function saveCfg(cfg) {
@@ -374,7 +470,15 @@ function launchApplyScript() {
 function computeNoProxy(cfg) {
   const list = ["127.0.0.1", "localhost"];
   const add = (host, useProxy) => { if (!useProxy && host && !list.includes(host)) list.push(host); };
-  add(hostOf(cfg.wb?.upstream || DEFAULTS.wb.upstream), cfg.wb?.useProxy === true);
+  // v1.0.59：wb 上游按登录版别在 .ai/.cn 之间自愈（loadCfg 的 wbHealUpstream），NO_PROXY 把
+  // 两个版别的默认域**都**收进来——否则切到国内版后实际打的 www.workbuddy.cn 不在表里、
+  // 直连语义失效；也免得 main.js（读原始 config）与本函数（读自愈结果）各算一张不一样的表。
+  // 这三行 add 与 src/main.js 的 addNoProxyHost 三行**逐字同步**（顺序也要一致：先 intl、
+  // 再 cn、再当前 upstream 值），否则精确比对判定漂移 → 警告/重启风险（历史事故同款）。
+  const wbUseProxy = cfg.wb?.useProxy === true;
+  add(hostOf(WB_UPSTREAM_INTL), wbUseProxy);
+  add(hostOf(WB_UPSTREAM_CN), wbUseProxy);
+  add(hostOf(cfg.wb?.upstream || DEFAULTS.wb.upstream), wbUseProxy);
   add(hostOf(cfg.sn?.upstream || DEFAULTS.sn.upstream), cfg.sn?.useProxy === true);
   add(hostOf(cfg.zen?.upstream || DEFAULTS.zen.upstream), cfg.zen?.useProxy === true);
   add(hostOf(cfg.qd?.upstream || DEFAULTS.qd.upstream), cfg.qd?.useProxy === true);
@@ -1099,10 +1203,16 @@ function wbCandidateBases() {
   // ① 当前用户（最常见：%LOCALAPPDATA%\Programs\WorkBuddyAI）
   push(path.join(userLocal, "Programs", "WorkBuddyAI"));
   push(path.join(userLocal, "Programs", "workbuddy"));
+  push(path.join(userLocal, "Programs", "CodeBuddy")); // v1.0.59 国内版常见：%LOCALAPPDATA%\Programs\CodeBuddy
   push(path.join(userLocal, "WorkBuddyAI"));
-  // ② Program Files 系
+  // ② Program Files 系。v1.0.59 补国内版常见安装位：纯 `WorkBuddy`、`CodeBuddy`
+  //    （国内版 workbuddy-desktop / CodeBuddyExtension 系常落在这两个名字下）。
+  //    本机真实教训：注册表 InstallLocation 可以是空的——此时全靠候选目录，
+  //    漏一个位置就直接「未找到 WorkBuddy 程序」，所以宁多勿漏。
   for (const k of ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]) {
-    if (process.env[k]) { push(path.join(process.env[k], "WorkBuddyAI")); push(path.join(process.env[k], "WorkBuddy AI")); }
+    if (process.env[k]) {
+      for (const n of ["WorkBuddyAI", "WorkBuddy AI", "WorkBuddy", "CodeBuddy"]) push(path.join(process.env[k], n));
+    }
   }
   // ③ 所有盘符（含 D:/E:/F:…）：\Users\<用户>\AppData\Local\Programs\WorkBuddyAI 及 \Program Files\WorkBuddyAI
   //    安装程序把 LOCALAPPDATA 重定向到别的盘时，实际路径就落在这些位置
@@ -1110,8 +1220,13 @@ function wbCandidateBases() {
   const drives = [];
   for (let c = 67; c <= 90; c++) drives.push(String.fromCharCode(c) + ":"); // C: ~ Z:
   for (const d of drives) {
-    if (user) push(path.join(d, "Users", user, "AppData", "Local", "Programs", "WorkBuddyAI"));
+    if (user) {
+      push(path.join(d, "Users", user, "AppData", "Local", "Programs", "WorkBuddyAI"));
+      push(path.join(d, "Users", user, "AppData", "Local", "Programs", "CodeBuddy"));
+    }
     push(path.join(d, "Program Files", "WorkBuddyAI"));
+    push(path.join(d, "Program Files", "WorkBuddy"));
+    push(path.join(d, "Program Files", "CodeBuddy"));
   }
   return out;
 }
@@ -1416,7 +1531,7 @@ async function wbCaptureToken(timeoutMs = 150000) {
     throw new Error(`上一次获取还在进行中（已等待 ${secs} 秒）。请在 WorkBuddy 客户端里发一条消息，或稍候重试`);
   }
   const script = await findWbCliScript();
-  if (!script) throw new Error("未找到 WorkBuddy 程序（请确认本机已安装 WorkBuddy AI 客户端）");
+  if (!script) throw new Error("未找到 WorkBuddy 程序（请确认本机已安装国内版 WorkBuddy 或国际版 WorkBuddy AI 客户端）");
   const outFile = path.join(DATA_DIR, "wb-captured-token.json");
   await fsPromises.rm(outFile, { force: true }).catch(() => { });
   const original = await fsPromises.readFile(script, "utf8");
@@ -3059,6 +3174,9 @@ async function statusPayload() {
   let qdTok = null;
   try { qdTok = qdEnsureToken(cfg); } catch { }
   const wbExp = wbTokenExp(cfg.wb?.accessToken);
+  // 版别（v1.0.59）：按登录域名判定 cn/intl（读不到登录文件 → null），面板要能
+  // 一眼看出「现在配的是哪版的通道、实际上游拨到了哪个端点」
+  const wbAuthNow = wbDetectAuth();
   // OpenRouter 的额度真相（/auth/key）：面板轮询走 60 秒缓存，不打上游
   const orQuota = orQuotaSnapshot(cfg);
   const orKeysNow = orKeys(cfg);
@@ -3090,6 +3208,10 @@ async function statusPayload() {
     wb: {
       relay: wb.relay, relayLast: wb.relayLast, upstream: wb.upstream, recent: wb.recent,
       useProxy: cfg.wb?.useProxy === true,
+      // 版别（v1.0.59）："cn"=国内版 / "intl"=国际版 / null=读不到登录文件；
+      // authDomain 为登录文件里的 auth.domain 原文（配合上游 host 即能看出是否已自动拨对）
+      edition: wbAuthNow.edition,
+      authDomain: wbAuthNow.domain,
       // 令牌体检：有无令牌、访问令牌到期时间、是否带刷新令牌
       token: {
         configured: !!cfg.wb?.accessToken,

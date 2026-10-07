@@ -83,10 +83,21 @@ window.BAI_CARDS["token-capture"] = {
           return typeof p.exp === "number" ? p.exp : null;
         } catch { return null; }
       })();
-      if (!wb.accessToken) stat.innerHTML = `<span>访问令牌：<b class="warn">未配置</b></span>`;
+      // 版别与实际上游（v1.0.59）：面板一眼看出「现在配的是哪版的通道」。
+      // 版别来自 /api/status 的 wb.edition（按登录域名判定），上游取自愈后的配置值。
+      const stWb = (ctx.status && ctx.status.wb) || {};
+      const esc = typeof ctx.esc === "function" ? ctx.esc : (s) => String(s == null ? "" : s);
+      const edTxt = stWb.edition === "cn" ? "<b>国内版 WorkBuddy</b>（.cn）"
+        : stWb.edition === "intl" ? "<b>国际版 WorkBuddy AI</b>（.ai）"
+        : "<b>未检测到</b>（读不到登录文件）";
+      const head =
+        `<span>登录版别：${edTxt}</span>` +
+        `<span>登录域名：<b>${esc(stWb.authDomain || "—")}</b></span>` +
+        `<span>实际上游：<b>${esc(wb.upstream || "")}</b></span>`;
+      if (!wb.accessToken) stat.innerHTML = head + `<span>访问令牌：<b class="warn">未配置</b></span>`;
       else {
         const days = exp ? Math.max(0, Math.round((exp * 1000 - Date.now()) / 86400000)) : null;
-        stat.innerHTML =
+        stat.innerHTML = head +
           `<span>访问令牌：<b>已配置</b></span>` +
           (exp ? `<span>有效期至 <b>${new Date(exp * 1000).toLocaleDateString("zh-CN")}</b>（剩 ${days} 天）</span>` : `<span>有效期：<b>无法解析</b></span>`) +
           `<span>刷新令牌：<b>${wb.refreshToken ? "有（自动续期）" : "无"}</b></span>` +
