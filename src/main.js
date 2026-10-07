@@ -161,6 +161,14 @@ function spawnServer() {
     if (useProxy === true) return;
     try { const h = new URL(upstream).host; if (h && !noProxyList.includes(h)) noProxyList.push(h); } catch { }
   };
+  // WorkBuddy 版别（v1.0.59）：wb 上游按登录域名在 .ai/.cn 之间自愈切换
+  // （server.mjs 的 wbHealUpstream），NO_PROXY 把两个版别的默认域**都**收进来。
+  // 下面三行与 server.mjs computeNoProxy 的三行 add **逐字同步**（顺序也一致：
+  // 先 intl、再 cn、再当前 upstream 值）。本进程读的是原始 config.json（不自愈），
+  // server 读的是自愈后的值——只有两个默认域都进表，两边算出的 NO_PROXY 才在任何
+  // 版别/配置组合下都逐字符相等，否则又是 NO_PROXY 漂移（见本函数顶部注释）。
+  addNoProxyHost("https://www.workbuddy.ai", cfg.wb?.useProxy);
+  addNoProxyHost("https://www.workbuddy.cn", cfg.wb?.useProxy);
   addNoProxyHost(cfg.wb?.upstream || "https://www.workbuddy.ai", cfg.wb?.useProxy);
   addNoProxyHost(cfg.sn?.upstream || "https://token.sensenova.cn", cfg.sn?.useProxy);
   addNoProxyHost(cfg.zen?.upstream || "https://opencode.ai/zen/v1", cfg.zen?.useProxy);
