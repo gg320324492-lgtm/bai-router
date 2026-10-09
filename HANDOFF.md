@@ -68,12 +68,15 @@ v13 执行时，我（编排者）会逐条复验：
 4. **key 明文绝不进** `config.defaults.json` / `providers.js` / 任何会提交的文件
 5. **端口**：现有 15722/15732/15742/15752/15762 + 面板 15723，新家用 15772
 
-### 待办 / 风险：历史里的明文 SenseNova key（**等用户授权**）
+### 历史里的明文 SenseNova key —— **已清除**（2026-10-09）
 
 git 历史里 `scripts/sandbox-launch.cjs` 旧版含明文 SenseNova key `sk-1CLPUw…`（当前版本已改为读 `BAI_TEST_SN_KEY` 环境变量，工作区 0 出现）。
 
-- **本地历史改写**（`git filter-repo` 全仓）已备好方案与备份 bundle，但涉及**重写 v1.0.29–v1.0.59 共 31 个 tag** + force push，**等用户授权后执行**。
-- **该 key 应视为已泄露** —— 它随 v1.0.29–v1.0.59 共 31 个 release 的源码公开过。**正解是去 SenseNova 后台轮换/吊销该 key**；本地改写只是让**新 clone 干净**，救不了已公开的历史。
+- **本地改写已执行**：`git filter-repo` 全仓重写（`--replace-text` + `--replace-message`），46 个 commit 的 blob 已替换为 `***REMOVED***`，48 个 commit 换 SHA（含顺手把整理提交 message 的「15 份」修正为「14 份」）。
+- **远端已 force push**：main + **61 个 tag**（v1.0.29–v1.0.59 共 31 个换了 SHA；v1.0.0–v1.0.28 内容不变 SHA 不变；v1.0.60 的 tag 原本只存在于远端且指向旧 history，已补本地 tag 指向改写后的等价 Merge commit `1c8a07c` 后强推）。远端 `fix/or-free-model-modality-factor` 分支已删除，远端只剩 `main`。
+- **终验**：全历史 `sk-[A-Za-z0-9]{20,}` 0 命中；GitHub 代码搜索该完整 key 0 结果；61 个 tag 本地与远端逐一 SHA 一致；CI（manifest-gate）在改写后的历史上 success。
+- **仍待办（用户人工操作）**：该 key 已随 v1.0.29–v1.0.59 共 31 个 release 的源码公开过，应视为已泄露——**正解是去 SenseNova 后台轮换/吊销**；本地改写只保证新 clone 干净，救不了已公开的历史。GitHub 侧旧对象在 GC 前仍可能被 PR 引用/源码包取到，如需彻底 purge 需联系 GitHub Support。
+- **备份**：改写前的完整 bundle 在 `%TEMP%\bai-pre-filter.bundle` 与 `%TEMP%\bai-pre-filter-full.bundle`（verify 通过），待新 clone 验证无恙后再删。
 
 ---
 
