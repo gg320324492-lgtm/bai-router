@@ -223,6 +223,24 @@ h1 small { font-family: var(--mono); font-size: 11px; color: var(--dim); letter-
 .themeBtn:active { transform: scale(.96); }
 body.no-frame .themeBtn { margin-right: 8px; }
 
+/* 「刷新全部模型」按钮的挂位（cards/model-sync.js 注入到 header）。
+   .svc { margin-left:auto } 已经把右半边顶开了，这里只补间距、不再自带 auto——
+   两个 auto 会把中间的空白平分，按钮反而跑到页头中间去，把布局挤歪。
+   右边距也不加：.winCtrls 是 position:absolute 贴右上角，靠 .themeBtn 的
+   margin-right:146px 让位，本块跟着排就够了。
+   no-drag 显式写一遍：header { drag } + header * { no-drag } 已经覆盖了按钮
+   （见上），这里是把这个依赖关系摊开写明——将来谁把这条挪进 .prov-nav 里，
+   上面那条 header * 就压不住它了。 */
+.msync-nav { -webkit-app-region: no-drag; display: flex; align-items: center; gap: 8px; margin-left: 14px; }
+.msync-nav button {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 1px; color: var(--dim);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 99px;
+  padding: 5px 12px; cursor: pointer;
+}
+.msync-nav button:hover { color: var(--ink); border-color: var(--dim); }
+.msync-nav button:active { transform: scale(.96); }
+.msync-nav button[disabled] { opacity: .5; cursor: default; }
+
 /* ============================================================================
    6. 卡片
    ========================================================================== */
@@ -479,6 +497,25 @@ footer .paths { flex: 1; min-width: 260px; }
 .tokstat { display: flex; gap: 14px; flex-wrap: wrap; font-family: var(--mono); font-size: 11px; color: var(--dim); margin-bottom: 10px; }
 .tokstat b { color: var(--ink); font-weight: 600; }
 .tokstat b.warn { color: var(--err); }
+
+/* ---- 以下为 model-sync 卡片（跨提供方「刷新全部模型」）的汇总面板用 ----
+       一行一个提供方；增删数字是 .msync-delta 的两个子块，块内只改颜色，
+       字体/字号由 .msync-delta 继承（跟 .tokstat b 一个路子）。 */
+.msync-row {
+  display: flex; align-items: center; gap: 10px; padding: 7px 12px;
+  border: 1px solid rgba(var(--accent-rgb), .4); background: var(--accent-soft);
+  border-radius: 9px; font-size: 12.5px; color: var(--ink);
+}
+.msync-row + .msync-row { margin-top: 6px; }
+/* 有增删的行才可点开看明细（model-sync.js 据此挂 .openable/.open）——
+   没有这两条样式，可点的行和不可点的行长得一模一样，用户不知道能点。 */
+.msync-row.openable { cursor: pointer; }
+.msync-row.openable:hover { border-color: var(--dim); background: var(--panel2); }
+.msync-row.open { border-color: var(--accent); }
+.msync-delta { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--dim); white-space: nowrap; }
+.msync-add { color: var(--ok); font-weight: 600; }
+.msync-del { color: var(--err); font-weight: 600; }
+.msync-note { margin-top: 10px; font-size: 12px; color: var(--dim); line-height: 1.6; }
 
 /* ---- 以下为旧 class 名兼容：新渲染层统一发 state-mine / badge.mine，
         但 ui.html 曾用 state-bai/state-cc/badge.bai/badge.sn，sn.html 用 state-sn/badge.sn。

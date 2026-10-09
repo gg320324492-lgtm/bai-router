@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld("baiDesktop", {
   diagRetry: () => ipcRenderer.invoke("diag-retry"),
   trustCert: () => ipcRenderer.invoke("trust-cert"),
   openLog: (p) => ipcRenderer.invoke("open-log", p),
+  // 「刷新全部模型」跑完且确有变化时，弹一条 Windows 通知（主进程判空与系统支持后再弹）
+  notifyModelsChanged: (payload) => ipcRenderer.invoke("models-changed", payload),
   onAppEvent: (cb) => ipcRenderer.on("app-event", (_e, payload) => cb(payload)),
   // v1.0.34：自绘标题栏的窗口控制（浏览器直开面板时为 undefined，页面自动退回无按钮）
   winMinimize: () => ipcRenderer.invoke("win-minimize"),
