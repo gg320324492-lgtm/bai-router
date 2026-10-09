@@ -3,7 +3,7 @@
   provider.html —— 五家提供方（B.AI / SenseNova / WorkBuddy / OpenCode Zen / Qoder）共用的唯一模板。
   由 src/server/provider.html 一份模板 + panel-common.css + panel-common.js + providers.js 渲染。
 
-  约定（见 REFACTOR-CONTRACT.md）：
+   约定（见 docs/contracts/REFACTOR-CONTRACT.md）：
   · 本文件只放「外壳 + 容器 + 插槽」，具体文案一律来自 providers.js 清单，由 panel-common.js 注入。
   · 不得出现任何 inline <style>；唯一的 inline <script> 是 <head> 里那一段 data-provider 引导，
     因为它必须在 panel-common.js 之前跑，且要在首帧前定好配色（html[data-provider] 切换强调色）。

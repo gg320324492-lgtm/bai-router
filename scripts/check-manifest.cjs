@@ -152,10 +152,10 @@ const uniq = (a) => [...new Set(a)];
 const setEq = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
 
 /* ============================================================================
- * 契约常量（改这里 = 改 REFACTOR-CONTRACT.md，两边要一起改）
+ * 契约常量（改这里 = 改 docs/contracts/REFACTOR-CONTRACT.md，两边要一起改）
  * ==========================================================================*/
 
-/* C4：REFACTOR-CONTRACT.md「元素 id 约定」里逐条列出的 id。
+/* C4：docs/contracts/REFACTOR-CONTRACT.md「元素 id 约定」里逐条列出的 id。
  * 注意 #bnrUpdate / #updBtn / #btnSelfUpd / #stopBtn **不在**这里——契约写明它们由
  * panel-common.js 注入，模板里本就不该有。（见 provider.html 顶部注释同一句。） */
 const CONTRACT_IDS = [
@@ -411,7 +411,7 @@ setCheck("C4");
   let bad = 0;
   for (const id of CONTRACT_IDS) {
     const n = countId(htmlNoComment, id);
-    if (n === 0) { err(`id "${id}" (REFACTOR-CONTRACT.md "element id" list) is missing from provider.html -- panel-common.js reads it, the element would be null`); bad++; }
+    if (n === 0) { err(`id "${id}" (docs/contracts/REFACTOR-CONTRACT.md "element id" list) is missing from provider.html -- panel-common.js reads it, the element would be null`); bad++; }
     else if (n > 1) { err(`id "${id}" appears ${n} times in provider.html -- expected exactly 1 (getElementById returns only the first)`); bad++; }
   }
   if (!bad) ok(`${CONTRACT_IDS.length} contract ids, each exactly once in provider.html`);

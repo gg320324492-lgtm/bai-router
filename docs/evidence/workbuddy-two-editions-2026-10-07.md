@@ -1,6 +1,6 @@
 # 证据存档 — WorkBuddy 两版差异（国际版带 AI / 国内版不带）（2026-10-07）
 
-**状态：v1.0.59 契约 `REFACTOR-CONTRACT-v14.md` 执行中。** 本文档只存原始证据与复现命令。
+**状态：v1.0.59 契约 `../contracts/REFACTOR-CONTRACT-v14.md` 执行中。** 本文档只存原始证据与复现命令。
 
 ---
 

@@ -10,7 +10,7 @@
 > OpenRouter 上有很多免费模型。再开一个 **OpenRouter 专区**，能读取免费模型，**在免费模型过期时自动更换下一个**，保证一个持续可用的 OpenRouter 免费流水区。做**三个 key 的更换区**（用户不止一个 key）。OpenRouter 是**在没有任何模型可用时的兜底**。
 
 测试 key（用户已给，完整值见对话历史）：`sk-or-v1-…（掩码）`
-**安全红线：key 明文绝不写进 `config.defaults.json`（随包种子）、`providers.js`、`HANDOFF.md` 或任何会被提交/分发的文件。** 只能进 `%APPDATA%\bai-router\config.json`（本机，已 gitignore）。
+**安全红线：key 明文绝不写进 `config.defaults.json`（随包种子）、`providers.js`、`../../HANDOFF.md` 或任何会被提交/分发的文件。** 只能进 `%APPDATA%\bai-router\config.json`（本机，已 gitignore）。
 
 ---
 

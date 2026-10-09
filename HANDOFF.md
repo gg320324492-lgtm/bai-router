@@ -14,12 +14,12 @@
 
 | 顺序 | 任务 | 契约 | 状态 |
 |---|---|---|---|
-| 1 | OpenCode Zen 429 归因 + 故障转移让位 | `REFACTOR-CONTRACT-v12.md` | ✅ 完成并复验 |
-| 2 | 修 Qoder 中转 Bug A/B | `REFACTOR-CONTRACT-v10.md` | ✅ 完成并复验 |
-| 3 | Zen 500 文案 + WorkBuddy 令牌（v1.0.58） | `REFACTOR-CONTRACT-v11.md` | ✅ 完成并复验 |
-| 4 | **OpenRouter 免费兜底区**（第 6 个提供方） | `REFACTOR-CONTRACT-v13.md` | ✅ 完成并复验 |
+| 1 | OpenCode Zen 429 归因 + 故障转移让位 | `docs/contracts/REFACTOR-CONTRACT-v12.md` | ✅ 完成并复验 |
+| 2 | 修 Qoder 中转 Bug A/B | `docs/contracts/REFACTOR-CONTRACT-v10.md` | ✅ 完成并复验 |
+| 3 | Zen 500 文案 + WorkBuddy 令牌（v1.0.58） | `docs/contracts/REFACTOR-CONTRACT-v11.md` | ✅ 完成并复验 |
+| 4 | **OpenRouter 免费兜底区**（第 6 个提供方） | `docs/contracts/REFACTOR-CONTRACT-v13.md` | ✅ 完成并复验 |
 | 5 | 发布 v1.0.58（bump → 打包 → 推送 → publish） | `docs/evidence/release-checklist-1.0.58.md` | ✅ **已发布** [v1.0.58](https://github.com/gg320324492-lgtm/bai-router/releases/tag/v1.0.58)（2026-10-07，两道闸门全过、latest.yml 带 releaseNotes、快照脱敏复验 C13=0） |
-| 6 | **WorkBuddy 国内版支持（v1.0.59）** | `REFACTOR-CONTRACT-v14.md` + `docs/evidence/workbuddy-two-editions-2026-10-07.md` | ✅ **已发布** [v1.0.59](https://github.com/gg320324492-lgtm/bai-router/releases/tag/v1.0.59)（三场景隔离实测：intl不翻转/cn翻转/自定义不覆盖；闸门0；.cn 对话路径未真机验证） |
+| 6 | **WorkBuddy 国内版支持（v1.0.59）** | `docs/contracts/REFACTOR-CONTRACT-v14.md` + `docs/evidence/workbuddy-two-editions-2026-10-07.md` | ✅ **已发布** [v1.0.59](https://github.com/gg320324492-lgtm/bai-router/releases/tag/v1.0.59)（三场景隔离实测：intl不翻转/cn翻转/自定义不覆盖；闸门0；.cn 对话路径未真机验证） |
 
 **任务 1–4 全部完成。** 复验方式统一为：隔离实例实测（17xxx 端口）+ 闸门全量 + 回归计数比对基线，**不采信 agent 自述**。
 
@@ -125,7 +125,7 @@ WorkBuddyAI.exe
 
 ## 三、Qoder —— 已实测确证「链路是通的」
 
-用户报告「本机 Qoder 接入失败」。实测**中转和上游都正常**（HTTP 200）。详见 `REFACTOR-CONTRACT-v10.md`。
+用户报告「本机 Qoder 接入失败」。实测**中转和上游都正常**（HTTP 200）。详见 `docs/contracts/REFACTOR-CONTRACT-v10.md`。
 
 要点（省得你重查）：
 

@@ -1,10 +1,10 @@
-// 一键发布新版本：先改 package.json 的 version，然后运行  node publish.mjs "更新说明"
+// 一键发布新版本：先改 package.json 的 version，然后运行  node scripts/publish.cjs "更新说明"
 // 流程：electron-builder 构建 → gh release create v<version> (exe + latest.yml)
 const { execSync, execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-const ROOT = __dirname;
+const ROOT = path.resolve(__dirname, "..");
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
 const v = pkg.version;
 const owner = pkg.build.publish[0].owner, repo = pkg.build.publish[0].repo;
@@ -12,7 +12,7 @@ const exe = `BARRouter-Setup-${v}.exe`;
 
 // 更新日志来源（v1.0.51）：release-notes.md 是唯一权威来源。
 // 理由：该文件同时被 electron-builder（build.releaseInfo.releaseNotesFile）写进
-// latest.yml —— 也就是客户端「软件内更新」真正读的那份。命令行 `node publish.cjs "..."` 只发
+// latest.yml —— 也就是客户端「软件内更新」真正读的那份。命令行 `node scripts/publish.cjs "..."` 只发
 // GitHub release 页面（人看的），两者分开就会漂移（这就是本次要修的"数据链路断在中间"）。
 // 所以：文件存在 → 一律以文件为准，命令行参数降级为「GitHub release 正文」的补充说明；
 // 文件不存在 → 回退到旧的命令行参数行为，保证老习惯仍可用，不硬失败。

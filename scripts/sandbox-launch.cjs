@@ -32,7 +32,9 @@ if (!fs.existsSync(path.join(DATA, "config.json"))) {
       "claude-haiku-4-5": { target: "qwen3.8-flash", label: "Qwen" },
     },
     sn: {
-      apiKey: "***REMOVED***", upstream: "https://token.sensenova.cn",
+      // 自测 SenseNova 需要真 key：本机先 `$env:BAI_TEST_SN_KEY = "sk-..."` 再跑本脚本。
+      // 绝不把真 key 写进仓库（安全红线，C13 闸门同理）——留空则 sn 档位探测会 401，属预期。
+      apiKey: process.env.BAI_TEST_SN_KEY || "", upstream: "https://token.sensenova.cn",
       relayPort: 16732, defaultModel: "sensenova-6.8-flash-lite",
       availableModels: ["sensenova-6.8-flash-lite", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.2", "kimi-k3"],
       mapping: {
@@ -45,7 +47,8 @@ if (!fs.existsSync(path.join(DATA, "config.json"))) {
   }, null, 2) + "\n");
 }
 
-const SRV = "C:\\Users\\pc\\bai-router-build\\src\\server\\server.mjs";
+// server.mjs 相对本仓库解析（scripts/ 的上一级），不再写死发布机绝对路径
+const SRV = path.resolve(__dirname, "..", "src", "server", "server.mjs");
 const child = execFile(process.execPath, [SRV], {
   env: { ...process.env, BAI_DATA_DIR: DATA, USERPROFILE: HOME, NODE_USE_ENV_PROXY: "1", NO_PROXY: "127.0.0.1,localhost", HTTP_PROXY: "", HTTPS_PROXY: "" },
   windowsHide: true,

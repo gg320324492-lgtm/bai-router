@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win nsis",
-    "publish": "node publish.cjs",
+    "publish": "node scripts/publish.cjs",
     "postinstall": "node scripts/patch-updater.cjs"
   },
   "build": {
