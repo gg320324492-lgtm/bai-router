@@ -53,7 +53,7 @@ window.BAI_PROVIDERS = {
       clash: ":7890 → 外网",
       relay: ":15722 → 上游",
     },
-    extraCards: ["failover"],
+    extraCards: ["failover", "model-sync"],
     footNote: "数据保存在 %APPDATA%\\bai-router · 切换前自动快照到 backups/",
     footNoteAlt: null,                        // 本页没有浏览器直开时的分支
     cardEyebrow: "01",                        // 契约外补充：「当前接线」卡的编号
@@ -121,7 +121,7 @@ window.BAI_PROVIDERS = {
       cc: "CC Switch",
     },
     lampSubs: { relay: ":15732 → 上游" },
-    extraCards: [],
+    extraCards: ["model-sync"],
     footNote: "SenseNova 与 B.AI 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "01",
@@ -188,7 +188,7 @@ window.BAI_PROVIDERS = {
     // 旧 wb 页未配置时副行是「在下方粘贴访问令牌」；缺这项会落到通用兜底
     // 「在下方「WorkBuddy 设置」里填」，与旧文案不一致。
     cred: { subNone: "在下方粘贴访问令牌" },
-    extraCards: ["token-capture"],
+    extraCards: ["token-capture", "model-sync"],
     footNote: "WorkBuddy 与 B.AI/SenseNova 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "状态",
@@ -254,7 +254,7 @@ window.BAI_PROVIDERS = {
       cred: "API Key",
     },
     lampSubs: { relay: ":15752 → 协议桥 → 上游", cred: "oc_sk_… 密钥" },
-    extraCards: ["model-catalog"],
+    extraCards: ["model-catalog", "model-sync"],
     footNote: "OpenCode Zen 与 B.AI/SenseNova/WorkBuddy 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "状态",
@@ -322,7 +322,7 @@ window.BAI_PROVIDERS = {
       cred: "访问令牌",
     },
     lampSubs: { relay: ":15762 → 协议桥 → 上游", cred: "读取自 Qoder 客户端" },
-    extraCards: ["model-catalog"],
+    extraCards: ["model-catalog", "model-sync"],
     footNote: "Qoder 与 B.AI/SenseNova/WorkBuddy/Zen 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "状态",
@@ -393,7 +393,7 @@ window.BAI_PROVIDERS = {
       cred: "API Key",
     },
     lampSubs: { relay: ":15772 → 协议桥 → 上游", cred: "sk-or-v1… 密钥" },
-    extraCards: ["or-rotation"],
+    extraCards: ["or-rotation", "model-sync"],
     footNote: "OpenRouter 与 B.AI/SenseNova/WorkBuddy/Zen/Qoder 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "状态",

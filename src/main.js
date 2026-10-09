@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, dialog } = require("electron");
+const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, dialog, Notification } = require("electron");
 const { spawn, execFile } = require("child_process");
 const path = require("path");
 const fs = require("fs");
@@ -854,6 +854,29 @@ ipcMain.handle("trust-cert", async () => {
   const b = await run(["-addstore", "-user", "TrustedPublisher", cer]);
   logMain(`trust-cert 导入：Root=${a ? "OK" : "FAIL"} TrustedPublisher=${b ? "OK" : "FAIL"}`);
   return { ok: a && b };
+});
+
+// 「刷新全部模型」跑完后由渲染层上报（cards/model-sync.js）。
+// 渲染层可能给 { changed: [{name,added,removed}] }、也可能只给一个计数 { count: N }——
+// 都收下，但计数一律按数组长度算，绝不把模型 id 数组直接插值成字符串。
+// 没变化一律不弹：Windows 通知一旦开始刷就烦人，宁可漏报也不误报。
+// isSupported() 为假（部分精简版系统）时静默跳过，调用方拿到 false 即可。
+ipcMain.handle("models-changed", (_e, payload) => {
+  const p = payload || {};
+  const list = Array.isArray(p.changed) ? p.changed : Array.isArray(payload) ? payload : [];
+  const nOf = (v) => (Array.isArray(v) ? v.length : Number(v) || 0);
+  const n = list.length || nOf(p.changed) || nOf(p.count);
+  if (n <= 0) return false;
+  if (typeof Notification === "undefined" || !Notification.isSupported()) return false;
+  // 最多列三家，六个全列出来通知会宽到换行，反而看不清
+  const detail = list.slice(0, 3)
+    .map((c) => `${c.name || c.key || "?"} +${nOf(c.added)}/-${nOf(c.removed)}`)
+    .join("、");
+  new Notification({
+    title: "模型列表有变化",
+    body: detail ? `${n} 个提供方有新模型：${detail}` : `${n} 个提供方有新模型`,
+  }).show();
+  return true;
 });
 
 app.on("before-quit", () => {
