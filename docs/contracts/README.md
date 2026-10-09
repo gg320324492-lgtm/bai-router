@@ -1,4 +1,4 @@
-# 历史任务契约档案（v1–v14）
+# 历史任务契约档案（v1–v16）
 
 | 契约 | 版本 | 主题 | 状态 |
 |---|---|---|---|
@@ -16,5 +16,7 @@
 | `REFACTOR-CONTRACT-v12.md` | v12 | OpenCode Zen 429 归因修正（v1.0.58） | 已完成并复验 |
 | `REFACTOR-CONTRACT-v13.md` | v13 | OpenRouter 免费兜底区（第 6 个提供方） | 已完成并复验 |
 | `REFACTOR-CONTRACT-v14.md` | v14 | WorkBuddy 国内版支持（v1.0.59） | 已完成并复验 |
+| `REFACTOR-CONTRACT-v15.md` | v15 | 公共功能主界面（总览页）+ 提供方页收敂为免费模型界面 | 已完成并复验（v1.0.61） |
+| `REFACTOR-CONTRACT-v16.md` | v16 | Claude 桌面版在 openai 桥（qd/wb/zen/or）上「模型不可用」 | 已完成并复验（v1.0.62） |
 
 本目录为历史任务契约档案，仅作追溯，不再更新；进行中的任务契约直接放仓库根。

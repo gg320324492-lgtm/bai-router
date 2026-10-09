@@ -1,6 +1,6 @@
 # HANDOFF — 让其他机器直接接手当前工作
 
-> 最后更新：2026-10-09 · 当前版本 `1.0.60`（本地与 `origin/main` **已完全同步**，整理提交 `85402f7` 已推送）
+> 最后更新：2026-10-10 · 当前版本 `1.0.62`（本地 `main` 与 `origin/main` **已同步**：两边同为 `03b4f98`「v1.0.61 发布：面板总览页改版」，ahead/behind 均为 0；v1.0.62 的改动仍在工作区未提交，`package.json` 尚未 bump，仍是 `1.0.61`）
 
 ## 这份文档给谁看
 
@@ -21,6 +21,8 @@
 | 5 | 发布 v1.0.58（bump → 打包 → 推送 → publish） | `docs/evidence/release-checklist-1.0.58.md` | ✅ **已发布** [v1.0.58](https://github.com/gg320324492-lgtm/bai-router/releases/tag/v1.0.58)（2026-10-07，两道闸门全过、latest.yml 带 releaseNotes、快照脱敏复验 C13=0） |
 | 6 | **WorkBuddy 国内版支持（v1.0.59）** | `docs/contracts/REFACTOR-CONTRACT-v14.md` + `docs/evidence/workbuddy-two-editions-2026-10-07.md` | ✅ **已发布** [v1.0.59](https://github.com/gg320324492-lgtm/bai-router/releases/tag/v1.0.59)（三场景隔离实测：intl不翻转/cn翻转/自定义不覆盖；闸门0；.cn 对话路径未真机验证） |
 | 7 | 仓库结构整理：14 份契约归档 `docs/contracts/`（附索引 README）、`publish.cjs` 移入 `scripts/`、README 新增「仓库结构」导航 | — | ✅ **已完成并推送**（commit `85402f7`，闸门全程 0 error，功能代码零 diff——仅注释/路径变动） |
+| 8 | **面板信息架构重构**：新增总览页 `/`、B.AI 迁 `/bai`、六家提供方页收敂为免费模型界面 | `docs/contracts/REFACTOR-CONTRACT-v15.md` | ✅ **已完成并发布（v1.0.61）**（commit `6a97b1b` + `03b4f98`） |
+| 9 | **Claude 桌面版「模型不可用」修复**：`count_tokens` 按规范本机估算、`GET /v1/models` 按规范应答、准入门与小请求留痕 | `docs/contracts/REFACTOR-CONTRACT-v16.md` | ✅ **已完成并发布（v1.0.62）**（隔离实例实测 200 + 上游 0 请求；桌面版真机仍待用户验证） |
 
 **任务 1–4 全部完成。** 复验方式统一为：隔离实例实测（17xxx 端口）+ 闸门全量 + 回归计数比对基线，**不采信 agent 自述**。
 
@@ -134,6 +136,54 @@ WorkBuddyAI.exe
 
 ---
 
+## Qoder / 桌面版「模型不可用」—— 根因（已实测确证）
+
+### 现象
+
+Claude **桌面版**接入 Qoder 后，UI 报：
+
+```
+Model isn't available
+There's an issue with the selected model (claude-opus-5[1m]). It may not exist or you may not have access to it.
+```
+
+**CLI 正常、B.AI/SenseNova 正常**，只有走 Qoder 的桌面版起不来。
+
+### 根因
+
+**openai 桥（qd/wb/zen/or）把桌面版的两个探测请求答错了**，桌面版据此判定「模型不可用」：
+
+1. **`POST /v1/messages/count_tokens`** 被当成模型调用 —— 真打了一次上游，还把 **assistant message 当答案**返回（`{"id":"msg_…","type":"message",…}`），**违反 Anthropic 规范**（规范要求 `{"input_tokens": <int>}`）。
+2. **`GET /v1/models`** 被准入门挡成 **405**（准入门只放行 POST）。
+
+**只有 openai 桥受影响**：
+
+- **CLI 不做这类探测** —— 所以 CLI 侧一直正常；
+- **B.AI/SenseNova 原样透传** —— `count_tokens` 由上游按规范回答，桌面版满意。
+
+### 为什么日志里看不见
+
+`POST /v1/messages` 里桌面版的**小请求**（健康探测/起标题，`max_tokens ≤128`）按设计**不写 `relayLast`**；被准入门挡掉的请求更不会写。
+
+**→ 所以「中转零记录」不等于「客户端没发请求」。** 这是本次最容易误判成「日志干净 = 没问题」的地方。
+
+### 修复与验证
+
+- **`/v1/messages/count_tokens`** —— 本机估算 `input_tokens`（字符数 ÷ 4），**不再调上游**（顺带省掉白烧的一次额度）；范围含 `system` + 全部 messages + `tools`。
+- **`GET /v1/models`** —— 按规范应答（`data[]` 取本家四档档位名 + 清单 label，`has_more:false`）；准入门对**非**这两个端点的 404/405 语义原样保留。
+- **日志留痕** —— 准入门每次拒绝（404/405）留一行「方法 + 路径 + 状态码」；桥的小请求也留一行访问行。**只记路径与状态，不记 body、不落盘文件**；正常对话（`max_tokens ≥ 512`）继续走既有 `relayLast`，不刷屏。
+- **验证** —— 隔离实例实测：响应 **200**、响应体符合规范、**上游 0 请求**。
+
+### 仍待人工验证
+
+本机**没有可被自动驱动的 Claude 桌面版会话**，无法自动确认「桌面版真的因此恢复可用」。
+
+**需用户在正式机升级到含本修复的版本后确认**：重新接入 Qoder、在桌面版发一条消息。
+
+**若仍复现 —— `%APPDATA%\bai-router\server.log` 里的新留痕行就是下一步线索**（能看到桌面版到底打了哪些路径）。
+
+---
+
 ## 三、Qoder —— 已实测确证「链路是通的」
 
 用户报告「本机 Qoder 接入失败」。实测**中转和上游都正常**（HTTP 200）。详见 `docs/contracts/REFACTOR-CONTRACT-v10.md`。
@@ -238,10 +288,10 @@ md5sum cli/bin/codebuddy   # 应为 d3d1378b8efccc9dba2af9061cb3508d，11407 字
 
 ---
 
-## 七、发布流程（v1.0.58）
+## 七、发布流程（v1.0.62）
 
-完整清单：**`docs/evidence/release-checklist-1.0.58.md`**
-release notes 草稿：**`docs/evidence/release-notes-1.0.58-draft.md`**
+完整清单：**`docs/evidence/release-checklist-1.0.61.md`**（1.0.62 尚未另出清单，沿用同一份；步骤无变化）
+release notes 草稿：**`docs/evidence/release-notes-1.0.61-draft.md`**（1.0.62 草稿待写）
 
 **四个已知风险**（清单里有详细说明）：
 1. **`dist/win-unpacked` 是 v1.0.57 旧产物** —— 不重打包就跑 `verify-artifact` 是**假绿灯**

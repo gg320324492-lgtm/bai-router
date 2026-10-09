@@ -654,6 +654,73 @@ function resolveModel(name, cfg) {
   return cfg.defaultModel;
 }
 
+// ---------- 桌面版可用性探测的两个端点（本机应答，不进模型调用链路）----------
+// 桌面版在把模型显示进选择器之前会先探测推理网关：POST /v1/messages/count_tokens（数 token）
+// 与 GET /v1/models（列模型）。以前这两个请求都落进了模型调用链路——count_tokens 真的打了一次
+// 上游，并把完整的 assistant message 当答案返回（违反 Anthropic 规范，规范只要 input_tokens）；
+// /v1/models 则被准入门 405 掉。桌面版据此判定「模型不可用」。CLI 不做这类探测，所以 CLI 侧
+// 一直正常；B.AI/SenseNova 是原样透传、count_tokens 由上游按规范回答，也正常——
+// 只有 openai 桥（wb/qd/zen/or）受影响。
+
+// 取一段 Anthropic 内容（字符串 / 块数组 / 嵌套块）的字符数。
+function anthroChars(v) {
+  if (v == null) return 0;
+  if (typeof v === "string") return v.length;
+  if (Array.isArray(v)) return v.reduce((n, x) => n + anthroChars(x), 0);
+  if (typeof v === "object") {
+    let n = 0;
+    if (typeof v.text === "string") n += v.text.length;
+    if (v.content !== undefined) n += anthroChars(v.content);
+    // tool_use / tool_result 的结构化载荷：按其 JSON 字符数一并计入，宁多勿少
+    if (v.input !== undefined) { try { n += JSON.stringify(v.input).length; } catch { } }
+    return n;
+  }
+  return 0;
+}
+
+// token 估算口径：**不调上游、不做真实分词**，纯按字符数近似（4 字符 ≈ 1 token）。
+// Anthropic 客户端只用这个数做预算/截断判断，不要求精确；而真要精确就得为一次计数再打一次
+// 上游——那正是这里要消掉的白烧额度。覆盖范围：system + 全部 messages + tools（含 input_schema）。
+function estimateInputTokens(j) {
+  let chars = 0;
+  chars += anthroChars(j.system);
+  if (Array.isArray(j.messages)) {
+    for (const m of j.messages) chars += anthroChars(m && m.content !== undefined ? m.content : m);
+  }
+  if (Array.isArray(j.tools)) {
+    for (const t of j.tools) {
+      if (!t || typeof t !== "object") continue;
+      chars += anthroChars(t.name) + anthroChars(t.description);
+      if (t.input_schema !== undefined) { try { chars += JSON.stringify(t.input_schema).length; } catch { } }
+    }
+  }
+  if (j.tool_choice !== undefined) chars += anthroChars(j.tool_choice);
+  return Math.max(1, Math.ceil(chars / 4)); // 下限 1：空请求也回一个像样的正整数
+}
+
+// GET /v1/models 的应答体：清单驱动——档位取 TIERS（不写死任何提供方名），
+// display_name 取本家 mapping 里该档的 label（正是写进桌面版 inferenceModels 的 labelOverride），
+// 找不到就退回档位 key。[1m] 之类的 1M 变体不列——桌面版按基础名匹配 inferenceModels。
+function relayModelsPayload(mapping) {
+  return {
+    data: TIERS.map((t) => ({
+      type: "model",
+      id: t.key,
+      display_name: (mapping && mapping[t.key] && mapping[t.key].label) || t.key,
+    })),
+    has_more: false,
+  };
+}
+
+// 准入门挡下请求时：先留一行痕（方法 + 路径 + 状态码 + 一句话用途），再按**原有语义**应答。
+// 留痕的理由：桌面版到底打了哪些方法/路径，以前只能靠猜（405 一律笼统），中转观察里也看不见
+// （被挡的请求压根不进那条记录）。只记方法与路径，不记 body、不落盘。
+// tag 区分「不认识的路径/方法」与「认识但请求体坏了」——两者都不是成功，留痕措辞必须如实。
+function rejectRelay(req, res, pathOnly, status, msg, tag) {
+  log(`${tag || "未识别请求"}：${req.method} ${pathOnly} → ${status}（${msg}）`);
+  return wbAnthroError(res, status, msg);
+}
+
 // 最近真实调用观察（Claude Code 每次请求都会经过中转，天然全知）
 // 每个提供方一份：B.AI 侧观察不能依赖 sn 侧流量，反之亦然。记录逻辑内联在 makeRelay 里。
 const recentCallsBai = [];  // {tier, served, at}
@@ -2784,16 +2851,49 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
       // 注意：必须在 body 收完（本回调内）再应答——req.on("data") 已经在收集，
       // 提前 return 而不 res.end() 会让 socket 一直挂着。
       // 只门 openai 桥：bAI/SenseNova 是原样透传中转，非 /v1/ 路径交给上游自己答，保持原行为。
+      const urlPath = String(req.url || "").split("?")[0];
       if (opts.openai) {
-        const pathOnly = String(req.url || "").split("?")[0];
+        // 端点匹配用：容忍结尾多余的 "/"（路径归一化只影响识别，判 404 的文案仍用原样 urlPath）
+        const epPath = urlPath.length > 1 ? urlPath.replace(/\/+$/, "") : urlPath;
         setErrProvider(relayLabel(p));
-        if (!pathOnly.startsWith("/v1/")) {
+        // —— 桌面版探测端点 ①：token 计数。本机按字符数估算应答，绝不为此调用上游 ——
+        if (epPath === "/v1/messages/count_tokens") {
+          if (req.method !== "POST") {
+            try { res.setHeader("Allow", "POST"); } catch { }
+            return rejectRelay(req, res, urlPath, 405,
+              `${req.method} 不被识别——token 计数只接受 POST /v1/messages/count_tokens`);
+          }
+          const ctc = (req.headers["content-type"] || "").toLowerCase();
+          let j = null;
+          try { j = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { }
+          if (!j || typeof j !== "object" || Array.isArray(j)) {
+            return rejectRelay(req, res, urlPath, 400,
+              `请求体无法解析为 Anthropic messages JSON：${ctc.includes("json") ? "body 不是合法 JSON" : "Content-Type 不是 JSON"}｜Content-Type=${ctc || "(未带 Content-Type)"}｜长度=${Buffer.concat(chunks).length} 字节`,
+              "token 计数请求体非法");
+          }
+          const n = estimateInputTokens(j);
+          json(res, 200, { input_tokens: n });   // Anthropic 规范：只有这一个字段
+          log(`token 计数：POST ${urlPath} → 200（本机估算 input_tokens=${n}，未调用上游）`);
+          return;
+        }
+        // —— 桌面版探测端点 ②：模型列表。按本家映射回清单档位，不打上游 ——
+        if (epPath === "/v1/models") {
+          if (req.method !== "GET") {
+            try { res.setHeader("Allow", "GET"); } catch { }
+            return rejectRelay(req, res, urlPath, 405,
+              `${req.method} 不被识别——模型列表只接受 GET /v1/models`);
+          }
+          const Sm = getSlice(loadCfg());
+          return json(res, 200, relayModelsPayload(Sm && Sm.mapping));
+        }
+        if (!urlPath.startsWith("/v1/")) {
           // 面板的 /api/* 注册在面板端口那个 server 上，中转端口本来就不服务它们
-          return wbAnthroError(res, 404, `中转端口只承接 /v1/* 模型调用，不提供 ${pathOnly || "/"}（面板接口请走面板端口）`);
+          return rejectRelay(req, res, urlPath, 404,
+            `中转端口只承接 /v1/* 模型调用，不提供 ${urlPath || "/"}（面板接口请走面板端口）`);
         }
         if (req.method !== "POST") {
           try { res.setHeader("Allow", "POST"); } catch { }
-          return wbAnthroError(res, 405, `${req.method} 不是模型调用——本中转只接受 POST /v1/*`);
+          return rejectRelay(req, res, urlPath, 405, `${req.method} 不是模型调用——本中转只接受 POST /v1/*`);
         }
       }
       const cfg = loadCfg(); // 每请求实时读：映射改完立即生效，无需重启
@@ -2821,6 +2921,16 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
           rewritten = j;
           body = Buffer.from(JSON.stringify(j));
         } catch { /* 非 JSON 原样透传 */ }
+      }
+      // 桌面版后台探测类小请求（max_tokens < 512）在日志里原本完全隐形：它不算「用户正在用的
+      // 档位」，不写上面那条中转观察，也没有别的记录——排查时看不到桌面版到底打了什么。
+      // 这里补一行访问痕：只记方法、路径、状态码与耗时，不记 body、不落盘。
+      // 对话流量（max_tokens ≥ 512）继续走中转观察，不额外打日志，避免刷屏。
+      if (opts.openai && typeof (rewritten && rewritten.max_tokens) === "number" && rewritten.max_tokens < 512) {
+        const mt = rewritten.max_tokens, t0 = Date.now();
+        res.on("finish", () => {
+          log(`小请求：${req.method} ${urlPath} → ${res.statusCode}（${Math.max(0, Date.now() - t0)}ms，max_tokens=${mt}）`);
+        });
       }
       // 探活级小请求（max_tokens≤8）：更短超时
       const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();

@@ -146,7 +146,7 @@
     "useProxy": false
   },
   "failover": {
-    "enabled": false,
+    "enabled": true,
     "chain": [
       "qd",
       "bai",
