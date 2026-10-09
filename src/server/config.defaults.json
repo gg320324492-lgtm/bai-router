@@ -53,8 +53,19 @@
     "qwen3.8-27b",
     "qwen3.8-flash",
     "qwen3.8-max",
-    "deepseek-v4-flash",
-    "deepseek-v4-flash-vision-exp"
+    "claude-haiku-5.5",
+    "claude-opus-5.5",
+    "claude-sonnet-5.5",
+    "glm-5.3-flashx",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-image-2",
+    "jev-1.13.0",
+    "jev-latest",
+    "kimi-k2.8-preview",
+    "mimo-v2.6-flash",
+    "mimo-v2.6-pro"
   ],
   "mapping": {
     "claude-fable-5": {
@@ -81,16 +92,16 @@
     "defaultModel": "sensenova-6.8-flash-lite",
     "availableModels": [
       "deepseek-v4-flash",
-      "deepseek-v4-pro",
       "glm-5.2",
       "kimi-k3",
-      "sensenova-6.7-flash-lite",
-      "sensenova-6.8-flash-lite"
+      "sensenova-6.8-flash-lite",
+      "deepseek-flash",
+      "deepseek-v4.1-flash"
     ],
     "mapping": {
       "claude-fable-5": {
         "target": "sensenova-6.8-flash-lite",
-        "label": "SenseNova 6.8 Flash-Lite"
+        "label": "SenseNova-6.8-Flash-Lite"
       },
       "claude-sonnet-5": {
         "target": "deepseek-v4-flash",
@@ -135,7 +146,7 @@
     "useProxy": false
   },
   "failover": {
-    "enabled": true,
+    "enabled": false,
     "chain": [
       "qd",
       "bai",
@@ -157,7 +168,8 @@
       "qmodel",
       "kmodel",
       "dmodel",
-      "mmodel"
+      "mmodel",
+      "gmodel"
     ],
     "mapping": {
       "claude-fable-5": {
@@ -184,7 +196,7 @@
   },
   "wb": {
     "relayPort": 15742,
-    "upstream": "https://www.workbuddy.ai",
+    "upstream": "https://www.workbuddy.cn",
     "defaultModel": "deepseek-v4.1-flash",
     "availableModels": [
       "deepseek-v4.1-flash",
@@ -235,8 +247,6 @@
       "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
       "google/gemma-4-26b-a4b-it:free",
       "google/gemma-4-31b-it:free",
-      "google/lyria-3-pro-preview",
-      "google/lyria-3-clip-preview",
       "nvidia/nemotron-3-super-120b-a12b:free",
       "openrouter/free"
     ],

@@ -51,7 +51,11 @@ window.BAI_PROVIDERS = {
     foldKey: "bai.homesec3",
     lamps: ["clash", "relay", "cc"],    // 全局视角三盏：出海代理 / 中转服务 / CC Switch
     lampNames: { clash: "本机代理", relay: "中转服务", cc: "CC Switch" },
-    lampSubs: { relay: ":15723 面板端口", cc: "配置接管状态" },
+    // 副行不写死端口：paintRelay() 会剥掉开头的「:数字」并用 status 里的真实 relayPort 拼上，
+      // 后缀原样保留（panel-common.js paintRelay）。原来写「:15723 面板端口」会被显示成
+      // 「:15722 面板端口」——中转端口号配着「面板端口」字样，语义打架（v1.0.61 渲染截图时发现）。
+      // 所以这里只留 cc 的副行；relay 副行由 paintRelay 生成「:<中转端口>」。
+      lampSubs: { cc: "配置接管状态" },
     extraCards: ["failover", "model-sync", "overview"],
     footNote: "本页管公共功能（故障转移 / 接回 CC Switch / 全部刷新）；改模型映射请去上方对应提供方页签",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 本页管公共功能，模型映射在各家页签",
