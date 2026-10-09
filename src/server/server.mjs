@@ -2170,8 +2170,15 @@ async function orFetchFreeModels(cfg) {
     if (!pr) return false;
     // 实测取值是字符串 "0"；用 Number() 兼容 "0.000000" 之类的写法
     if (Number(pr.prompt) !== 0 || Number(pr.completion) !== 0) return false;
-    const outs = m.output_modalities;
-    return !Array.isArray(outs) || outs.includes("text");
+    const arch = (m && m.architecture) || {};
+    // 模态字段已从顶层挪进 architecture.output_modalities：顶层恒为 undefined 时旧写法
+    // `!Array.isArray(outs)` 永远为真，过滤器静默退化成空操作，音乐模型会混进下拉框。
+    // 判据是「输出**只有** text」而不是「包含 text」——lyria-3 是 ["text","audio"]，
+    // contains 会误放行；顶层与 architecture 都拿不到时再从 modality 串的箭头右侧兜底。
+    const outs = Array.isArray(arch.output_modalities) ? arch.output_modalities : m.output_modalities;
+    if (Array.isArray(outs)) return outs.length === 1 && outs[0] === "text";
+    const out = String(arch.modality || "").split("->")[1] || "";
+    return !out || out === "text";
   });
   const ids = [...new Set(free.map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))];
   if (!ids.length) throw new Error("OpenRouter 目录里一个 pricing 全 0 的模型都没筛出来（上游结构可能变了）");
@@ -3407,7 +3414,8 @@ const panel = http.createServer(async (req, res) => {
       if (p === "or") {
         // OpenRouter 公开目录（无需鉴权也能拉，带 key 更稳）：按 pricing 全 0 筛免费模型。
         // 判据是 pricing 而**不是 `:free` 后缀**——实测 inclusionai/ling-3.1-flash 没有后缀
-        // 但 pricing 全 0（466 个模型里 20 个免费，其中 2 个是音乐模型、已按 output_modalities 剔除）。
+        // 但 pricing 全 0（2026-10 实测 469 个模型里 19 个免费，其中 2 个 lyria 音乐模型、
+        // 1 个 ling-3.0-flash-sante 已转付费档，均已剔除，见 orFetchFreeModels 的模态判据）。
         try {
           const r = await orFetchFreeModels(c2);
           return json(res, 200, {
