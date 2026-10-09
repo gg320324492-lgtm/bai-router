@@ -175,6 +175,9 @@ body {
 body.app-frame { padding-top: 0; }
 header {
   -webkit-app-region: drag;
+  position: sticky; top: 0; z-index: 40;        /* v1.0.60 修复：header 跟着 .wrap 一起被滚走，
+                                                       顶部的最小化/最大化/关闭三个按钮随之消失。
+                                                       sticky 顶在视口顶端，按钮不再随内容滚走。 */
   padding: 14px 0 16px;                 /* 顶部留出拖动与窗口按钮的高度 */
   margin: 0 -28px 18px;                  /* 负边距贴到窗口两侧 */
   padding-left: 28px; padding-right: 8px;
@@ -194,8 +197,8 @@ header .logo-dot, header h1, header .prov-nav, header .svc { -webkit-app-region:
 .winCtrls button.close:hover { background: #c42b1c; color: #fff; }
 .winCtrls svg { width: 10px; height: 10px; stroke: currentColor; stroke-width: 1; fill: none; }
 .winCtrls button svg { fill: currentColor; stroke: none; }
-/* 非 Electron 环境（浏览器直开面板）不显示窗口按钮 */
-body.no-frame header { padding-top: 28px; }
+/* 非 Electron 环境（浏览器直开面板）不显示窗口按钮 + 没必要粘顶 */
+body.no-frame header { padding-top: 28px; position: static; }
 body.no-frame .winCtrls { display: none; }
 body.no-frame .themeBtn { right: 16px; }   /* 浏览器直开：没有窗口按钮，无需让位 */
 header h1 { padding-left: 4px; }
