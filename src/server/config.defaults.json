@@ -6,13 +6,8 @@
   "panelPort": 15723,
   "defaultModel": "qwen3.8-flash",
   "availableModels": [
-    "qwen3.8-flash",
-    "glm-5.3-flash",
-    "deepseek-v4-flash",
-    "deepseek-v4-flash-vision-exp",
-    "hy3",
-    "mimo-v2.5",
     "claude-fable-5",
+    "claude-fable-5.1",
     "claude-haiku-4.5",
     "claude-opus-4.5",
     "claude-opus-4.6",
@@ -23,14 +18,17 @@
     "claude-sonnet-4.6",
     "claude-sonnet-5",
     "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
     "gemini-3-flash",
     "gemini-3.1-pro",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
+    "gemini-3.8-flash",
     "glm-5.1",
     "glm-5.2",
     "glm-5.3",
+    "glm-5.3-flash",
     "gpt-5-mini",
     "gpt-5-nano",
     "gpt-5.2",
@@ -43,14 +41,20 @@
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-6-astra",
+    "hy3",
     "hy4-preview",
     "kimi-k2.6",
     "kimi-k3",
+    "mimo-v2.5",
     "mimo-v2.5-pro",
     "minimax-m2.7",
     "minimax-m3",
     "qwen3.8-27b",
-    "qwen3.8-max"
+    "qwen3.8-flash",
+    "qwen3.8-max",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp"
   ],
   "mapping": {
     "claude-fable-5": {
@@ -76,11 +80,12 @@
     "relayPort": 15732,
     "defaultModel": "sensenova-6.8-flash-lite",
     "availableModels": [
-      "sensenova-6.8-flash-lite",
-      "deepseek-v4-pro",
       "deepseek-v4-flash",
+      "deepseek-v4-pro",
       "glm-5.2",
-      "kimi-k3"
+      "kimi-k3",
+      "sensenova-6.7-flash-lite",
+      "sensenova-6.8-flash-lite"
     ],
     "mapping": {
       "claude-fable-5": {
@@ -88,16 +93,16 @@
         "label": "SenseNova 6.8 Flash-Lite"
       },
       "claude-sonnet-5": {
-        "target": "sensenova-6.8-flash-lite",
-        "label": "SenseNova 6.8 Flash-Lite"
+        "target": "deepseek-v4-flash",
+        "label": "DeepSeek-V4-Flash"
       },
       "claude-opus-5": {
-        "target": "sensenova-6.8-flash-lite",
-        "label": "SenseNova 6.8 Flash-Lite"
+        "target": "glm-5.2",
+        "label": "GLM-5.2"
       },
       "claude-haiku-4-5": {
-        "target": "sensenova-6.8-flash-lite",
-        "label": "SenseNova 6.8 Flash-Lite"
+        "target": "kimi-k3",
+        "label": "Kimi-K3"
       }
     }
   },
@@ -146,7 +151,13 @@
     "defaultModel": "lite",
     "availableModels": [
       "lite",
-      "auto"
+      "auto",
+      "performance",
+      "ultimate",
+      "qmodel",
+      "kmodel",
+      "dmodel",
+      "mmodel"
     ],
     "mapping": {
       "claude-fable-5": {
@@ -182,8 +193,8 @@
     ],
     "mapping": {
       "claude-fable-5": {
-        "target": "hy4-preview-f",
-        "label": "Hy4-Preview-F"
+        "target": "deepseek-v4.1-flash",
+        "label": "DeepSeek-V4.1-Flash"
       },
       "claude-sonnet-5": {
         "target": "hy4-preview-f",
@@ -201,7 +212,7 @@
     "accessToken": "",
     "refreshToken": "",
     "deviceToken": "",
-    "userId": "91a1b55c-54b8-4257-81b5-59263f1029e5",
+    "userId": "1a358c7d-a663-430a-a21e-ac4300486075",
     "useProxy": false
   },
   "or": {
@@ -209,10 +220,8 @@
     "relayPort": 15772,
     "defaultModel": "openrouter/free",
     "availableModels": [
-      "openrouter/free",
       "inclusionai/ling-3.1-flash",
       "apodex/apodex-1.1-mini:free",
-      "inclusionai/ling-3.0-flash-sante:free",
       "dots-studio/dots-3-note-preview:free",
       "liquid/lfm-2.5-2.6b:free",
       "nvidia/nemotron-3.5-lightning:free",
@@ -226,7 +235,10 @@
       "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
       "google/gemma-4-26b-a4b-it:free",
       "google/gemma-4-31b-it:free",
-      "nvidia/nemotron-3-super-120b-a12b:free"
+      "google/lyria-3-pro-preview",
+      "google/lyria-3-clip-preview",
+      "nvidia/nemotron-3-super-120b-a12b:free",
+      "openrouter/free"
     ],
     "mapping": {
       "claude-fable-5": {

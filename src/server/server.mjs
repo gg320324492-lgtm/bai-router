@@ -2170,12 +2170,127 @@ async function orFetchFreeModels(cfg) {
     if (!pr) return false;
     // 实测取值是字符串 "0"；用 Number() 兼容 "0.000000" 之类的写法
     if (Number(pr.prompt) !== 0 || Number(pr.completion) !== 0) return false;
-    const outs = m.output_modalities;
-    return !Array.isArray(outs) || outs.includes("text");
+    const arch = (m && m.architecture) || {};
+    // 模态字段已从顶层挪进 architecture.output_modalities：顶层恒为 undefined 时旧写法
+    // `!Array.isArray(outs)` 永远为真，过滤器静默退化成空操作，音乐模型会混进下拉框。
+    // 判据是「输出**只有** text」而不是「包含 text」——lyria-3 是 ["text","audio"]，
+    // contains 会误放行；顶层与 architecture 都拿不到时再从 modality 串的箭头右侧兜底。
+    const outs = Array.isArray(arch.output_modalities) ? arch.output_modalities : m.output_modalities;
+    if (Array.isArray(outs)) return outs.length === 1 && outs[0] === "text";
+    const out = String(arch.modality || "").split("->")[1] || "";
+    return !out || out === "text";
   });
   const ids = [...new Set(free.map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))];
   if (!ids.length) throw new Error("OpenRouter 目录里一个 pricing 全 0 的模型都没筛出来（上游结构可能变了）");
   return { ids, total: all.length };
+}
+
+// 带 HTTP 状态码的错误：只有「or 拉取失败」和「没填 key」两种是 400（用户自己能改），
+// 其余一律不设 httpStatus，照旧往上抛给外层 catch 记栈回 500——与抽函数前行为一致。
+function catalogError(msg, httpStatus) {
+  const e = new Error(msg);
+  e.httpStatus = httpStatus;
+  return e;
+}
+
+// v1.0.60：把「拉某一家真实模型目录」从 /api/models 的内联分支里抽出来，供
+// /api/models/scan-all 一并复用。归一化成 { ok, models, count, ... }。
+// **models 是六家唯一共同契约**，批量 diff 一律只看它——count 对 zen/qd 是全目录长度
+// 而非 models.length，直接拿来比会算出假差异。
+// 六家的怪癖全封在这里，调用方不必再分叉：
+//   or  —— 网络，按 pricing 全 0 筛免费；失败一律 400
+//   qd  —— 同步读本地明文目录，读不到退回静态内置（带 static:true，永不报错）
+//   wb  —— 没有目录接口，就是把当前配置回显（永远「无变化」）
+//   zen —— 公开目录但只有 space-bunny-free 能外部调用；拉不到时静默返回过期缓存
+//   sn  —— 走 directHttp 境内直连，只留能输出 text 的
+//   bai —— fetch 打上游 /v1/models
+async function fetchCatalogFor(p, cfg) {
+  const S = sliceOf(cfg, p);
+
+  if (p === "or") {
+    // OpenRouter 公开目录（无需鉴权也能拉，带 key 更稳）：按 pricing 全 0 筛免费模型。
+    // 判据是 pricing 而**不是 `:free` 后缀**——实测 inclusionai/ling-3.1-flash 没有后缀
+    // 但 pricing 全 0。模态判据（剔除 lyria 音乐模型）见 orFetchFreeModels。
+    try {
+      const r = await orFetchFreeModels(cfg);
+      return {
+        ok: true, count: r.ids.length, models: r.ids, freeCount: r.ids.length,
+        note: `OpenRouter 公开目录共 ${r.total} 个模型，按 pricing.prompt/completion 全为 0 筛出 ${r.ids.length} 个免费文本模型（:free 后缀不是判据）。`,
+      };
+    } catch (e) {
+      throw catalogError("拉取 OpenRouter 免费模型目录失败：" + String((e && e.message) || e).slice(0, 160), 400);
+    }
+  }
+
+  if (p === "qd") {
+    // Qoder 的目录没有公开接口，但 worker 拉回后在本地解密再 parse——补丁把那份明文
+    // 写到了 tokenFile 同级的 qoder-models.json，这里直接读，不必复刻 Cosy 签名。
+    const r = qdReadCatalog(cfg);
+    // 读不到目录也要如实标注价格：下拉里付费档不能看起来和免费档一样。
+    return r.ok ? r : qdStaticCatalog(S);
+  }
+
+  if (p === "wb") {
+    // WorkBuddy 没有公开的模型目录接口（模型清单随客户端 product config 下发），
+    // 返回当前可选列表即可——三款免费模型由发布机默认随版本推送
+    return { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true };
+  }
+
+  if (p === "zen") {
+    // Zen 提供公开模型目录（无需鉴权），但只给 id、没有价格与免费标记。
+    // 全部列出来并按实测结论标注可用性——让用户看得见"上游有什么、为什么用不了"，
+    // 而不是下拉框里只有孤零零一个模型。不可用的**不进下拉**，免得选了必然报错。
+    const cat = await zenReadCatalog();
+    const all = cat.map((id) => ({
+      key: id, name: id, free: id.includes("free"), external: ZEN_EXTERNAL_OK.has(id),
+    }));
+    const freeN = all.filter((m) => m.free).length;
+    const okN = all.filter((m) => m.external).length;
+    return {
+      ok: true, count: all.length,
+      models: all.filter((m) => m.external).map((m) => m.key),
+      all, freeCount: freeN,
+      note: cat.length
+        ? `Zen 公开目录共 ${all.length} 个模型，其中 ${freeN} 个标 free；实测只有 ${okN} 个能从中转调用。`
+          + `其余 -free 会被服务端拒为 FreeTierError（"can only be used from within OpenCode"，产品级限制，非本机可绕），付费模型则需 API Key 有余额。`
+        : "未读到 Zen 公开目录（网络或上游暂时不可达），当前显示内置列表",
+    };
+  }
+
+  // 走到这里的只有 sn 与 bai 两家——qd/wb/zen 在上面各自的分支里已经 return：
+  // qd 读本地明文目录、wb 返回静态列表、zen 是无需鉴权的公开目录，三家都不吃 key。
+  // 这两家要带 Bearer 打上游，key 为空时上游只会回一句 401/403（SenseNova 干脆是
+  // 光秃秃的 "Forbidden"），原样透出去就成了天书——用户看不出是自己的 key 没填。
+  // 所以空 key 一律**不去打上游**，直接说人话。400 而非 200：让前端的 api() 抛错，
+  // 错误才能浮到按钮旁边的结果槽，而不是被当成"拉取成功、0 个模型"。
+  if (!S.key) {
+    throw catalogError(`尚未填写 ${S.zh} API Key，无法拉取模型目录——请先在路由卡填入并点「保存映射」`, 400);
+  }
+
+  let j;
+  if (p === "sn") {
+    const r = await directHttp(S.upstream + "/v1/models", {
+      method: "GET", headers: { authorization: `Bearer ${S.key}`, "anthropic-version": "2023-06-01" }, timeoutMs: 15000,
+    });
+    j = await readProbeJson({ status: r.status, headers: r.headers, text: async () => {
+      const { Readable } = await import("node:stream");
+      return await Readable.from(r.body).reduce((s, c) => s + c, "");
+    } });
+    if (r.status >= 400) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
+    // SenseNova 目录带 modalities：只把能输出文本的模型作为可路由目标
+    const chat = (j.data || []).filter((m) => (m.output_modalities || ["text"]).includes("text"));
+    const models = [...new Set(chat.map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))].sort();
+    return { ok: true, count: models.length, models };
+  }
+
+  const r = await fetch(S.upstream + "/v1/models", {
+    headers: { authorization: `Bearer ${S.key}`, "anthropic-version": "2023-06-01" },
+    signal: AbortSignal.timeout(15000),
+  });
+  j = await readProbeJson(r);
+  if (!r.ok) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
+  const models = [...new Set((j.data || []).map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))].sort();
+  return { ok: true, count: models.length, models };
 }
 
 /* GET /api/v1/auth/key 的额度真相：面板显示 free_model_daily_requests 剩余次数。
@@ -3401,94 +3516,126 @@ const panel = http.createServer(async (req, res) => {
       const pRaw = u.searchParams.get("p");
       const p = pRaw === "sn" ? "sn" : pRaw === "wb" ? "wb" : pRaw === "zen" ? "zen" : pRaw === "qd" ? "qd" : pRaw === "or" ? "or" : "bai";
       const c2 = loadCfg();
-      const S = sliceOf(c2, p);
-      // WorkBuddy 没有公开的模型目录接口（模型清单随客户端 product config 下发），
-      // 返回当前可选列表即可——三款免费模型由发布机默认随版本推送
-      if (p === "or") {
-        // OpenRouter 公开目录（无需鉴权也能拉，带 key 更稳）：按 pricing 全 0 筛免费模型。
-        // 判据是 pricing 而**不是 `:free` 后缀**——实测 inclusionai/ling-3.1-flash 没有后缀
-        // 但 pricing 全 0（466 个模型里 20 个免费，其中 2 个是音乐模型、已按 output_modalities 剔除）。
-        try {
-          const r = await orFetchFreeModels(c2);
-          return json(res, 200, {
-            ok: true, count: r.ids.length, models: r.ids, freeCount: r.ids.length,
-            note: `OpenRouter 公开目录共 ${r.total} 个模型，按 pricing.prompt/completion 全为 0 筛出 ${r.ids.length} 个免费文本模型（:free 后缀不是判据）。`,
-          });
-        } catch (e) {
-          return json(res, 400, { error: "拉取 OpenRouter 免费模型目录失败：" + String((e && e.message) || e).slice(0, 160) });
+      try {
+        return json(res, 200, await fetchCatalogFor(p, c2));
+      } catch (e) {
+        // 只有带 httpStatus 的（or 拉取失败 / 没填 key）在这里回，前端 api() 会抛到
+        // 按钮旁边的结果槽；其余原样往上抛，由外层 catch 记栈回 500——抽函数前后一致。
+        if (!e || !e.httpStatus) throw e;
+        return json(res, e.httpStatus, { error: String((e && e.message) || e).slice(0, 200) });
+      }
+    }
+
+    // v1.0.60：六家提供方的顺序（扫描与批量写入都按这个顺序走，面板展示顺序一致）
+    const ALL_PKEYS = ["bai", "sn", "wb", "zen", "qd", "or"];
+
+    /* 一键刷新全部提供方 —— 扫描端。
+     *
+     * **本接口全程只读**：不调 saveCfg、不调 applyToCli/applyToDesktop，
+     * 扫完 config.json 必须逐字节不变（用户没点确认之前，一个字节都不许落地）。
+     *
+     * 基线取 loadCfg() 的**当前内存快照**，而不是拉回来的原始结果——onActivated() 已经把
+     * config.defaults.json 并进了每家的 availableModels，拿裸结果比会凭空多出一堆「新增」。
+     *
+     * 六家并行拉（allSettled，一家挂了不牵连其余），墙钟时间由最慢的那家（15s 超时）封顶。 */
+    if (req.method === "POST" && u.pathname === "/api/models/scan-all") {
+      const cfg = loadCfg();
+      const settled = await Promise.allSettled(ALL_PKEYS.map((k) => fetchCatalogFor(k, cfg)));
+      const providers = ALL_PKEYS.map((k, i) => {
+        const S = sliceOf(cfg, k);
+        const name = PROVIDERS[k] || k;
+        const haveArr = Array.isArray(S.availableModels) ? S.availableModels : [];
+        const base = { key: k, name, have: haveArr.length };
+        const st = settled[i];
+        if (st.status === "rejected") {
+          return { ...base, status: "error", added: [], removed: [], count: 0,
+            error: String((st.reason && st.reason.message) || st.reason || "").slice(0, 200) };
         }
-      }
-      if (p === "qd") {
-        // Qoder 的目录没有公开接口，但 worker 拉回后在本地解密再 parse——补丁把那份明文
-        // 写到了 tokenFile 同级的 qoder-models.json，这里直接读，不必复刻 Cosy 签名。
-        const r = qdReadCatalog(c2);
-        if (!r.ok) {
-          // 读不到目录也要如实标注价格：下拉里付费档不能看起来和免费档一样。
-          return json(res, 200, qdStaticCatalog(S));
+        const r = st.value || {};
+        // **只看 models，绝不用 result.count**：zen/qd 的 count 是上游全目录长度，
+        // 而 models 是筛过可用性之后的子集（zen 只留实测能外部调用的那几个）。
+        // 拿 count 当长度会算出几百条并不存在的「新增/删除」。
+        const models = Array.isArray(r.models) ? r.models : [];
+        // 状态四选一，让前端能区分「真没变化」和「压根没拿到可信数据」。
+        let status = "ok";
+        if (r.static === true) status = "static";        // qd 读不到本地目录退回内置静态表 / wb 本就只是回显配置
+        else if (!models.length) status = "empty";      // zenReadCatalog() 会吞掉错误返回过期空缓存（HTTP 200），空列表是真故障
+        // **只有 status==="ok" 才比差异。** 没拿到可信目录时算出来的 added/removed 是假的：
+        //   empty —— 上游没给任何模型，「removed」会等于当前整张列表，照着应用就把配置洗成空；
+        //   static —— qd 退回的是内置表，拿它跟真实配置比会凭空冒出差异。
+        // 这层闸门放在服务端而不是前端：前端六个状态里漏判一个就是一次静默的数据丢失。
+        if (status !== "ok") {
+          return { ...base, status, added: [], removed: [], count: 0,
+            ...(r.note ? { note: r.note } : {}) };
         }
-        return json(res, 200, r);
-      }
-      if (p === "wb") {
-        return json(res, 200, { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true });
-      }
-      if (p === "zen") {
-        // Zen 提供公开模型目录（无需鉴权），但只给 id、没有价格与免费标记。
-        // 全部列出来并按实测结论标注可用性——让用户看得见"上游有什么、为什么用不了"，
-        // 而不是下拉框里只有孤零零一个模型。不可用的**不进下拉**，免得选了必然报错。
-        const cat = await zenReadCatalog();
-        const all = cat.map((id) => ({
-          key: id,
-          name: id,
-          free: id.includes("free"),
-          external: ZEN_EXTERNAL_OK.has(id),
-        }));
-        const freeN = all.filter((m) => m.free).length;
-        const okN = all.filter((m) => m.external).length;
-        return json(res, 200, {
-          ok: true, count: all.length,
-          models: all.filter((m) => m.external).map((m) => m.key),
-          all,
-          freeCount: freeN,
-          note: cat.length
-            ? `Zen 公开目录共 ${all.length} 个模型，其中 ${freeN} 个标 free；实测只有 ${okN} 个能从中转调用。`
-              + `其余 -free 会被服务端拒为 FreeTierError（"can only be used from within OpenCode"，产品级限制，非本机可绕），付费模型则需 API Key 有余额。`
-            : "未读到 Zen 公开目录（网络或上游暂时不可达），当前显示内置列表",
-        });
-      }
-      // 走到这里的只有 sn 与 bai 两家——qd/wb/zen 在上面各自的分支里已经 return：
-      // qd 读本地明文目录、wb 返回静态列表、zen 是无需鉴权的公开目录，三家都不吃 key。
-      // 这两家要带 Bearer 打上游，key 为空时上游只会回一句 401/403（SenseNova 干脆是
-      // 光秃秃的 "Forbidden"），原样透出去就成了天书——用户看不出是自己的 key 没填。
-      // 所以空 key 一律**不去打上游**，直接说人话。400 而非 200：让前端的 api() 抛错，
-      // 错误才会经 withBusy 落到按钮旁边的结果槽，而不是被当成"拉取成功、0 个模型"。
-      if (!S.key) {
-        return json(res, 400, {
-          error: `尚未填写 ${S.zh} API Key，无法拉取模型目录——请先在路由卡填入并点「保存映射」`,
-        });
-      }
-      let j;
-      if (p === "sn") {
-        const r = await directHttp(S.upstream + "/v1/models", {
-          method: "GET", headers: { authorization: `Bearer ${S.key}`, "anthropic-version": "2023-06-01" }, timeoutMs: 15000,
-        });
-        j = await readProbeJson({ status: r.status, headers: r.headers, text: async () => {
-          const { Readable } = await import("node:stream");
-          return await Readable.from(r.body).reduce((s, c) => s + c, "");
-        } });
-        if (r.status >= 400) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
-        // SenseNova 目录带 modalities：只把能输出文本的模型作为可路由目标
-        const chat = (j.data || []).filter((m) => (m.output_modalities || ["text"]).includes("text"));
-        const models = [...new Set(chat.map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))].sort();
-        return json(res, 200, { ok: true, count: models.length, models });
-      }
-      const r = await fetch(S.upstream + "/v1/models", {
-        headers: { authorization: `Bearer ${S.key}`, "anthropic-version": "2023-06-01" },
-        signal: AbortSignal.timeout(15000),
+        // 比对一律转小写：POST /api/config 存进去的都是小写，但 wb 是把配置原样回显、
+        // qd 也未必归一，不转小写会把大小写差异当成模型增减。
+        const cur = new Set(haveArr.map((x) => String(x).trim().toLowerCase()));
+        const next = new Set(models.map((x) => String(x).trim().toLowerCase()).filter(Boolean));
+        const added = [...next].filter((x) => !cur.has(x));
+        const removed = [...cur].filter((x) => !next.has(x));
+        return { ...base, status, added, removed, count: next.size, ...(r.note ? { note: r.note } : {}) };
       });
-      j = await readProbeJson(r);
-      if (!r.ok) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
-      const models = [...new Set((j.data || []).map((m) => String(m.id || "").trim().toLowerCase()).filter(Boolean))].sort();
-      return json(res, 200, { ok: true, count: models.length, models });
+      const changed = providers.some((x) => x.added.length || x.removed.length);
+      return json(res, 200, { ok: true, changed, providers });
+    }
+
+    /* 一键刷新全部提供方 —— 写入端。
+     *
+     * 为什么必须单独一趟而不是让前端并发打六次 /api/config：saveCfg 走 writeAtomic 整文件
+     * 重写且**没有锁**，六次并发各自读到不同快照，最后一次写会把另外五家的改动悄无声息地覆盖掉。
+     * 所以这里 loadCfg() 一次、攒够六家再 saveCfg() 一次。 */
+    if (req.method === "POST" && u.pathname === "/api/models/apply-all") {
+      const b = await readBody(req);
+      const apply = b && typeof b === "object" && b.apply && typeof b.apply === "object" && !Array.isArray(b.apply) ? b.apply : null;
+      if (!apply) return json(res, 400, { error: "请求体需为 { apply: { 提供方键: [模型 id…] } }" });
+      const cfg = loadCfg();
+      const done = [], skipped = [];
+      for (const k of ALL_PKEYS) {
+        if (!Object.prototype.hasOwnProperty.call(apply, k)) continue;
+        const ids = apply[k];
+        // 未知键直接不认（ALL_PKEYS 之外的根本不会走到这里），非数组也只跳过不抛——
+        // 这一趟是整批写入，宁可少写一家也不能因为一家的脏数据把其余五家一起拖下水
+        if (!Array.isArray(ids)) { skipped.push(k); continue; }
+        // 归一化与 POST /api/config 完全一致：去空白 → 转小写 → 去空 → 去重
+        const arr = ids.map((x) => String(x == null ? "" : x).trim().toLowerCase()).filter(Boolean);
+        // **空数组保持原列表不动**（沿用 /api/config 的既有语义）：宁可留着旧列表，
+        // 也不能让一次误操作把某家的模型列表整个清空
+        if (!arr.length) { skipped.push(k); continue; }
+        // bai 是「扁平」的：它的字段就写在 cfg 顶层，没有 cfg.bai 这一层包装
+        if (k !== "bai" && !cfg[k]) cfg[k] = { ...(DEFAULTS[k] || {}) };
+        const sub = k === "bai" ? cfg : cfg[k];
+        // 防呆：正在用的四档映射目标绝不能被刷掉。与面板单家刷新同一条规矩
+        // （panel-common.js 的 refreshModels）——目标一旦不在下拉里，面板就会显示成
+        // 「未映射」，等于这次刷新把用户的配置改坏了。
+        const keep = Object.values(sub.mapping || {}).map((m) => String((m || {}).target || "").trim().toLowerCase()).filter(Boolean);
+        sub.availableModels = [...new Set([...arr, ...keep])];
+        done.push(k);
+      }
+      if (!done.length) {
+        return json(res, 200, { ok: true, applied: [], needRestart: false, hints: ["没有可写入的提供方（空列表会被忽略，未知键会被跳过）"] });
+      }
+      saveCfg(cfg);
+      // 端上已接到本次写入的某家提供方的话，立即同步新映射——**每端只做一次**，
+      // 不按提供方逐个重写（写六遍同一个目标没有意义，还白白发出一堆外部快照告警）
+      const applied = [];
+      const curCli = cliMode(cfg).mode, curDesk = desktopMode(cfg).mode;
+      if (done.includes(curCli)) { applyToCli(sliceOf(cfg, curCli)); applied.push("cli"); }
+      if (done.includes(curDesk)) { applyToDesktop(sliceOf(cfg, curDesk)); applied.push("desktop"); }
+      log(`批量模型列表已写入:`, done.join(",") + (skipped.length ? `（跳过:${skipped.join(",")}）` : ""), "重应用到:", applied.join(",") || "无");
+      return json(res, 200, {
+        ok: true,
+        applied: done,
+        skipped,
+        // 只动 availableModels：中转每次请求实时读 config.json，映射即时生效，不需要重启
+        needRestart: false,
+        hints: [
+          `已一次性写入 ${done.length} 家提供方的模型列表`,
+          skipped.length ? `已跳过（空列表或非法值，保持原样）：${skipped.join("、")}` : null,
+          applied.includes("cli") ? "CLI：新开的终端生效" : null,
+          applied.includes("desktop") ? "桌面版：需完全退出并重开 Claude 生效" : null,
+        ].filter(Boolean),
+      });
     }
 
     if (req.method === "GET" && u.pathname === "/api/status") return json(res, 200, await statusPayload());
