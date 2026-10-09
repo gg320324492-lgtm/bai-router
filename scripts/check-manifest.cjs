@@ -193,7 +193,7 @@ const REQUIRED_FIELDS = [
   { name: "settingsTitle", type: "str" },
 ];
 
-const EXPECTED_PATHS = { bai: "/", sn: "/sn", wb: "/wb", zen: "/zen", qd: "/qd" };
+const EXPECTED_PATHS = { home: "/", bai: "/bai", sn: "/sn", wb: "/wb", zen: "/zen", qd: "/qd", or: "/or" };
 
 /* ============================================================================
  * 载入
@@ -266,9 +266,9 @@ const C1_START = findings.length;
       }
     }
 
-    /* path 形状：bai 是 "/"，其余是 "/" + key */
+    /* path 形状：home 是 "/"，其余（含 bai）都是 "/" + key */
     if (typeof P.path === "string" && P.path) {
-      const want = key === "bai" ? "/" : "/" + key;
+      const want = key === "home" ? "/" : "/" + key;
       const shapeOk = P.path === want;
       if (!shapeOk) {
         err(`${key}: field "path" is ${show(P.path)} -- expected "${want}"`);
@@ -611,7 +611,7 @@ setCheck("C10");
   const aliased = aliasMap ? [...aliasMap[1].matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]) : [];
   const normP = (p) => (p || "/").replace(/\/+$/, "") || "/";
   const manifestPaths = new Set(keys.map((k) => normP(manifest[k].path)));
-  const canonical = new Set(["/", "/sn", "/wb", "/zen", "/qd"]);
+  const canonical = new Set(["/", "/sn", "/wb", "/zen", "/qd", "/or"]);
 
   for (const pth of served) {
     if (canonical.has(normP(pth))) ok(`template route "${pth}" -> manifest path ${pth}`);

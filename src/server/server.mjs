@@ -3423,7 +3423,7 @@ const panel = http.createServer(async (req, res) => {
     // scripts/check-manifest.cjs 的 C1（清单 path 必须在服务端有对应分支）与
     // C10（渲染模板的路径必须有清单 path 匹配）能用字面量 grep 判断。
     if (req.method === "GET" && (
-      u.pathname === "/" || u.pathname === "/sn" || u.pathname === "/wb" ||
+      u.pathname === "/" || u.pathname === "/bai" || u.pathname === "/sn" || u.pathname === "/wb" ||
       u.pathname === "/zen" || u.pathname === "/qd" || u.pathname === "/or"
     )) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });

@@ -24,10 +24,65 @@
  */
 window.BAI_PROVIDERS = {
 
+  /* ================= 总览（/）—— 公共功能主界面 =================
+   * 定位（用户原话）：「故障转移、接回 CC Switch 这些公共功能单独做一个主界面」。
+   * 本页没有任何「可接通的对象」，也没有模型映射——那些去各家页签。
+   * hideApply / hideCards 是本页的清单开关：panel-common.js 按字段分支，
+   * **不得**因此出现 provider 字面量（C11 会拦）。 */
+  home: {
+    key: "home",
+    path: "/",
+    tab: "总览",
+    h1: "路由台总览",
+    sub: "公共功能 · 六家免费渠道",
+    title: "路由台总览 · B.AI 路由台",
+    /* C1 的 REQUIRED_FIELDS 要求 accentLabel / targetName / settingsTitle 三者都是非空
+       字符串，而本页这三处原样写 null/""。这里填的就是渲染层原本的兜底值（panel-common.js
+       的 `P.accentLabel || "接通"`、`applyText("thTarget", null)` 后模板自带的「→ 模型」、
+       `applyText("ttlSys", null)` 后模板自带的「本机设置」），所以**页面显示一个字节都没变**：
+       接线卡没有「接通」按钮、路由表整卡隐藏，这三个字段谁都读不到。 */
+    accentLabel: "接通",                // 本页没有「接通」动作（值只是渲染层兜底，按钮已被 hideApply 收掉）
+    primaryBtn: "",                     // hideApply=true，渲染层不会用它
+    targetName: "模型",                 // 本页没有路由表（hideCards 含 "route"，整卡隐藏）
+    relayHint: null,
+    guide: [],                          // 无两步引导（C2 合法值：0 或 2）
+    hint: null,
+    settingsTitle: "本机设置", settingsAux: null, settingsEyebrow: null,
+    foldKey: "bai.homesec3",
+    lamps: ["clash", "relay", "cc"],    // 全局视角三盏：出海代理 / 中转服务 / CC Switch
+    lampNames: { clash: "本机代理", relay: "中转服务", cc: "CC Switch" },
+    lampSubs: { relay: ":15723 面板端口", cc: "配置接管状态" },
+    extraCards: ["failover", "model-sync", "overview"],
+    footNote: "本页管公共功能（故障转移 / 接回 CC Switch / 全部刷新）；改模型映射请去上方对应提供方页签",
+    footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 本页管公共功能，模型映射在各家页签",
+    cardEyebrow: "状态",
+    routeEyebrow: null, routeTitle: null,
+    routeKey: null,
+    wireHint: "这里显示 Claude Code（终端 + 桌面版）当前接在哪家；「接回 CC Switch」随时把配置还给 CC Switch。四档模型映射与免费模型选择，请去上方对应的提供方页签。",
+    /* ---- 本页专属开关（清单驱动；C12 要求的字段仍在下方） ---- */
+    hideApply: true,                    // 接线卡不显示「接通」按钮（本页没有可接通的对象）
+    hideCards: ["route", "settings"],   // 本页不渲染路由表与本机设置卡
+    /* ---- v1.0.48 清单化字段（C12 强制：全部必须存在且合形） ---- */
+    brands: { free: "免费" },           // C12 要非空对象；本页无路由表，overview 卡实际读各家的 brands
+    defaultModels: [],                  // 本页没有「恢复默认模型」按钮（[] 合法）
+    applyInfoMsg: null, resetModelsMsg: null, step1Hint: null,
+    keyMatch: "keyMatch",               // C12 要非空字符串；本页无凭据灯，该字段不会被读到
+    shape: "flat",                      // 与 bai 同为顶层形状：灯/接线语义正是全局视角
+    sys: {},                            // C12 要对象；本页无刷新/部署/保存按钮
+    modelsEndpoint: null,
+    settingsLabels: { relayPort: "中转端口" },
+    notices: {
+      stale: "当前有一端接在本路由台的某个渠道上。想换渠道去上方对应页签；想把配置还给 CC Switch，点下方「接回 CC Switch」。",
+      ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若某个渠道突然失效，去对应页签重新接通即可。",
+    },
+    // 别从灯名反推简称。
+    shortName: "路由台",
+  },
+
   /* ================= B.AI（/） ================= */
   bai: {
     key: "bai",
-    path: "/",
+    path: "/bai",
     tab: "B.AI",
     h1: "B.AI 路由台",
     sub: "MODEL ROUTER",
@@ -53,7 +108,7 @@ window.BAI_PROVIDERS = {
       clash: ":7890 → 外网",
       relay: ":15722 → 上游",
     },
-    extraCards: ["failover", "model-sync"],
+    extraCards: [],                     // 公共卡（故障转移 / 刷新全部模型）已收缩到总览页，本页不再挂
     footNote: "数据保存在 %APPDATA%\\bai-router · 切换前自动快照到 backups/",
     footNoteAlt: null,                        // 本页没有浏览器直开时的分支
     cardEyebrow: "01",                        // 契约外补充：「当前接线」卡的编号
@@ -121,7 +176,7 @@ window.BAI_PROVIDERS = {
       cc: "CC Switch",
     },
     lampSubs: { relay: ":15732 → 上游" },
-    extraCards: ["model-sync"],
+    extraCards: [],                     // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
     footNote: "SenseNova 与 B.AI 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "01",
@@ -188,7 +243,7 @@ window.BAI_PROVIDERS = {
     // 旧 wb 页未配置时副行是「在下方粘贴访问令牌」；缺这项会落到通用兜底
     // 「在下方「WorkBuddy 设置」里填」，与旧文案不一致。
     cred: { subNone: "在下方粘贴访问令牌" },
-    extraCards: ["token-capture", "model-sync"],
+    extraCards: ["token-capture"],      // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
     footNote: "WorkBuddy 与 B.AI/SenseNova 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "状态",
@@ -254,7 +309,7 @@ window.BAI_PROVIDERS = {
       cred: "API Key",
     },
     lampSubs: { relay: ":15752 → 协议桥 → 上游", cred: "oc_sk_… 密钥" },
-    extraCards: ["model-catalog", "model-sync"],
+    extraCards: ["model-catalog"],      // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
     footNote: "OpenCode Zen 与 B.AI/SenseNova/WorkBuddy 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "状态",
@@ -322,7 +377,7 @@ window.BAI_PROVIDERS = {
       cred: "访问令牌",
     },
     lampSubs: { relay: ":15762 → 协议桥 → 上游", cred: "读取自 Qoder 客户端" },
-    extraCards: ["model-catalog", "model-sync"],
+    extraCards: ["model-catalog"],      // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
     footNote: "Qoder 与 B.AI/SenseNova/WorkBuddy/Zen 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "状态",
@@ -393,7 +448,7 @@ window.BAI_PROVIDERS = {
       cred: "API Key",
     },
     lampSubs: { relay: ":15772 → 协议桥 → 上游", cred: "sk-or-v1… 密钥" },
-    extraCards: ["or-rotation", "model-sync"],
+    extraCards: ["or-rotation"],        // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
     footNote: "OpenRouter 与 B.AI/SenseNova/WorkBuddy/Zen/Qoder 各自独立配置，共用同一个路由台服务",
     footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
     cardEyebrow: "状态",

@@ -684,11 +684,14 @@
 
   /* 没有两步引导的页面（B.AI / SenseNova）：把引导卡里的主按钮、两端勾选框与
      #applyResult 搬进接线卡，还原旧页面「接通 X / 接回 CC Switch / 终端·桌面版」
-     一行排布，而不是白留一张空卡。 */
+     一行排布，而不是白留一张空卡。
+     但本页没有「可接通的对象」时（清单 hideApply=true，如总览页）不搬：接线卡只留
+     原生的「接回 CC Switch」，引导卡整体隐藏——搬过去也只会多一个没人点的按钮。 */
   function relocateApplyRow() {
     const guide = q(".card.guide");
     if (!guide) return;
     if (HAS_GUIDE) return;
+    if (P.hideApply) { guide.style.display = "none"; return; }
     const actions = q("#btnRestore") && $("btnRestore").closest(".actions");
     const body = actions && actions.parentNode;
     const step2 = $("step2");
@@ -760,6 +763,12 @@
     if (rh) { if (P.hint) rh.innerHTML = P.hint; else rh.style.display = "none"; }
     buildRouteKey();
 
+    /* 整卡隐藏由清单 hideCards 字段驱动（总览页没有路由表、也没有本机设置）。
+       渲染逻辑照常跑（卡被隐藏，填值无人看见），只是不占版面；showEl 是既有写法。 */
+    const hideCards = Array.isArray(P.hideCards) ? P.hideCards : [];
+    const routeCard = $("routeBody") && $("routeBody").closest(".card");
+    showEl(routeCard, !hideCards.includes("route"));
+
     /* 4.6 设置卡 */
     applyText("eyebSys", P.settingsEyebrow);
     applyText("ttlSys", P.settingsTitle);
@@ -781,6 +790,7 @@
     showEl($("btnDeploy"), !!SYS.deploy);
     showEl($("btnResetModels"), DEFAULT_MODELS.length > 0);
     showEl($("btnModels"), !!SYS.modelsRefresh);
+    showEl($("cardSys"), !hideCards.includes("settings"));   // hideCards 含 settings = 整卡隐藏
 
     /* 4.7 页脚 */
     if (has("footPaths")) {

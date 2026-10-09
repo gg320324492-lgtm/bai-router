@@ -83,6 +83,16 @@ html[data-provider="or"] {
   --on-accent: #0b1226;
   --accent: #4d6bfe; --accent-soft: rgba(77, 107, 254, .14); --accent-rgb: 77, 107, 254;
 }
+/* 总览（/，主界面）：玫瑰红强调色，与六家（琥珀/青绿/紫/青/青/靛蓝）都不撞。
+    本页没有任何「可接通的对象」，取一个不带渠道属性的中性红，只为和各家区分。
+    同样给满 13 个变量（12 个 + --accent-rgb），暗色与下面的浅色各一份。 */
+html[data-provider="home"] {
+  --bg: #191519; --panel: #201b21; --panel2: #262028; --line: #352b36;
+  --ink: #efe6ec; --dim: #9a8d97;
+  --banner-bg: #292029; --scroll-thumb: #3b313d; --scroll-thumb-h: #4d3f50;
+  --on-accent: #2a0f1c;
+  --accent: #e0799f; --accent-soft: rgba(224, 121, 159, .14); --accent-rgb: 224, 121, 159;
+}
 
 /* ============================================================================
    3. 浅色主题（右上角按钮切换 html[data-theme]，默认暗色）
@@ -146,6 +156,14 @@ html[data-theme="light"][data-provider="or"] {
   --scroll-thumb: #c4cade; --scroll-thumb-h: #a6aecb;
   --accent: #3550d8; --accent-soft: rgba(53, 80, 216, .12); --accent-rgb: 53, 80, 216;
   --ink: #1f2430; --dim: #646b7d;
+}
+/* 总览页的浅色块：强调色取暗色那一支的加深版（其余家同一规律）。 */
+html[data-theme="light"][data-provider="home"] {
+  --bg: #faf5f8; --panel2: #f2e9ee; --line: #e6d5de;
+  --led-off: #cac2c8;
+  --scroll-thumb: #d8c6d0; --scroll-thumb-h: #b8a1ad;
+  --accent: #b84a78; --accent-soft: rgba(184, 74, 120, .12); --accent-rgb: 184, 74, 120;
+  --ink: #2a2229; --dim: #6e6068;
 }
 
 /* ============================================================================

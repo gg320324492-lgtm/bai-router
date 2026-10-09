@@ -26,10 +26,11 @@
 <link rel="stylesheet" href="/panel-common.css">
 <script>
 /* 唯一允许的内联脚本：只做一件事 —— 从路径推出当前 provider key，写到 <html data-provider>。
-   必须早于 panel-common.js 执行，也要早于首帧，否则会先闪一下错误的强调色。 */
+   必须早于 panel-common.js 执行，也要早于首帧，否则会先闪一下错误的强调色。
+   （空路径 = 根路径 = 总览页 home；/bai 等带路径的页签由路径本身给出 key。） */
 (function () {
   var seg = location.pathname.replace(/^\/+/, "").split("/")[0];
-  document.documentElement.setAttribute("data-provider", seg || "bai");
+  document.documentElement.setAttribute("data-provider", seg || "home");
 })();
 </script>
 </head>
@@ -41,7 +42,8 @@
     <span class="logo-dot"></span>
     <h1 id="h1"><span id="h1Text">路由台</span><small id="h1Sub"></small></h1>
     <nav class="prov-nav" id="provNav">
-      <a href="/" class="prov-tab" data-key="bai">B.AI</a>
+      <a href="/" class="prov-tab" data-key="home">总览</a>
+      <a href="/bai" class="prov-tab" data-key="bai">B.AI</a>
       <a href="/sn" class="prov-tab" data-key="sn">SenseNova</a>
       <a href="/wb" class="prov-tab" data-key="wb">WorkBuddy</a>
       <a href="/zen" class="prov-tab" data-key="zen">OpenCode Zen</a>
