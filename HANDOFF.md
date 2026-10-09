@@ -1,6 +1,6 @@
 # HANDOFF — 让其他机器直接接手当前工作
 
-> 最后更新：2026-10-07 · 当前版本 `1.0.57`（本地领先 `origin/main` **11 个提交**，未推送）
+> 最后更新：2026-10-09 · 当前版本 `1.0.60`（本地与 `origin/main` **已完全同步**，整理提交 `85402f7` 已推送）
 
 ## 这份文档给谁看
 
@@ -20,6 +20,7 @@
 | 4 | **OpenRouter 免费兜底区**（第 6 个提供方） | `docs/contracts/REFACTOR-CONTRACT-v13.md` | ✅ 完成并复验 |
 | 5 | 发布 v1.0.58（bump → 打包 → 推送 → publish） | `docs/evidence/release-checklist-1.0.58.md` | ✅ **已发布** [v1.0.58](https://github.com/gg320324492-lgtm/bai-router/releases/tag/v1.0.58)（2026-10-07，两道闸门全过、latest.yml 带 releaseNotes、快照脱敏复验 C13=0） |
 | 6 | **WorkBuddy 国内版支持（v1.0.59）** | `docs/contracts/REFACTOR-CONTRACT-v14.md` + `docs/evidence/workbuddy-two-editions-2026-10-07.md` | ✅ **已发布** [v1.0.59](https://github.com/gg320324492-lgtm/bai-router/releases/tag/v1.0.59)（三场景隔离实测：intl不翻转/cn翻转/自定义不覆盖；闸门0；.cn 对话路径未真机验证） |
+| 7 | 仓库结构整理：14 份契约归档 `docs/contracts/`（附索引 README）、`publish.cjs` 移入 `scripts/`、README 新增「仓库结构」导航 | — | ✅ **已完成并推送**（commit `85402f7`，闸门全程 0 error，功能代码零 diff——仅注释/路径变动） |
 
 **任务 1–4 全部完成。** 复验方式统一为：隔离实例实测（17xxx 端口）+ 闸门全量 + 回归计数比对基线，**不采信 agent 自述**。
 
@@ -66,6 +67,13 @@ v13 执行时，我（编排者）会逐条复验：
 3. **`provider.html` 的 52 个契约 id 只增不改**（红线）
 4. **key 明文绝不进** `config.defaults.json` / `providers.js` / 任何会提交的文件
 5. **端口**：现有 15722/15732/15742/15752/15762 + 面板 15723，新家用 15772
+
+### 待办 / 风险：历史里的明文 SenseNova key（**等用户授权**）
+
+git 历史里 `scripts/sandbox-launch.cjs` 旧版含明文 SenseNova key `sk-1CLPUw…`（当前版本已改为读 `BAI_TEST_SN_KEY` 环境变量，工作区 0 出现）。
+
+- **本地历史改写**（`git filter-repo` 全仓）已备好方案与备份 bundle，但涉及**重写 v1.0.29–v1.0.59 共 31 个 tag** + force push，**等用户授权后执行**。
+- **该 key 应视为已泄露** —— 它随 v1.0.29–v1.0.59 共 31 个 release 的源码公开过。**正解是去 SenseNova 后台轮换/吊销该 key**；本地改写只是让**新 clone 干净**，救不了已公开的历史。
 
 ---
 

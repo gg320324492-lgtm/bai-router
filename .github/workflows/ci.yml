@@ -1,0 +1,56 @@
+# CI 闸门：manifest-gate
+#
+# 这个 workflow 防的是什么事故 ——
+#   README「三条硬规矩」第 1 条要求：node scripts/check-manifest.cjs 必须 0 error。
+#   该项目头把五份 4467 行 HTML 收敛成「一份 provider.html 模板 + 一份 providers.js
+#   清单 + cards/*.js」后，加第六家提供方时「漏改一处仍会静默出错」——上一轮就出过
+#   五处（Zen 页表头写着 WorkBuddy、状态卡叫「JWT 有效期」、接线徽章判错 m.mode、
+#   cliMode 少字段……）。scripts/check-manifest.cjs 的 C1–C13 十三道闸门把这些
+#   「漏改一处」从运行期 bug 变成构建期失败。但它此前只在发布时跑，本 workflow 把它
+#   提前到「每次 push 到 main、每个指向 main 的 PR」都跑：漏改清单/模板/契约 id/配色的
+#   提交会在 CI 就红掉，根本进不了 main。
+#
+# 本 workflow 不使用任何 secrets，也不写仓库，因此 fork 来的 PR 同样能正常跑，
+#   无「fork PR 拿不到 secrets」之类的顾虑。
+name: manifest-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      # 拉取代码；默认 fetch-depth:1，跑闸门与语法检查绰绰有余，不浪费克隆时间
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 只为把 node 可执行文件放进 PATH。被检查的脚本零外部依赖，所以下面
+      #   绝不 npm ci / npm install（原因见对应 step 的注释）
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # 主闸门：provider 面板的清单/模板/契约 id/配色一致性（C1–C13）
+      #   绝不 npm ci / npm install —— check-manifest.cjs 是零依赖纯 Node 脚本
+      #   （只用 fs / path / vm 内置模块）；而 package.json 的 devDependencies
+      #   含 electron + electron-builder（数百 MB 的平台二进制），装它们只会白白
+      #   浪费几分钟 CI 时间，对本闸门毫无意义。node 退出码天然支持失败语义：
+      #   脚本尾部 `if (errors) process.exit(1)`，非 0 即令本 step/job 失败，
+      #   无需 if 判断。
+      - name: Manifest consistency gate (C1-C13)
+        run: node scripts/check-manifest.cjs
+
+      # 可选增强：对后端模块做 node --check 纯语法解析（只解析、不 import/不执行），
+      #   拦住 server.mjs / failover.mjs / qoder-patch.mjs 与 cards/*.js 的语法/笔误
+      #   级硬伤。同样零外部依赖；逐文件 `|| exit 1` 保证任一文件不过就让 step 失败
+      #   （不能只依赖循环末尾的退出码——否则最后一个文件若通过会掩盖前面的失败）。
+      - name: Syntax check (node --check)
+        run: |
+          for f in src/server/*.mjs src/server/cards/*.js; do
+            node --check "$f" || exit 1
+          done
