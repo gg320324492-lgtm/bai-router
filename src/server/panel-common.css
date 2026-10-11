@@ -152,8 +152,17 @@ code, .mono, .zh.mono { font-family: var(--mono); }
   display: flex; align-items: center; gap: 18px;
   height: 56px; margin-bottom: 14px;
   -webkit-app-region: drag;
+  /* 顶栏必须钉在视口顶端：窗口三键（最小化/最大化/关闭）是绝对定位到右上角的，
+     它们跟着页面一起滚走的话，往下滚就再也点不到——**只能靠 Alt+F4 关窗口**。
+     v1.0.60 修过一次（当时是 header 跟着 .wrap 一起被滚走）；v17 重写样式时这三行
+     被漏掉了，于是同样的毛病又回来了。改这块之前先读这条注释。
+     z-index 要低于 .banner-wrap(50) 与 .updModal(100)，通知与弹框才能盖在它上面。 */
+  position: sticky; top: 0; z-index: 40;
+  background: var(--bg);        /* sticky 必须有底色，否则内容从它下面透出来 */
 }
 .top * { -webkit-app-region: no-drag; }
+/* 应用壳（Electron 自绘标题栏）里顶栏贴到窗口两侧：负边距把它拉出 .app 的 22px 内边距，
+   右侧留 160px 给绝对定位的窗口三键，别让按钮压在主题按钮上。 */
 body.app-frame .top { margin-left: -22px; margin-right: -22px; padding: 0 160px 0 22px; }
 body.no-frame .top { padding-right: 0; }
 
