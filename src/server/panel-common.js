@@ -1285,15 +1285,23 @@
      * 抽屉只呈现「当前已知问题」，换模成功的多数不是问题；但下面两种情况是：
      *   ① 换到了**付费档**（跟钱有关，用户该知道自己在烧积分）
      *   ② 半小时内刚换过（说明这个模型正在被限流，马上还会再换）
-     * 超过半小时且没花钱的，就不占版面了——那属于历史，不是当前状况。 */
+     * 超过这些窗口的就不占版面了——那属于历史，不是当前状况。
+     *
+     * v1.0.67 的 bug：①用的是**整段历史里有没有过**（服务端扫全部 20 条、无时间边界），
+     * 于是换过一次付费档之后那个黄灯会一直挂着，直到再攒够 20 次才消失。现在服务端
+     * 报 escalatedAt（最近一次的时间），新鲜度在这里按窗口判——「多久算当前」是呈现
+     * 层的判断，不该由服务端一个无期限的布尔替它做主。 */
     {
       const rot = (status && status.wbRotation) || null;
       const when = (x) => (x ? new Date(x).toLocaleString("zh-CN", { hour12: false }) : "（时间未知）");
       const recent = rot && Array.isArray(rot.recent) ? rot.recent : [];
       if (recent.length) {
         const last = recent[0];
-        const ageMin = Math.round((Date.now() - new Date(last.at).getTime()) / 60000);
-        const paid = rot.escalated;
+        const ageMin = (Date.now() - new Date(last.at).getTime()) / 60000;
+        /* 付费档的提醒窗口比普通换模长得多：花钱这件事，用户隔一天回来看也该知道。
+         * 但也不能无限——一周前的一次换模不该再挂黄灯。 */
+        const paidMin = rot.escalatedAt ? (Date.now() - new Date(rot.escalatedAt).getTime()) / 60000 : Infinity;
+        const paid = paidMin < 24 * 60;
         const fresh = ageMin < 30;
         if (paid || fresh) {
           const rateTxt = (e) => (e.free === true ? "免费" : e.credits ? String(e.credits) : "倍率未知");
@@ -1301,11 +1309,14 @@
             const jump = e.steps > 1 ? `（连换 ${e.steps} 次）` : "";
             return `${when(e.at)}  ${e.from} → ${e.to}  ${rateTxt(e)}${e.recovered ? "" : "  ✗ 最终没成功"}${jump}`;
           });
+          const whenAg = (mins) => (mins < 60 ? `${Math.round(mins)} 分钟前`
+            : mins < 24 * 60 ? `${Math.round(mins / 60)} 小时前`
+            : `${Math.round(mins / 1440)} 天前`);
           items.push({
             s: paid ? "warn" : "idle",
             t: paid
-              ? `有请求被换到了付费模型（本次会话共 ${rot.total} 次）`
-              : `WorkBuddy 换过模（本次会话共 ${rot.total} 次，最近一次在 ${ageMin} 分钟前）`,
+              ? `有请求被换到了付费模型（${whenAg(paidMin)}，本次会话共 ${rot.total} 次换模）`
+              : `WorkBuddy 换过模（本次会话共 ${rot.total} 次，最近一次在 ${whenAg(ageMin)}）`,
             m: "触发原因：上游返回频率限制。换模是兜底手段，请求本身仍然成功——"
               + "所以它不是故障，此前却显示成「最近一次请求失败」。\n"
               + (paid ? "注意：换过去的是要消耗积分的档位，下面这几条请过一眼。\n" : "")

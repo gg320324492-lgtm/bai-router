@@ -1672,23 +1672,65 @@ function wbCandidateBases() {
  * "WorkBuddy" 子串，所以国际版必须先判、否则会互相误认）。
  * 取不到 / 没装 PowerShell 时返回 false —— 那就退回原来的提示，不制造假警报。
  */
-async function wbClientRunningBefore(p) {
-  if (!wbCapState.startedAt) return false;
+/* 取该版别客户端**最早**一个进程的启动时刻（Unix 毫秒），取不到返回 null。
+ *
+ * v1.0.70 实测修一个从 v1.0.65 就埋着的隐性 bug：原来这里写的是 `[int]`——
+ * Unix 毫秒是 13 位（1.79e12），**远超 Int32 上限 2,147,483,647**，于是 PowerShell
+ * 每次都抛 "Value was either too large or too small for an Int32" 并以非零码退出。
+ * execFile 的回调因此一直拿到错误 → 返回 null → Number(null)=0 → 后续比较全部退化：
+ *   · wbClientRunningBefore 恒返回 true ⇒ needRestart 一直显示「必须完全退出重启」，
+ *     碰巧几次答对了，但那是巧合，它从没真正检测过进程；
+ *   · wbClientRestartedAfter 恒返回 false ⇒ 重启探测永远不会触发。
+ * 因为 PowerShell 的 stderr 在回调里被丢掉了，这个失败从头到尾没有任何痕迹。
+ *
+ * 修法两处：强转用 [long]；探测失败时把 PowerShell 的 stderr 记进日志——
+ * 静默失效的探针等于没有探针，下次再坏还得从头找。 */
+async function wbClientEarliestStartMs(p) {
   const name = p === "wbai" ? "^WorkBuddyAI$" : "^WorkBuddy$";
   try {
     const out = await new Promise((res) => execFile("powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command",
         `$p=Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '${name}' }`
         + " | Sort-Object StartTime | Select-Object -First 1;"
-        + " if($p){ [int]$p.StartTime.ToUniversalTime().Subtract([datetime]'1970-01-01').TotalMilliseconds }"],
+        // 注意 [long]：Unix 毫秒 13 位，[int] 会溢出（见上面注释）
+        + " if($p){ [long]$p.StartTime.ToUniversalTime().Subtract([datetime]'1970-01-01').TotalMilliseconds }"],
       { windowsHide: true, timeout: 8000 },
-      (e, so) => res(e ? null : String(so).trim())));
+      (e, so, se) => {
+        if (e) {
+          const err = String(se || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+          log(`WorkBuddy 客户端进程探测失败（${p}）：${err || e.message}`.slice(0, 220));
+          res(null);
+          return;
+        }
+        res(String(so).trim());
+      }));
     const ms = Number(out);
-    // 留 2 秒容差：进程刚起、秒级取整可能与注入时刻擦边
-    return Number.isFinite(ms) && ms < wbCapState.startedAt - 2000;
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
   } catch {
-    return false;
+    return null;
   }
+}
+async function wbClientRunningBefore(p) {
+  if (!wbCapState.startedAt) return false;
+  const ms = await wbClientEarliestStartMs(p);
+  // 留 2 秒容差：进程刚起、秒级取整可能与注入时刻擦边
+  return ms != null && ms < wbCapState.startedAt - 2000;
+}
+
+/* 客户端是否已在**本次注入之后**重启过 —— 也就是钩子此刻是否已经生效。
+ *
+ * 为什么需要它：改磁盘上的入口脚本对**已在运行**的客户端无效（Node/Electron 启动时
+ * 就把脚本读进内存了），所以流程必须是「注入 → 你完全退出重开 → 发一条消息」。
+ * 以前这个「重开」只能靠人自己判断时机，于是 v1.0.68 那次用户隔了半小时才重启，
+ * 钩子早已超时还原，整轮白等。现在等待循环里主动探测：一旦探测到客户端是在注入之后
+ * 起的，就把状态从「必须完全退出重启」翻成「钩子已生效，发消息即可」，
+ * 不用再猜自己是不是做对了一步。
+ */
+async function wbClientRestartedAfter(p) {
+  if (!wbCapState.startedAt) return false;
+  const ms = await wbClientEarliestStartMs(p);
+  // 同样留 2 秒容差：重启恰好贴着注入时刻发生
+  return ms != null && ms > wbCapState.startedAt + 2000;
 }
 
 /* 按版别给候选目录排序：**两版都装了时，必须优先找对应版别的那个。**
@@ -2023,7 +2065,18 @@ async function wbCaptureRestore() {
 // 缺省仍是 wb（保住旧调用方的行为）。注意钩子本身装在**哪一份** WorkBuddy 程序上
 // 由 findWbCliScript 的候选目录顺序决定（两版都装了时无法从路径可靠区分），
 // 因此调用方应确认用户已启动对应版本的客户端。
-async function wbCaptureToken(timeoutMs = 150000, p = "wb") {
+/* 钩子的等待时长。
+ *
+ * 原来是 150 秒，v1.0.68 实测被用户绊了两次：流程要求「注入 → 完全退出客户端 →
+ * 重开 → 发一条消息」，这中间只要用户被打断、或者压根忘了钩子有时限，2 分半就没了，
+ * 而面板对此**只字不提**——用户看到的只是转圈，直到超时才知道白等。
+ *
+ * 放宽到 10 分钟：钩子只是往客户端的入口脚本里插一段临时代码，落在本机磁盘上，
+ * 捕获结束（含超时）都会立即还原，且下次启动还有 wbCaptureSelfHeal() 兜底自愈。
+ * 多留几分钟的风险远小于"用户被 2 分半的时限赶走"。
+ * 真要更强的保障，是下面的 restarted 探测——让用户不必猜自己该在什么时候发消息。 */
+const WB_CAPTURE_TIMEOUT_MS = 10 * 60 * 1000;
+async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
   const zh = p === "wbai" ? "WorkBuddy AI" : "WorkBuddy";
   if (wbCapState.active) {
     const secs = Math.round((Date.now() - wbCapState.startedAt) / 1000);
@@ -2052,6 +2105,7 @@ async function wbCaptureToken(timeoutMs = 150000, p = "wb") {
   wbCapState = {
     active: true, startedAt: Date.now(), error: null, script, backup, wrote: false, got: "",
     phase: "injecting", phaseText: "正在注入临时钩子…", kick: null, p,
+    restarted: false,          // 客户端是否已在本次注入之后重启过（钩子是否已生效）
   };
   await fsPromises.writeFile(script, patched, "utf8");
   wbCapState.wrote = true;
@@ -2095,9 +2149,21 @@ async function wbCaptureToken(timeoutMs = 150000, p = "wb") {
   const deadline = Date.now() + timeoutMs;
   // 已捕获到的最新一条（accessToken 可能已抓到、刷新令牌还没有）——用于给前端实时进度
   let seen = null;
+  /* 「客户端已重启、钩子已生效」的探测节流：每 3 秒查一次即可。
+   * 查到就把状态翻过去——用户不必自己判断"我是不是做对了一步"。 */
+  let restartProbeAt = 0;
   try {
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 1000));
+      if (wbCapState.needRestart && !wbCapState.restarted && Date.now() - restartProbeAt > 3000) {
+        restartProbeAt = Date.now();
+        if (await wbClientRestartedAfter(p)) {
+          wbCapState.restarted = true;
+          wbCapState.phase = "armed";
+          wbCapState.phaseText = "客户端已在本次注入之后重启，钩子已生效——现在在客户端里发一条消息即可抓到令牌";
+          log(`WorkBuddy 令牌捕获：检测到 ${zh} 客户端已在注入后重启，钩子已生效，等待请求…`);
+        }
+      }
       try {
         const raw = (await fsPromises.readFile(outFile, "utf8")).trim().split("\n").filter(Boolean).pop();
         if (raw) {
@@ -4378,7 +4444,12 @@ async function statusPayload() {
     wbRotation: {
       total: wbRotations.length,
       lastAt: wbRotations[0]?.at || null,
-      escalated: wbRotations.some((r) => r.recovered && r.free === false),
+      /* **给时刻，不给布尔**（v1.0.67 的 bug 修在这里）：原来是 escalated 布尔，
+       * 扫的是整个 20 条缓冲区且没有时间边界，于是历史上换过一次付费档之后，
+       * 那个黄灯会一直挂在诊断抽屉里，直到再攒够 20 次换模才消失——抽屉只讲
+       * 当前状况，几小时前的事不该一直占位。「多久算当前」是呈现层的判断，
+       * 所以这里只如实报「最近一次换到付费档是什么时候」，新鲜度交给面板判。 */
+      escalatedAt: (wbRotations.find((r) => r.recovered && r.free === false) || {}).at || null,
       recent: wbRotations.slice(0, 10),
     },
     // 接线状态（两端各自归属哪个提供方）。keyMatch* 是客户端实际用的凭据与本渠道
@@ -4560,7 +4631,7 @@ const panel = http.createServer(async (req, res) => {
         // 缺省 wb —— 旧调用方行为不变。
         const body = await readBody(req).catch(() => ({}));
         const p = (body && body.provider) === "wbai" ? "wbai" : "wb";
-        const r = await wbCaptureToken(150000, p);
+        const r = await wbCaptureToken(WB_CAPTURE_TIMEOUT_MS, p);
         return json(res, 200, { ok: true, ...r, provider: p, message: "令牌已自动填入并保存" });
       } catch (e) {
         return json(res, 200, { ok: false, error: String((e && e.message) || e) });
@@ -4574,8 +4645,13 @@ const panel = http.createServer(async (req, res) => {
         provider: wbCapState.p || "wb",   // 本次捕获写往哪个渠道（里程碑 1b）
         // v1.0.65：客户端在注入前就已启动 ⇒ 内存里是旧入口脚本，必须完全退出重启
         needRestart: wbCapState.needRestart === true,
+        // v1.0.70：客户端是否已在注入之后重启过 —— 为真表示钩子此刻已经生效，
+        // 前端据此把提示从「必须完全退出重启」翻成「发一条消息即可」，并显示剩余时间。
+        restarted: wbCapState.restarted === true,
+        timeoutMs: WB_CAPTURE_TIMEOUT_MS,
         startedAt: wbCapState.startedAt,
         elapsedMs: wbCapState.active ? Date.now() - wbCapState.startedAt : 0,
+        remainMs: wbCapState.active ? Math.max(0, WB_CAPTURE_TIMEOUT_MS - (Date.now() - wbCapState.startedAt)) : 0,
         gotAccessToken: !!(wbCapState.active && wbCapState.got),
         phase: wbCapState.phase || null,
         phaseText: wbCapState.phaseText || null,

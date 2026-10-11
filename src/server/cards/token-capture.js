@@ -82,16 +82,29 @@ window.BAI_CARDS["token-capture"] = {
           if (s && s.gotAccessToken) {
             sc.$('[data-role="ptitle"]').textContent = "已捕获到访问令牌，正在写入配置…";
             sc.$('[data-role="pdesc"]').textContent = "刷新令牌只在令牌到期续期时才会出现；没有它也能正常使用，到期后重新获取即可。";
-          } else if (s && s.needRestart) {
+          } else if (s && s.needRestart && !s.restarted) {
             /* v1.0.65：客户端在钩子注入前就已启动，内存里是旧入口脚本——
                改磁盘对它无效，光发消息是抓不到的。必须明说，否则用户会一直试。
-               这里**不**再拼「已等待 N 秒」——等再久也没用，要等的是用户重启客户端。 */
+               这里**不**拼「已等待 N 秒」——等再久也没用，要等的是用户重启客户端。 */
             sc.$('[data-role="ptitle"]').textContent = "需要先完全退出并重启客户端";
             sc.$('[data-role="pdesc"]').textContent = s.phaseText
               + "（关窗口不算，托盘图标也要退出；重开后发一条消息即可）";
+          } else if (s && s.restarted) {
+            /* v1.0.70：探测到客户端已在注入之后重启 —— 钩子此刻确实生效了。
+               不用再让用户自己判断"我这一步做对没有"，界面直接翻成「可以发消息了」。
+               剩下的时间也一并显示，免得再出现"我是不是又错过了时限"的悬念。 */
+            const left = Math.max(0, Math.round((s.remainMs || 0) / 1000));
+            const mm = Math.floor(left / 60);
+            const ss = String(left % 60).padStart(2, "0");
+            sc.$('[data-role="ptitle"]').textContent = "钩子已生效，发一条消息即可";
+            sc.$('[data-role="pdesc"]').textContent =
+              `已检测到客户端重启，钩子已经加载。现在到 ${s.provider === "wbai" ? "WorkBuddy AI" : "WorkBuddy"} 客户端里发一条消息即可抓到令牌`
+              + `（还剩 ${mm}:${ss}，超时后自动还原客户端脚本）`;
           } else if (s && s.active && s.phaseText) {
+            /* 时长由后端给（v1.0.70 之前这里写死「最长 150 秒」，与后端一改就对不上了）。 */
             const secs = Math.round((s.elapsedMs || 0) / 1000);
-            sc.$('[data-role="pdesc"]').textContent = s.phaseText + `（已等待 ${secs} 秒，最长 150 秒）`;
+            const mins = Math.round((s.timeoutMs || 0) / 60000);
+            sc.$('[data-role="pdesc"]').textContent = s.phaseText + `（已等待 ${secs} 秒，最长 ${mins} 分钟）`;
           }
         } catch { /* 轮询失败不影响主流程 */ }
       }, 2000);
