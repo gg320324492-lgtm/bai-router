@@ -1442,6 +1442,41 @@ async function wbFetchConfig(cfg, uaKind, p) {
   const promos = Array.isArray(d.modelPromotions) ? d.modelPromotions : null;
   return { ok: true, models, promotions: promos };
 }
+// 合并 CLI 与 App 两种形态的目录：并集，倍率一律以 CLI 为准。
+// 为什么要取并集：两种形态的 roster 并不相同，实测国际版 App 形态 31 个 / CLI 形态 22 个，
+//   有模型只在一边出现——只取 CLI 形态会漏掉 App 才上线的模型（step-5-preview 就是只在
+//   App 形态出现的，实测国际版 CLI 形态看不到、App 形态有、且能正常对话）。
+// 为什么倍率以 CLI 为准（同 id 时整条记录都用 CLI 的，不让 App 覆盖）：
+//   实测国内版 App 形态 37 个模型的 credits **全部为空**，拿它覆盖 CLI 会把已知倍率擦成未知；
+//   CLI 形态带 credits（倍率）才是可信来源，App 形态只用来补 roster 和 promotions。
+// 只有 CLI 没有、App 才有的新 id 才取 App 的记录：如果 App 也给了 credits 就用它的
+//   （实测国际版 App 形态 29/31 带 credits），没给则 credits:null（未知，与内置兜底同义）。
+// 入参 models 是 wbMapModel 产出的本地条目（已过滤），不是上游原始记录。
+//
+// **只对国际版（wbai）取并集**，国内版（wb）维持纯 CLI 形态——两版的增量性质完全不同：
+//   国际版增量 9 个全是真对话模型（含 step-5-preview / grok-4.7 / gpt-6-*），值得补；
+//   国内版增量 21 个里只有 6 个是能用的对话模型，其余 15 个是代码补全（codewise-* /
+//   completion-gf / *-taco-completion，maxOutputTokens 仅 256）、图像生成
+//   （hunyuan-image-v3.0-art）、以及 auto / default-1.x / hunyuan-3b 这类内部或旧版映射。
+//   这些没有 contextWindow、也没有倍率，进下拉只会让用户选中后调不通——而国内版 CLI
+//   形态本身已经有 33 个（覆盖主流模型），补这 15 个是纯副作用。
+//   所以合并**只在国际版启用**，由调用方按 p 判断（见 wbReadCatalog 里的那一处）。
+// 顺手排除图像/视频类：国际版 App 形态的增量里就有 gpt-image-2.5-sunburst 与
+// seedance-2.5（国内版对应 hunyuan-image-v3.0-art）。它们 maxOutputTokens 是正的，
+// wbMapModel 那套过滤拦不住，但本软件只做对话中转，选它们必然调不通——与 zen 渠道
+// 「不可用的不进下拉」是同一个契约。
+const WB_MEDIA_MODEL = /image|video|seedance|sunburst/i;
+function wbMergeModels(cliModels, appModels) {
+  const out = [...cliModels];                       // CLI 那份原样保留（含其倍率）
+  const seen = new Set(cliModels.map((m) => m.id));
+  for (const m of appModels) {
+    if (!m || seen.has(m.id)) continue;             // 同 id：CLI 已有，不覆盖
+    if (WB_MEDIA_MODEL.test(m.id)) continue;        // 图像/视频档不进对话下拉
+    seen.add(m.id);
+    out.push(m);
+  }
+  return out;
+}
 // 读上次成功目录（落盘降级用）。按渠道各读各的文件（里程碑 1b）。
 function wbReadCatDisk(p) {
   try { return JSON.parse(readFileSync(wbCatFiles[p], "utf8")); } catch { return null; }
@@ -1464,16 +1499,25 @@ async function wbReadCatalog(cfg, p) {
   if (cache.val && cache.upstream === upstream && now - cache.at < WB_CAT_TTL_MS) {
     return cache.val;
   }
-  // 两次请求：CLI 形态（倍率）优先；App 形态只补充促销（拿不到不影响大局）。
+  // 两次请求：CLI 形态（倍率，作为基线与可信倍率）优先；App 形态补齐 roster 与促销。
+  // 合并规则见 wbMergeModels 顶部注释（并集，倍率以 CLI 为准）。
   const cli = await wbFetchConfig(cfg, "cli", p);
   let val;
   if (cli.ok) {
     let promotions = null;
+    let models = cli.models;
     try {
       const app = await wbFetchConfig(cfg, "app", p);
-      if (app.ok) promotions = app.promotions || null;
-    } catch { /* App 形态失败无所谓，促销只是附注 */ }
-    val = { models: cli.models, promotions, source: "live", at: new Date().toISOString() };
+      if (app.ok) {
+        promotions = app.promotions || null;
+        /* roster 合并**只在国际版做**：国内版 App 形态的增量几乎都是代码补全/图像/内部
+           映射（实测 21 个增量里只有 6 个可用），而它 CLI 形态已有 33 个覆盖主流模型，
+           补进来纯是噪音。国际版增量 9 个全是真对话模型（含只在 App 形态出现的
+           step-5-preview），值得补。理由全文见 wbMergeModels 顶部注释。 */
+        if (p === "wbai") models = wbMergeModels(cli.models, app.models || []);
+      }
+    } catch { /* App 形态失败无所谓，促销只是附注，roster 退回纯 CLI */ }
+    val = { models, promotions, source: "live", at: new Date().toISOString() };
     try { writeAtomic(wbCatFiles[p], JSON.stringify(val, null, 2) + "\n"); } catch { /* 落盘失败不影响本次结果 */ }
   } else {
     const disk = wbReadCatDisk(p);
