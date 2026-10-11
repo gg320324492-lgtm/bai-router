@@ -1110,6 +1110,90 @@ setCheck("C13");
 }
 
 /* ============================================================================
+ * C14（附加）种子配置里不许有凭据
+ *   C13 管的是「本机路径 / 本机用户名」，管不到「本机凭据」。而 config.defaults.json
+ *   是随安装包发给每一台机器的——里面任何非空的令牌都是**公开泄露**，不是配置问题。
+ *
+ *   v1.0.65 实测在同一个地方踩了两次，成因完全相同：scripts/publish.cjs 负责把出厂
+ *   默认从发布机同步过来，那段「要抹掉哪些字段」的白名单是**手写**的。加第 7 家渠道
+ *   （wbai）时漏了一行，于是
+ *     ① 国际版的 accessToken（1411 字符）会被原样打进安装包，发给所有用户；
+ *     ② WorkBuddy 的账号 userId 也一起被带出去。
+ *   两次都没有任何报错：check-manifest 全绿、构建成功、发布成功。是靠人肉翻产物
+ *   才发现的。所以补成闸门——**让漏写白名单这件事在构建期就红**，而不是等发出去。
+ *
+ *   两条腿一起走：
+ *     ① 按**字段名**：凭据/本机身份字段一律必须为空。加新渠道若带凭据字段，
+ *        闸门会逼着把它写进下面的白名单，漏不掉。
+ *     ② 按**形态**：字段名不认识时的兜底。模型 id 最长能到 50 字符
+ *        （nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free），所以不能按「长度」判，
+ *        只能认凭据独有的开头。
+ * ==========================================================================*/
+setCheck("C14");
+{
+  let raw = null;
+  try {
+    raw = fs.readFileSync(F.defaults, "utf8");
+  } catch (e) {
+    err(`config.defaults.json 读不到：${e.message}`);
+  }
+  if (raw !== null) {
+    const MUST_BE_EMPTY = [
+      { rx: /token$/i, what: "令牌" },
+      { rx: /^apiKey$/i, what: "API Key" },
+      { rx: /^keys$/i, what: "Key 列表" },
+      { rx: /^userId$/i, what: "账号标识（与令牌同源，不是凭据但同样属于本机登录态）" },
+      { rx: /^(secret|password)/i, what: "机密" },
+    ];
+    /* JWT 是三段、点分隔的，eyJ 后面第一段（header）通常只有三十几个字符——
+       写成 /eyJ[A-Za-z0-9_-]{40,}/ 会因为够不到 40 而整个漏掉（负样本实测：真 JWT
+       塞进去闸门一片绿）。必须按三段形状认。 */
+    const SHAPES = [
+      { rx: /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/, what: "JWT" },
+      { rx: /\bsk-[A-Za-z0-9_-]{16,}/, what: "sk- 开头的 API Key" },
+      { rx: /\bjt-[A-Za-z0-9_-]{16,}/, what: "Qoder jt- jobToken" },
+      { rx: /\bghp_[A-Za-z0-9]{20,}/, what: "GitHub token" },
+    ];
+    let hits = 0;
+    const isEmpty = (v) => v == null || v === "" || (Array.isArray(v) && v.length === 0);
+    let doc = null;
+    try { doc = JSON.parse(raw); } catch (e) { err(`config.defaults.json 不是合法 JSON：${e.message}`); }
+    if (doc) {
+      /* 一遍遍历同时做两件事：按字段名判「必须为空」，按形态判「长得像凭据」。
+         分成两个 walker 会让数组元素被两条路径各报一次（负样本实测 or.keys[0] 重复告警）。 */
+      const walk = (node, trail) => {
+        if (Array.isArray(node)) { node.forEach((v, i) => walk(v, trail + "[" + i + "]")); return; }
+        if (node && typeof node === "object") {
+          for (const k of Object.keys(node)) {
+            const v = node[k], key = trail ? trail + "." + k : k;
+            const rule = MUST_BE_EMPTY.find((m) => m.rx.test(k));
+            if (rule && !isEmpty(v)) {
+              const shown = Array.isArray(v) ? "[" + v.length + " 项]" : '"' + show(String(v).slice(0, 24)) + '"';
+              err(key + ": seed config carries a non-empty " + rule.what + " -- " + shown
+                + ". 随安装包发给所有机器。出厂默认必须是空；真实值由运行期从用户自己的登录态/配置回填");
+              hits++;
+            }
+            walk(v, key);
+          }
+          return;
+        }
+        if (typeof node !== "string") return;
+        for (const s of SHAPES) {
+          if (s.rx.test(node)) {
+            err(trail + ": seed config carries a credential-shaped string (" + s.what + ") -- \""
+              + show(node.slice(0, 24)) + "…\". 该字段名不在凭据白名单里，只能按形态认。该文件随安装包发给所有机器，命中即公开泄露");
+            hits++;
+            break;
+          }
+        }
+      };
+      walk(doc, "");
+    }
+    if (!hits) ok("config.defaults.json carries no credentials and no non-empty identity fields");
+  }
+}
+
+/* ============================================================================
  * 打印
  * ==========================================================================*/
 
@@ -1127,8 +1211,9 @@ const CHECK_TITLES = {
   C11: "panel-common.js must not hard-code channel names",
   C12: "renderer-critical channel fields present for every channel",
   C13: "seed config must not carry machine-specific paths/usernames",
+  C14: "seed config must not carry credentials or non-empty identity fields",
 };
-const ORDER = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13"];
+const ORDER = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14"];
 
 console.log("check-manifest -- provider panel manifest/template consistency gate");
 console.log("root: " + ROOT);

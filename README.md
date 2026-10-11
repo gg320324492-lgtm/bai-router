@@ -66,9 +66,9 @@ WorkBuddy 说明：
 
 改代码前的三条硬规矩：
 
-1. **`node scripts/check-manifest.cjs` 必须 0 error** —— 13 道闸门（C1–C13，见 `scripts/check-manifest.cjs:816` 的 `ORDER`）；其中 C4 检查 `provider.html` 的契约 id **各出现且仅出现一次**，现有 52 个**只增不改**（`scripts/check-manifest.cjs:407-417`、`HANDOFF.md:66`）。
+1. **`node scripts/check-manifest.cjs` 必须 0 error** —— 14 道闸门（C1–C14，见 `scripts/check-manifest.cjs` 的 `ORDER`）；其中 C4 检查 `provider.html` 的契约 id **各出现且仅出现一次**，现有 52 个**只增不改**（`scripts/check-manifest.cjs:407-417`、`HANDOFF.md:66`）。
 2. **新增提供方时两处 `NO_PROXY` 名单必须逐字同步** —— `src/main.js` 的 `noProxyList` 与 `src/server/server.mjs` 的 `computeNoProxy`（两边注释都写着"逐字同步、顺序一致"）。漏了会 `noProxyMismatch` → 自检重启被看门狗计成崩溃 → **无限重启**（`src/main.js:166`、`src/server/server.mjs:476`、`HANDOFF.md:59-63`）。
-3. **密钥与本机路径绝不进仓库** —— `config.defaults.json` / `providers.js` / 任何会提交的文件都不行，C13 闸门直接拦（`scripts/check-manifest.cjs:717`、`HANDOFF.md:67`）。
+3. **密钥与本机路径绝不进仓库** —— `config.defaults.json` / `providers.js` / 任何会提交的文件都不行。该文件随安装包发给每一台机器，里面任何非空的凭据就是公开泄露：C13 拦本机路径与用户名，**C14 拦凭据**（按字段名 + 按形态两条腿走，`scripts/check-manifest.cjs`、`HANDOFF.md:67`）。
 
 ## Release 资产
 
