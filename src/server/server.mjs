@@ -1473,17 +1473,13 @@ async function wbFetchConfig(cfg, uaKind, p) {
 //   这些没有 contextWindow、也没有倍率，进下拉只会让用户选中后调不通——而国内版 CLI
 //   形态本身已经有 33 个（覆盖主流模型），补这 15 个是纯副作用。
 //   所以合并**只在国际版启用**，由调用方按 p 判断（见 wbReadCatalog 里的那一处）。
-// 顺手排除图像/视频类：国际版 App 形态的增量里就有 gpt-image-2.5-sunburst 与
-// seedance-2.5（国内版对应 hunyuan-image-v3.0-art）。它们 maxOutputTokens 是正的，
-// wbMapModel 那套过滤拦不住，但本软件只做对话中转，选它们必然调不通——与 zen 渠道
-// 「不可用的不进下拉」是同一个契约。
-const WB_MEDIA_MODEL = /image|video|seedance|sunburst/i;
+// 图像/视频档不在这里拦：wbMapModel 已经按上游 tags 在更前面拦掉了（比按 id 猜更可靠），
+// 这里再放一道同义正则只会让人以为漏了就靠它。
 function wbMergeModels(cliModels, appModels) {
   const out = [...cliModels];                       // CLI 那份原样保留（含其倍率）
   const seen = new Set(cliModels.map((m) => m.id));
   for (const m of appModels) {
     if (!m || seen.has(m.id)) continue;             // 同 id：CLI 已有，不覆盖
-    if (WB_MEDIA_MODEL.test(m.id)) continue;        // 图像/视频档不进对话下拉
     seen.add(m.id);
     out.push(m);
   }
