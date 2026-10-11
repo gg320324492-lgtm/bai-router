@@ -314,8 +314,9 @@ let lastSpawnError = null;
 let lastRecoverNoticeAt = 0;
 function logMain(msg) {
   try {
-    // 与 server.mjs 的 appendLog 同一套阈值/保留策略（两处刻意重复，不共享模块：
-    // main.js 是 CJS、server.mjs 是 ESM，硬要共用得再加一层转译，不值当）。
+    /* 超过 1MB 就滚动，保留一份 .old（v1.0.73 起日志轮转只在这一层：
+     * server.mjs 不再写任何日志文件，服务端日志统一由子进程 stdout 进
+     * server-child.log，本函数只管壳层自己的 app.log）。 */
     const f = path.join(DATA_DIR, "app.log");
     try {
       if (fs.existsSync(f) && fs.statSync(f).size >= 1024 * 1024) {
@@ -923,9 +924,10 @@ ipcMain.handle("diag-info", () => ({
   childLog: path.join(DATA_DIR, "server-child.log"),
   appLog: path.join(DATA_DIR, "app.log"),
   // 带上 .old：轮转之后最近一次事故往往在上一份里，只读当前文件会正好错过它。
+  // `server` 段现在指向 server-child.log——v1.0.73 起那是服务端日志的**唯一来源**
+  // （含崩溃栈）。面板这一栏的标题是「服务」，名字不用跟着改，免得用户以为是两个东西。
   logs: {
-    server: tailOf(path.join(DATA_DIR, "server.log")) + tailOf(path.join(DATA_DIR, "server.log.old")),
-    child: tailOf(path.join(DATA_DIR, "server-child.log")) + tailOf(path.join(DATA_DIR, "server-child.log.old")),
+    server: tailOf(path.join(DATA_DIR, "server-child.log")) + tailOf(path.join(DATA_DIR, "server-child.log.old")),
     app: tailOf(path.join(DATA_DIR, "app.log")) + tailOf(path.join(DATA_DIR, "app.log.old")),
   },
   panel: PANEL,

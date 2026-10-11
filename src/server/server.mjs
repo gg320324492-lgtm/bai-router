@@ -23,7 +23,6 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 绿色/开发模式回退到自身目录。config/backups/日志都放这里。
 const DATA_DIR = process.env.BAI_DATA_DIR || HERE;
 const CONFIG_FILE = path.join(DATA_DIR, "config.json");
-const LOG_FILE = path.join(DATA_DIR, "server.log");
 const APP_VERSION = process.env.APP_VERSION || "dev";
 /* 自己这个文件跑在哪 —— 面板与日志靠它回答"现在服务我的是哪一份代码"。 */
 const SERVER_SELF = fileURLToPath(import.meta.url);
@@ -79,51 +78,30 @@ const PASS_HEADERS = ["authorization", "content-type", "anthropic-version", "ant
 
 const BOOT = Date.now();
 
-/* 日志轮转：按大小滚动，保留一份 .old，超出就截断。
+/* 日志去向（v1.0.73 梳理）：
+ *   · server-child.log  服务端的**唯一**日志源。子进程 stdout/stderr 直通这个 fd，
+ *                      而 log() 只写 stdout —— 同一批日志不会再落第二份。
+ *                      它还天然含有崩溃栈：进程非正常退出时 log() 来不及跑，
+ *                      但已写到 stdout 的内容还在，这是任何主动写盘都拿不到的。
+ *   · app.log            Electron 壳层事件（启动/退出/崩溃重拉/自更新），由 main.js 写。
+ *   · server.log         已停用。保留文件只为不让旧版残留占地方，代码不再写它。
  *
- * 三处日志（server.log / server-child.log / app.log）原来各自为政，都有问题：
- *   · server.log      超过 256KB 就清空 —— 而且**每写一行都把整个文件读进内存再重写一遍**，
- *                      144KB 的文件意味着每次 log() 都是一次全量读写；
- *   · server-child.log 子进程 stdout/stderr 裸 fd 追加，**完全没有上限**（实测涨到 1.5MB+）；
- *   · app.log         同样没有上限。
- * 三者共同点是只增不减，跑久了就成死重量。
- *
- * 方案选「保留一份 .old」而不是删掉最旧一段：日志的价值几乎全在最近一次事故里，
- * 保留上一份旧文能在「本轮已经把现场刷掉」时还看得到之前发生了什么。两份加起来
- * 有界（上限约 2×ROTATE_BYTES），且 .old 由本进程自己写，不会被第二个实例并发追加。
- *
- * 阈值只在**追加前**查一次大小：statSync 比读全文便宜，且日志本身不是关键路径，
- * 多几 KB 无所谓——要的是有界，不是精确。
+ * 两个文件都在 main.js 各自滚动（保留一份 .old），子进程那份的滚动点是 spawn 之前——
+ * 追加发生在子进程里，主进程只能在这一瞬间干预。
  */
-const ROTATE_BYTES = 1024 * 1024;   // 1MB：比原来的 256KB 宽松，够装几十次完整事故
-const ROTATE_KEEP = 1;              // 保留几份旧文（1 = 只留上一份）
-/** 第 i 份旧文的名字：i=1 → `.old`，i=2 → `.old.1`（数字越小越新，与主流程读法一致）。 */
-const oldName = (file, i) => (i === 1 ? file + ".old" : `${file}.old.${i - 1}`);
-/** 需要时滚动。返回 true 表示调用方接下来该新建当前文件。 */
-function rotateIfNeeded(file) {
-  try {
-    if (!existsSync(file)) return false;
-    if (statSync(file).size < ROTATE_BYTES) return false;
-    // 从最旧的那份开始腾位置，否则 rename 会把旧内容覆盖掉
-    for (let i = ROTATE_KEEP; i >= 1; i--) {
-      const from = i === 1 ? file : oldName(file, i - 1);
-      const to = oldName(file, i);
-      if (existsSync(from)) { try { rmSync(to, { force: true }); } catch { } renameSync(from, to); }
-    }
-    return true;
-  } catch { return false; }
-}
-/** 追加一行，必要时先滚动。**不读全文**。 */
-function appendLog(file, line) {
-  try {
-    if (rotateIfNeeded(file)) writeFileSync(file, "");   // 滚动完就开新的
-    appendFileSync(file, line + "\n");
-  } catch { /* 日志写不出去不该影响主流程 */ }
-}
+
 function log(...a) {
-  const line = `[${new Date().toISOString()}] ${a.join(" ")}`;
-  appendLog(LOG_FILE, line);
-  console.log(line);
+  /* 只走 stdout，**不再**同时写 server.log（v1.0.73）。
+   *
+   * 原来两处都写，于是同一批日志落了两份：子进程的 stdout 直通 server-child.log，
+   * 而 log() 自己又写一遍 server.log。实测两份内容 100% 重复——server-child.log
+   * 没有任何一行是 server.log 没有的，白占一倍空间，还让人排查时不知道该看哪个
+   * （我就因此查错过一次：在旧版的日志里找新版才有的关键字，得到一个假的「没触发」）。
+   *
+   * 去掉主动写还有个额外好处：**崩溃栈自动就齐了**。进程非正常退出时 log() 来不及
+   * 执行，但已经写到 stdout 的内容还在 server-child.log 里——那是 server.log
+   * 永远拿不到的。所以 server-child.log 是唯一且更完整的服务端日志源。 */
+  console.log(`[${new Date().toISOString()}] ${a.join(" ")}`);
 }
 
 // ---------- 配置 ----------
