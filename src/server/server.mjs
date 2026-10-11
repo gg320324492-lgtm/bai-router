@@ -4983,6 +4983,28 @@ const panel = http.createServer(async (req, res) => {
       // —— 映射表 ——
       if (b.mapping && typeof b.mapping === "object") {
         const dst = sub.mapping;
+        /* 目标模型名对照上游目录核一遍（v1.0.71）。
+         *
+         * 动机：用户自己把国内版 Fable 指到 step-5-preview，界面照收不误，
+         * 之后每次调用都是 `400 code=11102 model [step-5-preview] service info not found`——
+         * 而面板显示「已就绪」。这和「令牌装错版」（v1.0.68 修的那个）是同一类漏洞：
+         * 存下了，**没有任何一处核对它对不对**。
+         *
+         * 为什么是「提示」而不是「拒绝」：上游目录**本身列不全**（实测国内版 37 个里
+         * 没有 hy4-preview-f，而它明明能调通），拿目录当权威清单会误伤合法的填写。
+         * 所以照收，只把对不上的名字如实列出来，由人决定。
+         *
+         * 取不到目录时完全不说——查不到不等于填错了，不能拿沉默当默认同意。 */
+        const unknown = await unknownMappingTargets(P, b.mapping, cfg);
+        if (unknown.length) {
+          const cat = await describeCatalog(P, cfg);
+          return json(res, 400, {
+            error: `以下模型名不在${cat}里：${unknown.join("、")}`
+              + "（已按原样保存，但如果调不通请换成本版目录里的名字）",
+            unknownTargets: unknown,
+            catalogHint: cat,
+          });
+        }
         for (const t of TIERS) {
           const m = b.mapping[t.key];
           if (!m) continue;
@@ -4992,7 +5014,42 @@ const panel = http.createServer(async (req, res) => {
           dst[t.key] = { target, label };
         }
       }
-      // —— 可选模型列表 ——
+      /** 取某渠道目录里的模型 id 列表（统一各渠道 shapes：wb/wbai/zen 传对象，or/sn 传字符串）。取不到返回 null。 */
+async function catalogIdsOf(p, cfg) {
+  try {
+    const c = await fetchCatalogFor(p, cfg || loadCfg());
+    if (!c || !Array.isArray(c.models)) { log(`映射核对：${p} 目录返回里没有 models 数组`); return null; }
+    return c.models.map((m) => (typeof m === "string" ? m : m && (m.id || m.key))).filter(Boolean);
+  } catch (e) {
+    log(`映射核对：取 ${p} 目录失败（${String((e && e.message) || e).slice(0, 140)}）——按「查不到不等于填错」放行`);
+    return null;
+  }
+}
+/** 目录的来源说明，用于把「目录里没有」这句话说清楚是哪一版的目录。 */
+async function describeCatalog(p, cfg) {
+  // 与 providers.js 的 shortName 对齐（不在渲染层写死渠道名，与 C11 同一原则）
+  const label = p === "wbai" ? "WorkBuddy AI" : p === "wb" ? "WorkBuddy" : p;
+  const ids = await catalogIdsOf(p, cfg);
+  return ids ? `${label}（当前目录 ${ids.length} 个模型）` : `${label}（目录暂时取不到，未作核对）`;
+}
+/* 返回这批映射里「上游目录里没有」的目标模型名（去重、只报对不上的）。
+ * 目录取不到时返回空数组 —— 查不到不等于填错，不能拿沉默当默认同意。 */
+async function unknownMappingTargets(p, mapping, cfg) {
+  const ids = await catalogIdsOf(p, cfg);
+  if (!ids || !ids.length) return [];
+  const lower = new Set(ids.map((x) => String(x).toLowerCase()));
+  const out = [];
+  for (const t of TIERS) {
+    const m = mapping[t.key];
+    if (!m) continue;
+    const target = String(m.target || "").trim().toLowerCase();
+    if (!target) continue;
+    if (!lower.has(target) && !out.includes(target)) out.push(target);
+  }
+  return out;
+}
+
+// —— 可选模型列表 ——
       if (Array.isArray(b.availableModels)) {
         const arr = b.availableModels.map((x) => String(x).trim().toLowerCase()).filter(Boolean);
         if (arr.length) sub.availableModels = [...new Set(arr)];
