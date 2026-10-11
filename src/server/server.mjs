@@ -3002,6 +3002,8 @@ async function fetchCatalogFor(p, cfg) {
       models: models.map((m) => m.id),
       all: models.map((m) => ({ key: m.id, name: m.name, credits: m.credits, free: m.free })),
       labels, freeCount: freeN, source: cat.source,
+      // 目录的**拉取时刻**：判断 disk 档是否过期就看它（面板出处徽标要用）
+      catalogAt: cat.at || null,
       // 降级到兜底时才标 static，让 scan-all 不动配置（契约：非可信数据不比差异）；
       // live/disk 都是真实目录，交给 scan-all 正常做 diff。
       ...(cat.source === "builtin" ? { static: true } : {}),

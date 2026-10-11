@@ -1595,6 +1595,47 @@
     showResult($("testResult"), lines.join("\n") + (tail ? "\n" + tail : ""), !!r.ok);
   }
 
+  /* 目录来源徽标：**常驻**在映射编辑区上方。
+   *
+   * 为什么要常驻而不是刷新时闪一句 showInfo：出处决定这份目录**该不该信**——
+   * 实时目录是上游当下的样子，落盘是上一次成功的快照（可能已经过期很久），
+   * 内置兜底则是写死在代码里的出厂值、可信度最低。v1.0.71 实测踩过这个：
+   * 我直连 /v3/config 拿到 37 个模型（其中没有 step-5-preview），而项目走
+   * wbReadCatalog 拿到的是 33 个的另一份——**同一渠道、两份目录、内容不一致**。
+   * 当时无法判断该信哪一份，正是因为面板上没写这份目录从哪来。 */
+  const CATALOG_SOURCE = {
+    live: { txt: "实时目录", hint: "刚从上游拉取，反映它此刻的样子" },
+    disk: { txt: "上次成功的目录", hint: "这次没能连上上游，用的是上一次拉到的快照——可能已经过期" },
+    builtin: { txt: "内置兜底目录", hint: "既没连上上游、也没有历史快照，用的是写死在代码里的出厂值，可信度最低" },
+  };
+  function paintCatalogSource(r) {
+    const el = $("catSource");
+    if (!el) return;
+    const s = (r && r.source) || null;
+    const meta = s ? (CATALOG_SOURCE[s] || { txt: s, hint: "来源未知" }) : null;
+    if (!meta) {
+      /* 分两种「没有 source」：这家渠道压根不报出处（sn/qd/or 的目录来自各自
+       * 的接口，没有「实时/快照/兜底」这一说），还是确实没拉过。
+       * 混为一谈就会把「这条渠道不适用」说成「你没拉」，误导人去点没用的按钮。 */
+      const n = r && Array.isArray(r.models) ? r.models.length : null;
+      if (n == null) {
+        el.className = "catsrc dim";
+        el.innerHTML = "模型目录：未拉取过，点「刷新模型列表」获取";
+        el.title = "";
+      } else {
+        el.className = "catsrc";
+        el.innerHTML = `模型目录：<b class="ok">已加载</b><span class="dim">（${n} 个 · 该渠道的目录每次都直接取，不分实时与快照）</span>`;
+        el.title = (r && r.note) || "";
+      }
+      return;
+    }
+    // disk / builtin 都不是上游当下的样子，标成需留意，别让它看起来和实时目录一样可信
+    el.innerHTML = `模型目录：<b class="${s === "live" ? "ok" : "warn"}">${meta.txt}</b>`
+      + `<span class="dim">（${r.count || 0} 个${r.catalogAt ? " · 拉取于 " + new Date(r.catalogAt).toLocaleString("zh-CN", { hour12: false }) : ""}）</span>`;
+    el.title = meta.hint + (r.note ? "\n\n" + r.note : "");
+    el.className = "catsrc";
+  }
+
   async function refreshModels() {
     const P = MANIFEST[selected] || {};
     const r = await api("/api/models?p=" + selected);
@@ -1607,7 +1648,7 @@
     await refreshConfig();
     refreshCards();
     showResult($("testResult"), `✔ ${nameOf(selected)} 已拉取模型 ${r.count} 个\n下拉框已更新（映射目标强制保留）`, true);
-    if (r.note) showInfo(nameOf(selected), r.note, 0);
+    paintCatalogSource(r);
     if (P.models && P.models.length) {
       /* 清单与实时目录有出入时据实提醒（发布机上的出厂清单 vs 本机实际可用） */
       const extra = merged.filter((m) => !P.models.includes(m));
@@ -1701,7 +1742,7 @@
     try {
       const s = await api("/api/status");
       status = s;
-      if (!selected) { pickInitial(s); applySelectionUi(); }
+      if (!selected) { pickInitial(s); applySelectionUi(); loadCatalogSource(); }
       paintBand(s);
       paintBadges(s);
       paintMatrix();
@@ -1777,6 +1818,24 @@
       cell.scrollIntoView({ block: "nearest", behavior: "smooth" });
     }
     refreshCards();
+    /* 换渠道时也把目录出处拉一次。不能只在点「刷新模型列表」后才显示出处——
+     * 那正是最需要它的时刻（判断这份目录能不能信）却恰恰看不到。走缓存，不打上游。 */
+    loadCatalogSource();
+  }
+
+  /* 只取目录信息、不动配置与下拉：切渠道/首次进入时用来画出处徽标。 */
+  async function loadCatalogSource() {
+    const key = selected;
+    if (!key) return;
+    try {
+      const r = await api("/api/models?p=" + key);
+      if (selected !== key) return;   // 期间又切了渠道，丢弃这次结果
+      paintCatalogSource(r);
+    } catch (e) {
+      /* 取不到就留着上一次显示的，不覆盖成误导性的「未拉取过」——
+         但要留下痕迹：这个静默曾经把「出处一直不显示」藏了很久。 */
+      console.warn("[catSource] 取目录出处失败", e && e.message);
+    }
   }
 
   /* ======================================================================
