@@ -516,6 +516,12 @@ const SU_REPO = "gg320324492-lgtm/bai-router";
 const SU_DIR = path.join(DATA_DIR, "selfupdate");
 const SU_STATE = path.join(SU_DIR, "state.json");
 const SU_EXE = path.join(SU_DIR, "setup.exe");
+/* 签名校验的重试次数——理由见 downloadLatestInstaller 里那段注释（实测间歇性失败，
+ * 连挂两次才通过）。3 次全败才判签名不可信。 */
+const SU_SIG_PROBE_TRIES = 3;
+/* PowerShell 的 stderr 带 ANSI 颜色码，直接塞进错误信息会显示成一串 [31;1m。剥掉。 */
+const suPlain = (s) => String(s || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+
 function suState(o) {
   try { mkdirSync(SU_DIR, { recursive: true }); writeAtomic(SU_STATE, JSON.stringify({ ...o, at: new Date().toISOString() }, null, 2)); } catch { }
 }
@@ -562,10 +568,37 @@ async function downloadLatestInstaller() {
   const digest = hash.digest("base64");
   if (mm && digest !== mm[1].trim()) throw new Error("安装包 sha512 校验不匹配");
   // ② Authenticode 发布者校验（只取 Subject 字符串，不走 JSON——避开 electron-updater 同款深度截断坑）
-  const subject = await new Promise((r) => execFile("powershell.exe",
+  /* v1.0.68 实测这段**间歇性**失败，代码与环境都相同：已装版 + 已装版 Electron 连挂两次、
+   * 第三次就过了；源码 + Electron、已装版 + 裸 node 都稳定通过。单次拿不到输出就把整个
+   * 升级判死，用户看到的是「签名校验失败」，而签名一直是对的——这是纯粹的用户损失。
+   * 所以重试三次再放弃（v1.0.68 首次升级时就在这里失败过两次，白等了两轮 106MB 下载）。
+   *
+   * 失败时把 execFile 的 err 与 stderr 一并带出来，别再只留一句「无有效签名」——
+   * 那句话把「命令没跑起来」和「签名真的不对」混成了一件事，排查时完全指不出方向。
+   * 签名**只有三次全败才当不可信**：宁可多等几秒，不误杀一个本来没问题的升级。 */
+  const SU_SIG_PROBE = () => new Promise((r) => execFile("powershell.exe",
     ["-NoProfile", "-NonInteractive", "-Command", `(Get-AuthenticodeSignature -LiteralPath '${SU_EXE.replace(/'/g, "''")}').SignerCertificate.Subject`],
-    { windowsHide: true, timeout: 25000 }, (e, so) => r(e ? "" : String(so).trim())));
-  if (!/B\.AI Router Personal/.test(subject)) throw new Error("安装包签名者校验失败：" + (subject || "无有效签名"));
+    { windowsHide: true, timeout: 25000 },
+    (e, so, se) => r({
+      err: e ? (e.killed ? `killed(${e.signal})` : String(e.message).slice(0, 200)) : null,
+      out: String(so || "").trim(),
+      stderr: suPlain(se).slice(0, 300),
+    })));
+  let sigProbe = null;
+  for (let attempt = 1; attempt <= SU_SIG_PROBE_TRIES; attempt++) {
+    sigProbe = await SU_SIG_PROBE();
+    if (/B\.AI Router Personal/.test(sigProbe.out)) break;
+    log(`备用升级：签名校验第 ${attempt}/${SU_SIG_PROBE_TRIES} 次没取到结果`
+      + `${sigProbe.err ? "（" + sigProbe.err + "）" : ""}${sigProbe.stderr ? " " + sigProbe.stderr : ""}`);
+    if (attempt < SU_SIG_PROBE_TRIES) await new Promise((r) => setTimeout(r, 1200));
+  }
+  const subject = sigProbe.out;
+  if (!/B\.AI Router Personal/.test(subject)) {
+    const why = sigProbe.err
+      ? `执行失败：${sigProbe.err}`
+      : (sigProbe.stderr ? `PowerShell 报错：${sigProbe.stderr}` : "命令成功但没取到 Subject");
+    throw new Error(`安装包签名者校验失败（已重试 ${SU_SIG_PROBE_TRIES} 次；${why}）`);
+  }
   suState({ phase: "ready", version: rel.tag_name, percent: 100 });
   log(`备用升级：${rel.tag_name} 已下载并校验通过（${Math.round(got / 1048576)}MB）`);
   return rel.tag_name;
