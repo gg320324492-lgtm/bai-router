@@ -42,7 +42,10 @@ try {
     else if (CUR.sn) { def.sn = { ...CUR.sn, apiKey: "" }; }
     // wb / wbai（WorkBuddy 两版）块：JWT 令牌绝不进发布机快照；发布机没配过就沿用代码默认（同样脱敏）
     // 两版凭据彼此独立，必须各清各的 —— 漏掉 wbai 就等于把国际版的 1411 字符 JWT 随安装包发给所有机器。
-    const WBD = { accessToken: "", refreshToken: "", deviceToken: "" };
+    // userId 一起清：它是指名账号的标识（请求里当 x-user-id 头带），本身不能鉴权，
+    // 但它是本机登录态的一部分，与令牌同源。运行期 wbEnsureToken() 会从用户自己的
+    // 登录态回填，出厂默认留空才是对的。v1.0.65 实测产物里两版都带着真实 UUID 发出去过。
+    const WBD = { accessToken: "", refreshToken: "", deviceToken: "", userId: "" };
     if (def.wb) { def.wb = { ...def.wb, ...WBD }; }
     else if (CUR.wb) { def.wb = { ...CUR.wb, ...WBD }; }
     if (def.wbai) { def.wbai = { ...def.wbai, ...WBD }; }
@@ -89,6 +92,22 @@ try {
     }
     def.proxy = CUR.proxy == null ? "" : CUR.proxy;
     if (def.wb && CUR.wb && CUR.wb.upstream) def.wb.upstream = CUR.wb.upstream;
+    /* availableModels 也取仓库的，不取发布机的。
+     *
+     * 理由与上面 failover/proxy 同一类，而且后果更直接：清单（providers.js）的 models
+     * 才是映射下拉真正渲染的那一份，C8 闸门要求两者**逐条完全相等**。把发布机
+     * 扫出来的目录烘进随包快照，就等于让这台机器的目录覆盖掉清单——两者一旦不同，
+     * 闸门直接拦下发布（v1.0.65 实测：发布机的 wb 目录已长到 33 个、wbai 23 个，
+     * 而清单里各只有 3 个，闸门报「在 seed config 里多出 30 个」）。
+     *
+     * 以前没暴露，是因为发布机的目录一直和清单一样短。用户扫了一次目录就漂了。
+     * 随包默认应该反映项目认定的模型集合；要更新就改仓库里那份，两边一起改。 */
+    if (Array.isArray(CUR.availableModels)) def.availableModels = CUR.availableModels;
+    for (const k of ["sn", "wb", "wbai", "zen", "or", "qd"]) {
+      if (def[k] && Array.isArray(CUR[k] && CUR[k].availableModels)) {
+        def[k] = { ...def[k], availableModels: CUR[k].availableModels };
+      }
+    }
     console.log(`» 本机状态字段取自仓库 defaults: proxy=${def.proxy || "(空=直连)"}`
       + ` failover.enabled=${def.failover ? def.failover.enabled : "(无)"}`
       + ` wb.upstream=${(def.wb && def.wb.upstream) || "(无)"}`);
