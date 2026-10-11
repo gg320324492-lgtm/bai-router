@@ -1376,7 +1376,19 @@ function wbMapModel(m) {
   const id = String(m.id || "").trim();
   if (!id) return null;
   if (m.disabled === true) return null;                       // 防御：实测当前无此字段
-  if (Number(m.maxInputTokens) <= 0 || Number(m.maxOutputTokens) <= 0) return null;
+  /* 图像/视频档不进对话下拉。上游用 tags 明说（实测国内版 CLI 形态的
+     hunyuan-image-alpha → tags:["text-to-image"]、hunyuan-image-alpha-edit →
+     ["image-to-image"]；国际版 App 形态的 gpt-image-2.5-sunburst / seedance-2.5 同理）。
+     本软件只做对话中转，这些选中必然调不通——与 zen 渠道「不可用的不进下拉」同一契约。
+
+     **必须显式拦**：这几个模型的 maxOutputTokens 是 undefined，而
+     Number(undefined) 得 NaN、NaN <= 0 是 false，所以下面那道 tokens 过滤拦不住它们
+     （实测它们正是这么一路穿过 wbMapModel 进了下拉）。 */
+  if (Array.isArray(m.tags) && m.tags.some((t) => /image|video/i.test(String(t)))) return null;
+  // tokens 缺失/非数字（Number(undefined) → NaN，而 NaN <= 0 是 false，原判据会被绕过）
+  // 一律当无效记录丢掉——上游没给限额的模型不该进下拉。
+  const tokIn = Number(m.maxInputTokens), tokOut = Number(m.maxOutputTokens);
+  if (!Number.isFinite(tokIn) || !Number.isFinite(tokOut) || tokIn <= 0 || tokOut <= 0) return null;
   const credits = wbNormalizeCredits(m.credits);
   return {
     id,
