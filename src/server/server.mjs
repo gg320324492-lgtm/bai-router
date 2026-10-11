@@ -3843,6 +3843,90 @@ function cliMode(cfg, creds) {
     return { mode: "unknown", baseUrl: "" };
   }
 }
+
+/* ---------- CLI 接线归属：~/.claude/settings.json 现在是谁写的 ----------
+ * 动机：本机和 CC Switch 都往**同一个文件**写，接线过程没有任何互斥。我们写进去
+ * 不等于一直生效——CC Switch 切一次供应商就把整块换掉，而且换得无声无息。
+ *
+ * 此前唯一的判据是 cliMode().mode，它只认端口与域名。CC Switch 开着本地代理时
+ * 写 127.0.0.1:15721，能命中 mode:"ccswitch"；但它在 **direct 模式**下写的是
+ * 自己供应商的 https 上游（enableLocalProxy=false），一条都对不上 → 落到
+ * mode:"other"，面板只显示「其他」，**看不出是谁接管的、什么时候被接管的**。
+ * v1.0.65 实测本机正是 direct 模式（~/.cc-switch/live-state.json 里 mode:"direct"）。
+ *
+ * 办法：每次写入留一枚指纹（env 块的哈希），状态查询时对一下。
+ *   对得上 = 还是我们写的；对不上 = 被人换掉了。这是**事实判断**，不靠猜。
+ * 归因是另一回事，要证据：光「进程在跑」不算数（它挂着不动也在跑），
+ * 光「文件变了」也不算数（用户手改也是那样）。两个都成立才判给它。 */
+const CLI_APPLY_FILE = path.join(DATA_DIR, "cli-apply.json");
+const CC_SWITCH_DIR = path.join(HOME, ".cc-switch");
+const CC_SWITCH_STATE_FILES = ["live-state.json", "settings.json"];
+
+/* env 块指纹：键序无关、只认内容。写盘顺序变了不该算「被换过」。 */
+function envFingerprint(env) {
+  const norm = Object.keys(env || {}).sort().map((k) => k + "=" + JSON.stringify(env[k])).join("\n");
+  return createHash("sha256").update(norm).digest("hex").slice(0, 16);
+}
+function mtimeOf(f) {
+  try { return statSync(f).mtime.toISOString(); } catch { return null; }
+}
+/* 记下「这次是我写的」+ 指纹。applyToCli 写盘之后立刻调。 */
+function recordCliApply(provider) {
+  try {
+    const s = readJson(SETTINGS);
+    writeAtomic(CLI_APPLY_FILE, JSON.stringify({
+      at: new Date().toISOString(),
+      provider: provider || "",
+      fp: envFingerprint(s?.env),
+      baseUrl: s?.env?.ANTHROPIC_BASE_URL || "",
+    }, null, 2) + "\n");
+  } catch { /* 记不住指纹只是退化成查不出被接管，不该影响接线本身 */ }
+}
+/* CC Switch 自己的状态文件刚动过 → 它就是换手的人。
+ *
+ * 窗口取 **30 秒**而不是「几分钟」：CC Switch 真正落盘时，它的状态文件与
+ * settings.json 是同一瞬间写的（实测同一次切换相差不到 1 秒），窗口放宽只会
+ * 把**之后**的无关改动也一并算到它头上——负样本实测：手动编辑发生在 CC Switch
+ * 状态文件变动之后 0.5 秒，5 分钟窗下被误判成「CC Switch 干的」。
+ * 冤枉人比说不准更糟：窗口内对不上就老实报 unknown，那只是不够具体，猜错了是误导。 */
+function ccSwitchTouchedAt(settingsMtimeMs) {
+  if (!settingsMtimeMs) return null;
+  for (const f of CC_SWITCH_STATE_FILES) {
+    const t = mtimeOf(path.join(CC_SWITCH_DIR, f));
+    if (t && Math.abs(Date.parse(t) - settingsMtimeMs) <= 30 * 1000) return t;
+  }
+  return null;
+}
+function cliOwnership(ccRunning) {
+  let rec = null;
+  try { rec = readJson(CLI_APPLY_FILE); } catch { }
+  let cur = null, mtimeMs = 0;
+  try { cur = readJson(SETTINGS); mtimeMs = statSync(SETTINGS).mtimeMs; } catch { }
+  const base = { currentBaseUrl: cur?.env?.ANTHROPIC_BASE_URL || "" };
+  if (!rec?.fp) return { state: "never", at: null, ...base };
+  if (envFingerprint(cur?.env) === rec.fp) {
+    return { state: "ours", at: rec.at, provider: rec.provider, ...base };
+  }
+  const ccAt = ccSwitchTouchedAt(mtimeMs);
+  const writer = ccRunning && ccAt ? "ccswitch" : "unknown";
+  /* 判据里的时间用本机时区写死成人类可读格式：面板其余地方也这么显示，
+     混一段原始 ISO 在句子里很跳（v1.0.65 实测输出就是这样，难看且对不上）。 */
+  const localTime = (x) => new Date(x).toLocaleString("zh-CN", { hour12: false });
+  return {
+    state: "taken-over",
+    at: rec.at,                 // 我们上次写入的时刻
+    provider: rec.provider,
+    writtenAt: mtimeMs ? new Date(mtimeMs).toISOString() : null,   // 实际被改的时刻
+    writer, writerAt: ccAt,
+    ...base,
+    evidence: writer === "ccswitch"
+      ? `CC Switch 正在运行，且它自己的状态文件在 ${localTime(ccAt)} 动过，与 settings.json 的改动时间对得上`
+      : ccRunning
+        ? "CC Switch 在运行，但没有证据表明是它改的（也可能是手动编辑，或它只在内存里切了供应商没落盘）"
+        : "CC Switch 未运行，更可能是手动编辑或其它工具",
+  };
+}
+
 function desktopMode(cfg, creds) {
   try {
     const f = desktopConfigFile();
@@ -3968,6 +4052,7 @@ async function applyToCli(S) {
   }
   e.NO_PROXY = "127.0.0.1,localhost";
   writeAtomic(SETTINGS, JSON.stringify(s, null, 2) + "\n");
+  recordCliApply(S.p);   // 留指纹：之后能分辨这份配置还是不是我们写的
 }
 // 通用：把一个提供方写进桌面版 configLibrary（都经由本地中转，桌面版不感知上游差异）
 function applyToDesktop(S) {
@@ -4045,6 +4130,7 @@ function restoreExternal(target, cfg) {
     }
     if (isOurs(cliMode(c).mode)) {
       writeAtomic(SETTINGS, JSON.stringify(FALLBACK_CC_CLI, null, 2) + "\n");
+      recordCliApply("ccswitch-fallback");   // 这份也是我们写的，别把自己判成"被接管"
       return "CLI 无快照，已写入内置 CC Switch 兜底配置";
     }
     return "CLI 当前不是本软件接管，无需恢复";
@@ -4151,7 +4237,7 @@ async function statusPayload() {
     panel: { port: cfg.panelPort, up: true },
     clash,
     proxy: cfg.proxy || "直连",
-    ccswitch: { running: ccswitch },
+    ccswitch: { running: ccswitch, cli: cliOwnership(ccswitch) },
     // 接线状态（两端各自归属哪个提供方）。keyMatch* 是客户端实际用的凭据与本渠道
     // 凭据的比对结果——客户端送来的 auth token 与我们配置里那把是不是同一把。
     cli: cliMode(cfg),

@@ -696,7 +696,9 @@
       const mismatch = ends.some((e) => e.mode === selected && keyMatchOf(e, selected) === false);
       if (mismatch) bits.push("面板里的凭据与实际生效的不一致，需重开对应端");
     }
-    if (s.ccswitch && s.ccswitch.running) bits.push("配置交还工具正在运行，它可能随时改回自己的配置");
+    if (s.ccswitch && s.ccswitch.cli && s.ccswitch.cli.state === "taken-over") {
+      bits.push("CLI 接线已被 " + (s.ccswitch.cli.writer === "ccswitch" ? "CC Switch" : "其它程序") + " 接管");
+    } else if (s.ccswitch && s.ccswitch.running) bits.push("配置交还工具正在运行，它可能随时改回自己的配置");
     /* 四类都要说到：只报"0 家可用 · 5 家还没配凭据"会把那 1 家"需留意"的吞掉，
        用户数格子时对不上账。 */
     const parts = [];
@@ -839,9 +841,18 @@
       const cr = q(".crelay", el);
       if (cr) {
         if (P.chainable !== true) {
-          cr.innerHTML = status && status.ccswitch && status.ccswitch.running
-            ? '<span class="rl warn">正在运行</span>'
-            : '<span class="rl idle">未运行</span>';
+          /* 交还区格子：把「它在跑」和「它已经把配置换掉了」分开显示。
+           * 后者是红色的——那一格的语义本来就是「配置交还给它」，被接管不是异常，
+           * 但**你可能不知道**，所以必须说。 */
+          const own = (status && status.ccswitch && status.ccswitch.cli) || null;
+          if (own && own.state === "taken-over") {
+            const who = own.writer === "ccswitch" ? "CC Switch" : "其它程序";
+            cr.innerHTML = `<span class="rl err" title="${esc("本路由台于 " + (own.at || "?") + " 写入的配置在 " + (own.writtenAt || "?") + " 被换掉，现在 CLI 连的是 " + (own.currentBaseUrl || "空") + "。判据：" + (own.evidence || ""))}">已被 ${esc(who)} 接管</span>`;
+          } else if (status && status.ccswitch && status.ccswitch.running) {
+            cr.innerHTML = '<span class="rl warn">正在运行</span>';
+          } else {
+            cr.innerHTML = '<span class="rl idle">未运行</span>';
+          }
         } else {
           const C = cfgOf(key);
           cr.innerHTML = `<span class="rl">中转 :${C.relayPort || "—"}</span><span class="rl2">${esc((P.credential || {}).label || "")}</span>`;
@@ -1219,9 +1230,29 @@
       }
     }
 
-    /* ④ 交还区 */
-    if (status && status.ccswitch && status.ccswitch.running) {
-      items.push({ s: "warn", t: "配置交还工具正在运行", m: "它可能随时把配置改回自己的端口。想让它退场：点「一键最优」或从任意渠道接通。" });
+    /* ④ 交还区：分「只是它在跑」和「它已经把配置换掉了」两档。
+     * 此前只有前者，而那是个弱信号——它挂着不动也算「在跑」。真正要紧的是后者：
+     * 我们写进 ~/.claude/settings.json 的东西没了，CLI 实际连的是别处，
+     * 而面板此前对此**完全沉默**（cliMode 只认端口/域名，CC Switch 走 direct 模式
+     * 写自己的 https 上游时落到 mode:"other"，看不出是谁接管的）。 */
+    {
+      const cc = (status && status.ccswitch) || null;
+      const own = (cc && cc.cli) || null;
+      const when = (x) => (x ? new Date(x).toLocaleString("zh-CN", { hour12: false }) : "（时间未知）");
+      if (own && own.state === "taken-over") {
+        const who = own.writer === "ccswitch" ? "CC Switch" : "别的程序（或手动编辑）";
+        items.push({
+          s: "err",
+          t: "CLI 接线已被 " + who + " 接管",
+          m: "本路由台于 " + when(own.at) + " 写进 ~/.claude/settings.json 的配置，"
+            + "在 " + when(own.writtenAt) + " 被换掉了。\n"
+            + "现在 CLI 实际连的是：" + (own.currentBaseUrl || "（空）") + "\n"
+            + "判据：" + (own.evidence || "") + "\n"
+            + "要让本路由台重新接管：随便点一张渠道卡的「接通」，或在交还工具里把供应商切回来。",
+        });
+      } else if (cc && cc.running) {
+        items.push({ s: "warn", t: "配置交还工具正在运行", m: "它的接线目前还是本路由台的，但它随时可能改回去。想让它退场：点「一键最优」或从任意渠道接通。" });
+      }
     }
 
     /* ⑤ 额度余量：上游不提供就如实说没有，不编数字（真实数据源留给阶段二） */

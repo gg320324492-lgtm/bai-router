@@ -7,6 +7,11 @@ cert/
 # 排除是为了防止哪天 git add -A 把一份本机配置提交上去。
 src/server/config.json
 
+# CLI 接线指纹（server.mjs 的 CLI_APPLY_FILE）。记的是「settings.json 现在是我们写的
+# 吗」——纯运行时状态，且里面是本机接线信息。安装模式下它在 %APPDATA%，但绿色/开发模式
+# 下 DATA_DIR 就是 src/server，同 config.json 一样有被 git add -A 带进去的风险。
+src/server/cli-apply.json
+
 # 手工留下的历史备份（*.bak / *.bak-v1.0.27 这类）。删掉旧页后这些备份备份的是
 # 已不存在的文件，留在仓库里只是死重量；真要留档就走 git 历史。
 *.bak
