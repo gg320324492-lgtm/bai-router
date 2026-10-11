@@ -82,6 +82,16 @@ try {
         delete def.failover;   // 仓库里没写这个块，就别把发布机的带进随包快照
       }
     }
+    // proxy（出海通道）：和 failover 同一类——**本机状态，不该进出厂默认**。
+    // 出厂默认就该是空（= 直连），启动自检会按各自机器上真正可用的通道写回正确值。
+    // 仓库里历史上存的是本机端口（v1.0.1 起 7890、v1.0.19 改成 7897），发布脚本再从
+    // 发布机抄一遍，等于把这个端口号发给所有新用户；自检会纠正它，所以一直没暴露，
+    // 但"出厂默认里有个只在你机器上成立的地址"本身就是错的。
+    {
+      const curProxy = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8")).proxy;
+      def.proxy = curProxy == null ? "" : curProxy;   // 出厂默认：空 = 直连
+      console.log(`» proxy 取自仓库 defaults（不跟发布机走）: ${def.proxy || "(空 = 直连)"}`);
+    }
     // qd（Qoder）块：token 是手动兜底用的 jt- jobToken，绝不进快照
     // （正常路径下它恒为空——真实令牌由 worker 补丁写在 %TEMP%\qoder-token.json，不落 config）
     // tokenFile/modelsFile 是发布机的 %TEMP% 绝对路径，原样进快照会被 C13 闸门拦下；

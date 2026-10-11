@@ -1,7 +1,7 @@
 {
   "apiKey": "",
   "upstream": "https://api.b.ai",
-  "proxy": "http://127.0.0.1:7897",
+  "proxy": "",
   "relayPort": 15722,
   "panelPort": 15723,
   "defaultModel": "qwen3.8-flash",
