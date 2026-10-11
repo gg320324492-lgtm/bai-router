@@ -1255,6 +1255,43 @@
       }
     }
 
+    /* ④b WorkBuddy 换模记录。
+     *
+     * 这件事此前**面板上完全看不见**，而且藏错了地方：换模走的是 noteRelayError，
+     * 于是显示成「最近一次请求失败（rate_limit_quota）」——而请求明明拿到了 200。
+     * 抽屉只呈现「当前已知问题」，换模成功的多数不是问题；但下面两种情况是：
+     *   ① 换到了**付费档**（跟钱有关，用户该知道自己在烧积分）
+     *   ② 半小时内刚换过（说明这个模型正在被限流，马上还会再换）
+     * 超过半小时且没花钱的，就不占版面了——那属于历史，不是当前状况。 */
+    {
+      const rot = (status && status.wbRotation) || null;
+      const when = (x) => (x ? new Date(x).toLocaleString("zh-CN", { hour12: false }) : "（时间未知）");
+      const recent = rot && Array.isArray(rot.recent) ? rot.recent : [];
+      if (recent.length) {
+        const last = recent[0];
+        const ageMin = Math.round((Date.now() - new Date(last.at).getTime()) / 60000);
+        const paid = rot.escalated;
+        const fresh = ageMin < 30;
+        if (paid || fresh) {
+          const rateTxt = (e) => (e.free === true ? "免费" : e.credits ? String(e.credits) : "倍率未知");
+          const lines = recent.slice(0, 4).map((e) => {
+            const jump = e.steps > 1 ? `（连换 ${e.steps} 次）` : "";
+            return `${when(e.at)}  ${e.from} → ${e.to}  ${rateTxt(e)}${e.recovered ? "" : "  ✗ 最终没成功"}${jump}`;
+          });
+          items.push({
+            s: paid ? "warn" : "idle",
+            t: paid
+              ? `有请求被换到了付费模型（本次会话共 ${rot.total} 次）`
+              : `WorkBuddy 换过模（本次会话共 ${rot.total} 次，最近一次在 ${ageMin} 分钟前）`,
+            m: "触发原因：上游返回频率限制。换模是兜底手段，请求本身仍然成功——"
+              + "所以它不是故障，此前却显示成「最近一次请求失败」。\n"
+              + (paid ? "注意：换过去的是要消耗积分的档位，下面这几条请过一眼。\n" : "")
+              + lines.join("\n"),
+          });
+        }
+      }
+    }
+
     /* ⑤ 额度余量：上游不提供就如实说没有，不编数字（真实数据源留给阶段二） */
     items.push({ s: "idle", t: "额度余量：暂无数据", m: "上游没有给本路由台可读的额度接口，页面上不显示任何估算数字。" });
 

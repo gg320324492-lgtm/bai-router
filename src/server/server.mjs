@@ -2590,19 +2590,43 @@ function wbAdvanceModel(p, failedModel, limit, skip) {
   if (failedModel) wbModelCool.set(coolKey(failedModel), limit.resetAt);
 
   const rate = (c) => { const v = parseFloat(String(c == null ? "" : c).replace(/^x/i, "")); return Number.isFinite(v) ? v : Infinity; };
+  /* 池里留整个对象而不只是 id：换完之后面板要说「换到了付费档 x0.79」，
+     倍率就在这儿，别让调用方再去查一遍目录（那条路上次踩过冷启动查不到的坑）。 */
   const pool = models.slice()
-    .sort((a, b) => rate(a.credits) - rate(b.credits))
-    .map((m) => m.id)
-    .filter((id) => id && id !== failedModel && !(skip && skip.has(id)));
+    .filter((m) => m && m.id && m.id !== failedModel && !(skip && skip.has(m.id)))
+    .sort((a, b) => rate(a.credits) - rate(b.credits));
   if (!pool.length) return { ok: false, reason: "no_alternative" };
 
-  for (const id of pool) {
-    if (!wbModelCoolLeft(coolKey(id), now)) {
-      wbState.lastSwitch = { at: new Date().toISOString(), from: failedModel || "(未知)", to: id, provider: p };
-      return { ok: true, model: id };
+  for (const m of pool) {
+    if (!wbModelCoolLeft(coolKey(m.id), now)) {
+      wbState.lastSwitch = { at: new Date().toISOString(), from: failedModel || "(未知)", to: m.id, provider: p };
+      return { ok: true, model: m.id, credits: m.credits ?? null, free: m.free === true };
     }
   }
   return { ok: false, reason: "all_cooling" };
+}
+
+/* 换模历史。**换模不是故障**——限流后换了模型、请求拿到 200，那就是成功了。
+ * 此前一律走 noteRelayError，面板会显示成「最近一次请求失败（rate_limit_quota）」，
+ * 而请求明明是好的；而且 noteRelayErrors 每渠道只有一个槽位，只留最后一次、
+ * 还会被真正的故障覆盖掉。用户要的恰恰是"我这些请求被悄悄换成别的模型了"这件事，
+ * 所以单独记一份有界的环形历史。 */
+const WB_ROTATION_HISTORY_MAX = 20;
+const wbRotations = [];
+function noteWbRotation(provider, fromModel, steps, recovered) {
+  const last = steps[steps.length - 1] || null;
+  wbRotations.unshift({
+    at: new Date().toISOString(),
+    provider,
+    from: fromModel || "(未知)",
+    to: last ? last.model : null,
+    credits: last ? last.credits : null,
+    free: last ? last.free : null,
+    steps: steps.length,
+    chain: steps.map((s) => s.model),
+    recovered: !!recovered,
+  });
+  if (wbRotations.length > WB_ROTATION_HISTORY_MAX) wbRotations.length = WB_ROTATION_HISTORY_MAX;
 }
 
 // OpenRouter 的两层轮换（orAdvance）是本节做法的参照实现。
@@ -3099,6 +3123,7 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     // 换一次就放弃等于「换个模型也用不了」，达不到「继续消耗积分继续用」。
     if (p === "wb" || p === "wbai") {
       const tried = new Set();
+      const steps = [];              // 本次依次换到了哪些模型（带倍率）
       let advance = 0;
       while (r.status === 429 && advance < WB_ADVANCE_MAX) {
         const peek = await readAllBody(r).catch(() => "");
@@ -3111,15 +3136,25 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
         const from = ob.model;
         /* ob 是 const 对象，不能改字段；整体换一个新对象（其余字段原样带走） */
         bodyStr = JSON.stringify({ ...ob, model: next.model });
-        noteRelayError(p, "rate_limit_quota",
-          `${from} 触发频率限制，已改用 ${next.model} 继续。`);
+        steps.push({ model: next.model, credits: next.credits, free: next.free });
         log(`WorkBuddy 限流轮换（${p}）→ ${from} → ${next.model}`);
         advance++;
         r = await doCall(token);
       }
-      /* 换够了仍是 429：正文留给下面的归因，如实把上游的 429 抛给用户，不假装成功 */
-      if (advance > 0 && r.status === 429 && !consumedBodyHint) {
-        consumedBodyHint = await readAllBody(r).catch(() => "");
+      /* 只有**连换 WB_ADVANCE_MAX 次仍 429** 才算故障，那时才进 relayErrors。
+         换成功了不是错误，此前一律 noteRelayError 会让面板显示成
+         「最近一次请求失败（rate_limit_quota）」——而请求明明拿到了 200。 */
+      if (steps.length) {
+        const recovered = r.status === 200;
+        noteWbRotation(p, ob.model, steps, recovered);
+        if (!recovered) {
+          noteRelayError(p, "rate_limit_quota",
+            `${ob.model} 触发频率限制，连换 ${steps.length} 个模型仍未成功。`);
+        }
+        /* 换够了仍是 429：正文留给下面的归因，如实把上游的 429 抛给用户，不假装成功 */
+        if (r.status === 429 && !consumedBodyHint) {
+          consumedBodyHint = await readAllBody(r).catch(() => "");
+        }
       }
     }
     // 探测级小请求遇 429：静默退避重试（与 B.AI/SenseNova 行为一致）
@@ -4238,6 +4273,15 @@ async function statusPayload() {
     clash,
     proxy: cfg.proxy || "直连",
     ccswitch: { running: ccswitch, cli: cliOwnership(ccswitch) },
+    /* WorkBuddy 两版的换模历史。单独一份而不是塞进 relayErrors：
+       换模多半是**成功**的，混进"最近一次错误"里既不对，还会把真正的错误挤掉。
+       escalated 单列一项，是因为它跟钱有关——悄悄从免费档换到付费档，用户该知道。 */
+    wbRotation: {
+      total: wbRotations.length,
+      lastAt: wbRotations[0]?.at || null,
+      escalated: wbRotations.some((r) => r.recovered && r.free === false),
+      recent: wbRotations.slice(0, 10),
+    },
     // 接线状态（两端各自归属哪个提供方）。keyMatch* 是客户端实际用的凭据与本渠道
     // 凭据的比对结果——客户端送来的 auth token 与我们配置里那把是不是同一把。
     cli: cliMode(cfg),
