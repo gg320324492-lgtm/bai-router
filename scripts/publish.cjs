@@ -35,72 +35,62 @@ try {
     const local = JSON.parse(fs.readFileSync(userCfgPath, "utf8"));
     const def = { ...local, apiKey: "" };
     delete def._modelsSynced;
+    /* 仓库当前的出厂默认：下面多处要拿它当权威值，先读一次。 */
+    const CUR = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
     // sn（SenseNova）块：发布机 config 可能还没有（旧版未写入）或残留密钥——一律以代码默认+脱敏为准
     if (def.sn) { def.sn = { ...def.sn, apiKey: "" }; }
-    else {
-      const cur = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
-      if (cur.sn) def.sn = { ...cur.sn, apiKey: "" };
-    }
+    else if (CUR.sn) { def.sn = { ...CUR.sn, apiKey: "" }; }
     // wb（WorkBuddy）块：JWT 令牌绝不进发布机快照；发布机没配过就沿用代码默认（同样脱敏）
     if (def.wb) { def.wb = { ...def.wb, accessToken: "", refreshToken: "", deviceToken: "" }; }
-    else {
-      const cur2 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
-      if (cur2.wb) def.wb = { ...cur2.wb, accessToken: "", refreshToken: "", deviceToken: "" };
-    }
+    else if (CUR.wb) { def.wb = { ...CUR.wb, accessToken: "", refreshToken: "", deviceToken: "" }; }
     // zen（OpenCode Zen）块：API Key 同样绝不进快照
     if (def.zen) { def.zen = { ...def.zen, apiKey: "" }; }
-    else {
-      const cur3 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
-      if (cur3.zen) def.zen = { ...cur3.zen, apiKey: "" };
-    }
+    else if (CUR.zen) { def.zen = { ...CUR.zen, apiKey: "" }; }
     // or（OpenRouter）块：三把 API Key 绝不进发布机快照——快照随安装包发给所有机器，
     // key 进去等于公开泄露（v1.0.58 加第 6 家时补上；本机没配过时从仓库 defaults 继承结构、keys 仍清空）。
     if (def.or) { def.or = { ...def.or, keys: [] }; }
-    else {
-      const curOr = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
-      if (curOr.or) def.or = { ...curOr.or, keys: [] };
-    }
-    // failover（自动故障转移）：**一律以仓库里的 config.defaults.json 为准**，不从发布机快照取。
-    // 原实现是 `def.failover || curFo.failover`——发布机的设置只要存在就赢。而「这台机器
-    // 勾没勾故障转移」是**用户偏好**，不是出厂默认：一旦发布机关着开关，每次发布都会把
-    // 随包快照里的 enabled 改成 false，发给所有新用户，等于替他们做了决定。
-    // chain 仍顺带收敛到已知提供方（与 loadCfg 语义一致：兜底恒在末尾）——仓库里写错也拦得住。
-    {
-      const curFo = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
-      if (curFo.failover) {
-        const fo = { ...curFo.failover };
-        const chain = (fo.chain || []).filter((x) => ["bai", "sn", "wb", "zen", "qd", "or"].includes(x));
-        /* 收敛后为空就原样保留仓库里写的 chain：这一段只做"剔除未知渠道 / 兜底垫末尾"，
-           不该把一份完整的出厂默认改写成空链。 */
-        if (chain.length) {
-          if (!chain.includes("or")) chain.push("or");
-          fo.chain = chain;
-        }
-        def.failover = fo;
-        console.log(`» failover 取自仓库 defaults（不跟发布机走）: enabled=${fo.enabled} chain=${(fo.chain || []).join(">")}`);
-      } else {
-        delete def.failover;   // 仓库里没写这个块，就别把发布机的带进随包快照
+    else if (CUR.or) { def.or = { ...CUR.or, keys: [] }; }
+    /* ════════════════════════════════════════════════════════════════════
+       「本机状态」字段：仓库里的值才是出厂默认，发布机那份只是这台机器当前的样子。
+       快照是随安装包发给所有机器的，把本机状态烘进去等于让发布者替所有用户做决定。
+
+       · failover  「这台机器勾没勾故障转移」是用户偏好。旧实现 `def.failover || 仓库`
+                    让发布机的设置只要存在就赢——发布机关着开关，每次发布都把随包快照的
+                    enabled 改成 false，发给所有新用户。
+       · proxy     出厂默认就该是空（= 直连）。历史上存的是本机端口（v1.0.1 起 7890、
+                    v1.0.19 改 7897），等于把一个只在你机器上成立的地址发给所有人。
+                    启动自检会纠正它，所以一直没暴露——但那只是掩盖，不是没问题。
+       · wb.upstream  发布机那条是 loadCfg 的 wbHealUpstream 按登录域名**自愈**的结果
+                    （v1.0.59 起 .ai/.cn 之间切换），把自愈结果当出厂默认，等于替所有
+                    新用户选了版别。自愈本身在运行期还会再跑一次。
+
+       三者共同点：运行期 server.mjs 都会按各自机器修正它们，所以留在出厂默认里没有
+       任何好处，只有"看起来配置齐全"的错觉。新增同类字段请写进这一段，别再散着写。
+       ════════════════════════════════════════════════════════════════════ */
+    if (CUR.failover) {
+      const fo = { ...CUR.failover };
+      const chain = (fo.chain || []).filter((x) => ["bai", "sn", "wb", "zen", "qd", "or"].includes(x));
+      /* 收敛后为空就原样保留仓库里写的 chain：这段只做"剔除未知渠道 / 兜底垫末尾"，
+         不该把一份完整的出厂默认改写成空链。 */
+      if (chain.length) {
+        if (!chain.includes("or")) chain.push("or");
+        fo.chain = chain;
       }
+      def.failover = fo;
+    } else {
+      delete def.failover;   // 仓库里没写这个块，就别把发布机的带进随包快照
     }
-    // proxy（出海通道）：和 failover 同一类——**本机状态，不该进出厂默认**。
-    // 出厂默认就该是空（= 直连），启动自检会按各自机器上真正可用的通道写回正确值。
-    // 仓库里历史上存的是本机端口（v1.0.1 起 7890、v1.0.19 改成 7897），发布脚本再从
-    // 发布机抄一遍，等于把这个端口号发给所有新用户；自检会纠正它，所以一直没暴露，
-    // 但"出厂默认里有个只在你机器上成立的地址"本身就是错的。
-    {
-      const curProxy = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8")).proxy;
-      def.proxy = curProxy == null ? "" : curProxy;   // 出厂默认：空 = 直连
-      console.log(`» proxy 取自仓库 defaults（不跟发布机走）: ${def.proxy || "(空 = 直连)"}`);
-    }
+    def.proxy = CUR.proxy == null ? "" : CUR.proxy;
+    if (def.wb && CUR.wb && CUR.wb.upstream) def.wb.upstream = CUR.wb.upstream;
+    console.log(`» 本机状态字段取自仓库 defaults: proxy=${def.proxy || "(空=直连)"}`
+      + ` failover.enabled=${def.failover ? def.failover.enabled : "(无)"}`
+      + ` wb.upstream=${(def.wb && def.wb.upstream) || "(无)"}`);
     // qd（Qoder）块：token 是手动兜底用的 jt- jobToken，绝不进快照
     // （正常路径下它恒为空——真实令牌由 worker 补丁写在 %TEMP%\qoder-token.json，不落 config）
     // tokenFile/modelsFile 是发布机的 %TEMP% 绝对路径，原样进快照会被 C13 闸门拦下；
     // 清空即可——运行期 fixQdFile() 会把空值/异机路径自愈回本机 os.tmpdir()。
     if (def.qd) { def.qd = { ...def.qd, token: "", tokenFile: "", modelsFile: "" }; }
-    else {
-      const cur4 = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
-      if (cur4.qd) def.qd = { ...cur4.qd, token: "", tokenFile: "", modelsFile: "" };
-    }
+    else if (CUR.qd) { def.qd = { ...CUR.qd, token: "", tokenFile: "", modelsFile: "" }; }
     fs.writeFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), JSON.stringify(def, null, 2) + "\n");
     console.log(`» 默认快照已同步发布机: ${def.availableModels.length} 个模型${def.sn ? " + SenseNova " + def.sn.availableModels.length + " 个" : ""}`);
   } else console.log("» 未找到发布机配置，沿用仓库内 defaults 快照");
