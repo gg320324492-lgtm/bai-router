@@ -1,102 +1,154 @@
-/* cards/failover.js —— B.AI 页的「自动故障转移」卡（v1.0.43 加的）。
+/* cards/failover.js —— 故障转移视图的主体（契约 v17 · 里程碑 4）。
  *
- * 整块从 ui.html 搬过来：markup、折叠交互、renderFailover、保存逻辑都逐字保留，
- * 只是把原来直接摸全局的地方换成 ctx。
+ * v17 之前这是「自动故障转移卡」：自带 .card.foldable 折叠壳，挂在 #slot-extra，
+ * 每家提供方页面各挂一份（同一件事挂了七遍）。现在它**归故障转移视图所有**——
+ * providers.js 的 window.BAI_VIEWS[fo].cards 点名它，视图容器 #viewFo 里的 #foPanel
+ * 是挂载点。折叠壳由视图提供，卡片不再自带。
  *
- * ctx = { cfg, status, $, api, showInfo, showResult, setLed, withBusy, PROVIDER, slot }
- * 下面用到两个契约里没列、但最好由 panel-common.js 提供的钩子（都做了存在性判断）：
- *   ctx.poll()          —— 保存后重新拉一次状态（原 ui.html 里的同名函数）
+ * 视图已提供「什么情况不会转移」那块说明，所以本卡只负责三件事：
+ *   1) 总开关
+ *   2) 顺序（↑↓ 调序，不再是逗号分隔的文本框）
+ *   3) 每家的冷却倒计时
+ *
+ * 渠道名单一律从 ctx.channels + ctx.chainOf() 取，**不写死任何渠道名**。
+ * 链序真实值来自 config.failover.chain（全局配置，不在清单条目里）。
  */
 window.BAI_CARDS = window.BAI_CARDS || {};
 window.BAI_CARDS["failover"] = {
   mount(ctx) {
     const $ = ctx.$ || ((id) => document.getElementById(id));
-    const api = ctx.api;
-    const slot = ctx.slot || $("slot-extra") || (() => {
-      const d = document.createElement("div");
-      (document.querySelector(".wrap") || document.body).appendChild(d);
-      return d;
-    })();
+    const esc = ctx.esc || ((s) => String(s == null ? "" : s));
+    const slot = ctx.slot || $("foPanel") || $("slot-extra");
+    if (!slot) return { update() { }, refresh() { } };
 
-    slot.insertAdjacentHTML("beforeend", `
-      <!-- 自动故障转移：Claude Code 只接一次线，额度用光/渠道挂掉时中转自己换人 -->
-      <div class="card foldable collapsed" id="cardFo">
-        <div class="head" id="headFo">
-          <span class="eyebrow">可选</span><span class="title">自动故障转移</span>
-          <span class="aux" id="foAux">额度用光时自动换渠道</span>
+    const MANIFEST = window.BAI_PROVIDERS || {};
+    /* 可进链的渠道（chainable）。顺序按清单书写序，即出厂默认的链序。 */
+    const POOL = (ctx.channels || Object.keys(MANIFEST))
+      .filter((k) => (MANIFEST[k] || {}).chainable === true);
+
+    slot.innerHTML = `
+      <div class="fohead">
+        <button class="switch" id="ckFailover" role="switch" aria-checked="false" aria-label="开启自动故障转移"><i></i></button>
+        <div class="foheadtxt">
+          <b>自动故障转移</b>
+          <span>当前渠道 429 / 5xx / 超时 / 断线时，中转按下面的顺序自己换人</span>
         </div>
-        <div class="body">
-          <label class="checks" style="font-size:13px;display:block;margin-bottom:10px">
-            <input type="checkbox" id="ckFailover"> 开启——当前渠道 429/5xx/超时/断线时，自动改用下面的顺序重试
-          </label>
-          <div class="fld">
-            <label for="fFoChain">转移顺序（当前渠道永远排第一，手动选的就是首选）</label>
-            <input type="text" id="fFoChain" placeholder="qd, bai, sn, zen, wb">
-          </div>
-          <div class="hint" style="margin-top:10px">
-            <b>只换渠道，不换请求语义</b>：换过去时会按新渠道自己的路由表重新解析模型名
-            （Qoder 的 <span class="mono">lite</span>、Zen 的 <span class="mono">space-bunny-free</span>
-            互不相通）。没配凭据的渠道会自动跳过。失败渠道会冷却 90 秒，避免每条请求都白等一遍超时。
-            <br><b>不做转移的情况</b>：HTTP 400（请求本身有问题，换谁都一样）与上游 200 里裹的
-            <span class="mono">event: error</span>（多半是模型名不被支持）——这类会把真实错误原样告诉你，而不是被下一次尝试盖掉。
-            <br><b>流式的边界</b>：只在首个响应头写出之前转移。一旦 SSE 的 message_start 已发出就不会再换——
-            否则等于把半截内容接上另一家的开头。
-          </div>
-          <div id="foCool" class="hint" style="margin-top:10px;display:none"></div>
-          <div class="saverow">
-            <button class="btn-main" id="btnSaveFo" style="padding:8px 20px">保存</button>
-            <span class="checks" style="font-size:12px">改完立即生效，无需重启服务</span>
-          </div>
-          <div class="result" id="foResult"></div>
-        </div>
-      </div>`);
+        <span class="spacer"></span>
+        <span class="monote" id="foAux"></span>
+      </div>
+      <div class="seq" id="foSeq"></div>
+      <div class="cooldown" id="foCool"></div>
+      <div class="saverow">
+        <button class="btn sm" id="btnSaveFo" type="button">保存顺序</button>
+        <span class="fpline" style="border:0;padding:0"><span class="v zh">改完点保存立即生效，无需重启服务</span></span>
+      </div>
+      <div class="result" id="foResult"></div>`;
 
-    // 自动故障转移卡：折叠交互 + 读写
-    {
-      const hd = $("headFo"), cd = $("cardFo");
-      if (hd) hd.addEventListener("click", (e) => {
-        if (e.target.closest("button") || e.target.closest("input")) return;
-        cd.classList.toggle("collapsed");
-      });
-    }
+    /* 链序草稿：用户调序期间只改内存，点保存才落盘 */
+    let draft = null;
+    let enabled = false;
+    let cooling = {};
 
-    function renderFailover(fo) {
-      const f = fo || {};
-      if ($("ckFailover")) $("ckFailover").checked = f.enabled === true;
-      if ($("fFoChain")) $("fFoChain").value = (f.chain || []).join(", ");
-      const cool = f.cooling || {};
-      const box = $("foCool");
-      if (box) {
-        const ks = Object.keys(cool);
-        if (!ks.length) { box.style.display = "none"; }
+    const order = () => {
+      const cur = ctx.chainOf();
+      const base = cur.length ? cur.filter((k) => POOL.includes(k)) : POOL.slice();
+      for (const k of POOL) if (!base.includes(k)) base.push(k);   // 没进链的补在链尾
+      return base;
+    };
+
+    function render() {
+      if (!draft) draft = order();
+      /* 池子变了（渠道增删）就把草稿对齐一次，避免留下一份对不上的序 */
+      if (draft.length !== POOL.length || draft.some((k) => !POOL.includes(k))) draft = order();
+
+      const sw = $("ckFailover");
+      if (sw) sw.setAttribute("aria-checked", String(enabled));
+
+      const seq = $("foSeq");
+      if (seq) {
+        seq.innerHTML = draft.map((k, i) => {
+          const st = ctx.channelState(k);
+          const cool = cooling[k];
+          return `<span class="node${i === 0 ? " first" : ""}" data-k="${esc(k)}" data-i="${i}">
+              <span class="no">${i + 1}</span>
+              <span class="nm">${esc(ctx.nameOf(k))}</span>
+              ${cool ? `<span class="cool">${Math.max(0, cool.leftSec | 0)}s</span>` : ""}
+              <span class="ops">
+                <button type="button" data-mv="up" title="上移"${i === 0 ? " disabled" : ""}>▲</button>
+                <button type="button" data-mv="down" title="下移"${i === draft.length - 1 ? " disabled" : ""}>▼</button>
+              </span>
+            </span>${i === draft.length - 1 ? "" : '<span class="sep">→</span>'}`;
+        }).join("");
+      }
+
+      const aux = $("foAux");
+      if (aux) aux.textContent = enabled ? `已开启 · ${draft.length} 个候选` : "当前已关闭（不会自动换渠道）";
+
+      const cool = $("foCool");
+      if (cool) {
+        const ks = Object.keys(cooling).filter((k) => (cooling[k].until || 0) * 1000 > Date.now());
+        if (!ks.length) { cool.innerHTML = ""; cool.style.display = "none"; }
         else {
-          box.style.display = "";
-          const zh = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen", qd: "Qoder" };
-          box.innerHTML = "<b>冷却中</b>（暂时不会被选中，约 " +
-            Math.min.apply(null, ks.map((k) => cool[k].cooldownLeftSec)) + " 秒后恢复）：<br>" +
-            ks.map((k) => "· " + (zh[k] || k) + " —— " + (cool[k].lastErr || "")).join("<br>");
+          cool.style.display = "";
+          cool.innerHTML = '<span class="k">冷却中</span>'
+            + ks.map((k) => {
+              return `<span class="crow_"><b>${esc(ctx.nameOf(k))}</b> ${Math.max(0, cooling[k].leftSec | 0)}s`
+                + (cooling[k].lastErr ? ` · ${esc(cooling[k].lastErr)}` : "") + "</span>";
+            }).join("");
         }
       }
-      const aux = $("foAux");
-      if (aux) aux.textContent = f.enabled === true ? "已开启 · " + ((f.chain || []).length) + " 个候选渠道" : "额度用光时自动换渠道";
     }
 
+    /* --- 事件 --- */
+    const sw = $("ckFailover");
+    if (sw) sw.addEventListener("click", () => {
+      enabled = sw.getAttribute("aria-checked") !== "true";
+      render();
+    });
+
+    const seq = $("foSeq");
+    if (seq) seq.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-mv]");
+      if (!btn) return;
+      const node = btn.closest(".node");
+      if (!node) return;
+      const i = Number(node.getAttribute("data-i"));
+      const j = btn.dataset.mv === "up" ? i - 1 : i + 1;
+      if (j < 0 || j >= draft.length) return;
+      const t = draft[i];
+      draft[i] = draft[j];
+      draft[j] = t;
+      render();
+    });
+
     $("btnSaveFo").addEventListener("click", () => ctx.withBusy($("btnSaveFo"), async () => {
-      const chain = $("fFoChain").value.split(/[,、\s]+/).map((x) => x.trim())
-        .filter((x) => ["bai", "sn", "wb", "zen", "qd"].includes(x));
-      const r = await api("/api/config", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ provider: ctx.PROVIDER, failover: { enabled: $("ckFailover").checked, chain } }),
-      });
-      ctx.showResult($("foResult"), "✔ 已保存：故障转移已" + ($("ckFailover").checked ? "开启" : "关闭") + "（立即生效）", true);
+      const r = await ctx.postJSON("/api/config", { failover: { enabled, chain: draft } });
+      ctx.showResult($("foResult"),
+        "✔ 已保存：故障转移已" + (enabled ? "开启" : "关闭")
+        + "，链序 " + draft.map((k) => ctx.nameOf(k)).join(" → ") + "（立即生效）", true);
       if (typeof ctx.poll === "function") ctx.poll();
+      if (r && r.messages && r.messages.length) draft = order();
     }));
 
+    render();
+
     return {
-      // 轮询刷新：既收整份 status，也容许直接传 status.failover
+      /* 轮询刷新：只读状态（开关与顺序在草稿里，用户没点保存前不被覆盖）。
+         cooling[k] 来自 failoverSnapshot()：{cooldownLeftSec, lastErr, quota}，
+         是**剩余秒数**不是绝对时间戳——每轮 poll 由服务端重新下发，直接显示即可。 */
       update(status) {
-        renderFailover(status && Object.prototype.hasOwnProperty.call(status, "failover") ? status.failover : status);
+        const f = (status && status.failover) || {};
+        if (typeof f.enabled === "boolean") enabled = f.enabled;
+        const c = f.cooling || {};
+        const next = {};
+        for (const k of Object.keys(c)) {
+          const v = c[k] || {};
+          next[k] = { leftSec: Number(v.cooldownLeftSec) || 0, lastErr: v.lastErr || "" };
+        }
+        cooling = next;
+        render();
       },
+      refresh() { render(); },
     };
   },
 };

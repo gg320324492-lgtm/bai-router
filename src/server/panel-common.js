@@ -1,34 +1,34 @@
-/* panel-common.js —— 五个提供方页面（bai / sn / wb / zen / qd）共用的渲染层。
+/* panel-common.js —— 单页控制台的全部渲染与交互（契约 REFACTOR-CONTRACT-v17 · 里程碑 4）。
  *
- * 由来：此前五页各带一份内联 <script>，约 2600 行、54–70% 逐字重复，而且已经漂移
- * （qd/zen 把 badge 的 mine 写成了 "wb"、sn 页的 keyMatch 字段各家不同、提示条里
- * 「接在别的渠道上」连本页自己的 mode 也算进去了……）。本文件是唯一一份渲染实现，
- * 各家差异全部从 window.BAI_PROVIDERS（providers.js 清单）读。
+ * 由来：v1.0.48 起这里是「五个提供方页面共用的一份渲染层」，七个 URL 各渲染同一张
+ * provider.html，只靠 path 决定选中哪家。v17 把「七页同构」改成「一张单页 + 四个视图」——
+ * 本文件随之重写：不再是"某一页的渲染层"，而是**整张单页**的渲染层。
  *
- * 页面结构：provider.html 是唯一模板，只有外壳 + 插槽；本文件负责把清单里的文案
- * 与结构填进去，并把通用交互（信号灯 / 徽章 / 提示条 / 路由表 / 设置卡 / 两步引导 /
- * 主题 / 窗口控制 / 折叠卡 / 页脚 / 横幅 / 底栏 / 备用升级）全部接上。
+ * 硬约束（由 scripts/check-manifest.cjs 的闸门强制，违反即构建期失败）：
+ *   C5  不许再读已被处置表删掉的 25 个 id（见 IN_FLIGHT_IDS，里程碑 4 落地后该台账清空）
+ *   C11 本文件里**不许出现任何渠道名字面量**——不做 `=== "wb"`、不拿 `["wb"]` 当下标、
+ *        不写死渠道名数组。各家差异一律从 window.BAI_PROVIDERS 清单读。
+ *   C12 渲染层必读的渠道字段每家都必须有（与 C1 求交集，防两处漂移）
  *
- * 各家专属（token-capture / model-catalog / failover）不在这里，由 cards/*.js 经
- * 下面的 mountCards() 挂到 #slot-extra；它们造出来的元素（#cardTok / #tokStat /
- * #tokToggle / #btnSaveTok …）共享层一律不再接管（存在即接 + 卡先挂载）。
- *
- * 启动顺序：pathname → key → 注入清单文案与结构 → 挂载 extraCards → 接线 → 轮询。
+ * 启动顺序：清单就位 → path 决定选中渠道 → hash 决定视图 → 注入文案与结构 →
+ *          挂载该视图的卡片 → 接线 → 轮询状态 + 配置。
  */
 (() => {
   if (document.panelCommonReady) return;
   document.panelCommonReady = 1;
 
   /* ======================================================================
-   * 0. 基础工具（自包含，不依赖任何页面内联脚本的全局）
+   * 0. 基础工具
    * ==================================================================== */
   const $ = (id) => document.getElementById(id);
   const has = (id) => !!$(id);
   const q = (sel, root) => (root || document).querySelector(sel);
+  const qa = (sel, root) => Array.from((root || document).querySelectorAll(sel));
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const clsx = (el, on, name) => { if (el) el.classList.toggle(name, !!on); };
   const showEl = (el, on) => { if (el) el.style.display = on ? "" : "none"; };
+  const cap = (s) => String(s || "").charAt(0).toUpperCase() + String(s || "").slice(1);
 
   async function api(path, opts) {
     const r = await fetch(path, opts);
@@ -40,6 +40,13 @@
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
   });
 
+  /* 状态语义色只有四态 + 一色品牌。led/badge/cell 一律走这里，CSS 侧同名。 */
+  const STATE = {
+    ok: { cls: "ok", txt: "就绪" },
+    warn: { cls: "warn", txt: "需留意" },
+    err: { cls: "err", txt: "故障" },
+    idle: { cls: "idle", txt: "未配置" },
+  };
   function setLed(el, state, pulse) {
     if (!el) return;
     el.className = "led " + state + (pulse ? " pulse" : "");
@@ -49,34 +56,22 @@
    * 1. 常量表：档位名与 mode 标签是固定领域名词，不随各家变
    * ==================================================================== */
   const TIERS = [
-    { key: "claude-fable-5", zh: "Fable · 最强" },
-    { key: "claude-sonnet-5", zh: "Sonnet · 均衡" },
-    { key: "claude-opus-5", zh: "Opus · 重型" },
-    { key: "claude-haiku-4-5", zh: "Haiku · 快速" },
+    { key: "claude-fable-5", zh: "Fable · 最强", short: "Fable" },
+    { key: "claude-sonnet-5", zh: "Sonnet · 均衡", short: "Sonnet" },
+    { key: "claude-opus-5", zh: "Opus · 重型", short: "Opus" },
+    { key: "claude-haiku-4-5", zh: "Haiku · 快速", short: "Haiku" },
   ];
-  const TIER_ZH = {
-    "claude-fable-5": "Fable", "claude-sonnet-5": "Sonnet",
-    "claude-opus-5": "Opus", "claude-haiku-4-5": "Haiku",
-  };
+  const TIER_ZH = {};
+  for (const t of TIERS) TIER_ZH[t.key] = t.short;
   const MODE_TXT = { ccswitch: "CC SWITCH", other: "其他", unknown: "未知" };
-
-  /* 本路由台自家提供的渠道。此前每页各自硬编码一份"还有别的端接在谁身上"的判断，
-   * 结果各漏一部分（sn 页漏了 zen/qd，wb/zen/qd 三页都只列了 bai+sn）——第五家一加
-   * 进来就又漂移。收口到这里，且不再写死名单：渠道集合就是清单的键集。
-   * （这两个全局当年是给旧页 sn/wb/zen/qd.html 用的，旧页已于 v1.0.48/v1.0.49 删除，
-   * 这里仍旧挂出去只为兼容可能残留的旧调用，新模板只用清单。） */
-  window.BAI_OURS = Object.keys(window.BAI_PROVIDERS || {});
-  window.baiIsOurs = (m) => window.BAI_OURS.includes(m);
-  /* 本页该拿哪个 keyMatch 字段来比对自己的凭据（此前各页都写死成 keyMatchWb）。
-   * 名单同样从清单取：每家自己声明 keyMatch；没声明的回落到 bai 的通用字段。 */
-  window.baiKeyMatchField = (provider) => {
-    const p = (window.BAI_PROVIDERS || {})[provider];
-    return (p && p.keyMatch) || "keyMatch";
-  };
+  for (const k in (window.BAI_PROVIDERS || {})) {
+    const t = (window.BAI_PROVIDERS[k] || {}).tab || k;
+    MODE_TXT[k] = String(t).toUpperCase();
+  }
 
   /* ======================================================================
    * 2. 保留区：更新横幅 / 底栏三按钮 / 备用升级 / 停止服务
-   *    （与重构前逐字一致，拆出来是因为它与"当前是哪个提供方"无关）
+   *    （与"当前是哪个提供方"无关，整段从重构前逐字保留）
    * ==================================================================== */
 
   /* --- 2.1 更新横幅（插在 bnrInfo 之前） --- */
@@ -119,7 +114,7 @@
     for (const b of add) { if (ref) ref.after(b); ref = b; }
   }
 
-  /* --- 2.3 内嵌通知横幅（showInfo，五页共用） --- */
+  /* --- 2.3 内嵌通知横幅（showInfo，全站共用） --- */
   let infoTimer = null;
   function showInfo(title, msg, ms) {
     const b = $("bnrInfo");
@@ -143,10 +138,11 @@
   let suTimer = null;
   function paintSelf(st) {
     const b = $("bnrUpdate");
+    if (!b) return;
     b.classList.add("show");
-    $("bnrUpdSelf").style.display = "none";
-    $("bnrUpdGo").style.display = "none";
-    $("bnrUpdLater").style.display = "none";
+    if (has("bnrUpdSelf")) $("bnrUpdSelf").style.display = "none";
+    if (has("bnrUpdGo")) $("bnrUpdGo").style.display = "none";
+    if (has("bnrUpdLater")) $("bnrUpdLater").style.display = "none";
     $("bnrUpdRow").style.display = "";
     if (st.phase === "resolving") {
       $("bnrUpdTitle").textContent = "备用升级：查询最新版…";
@@ -201,57 +197,36 @@
   if (has("bnrUpdSelf")) $("bnrUpdSelf").addEventListener("click", startSelfUpdate);
   if (has("bnrUpdLater")) $("bnrUpdLater").onclick = () => $("bnrUpdate").classList.remove("show");
   if (has("bnrUpdX")) $("bnrUpdX").onclick = () => $("bnrUpdate").classList.remove("show");
-  if (has("bnrUpdGo") && !window.baiDesktop) $("bnrUpdGo").onclick = () => window.baiDesktop && window.baiDesktop.installUpdate();
 
   if (has("stopBtn")) {
     $("stopBtn").addEventListener("click", () => {
       if (window.baiDesktop) {
-        if (confirm("退出软件？退出后中转停止，B.AI 模式下的桌面版 Claude 会断线。")) window.baiDesktop.quit();
+        if (confirm("退出软件？退出后中转停止，模式下的桌面版 Claude 会断线。")) window.baiDesktop.quit();
         return;
       }
-      if (!confirm("停止服务后中转 15722 也会停止，桌面版/CLI 若在 B.AI 模式会立即断线。确定停止？")) return;
+      if (!confirm("停止服务后中转也会停止，桌面版/CLI 若在中转模式下会立即断线。确定停止？")) return;
       api("/api/service/stop", { method: "POST" }).finally(() => {
-        document.body.innerHTML = '<div style="font-family:sans-serif;color:#8b8e9a;padding:40px;text-align:center">服务已停止。重新双击「B.AI 路由台」图标即可恢复。</div>';
+        document.body.innerHTML = '<div style="font-family:sans-serif;color:#8b8e9a;padding:40px;text-align:center">服务已停止。重新双击「路由台」图标即可恢复。</div>';
       });
     });
   }
 
-  /* --- 2.6 更新模态对话框（v1.0.52）
-   * 契约：手动点「检查更新」发现新版本时才弹（主进程把 state.manual 置 true）；
-   * 自动检查（启动 8 秒后、每 12 小时一次）保持静默，只走右下角横幅，不打扰用户。
-   *
-   * 为什么是页面内自绘而不是主进程 dialog.showMessageBox：① 主题/配色与面板统一
-   * （系统弹窗是浅色 OS 风格，和五家各自的强调色对不上）；② 更新日志可能很长，
-   * 原生弹窗在多行文本上排版与滚动都不受控；③ 弹窗要与横幅一样实时跟随
-   * 「下载中 N% → 可安装」的状态变化，原生弹窗做不到边显示边更新。
-   *
-   * 弹框元素由本文件 createElement 注入，**不写进 provider.html**——
-   * check-manifest.cjs 的 C4 要求那 52 个契约 id 在模板里各出现且仅出现一次，
-   * 加在模板里会破坏该不变式（v1.0.51 的 #bnrUpdNotes 同理，加在 HTML 串里）。
-   *
-   * 生命周期：手动发现新版（manual:true, phase:"downloading", percent:0）→ 弹框；
-   * 下载进度事件（phase:"downloading"）实时把 percent 打进副标题与进度条；
-   * 下载完成（phase:"ready"）按钮从「下载并安装」变成「立即重启安装」。
-   * 用户点「稍后」= 只收起弹框（后台继续下载，横幅仍在，不误删已下流量）。 */
-
-  /* 日志文本归一化：主进程已归一成字符串，但这里仍按契约把
-     string | Array<{note}> | null 都吃下——与 paintNotes 同一套降级思路，
-     只是弹框里要显示**全文**，所以不做折叠，全部交给 CSS 滚动。 */
-  const modalNotesText = (raw) => {
+  /* --- 2.6 更新模态对话框（手动检查才弹；自动检查保持静默） --- */
+  const notesToText = (raw) => {
     if (raw == null) return "";
     if (Array.isArray(raw)) {
       return raw.map((r) => (r && typeof r.note === "string" ? r.note : "")).filter(Boolean).join("\n\n");
     }
     if (typeof raw !== "string") return "";
     return raw
-      .replace(/^[ \t]*#{1,6}[ \t]*/gm, "")   // 去掉 "### " 之类的 shell 味标题前缀
-      .replace(/\*\*/g, "")                    // 去掉 markdown 加粗，免得在 <pre> 里露裸星号
+      .replace(/^[ \t]*#{1,6}[ \t]*/gm, "")
+      .replace(/\*\*/g, "")
       .replace(/\r\n?/g, "\n")
       .trim();
   };
 
-  let modalEl = null;        // 懒创建：只有真的要弹时才建 DOM
-  let lastModalState = null; // 最后一次渲染弹框用的 state，收起时据此把横幅接回来
+  let modalEl = null;
+  let lastModalState = null;
   function ensureUpdateModal() {
     if (modalEl) return modalEl;
     modalEl = document.createElement("div");
@@ -274,32 +249,22 @@
         '</div>' +
       '</div>';
     document.body.appendChild(modalEl);
-    /* 「稍后」与点遮罩空白处 = 收起弹框（两种「先不看」的直觉操作等价）。
-       不 cancel 下载（既有链路没有取消能力），也不清状态。
-       收起时把右下角横幅接回来：弹框期间横幅是让位的（见 onAppEvent 的互斥逻辑），
-       关掉后若不接回，用户就再也看不到「还在后台下载」以及「可以重启安装了」。 */
     $("updModalLater").onclick = () => closeUpdateModal();
     $("updModalMask").onclick = () => closeUpdateModal();
-    /* 「立即安装」：走既有安装流程。download 阶段它会开始下载、ready 阶段它会
-       quitAndInstall，两态由主进程 installReadyUpdate() 自己分流，渲染层不重复判断。 */
     $("updModalGo").onclick = () => {
       if (window.baiDesktop) window.baiDesktop.installUpdate();
     };
     return modalEl;
   }
 
-  /* 收起弹框。lastModalState 记住最后一次渲染用的状态，用来把横幅接回来——
-     弹框让位期间横幅一直没被 paintUpdate 碰过，不重画的话它会停在旧内容上。 */
   function closeUpdateModal() {
     if (modalEl) modalEl.style.display = "none";
-    if (lastModalState) { try { paintUpdate(lastModalState); } catch { } }
+    if (lastModalState) { try { paintUpdate(lastModalState); } catch { /* 收起时的重画失败不阻塞 */ } }
   }
 
-  /* 渲染弹框。rawNotes 为假值（""/null/undefined/[]/纯空白）时整块日志区隐藏，
-     弹框退回「标题 + 副标题 + 按钮」的极简形态——这正是契约点名的老包降级项。 */
   function paintUpdateModal(st) {
     ensureUpdateModal();
-    lastModalState = st;   // 收起时据此把横幅接回来
+    lastModalState = st;
     const title = $("updModalTitle"), sub = $("updModalSub");
     const barWrap = $("updModalBarWrap"), bar = $("updModalBar");
     const go = $("updModalGo");
@@ -318,36 +283,29 @@
         : "点「立即安装」开始下载；也可以稍后再说。";
       barWrap.style.display = "";
       bar.style.width = pct + "%";
-      /* 下载中把按钮置灰：文案已说明在下载，此时它没有可执行的语义。
-         用户不会被锁死——「稍后」始终可点（收起弹框后右下角横幅仍显示进度），
-         再点一次「检查更新」也会走 manualCheckUpdate 的补发分支把弹框重新打开。 */
       go.textContent = pct > 0 ? "正在下载…" : "立即安装";
       go.disabled = pct > 0;
     }
 
-    /* 日志区降级：没有日志就整块 hide，不留空框、不报错。 */
-    const wrap = $("updModalNotesWrap");
-    const txt = modalNotesText(st.releaseNotes);
+    const notesWrap = $("updModalNotesWrap");
+    const txt = notesToText(st.releaseNotes);
     if (!txt) {
-      wrap.style.display = "none";
+      notesWrap.style.display = "none";
       $("updModalNotes").textContent = "";
     } else {
-      wrap.style.display = "";
-      /* 纯文本 + <pre> + CSS 的 max-height/overflow-y：日志多长都只在这块里滚，
-         不会把弹框撑高、更不会撑爆窗口（见 panel-common.css 的 .updModal .notes）。 */
+      notesWrap.style.display = "";
       $("updModalNotes").textContent = txt;
     }
 
     if (modalEl.style.display === "none") modalEl.style.display = "";
   }
 
-  /* --- 2.6 桌面壳 / 浏览器 的页脚按钮差异 + 更新状态渲染 --- */
+  /* --- 2.7 桌面壳 / 浏览器 的页脚按钮差异 + 更新状态渲染 --- */
   if (window.baiDesktop) {
     if (has("stopBtn")) $("stopBtn").textContent = "退出软件";
     if (has("updBtn")) $("updBtn").style.display = "";
     if (has("btnSelfUpd")) $("btnSelfUpd").style.display = "";
 
-    // 旧副本提示（v1.0.29）：正从手工副本运行、正式版在别处且更新
     const paintStale = (st) => {
       const b = $("bnrUpdate");
       b.classList.add("show");
@@ -377,37 +335,11 @@
       }
     };
 
-    /* --- 2.6.1 更新日志（本次更新了什么） ---
-       日志可能很长，直接铺开会把右下角的横幅撑得满屏高，所以默认只露前几行、
-       点「详情」再展开。展开态只在内存里（isOpenNotes），刷新页面即回到折叠；
-       不写 localStorage —— 它是「本次更新」的一次性说明，没必要跨会话记住。
-       同一个会话里跨事件保持用户的选择：用户既然点开了，就别在下一轮进度
-       回调里又给他收回去。 */
-    const NOTES_MAX = 3;            // 折起来时可见的行数（按换行算，不按字符宽度）
-    const NOTES_BULLET = "· ";      // 与 #bnrUpdMsg 同款点号前缀
+    const NOTES_MAX = 3;
+    const NOTES_BULLET = "· ";
     const isOpenNotes = { v: false };
-
-    /* 把日志整成纯文本：数组（老版本只给 note 字段）先摊平；去掉 shell 味的
-       "### " 与 markdown 加粗标记，避免在 <pre> 里露出裸符号。确如契约所说
-       releaseNotes 可能是 string | Array<{note}> | null —— 两种都要能吃下。
-       反过来，主进程已把它归一成字符串时这里就是恒等变换，不重复加工。 */
-    const notesToText = (raw) => {
-      if (raw == null) return "";
-      if (Array.isArray(raw)) {
-        return raw.map((r) => (r && typeof r.note === "string" ? r.note : "")).filter(Boolean).join("\n\n");
-      }
-      if (typeof raw !== "string") return "";
-      return raw
-        .replace(/^[ \t]*#{1,6}[ \t]*/gm, "")
-        .replace(/\*\*/g, "")
-        .replace(/\r\n?/g, "\n")
-        .trim();
-    };
     const notesLines = (txt) => String(txt || "").split("\n").map((l) => l.trim()).filter(Boolean);
 
-    /* 渲染日志区。没有日志时（老包不带 releaseNotes，或字段是 null/[]/空白）
-       整块 #bnrUpdNotes 保持 display:none —— 不显示空框、不报错，横幅退回
-       与加此功能之前逐字一致的样子。这正是契约点名的降级项。 */
     function paintNotes(raw) {
       const box = $("bnrUpdNotes");
       if (!box) return;
@@ -416,17 +348,11 @@
       box.style.display = "";
       const lines = notesLines(txt);
       const more = lines.length > NOTES_MAX;
-      /* 折叠行的选择：默认只显示前 NOTES_MAX 行。用「前 N 行」而不是「第一行」，
-         是因为更新说明常写成「- 改点1 / - 改点2 …」，只给一行反而看不出改了啥。 */
       const shown = isOpenNotes.v ? lines : lines.slice(0, NOTES_MAX);
       const rest = lines.length - NOTES_MAX;
       let html = `<pre class="notes">${esc(shown.map((l) => NOTES_BULLET + l).join("\n"))}</pre>`;
       if (more) {
-        /* 用 <button> 而不是 <a>：横幅里已有多个 button，样式统一好收口，且不被
-           C5 的 id 反向检查盯上（那个检查只看 $()/onClick/applyText/has 的字符串）。 */
-        const label = isOpenNotes.v
-          ? "收起"
-          : `详情（还有 ${rest} 行）`;
+        const label = isOpenNotes.v ? "收起" : `详情（还有 ${rest} 行）`;
         html += `<button class="btn-sm notesToggle" id="bnrUpdNotesBtn" type="button" style="margin-top:6px;padding:3px 10px;font-size:11px">${esc(label)}</button>`;
       }
       box.innerHTML = html;
@@ -438,6 +364,7 @@
 
     const paintUpdate = (st) => {
       const b = $("bnrUpdate");
+      if (!b) return;
       if (!st || st.phase === "latest" || st.phase === "checking") { b.classList.remove("show"); return; }
       b.classList.add("show");
       if (st.phase === "downloading") {
@@ -457,7 +384,7 @@
         $("bnrUpdBarWrap").style.display = "none";
         $("bnrUpdMsg").textContent = (certIssue
           ? "这台电脑还没信任软件证书（每台电脑只需一次）。点「信任并重试」即可自动完成。"
-          : ((st.msg || "未知错误") + " —— 多为 Clash 节点抖动：开/换节点后点「重试」，或直接点「备用升级」（走路由台下载通道，通常更稳）。"));
+          : ((st.msg || "未知错误") + " —— 多为代理节点抖动：开/换节点后点「重试」，或直接点「备用升级」（走路由台下载通道，通常更稳）。"));
         $("bnrUpdRow").style.display = "";
         $("bnrUpdSelf").style.display = "";
         $("bnrUpdGo").textContent = certIssue ? "信任并重试" : "重试更新";
@@ -475,559 +402,483 @@
       }
       $("bnrUpdGo").textContent = "重启安装";
       $("bnrUpdGo").onclick = () => window.baiDesktop.installUpdate();
-      /* 只在这里渲染一次日志。error 分支在上面已 return，走不到这里；
-         downloading / ready 都会落到这里——所以那两处**不要**再各调一次，
-         否则同一事件会重建两遍 #bnrUpdNotes（innerHTML 被覆盖、按钮重建）。 */
       paintNotes(st.releaseNotes);
     };
 
-    /* v1.0.55 当前事务跟踪。
-       契约核心：横幅与弹框**不是互斥的两件事**，而是**同一个事务的两个视图**。
-       v1.0.54 把「手动」翻译成「只弹框、不画横幅」，掩盖了两个并行事务并存的真因——
-       用户在下 vA 的途中点检查又拿到 vB 时，vB 走手动分支弹框、vA 的进度事件
-       走非手动分支重画横幅，一屏就同时出现两个版本的通知。
-       真正的规则：认准「当前正在显示哪个事务」，只渲染它；其余一律丢弃。
-       事务标识 = txid（主进程单调递增）。
-       为什么不用 version 排序：版本号是字符串，且可能「同版本重开一次检查」，
-       无法区分同版本的两笔事务谁新谁旧；txid 是数字且只增不减，天然可分先后。
-       version 仍随 state 下发，用于标题/日志文案。 */
-    /* curTxid：当前正在显示的事务；seenTxid：迄今见过的最大 txid（水位线）。
-       分开记是必要的：latest/checking 会把 curTxid 清成 null（没有事务在显示了），
-       但若只靠 curTxid 判旧，null 会让下面那个 `s.txid < curTxid` 守卫整个失效——
-       于是一笔已作废事务迟到的进度/ready 会被放行，把刚收起来的弹框又弹回来。
-       水位线不与「当前显示哪笔」绑定，作废后仍能挡住迟到的旧事件。
-       （实测复现：latest 之后再收 txid=1 的进度事件，弹框会复活。） */
-    let curTxid = null;    // 当前显示的事务 tid；null = 当前无事务在显示
-    let seenTxid = 0;      // 水位线：见过的最大 txid，只增不减
+    /* 横幅与弹框是**同一笔更新事务的两个视图**，靠 txid（主进程单调递增）认事务：
+       只渲染当前事务，其余一律丢弃。curTxid=当前显示哪笔，seenTxid=见过的最大 txid
+       （水位线，不随事务作废而清零——否则作废后迟到的旧事件会复活弹框）。 */
+    let curTxid = null;
+    let seenTxid = 0;
 
     window.baiDesktop.onAppEvent((ev) => {
       if (!ev || ev.kind !== "update") return;
       const s = ev.state || {};
 
-      /* 无 txid 的状态（checking / latest / 以及任何没带事务字段的兜底态）：
-         它们不构成一笔更新事务。latest/checking 是「没有新版在跑」的终态，
-         把当前事务取消掉并把界面清干净（收横幅、收弹框）。 */
       if (s.txid == null) {
         if (s.phase === "latest" || s.phase === "checking") curTxid = null;
         closeUpdateModal();
         paintUpdate(s);
         return;
       }
-
-      /* 丢弃旧事务迟到的事件——这是本版最关键的一行。
-         场景：下载 vA（txid=1）途中点检查又发现 vB（txid=2），界面已整体切到 vB；
-         此时 vA 可能还有一个 download-progress / update-downloaded / error 事件正在路上。
-         若照单全收，它会以 vA 的身份重画横幅，屏幕上就又出现 vA 的进度条——
-         正是用户实拍的那个 bug。txid 单调递增，所以「比当前小」= 旧事务，直接丢。
-         相等 = 当前事务的后续事件（进度/ready），放行。
-         error 也一并丢弃：作废旧事务时，旧下载报错是新流程的预期副作用
-         （autoUpdater 无法真正取消，旧任务失败在所难免），
-         把它弹成「更新失败」横幅只会误导用户——错误横幅应只反映当前事务的失败。
-         （真正需要暴露的 error 一定发生在其自身 txid 就是当前值时，不会被这里挡。）
-         注意这里比较的是数字，主进程保证 txid 只增不减，不会回绕到旧值。
-         比对的是 **seenTxid 水位线**而不是 curTxid：latest/checking 之后 curTxid 为 null，
-         用它作判据会让守卫失效（见上面的说明）。 */
       if (s.txid < seenTxid) return;
       seenTxid = s.txid;
 
-      /* 事务切换：txid 变了（更大 = 新事务；更小的情况上面已 return）。
-         换事务时先收掉上一笔的弹框，清掉它残留的 DOM 内容与「稍后」接回横幅的挂钩，
-         再让本次事件按自己的视图重画，保证屏幕上的横幅/弹框始终同属一笔事务。 */
       if (s.txid !== curTxid) {
         closeUpdateModal();
         curTxid = s.txid;
       }
 
-      /* v1.0.52 弹框分流：只有「用户手动检查」才发现的新版本才弹模态框
-         （主进程按 manualCheckAt 时间窗判定后写进 state.manual）。
-         自动检查（启动 8 秒后 / 每 12 小时一次）state.manual 为假 —— 保持静默，
-         只留下角横幅，不打扰用户，避免每次开机都弹一次框的倒退。
-         后续的下载进度事件沿用同一 state.manual，所以弹框会一路跟到 ready。
-         v1.0.55：这两个视图现在**同属当前事务**，绝不会跨事务错配。 */
       const wantsModal = s.manual === true && (s.phase === "downloading" || s.phase === "ready");
       if (wantsModal) {
         const b = $("bnrUpdate");
-        if (b) b.classList.remove("show");   // 弹框接管提示，横幅让位（事务的另一个视图）
+        if (b) b.classList.remove("show");
         paintUpdateModal(s);
       } else {
-        /* 非手动（自动检查 / 已是最新 / 出错）时，把可能还开着的弹框收掉。
-           不能只画横幅就完事：手动那次把弹框打开后，若后续来了个自动事件
-           （manual 为假），弹框会一直挂在屏幕中央——「自动检查静默」就破功了。
-           注意：能走到这里的事件必属于当前事务（txid 相等或刚被切换），
-           所以收掉弹框不会误伤「另一个事务」。 */
         closeUpdateModal();
         paintUpdate(s);
       }
     });
     if (has("bnrUpdGo")) $("bnrUpdGo").onclick = () => window.baiDesktop.installUpdate();
+    if (window.baiDesktop.onStaleCopy) {
+      try { window.baiDesktop.onStaleCopy(paintStale); } catch { /* 旧壳没有这个桥 */ }
+    }
   }
 
   /* ======================================================================
-   * 3. 定位当前提供方
+   * 3. 清单 / 视图表 / 选中渠道
    * ==================================================================== */
   const MANIFEST = window.BAI_PROVIDERS || {};
-  const normPath = (p) => (p || "/").replace(/\/+$/, "") || "/";
-  const here = normPath(location.pathname);
-  let KEY = null;
-  for (const k in MANIFEST) {
-    if (MANIFEST[k] && normPath(MANIFEST[k].path) === here) { KEY = k; break; }
-  }
-  const P = KEY ? (MANIFEST[KEY] || {}) : null;
+  const VIEWS = Array.isArray(window.BAI_VIEWS) ? window.BAI_VIEWS : [];
+  const ALL_KEYS = Object.keys(MANIFEST).filter((k) => MANIFEST[k]);
+  /* 进转移链的渠道（矩阵格序 = 转移链顺序；清单的书写顺序就是链序） */
+  const CHAIN_KEYS = ALL_KEYS.filter((k) => MANIFEST[k].chainable === true);
+  /* 不进链的那几格（交还区） */
+  const HANDOFF_KEYS = ALL_KEYS.filter((k) => MANIFEST[k].chainable !== true);
 
-  /* 兜底守卫：只保留区生效，两种情况 ——
-     1) 清单里没有当前路径（providers.js 还没这个提供方）
-     2) 页面里没有 #slot-extra 插槽。旧五页（ui/sn/wb/zen/qd.html）已于 v1.0.46 被
-        provider.html 取代、v1.0.49 删除，所以这已不可能是「旧页」，只可能是模板损坏、
-        加载顺序出错或路由发错了文件。此处仍必须返回：模板缺插槽时共享渲染层再跑一遍，
-        会和页面自带的内联 <script> 双重绑定。 */
-  if (!P || !has("slot-extra")) {
-    console.warn("[panel-common] " + here + " 缺少 #slot-extra 插槽（模板损坏或加载顺序错误），只启用保留区");
-    return;
-  }
-  P.key = P.key || KEY;
-  const key = P.key;
-  const C = P.cred || {};                    // 凭据灯文案（可选）
+  /* 凭据 / 中转这类字段的取法：清单里有的渠道在 status/config 里挂在同名子对象下，
+     有的（最早那家）是**平铺**的——顶层字段直接就是它自己的。这里运行时探测，
+     不在渲染层写死是哪一家（C11：渲染层不许出现渠道名字面量）。 */
+  const sliceOf = (obj, key) => {
+    if (!obj) return {};
+    const sub = obj[key];
+    return (sub && typeof sub === "object" && !Array.isArray(sub)) ? sub : obj;
+  };
+  const cfgOf = (key) => sliceOf(cfg, key);
+  const stOf = (key) => sliceOf(status, key);
 
-  /* 简称：清单未给 shortName 时，从灯名反推（"Zen 中转" → "Zen"） */
-  const SHORT = P.shortName || String((P.lampNames && P.lampNames.relay) || "")
-    .replace(/\s*中转$/, "") || P.tab || key;
+  const nameOf = (key) => {
+    const p = MANIFEST[key] || {};
+    return p.name || p.shortName || p.tab || key;
+  };
 
-  /* 徽章文字：清单 badgeText 优先，否则 tab 大写（"OpenCode Zen" → "ZEN" 的家自己声明）。 */
-  for (const k in MANIFEST) {
-    const t = MANIFEST[k].tab || k;
-    MODE_TXT[k] = MANIFEST[k].badgeText || t.toUpperCase();
-  }
-
-  /* /api/config 与 /api/status 的形状由清单 shape 决定：
-     "flat" = 本家数据在顶层（原 bai）；"nested" = 在同名子对象里（其余各家）。 */
-  const flatShape = (p) => ((MANIFEST[p] || {}).shape === "flat");
-  const sliceOf = (c, p) => (flatShape(p) ? (c || {}) : ((c || {})[p] || {}));
-  const stOf = (s) => (flatShape(key) ? (s || {}) : ((s || {})[key] || {}));
+  /* 接线徽章的比对字段：/api/status 的 cli/desktop 里带 keyMatch<首字母大写> 家族
+     （keyMatchSn / keyMatchWb …），最早那家是裸的 keyMatch。两个候选都试，
+     渲染层因此不需要知道具体是哪一家。 */
+  const keyMatchOf = (m, key) => {
+    if (!m) return undefined;
+    const alt = "keyMatch" + key.charAt(0).toUpperCase() + key.slice(1);
+    if (typeof m[alt] === "boolean") return m[alt];
+    if (typeof m.keyMatch === "boolean") return m.keyMatch;
+    return undefined;
+  };
 
   let cfg = null, status = null, busy = false, cards = [];
-  const slice = () => sliceOf(cfg, key);
-  const st = () => stOf(status);
+  let polling = false;      // 轮询重入保护（不是 busy：busy 是"有动作在飞"）
+  let selected = null;      // 当前选中的渠道 key；null = 还没定（等第一次 status）
+  let fromPath = false;     // 选中是否由 URL 路径直接决定（决定要不要滚动+高亮）
 
-  /* v1.0.48：原先这里的 FB[key] 兜底表已整表搬进 providers.js 对应条目。
-     现在唯一的数据源就是清单；下列取值全部直读 P。 */
-  const opt = (name) => P[name];
-  const DEFAULT_MODELS = opt("defaultModels") || [];
-  const BRANDS = opt("brands") || {};
-  const LABEL_SUFFIX = opt("labelSuffix") || "";
-  const CRED = C;
-
-  const GUIDE = Array.isArray(P.guide) ? P.guide : [];
-  const HAS_GUIDE = GUIDE.length > 0;
-  const primaryBtn = P.primaryBtn || `${P.accentLabel || "接通"} ${SHORT}`;
-
-  /* {btn} → primaryBtn（清单里所有提示条都这么写） */
-  const fill = (tpl, vars) => String(tpl == null ? "" : tpl)
-    .replace(/\{btn\}/g, primaryBtn)
-    .replace(/\{(\w+)\}/g, (m, k) => (vars && vars[k] != null ? vars[k] : m));
-
-  /* ======================================================================
-   * 4. 静态文案 + 结构注入：把清单里的文本位与专属区块填进模板
-   * ==================================================================== */
-  function applyText(id, text, html) {
-    const el = $(id);
-    if (!el) return null;
-    if (text == null) return el;                       // null = 本页没有这块，调用方决定去留
-    if (html) el.innerHTML = text; else el.textContent = text;
-    return el;
+  const normPath = (p) => (p || "/").replace(/\/+$/, "") || "/";
+  function keyFromPath(p) {
+    const here = normPath(p);
+    for (const k of ALL_KEYS) {
+      const mp = MANIFEST[k].path;
+      if (mp == null) continue;                 // 交还区没有独立 URL
+      if (normPath(mp) === here) return k;
+    }
+    return null;
   }
-
-  function buildRouteKey() {
-    const rk = P.routeKey;
-    const slot = $("slot-route");
-    if (!slot || !rk) return;
-    slot.innerHTML = `
-      <div class="keyrow">
-        <span class="k">${esc(rk.label || "")}</span>
-        <input type="password" id="apiKey" autocomplete="off" placeholder="${esc(rk.placeholder || "")}">
-        <button class="btn-sm" id="keyToggle" type="button">显示</button>
-      </div>`;
-  }
-
-  function buildSysExtras() {
-    const slot = $("slot-sys");
-    if (!slot) return;
-    const S = P.sys || {};
-    if (S.proxy || S.panelPort || S.proxyDetect) {
-      const g = document.createElement("div");
-      g.className = "grid2";
-      g.innerHTML = `
-        <div class="fld"><label for="fProxy">本地代理（出海通道，留空=直连/TUN）</label><input type="text" id="fProxy" placeholder="http://127.0.0.1:7890 / 7897 / 留空直连"></div>
-        ${S.proxyDetect ? '<button class="btn-sm" id="btnProxyDetect" type="button" style="align-self:end">自动检测代理</button>' : ""}
-        ${S.panelPort ? '<div class="fld"><label for="fPanelPort">面板端口</label><input type="text" id="fPanelPort" placeholder="15723"></div>' : ""}`;
-      slot.appendChild(g);
-    }
-    if (S.tokenView) {
-      const d = document.createElement("div");
-      d.className = "fld";
-      d.innerHTML = `<label for="fTokenView">令牌（jt-…）</label><input type="text" id="fTokenView" readonly placeholder="启动 ${esc(SHORT)} 后自动读取" style="font-family:var(--mono);opacity:.75">`;
-      slot.appendChild(d);
-    }
-    /* 凭据手填框（Zen 的 oc_sk_…）：标题取清单里凭据灯的名字，括注与占位符取副行
-       第一个词（"oc_sk_… 密钥" → oc_sk_…），造好挪进 .grid2 排在上游地址前面。 */
-    if (S.apiKey) {
-      const credName = (P.lampNames && P.lampNames.cred) || "API Key";
-      const credHint = String((P.lampSubs && P.lampSubs.cred) || "").split(/\s+/)[0] || "";
-      const d = document.createElement("div");
-      d.className = "fld";
-      d.innerHTML = `<label for="fApiKey">${esc(credName)}${credHint ? "（" + esc(credHint) + "）" : ""}</label>`
-        + `<input type="password" id="fApiKey" placeholder="${esc(credHint)}">`;
-      slot.appendChild(d);
-      const g2 = q("#cardSys .grid2") || q(".card .grid2");
-      if (g2) g2.prepend(d);
-    }
-  }
-
-  /* 没有两步引导的页面（B.AI / SenseNova）：把引导卡里的主按钮、两端勾选框与
-     #applyResult 搬进接线卡，还原旧页面「接通 X / 接回 CC Switch / 终端·桌面版」
-     一行排布，而不是白留一张空卡。
-     但本页没有「可接通的对象」时（清单 hideApply=true，如总览页）不搬：接线卡只留
-     原生的「接回 CC Switch」，引导卡整体隐藏——搬过去也只会多一个没人点的按钮。 */
-  function relocateApplyRow() {
-    const guide = q(".card.guide");
-    if (!guide) return;
-    if (HAS_GUIDE) return;
-    if (P.hideApply) { guide.style.display = "none"; return; }
-    const actions = q("#btnRestore") && $("btnRestore").closest(".actions");
-    const body = actions && actions.parentNode;
-    const step2 = $("step2");
-    const act = step2 && q(".stepAct", step2);
-    const apply = $("btnApply");
-    const checks = act && act.querySelector(".checks");
-    if (actions && apply) {
-      apply.textContent = primaryBtn;
-      $("btnRestore").before(apply);
-      if (checks) $("btnRestore").after(checks);
-    }
-    const res = $("applyResult");
-    if (body && res) body.appendChild(res);
-    guide.style.display = "none";
-  }
-
-  function applyManifest() {
-    /* 4.0 data-provider（provider.html 的引导脚本已设，这里只兜底） */
-    const root = document.documentElement;
-    if (!root.getAttribute("data-provider")) root.setAttribute("data-provider", key);
-    if (document.body && !document.body.getAttribute("data-provider")) {
-      document.body.setAttribute("data-provider", key);
-    }
-
-    /* 4.1 标题 */
-    if (P.title) document.title = P.title;
-    applyText("h1Text", P.h1);
-    applyText("h1Sub", P.sub);
-
-    /* 4.2 导航 tab 高亮（模板里写死的那份 .active 不保险，按 data-key 重算） */
-    for (const a of document.querySelectorAll(".prov-tab")) {
-      const k = a.dataset ? a.dataset.key : null;
-      if (k) clsx(a, k === key, "active");
-    }
-
-    /* 4.3 两步引导 */
-    if (has("btnApply")) $("btnApply").textContent = primaryBtn;
-    if (HAS_GUIDE) {
-      applyText("eyebGuide", P.guideEyebrow);
-      applyText("ttlGuide", P.guideTitle);
-      for (let i = 0; i < 2; i++) {
-        const g = GUIDE[i];
-        if (!g) continue;
-        applyText("ttlStep" + (i + 1), g.title, true);
-        applyText("descStep" + (i + 1), g.desc, true);
-      }
-      /* 第 1 步自带按钮的页面（WorkBuddy）：按钮文案来自 guide[0].act，
-         点击逻辑由 token-capture 卡接（它按 #btnCapture 找）。 */
-      const act = GUIDE[0] && GUIDE[0].act;
-      const slot = $("slot-step1");
-      if (act && slot) {
-        slot.innerHTML = `<button class="btn-main" id="btnCapture">${esc(act)}</button><span class="stepHint" id="hint1"></span>`;
-      }
-    }
-    relocateApplyRow();
-
-    /* 4.4 接线卡 */
-    applyText("eyebPatch", P.cardEyebrow);
-    const ph = $("patchHint");
-    if (ph) {
-      if (P.wireHint) ph.innerHTML = P.wireHint; else ph.style.display = "none";
-    }
-
-    /* 4.5 路由表 */
-    applyText("eyebRoute", P.routeEyebrow);
-    applyText("ttlRoute", P.routeTitle);
-    applyText("thTarget", P.targetName ? "→ " + P.targetName : null);
-    const rh = $("routeHint");
-    if (rh) { if (P.hint) rh.innerHTML = P.hint; else rh.style.display = "none"; }
-    buildRouteKey();
-
-    /* 整卡隐藏由清单 hideCards 字段驱动（总览页没有路由表、也没有本机设置）。
-       渲染逻辑照常跑（卡被隐藏，填值无人看见），只是不占版面；showEl 是既有写法。 */
-    const hideCards = Array.isArray(P.hideCards) ? P.hideCards : [];
-    const routeCard = $("routeBody") && $("routeBody").closest(".card");
-    showEl(routeCard, !hideCards.includes("route"));
-
-    /* 4.6 设置卡 */
-    applyText("eyebSys", P.settingsEyebrow);
-    applyText("ttlSys", P.settingsTitle);
-    applyText("sysAux", P.settingsAux);
-    const SL = P.settingsLabels || {};
-    const bridge = /协议桥/.test(String((P.lampSubs && P.lampSubs.relay) || ""));
-    applyText("lblUpstream", SL.upstream || `上游地址（${bridge ? "OpenAI 协议，内置桥翻译" : "Anthropic 兼容"}）`);
-    applyText("lblRelayPort", SL.relayPort || "中转端口");
-    const SYS = P.sys || {};
-    const upRow = $("useProxyRow");
-    if (upRow) {
-      const on = SYS.useProxyRow !== false;
-      showEl(upRow, on);
-      if (on) applyText("useProxyText", P.useProxyText || `让 ${SHORT} 也走本机代理（默认直连；仅当直连被拦时开启）`);
-    }
-    buildSysExtras();
-    /* 「部署到本机…」与「刷新模型列表」由清单 sys 开关控制（后者只有真有可拉实时目录的
-       家有：wb 的模型清单随客户端 product config 下发、zen/qd 各有专属目录卡）。 */
-    showEl($("btnDeploy"), !!SYS.deploy);
-    showEl($("btnResetModels"), DEFAULT_MODELS.length > 0);
-    showEl($("btnModels"), !!SYS.modelsRefresh);
-    showEl($("cardSys"), !hideCards.includes("settings"));   // hideCards 含 settings = 整卡隐藏
-
-    /* 4.7 页脚 */
-    if (has("footPaths")) {
-      $("footPaths").textContent = window.baiDesktop
-        ? (P.footNote || "")
-        : (P.footNoteAlt || "");
-    }
+  function chainOf() {
+    const f = (status && status.failover) || {};
+    const list = Array.isArray(f.chain) && f.chain.length ? f.chain.slice() : CHAIN_KEYS.slice();
+    return list.filter((k) => CHAIN_KEYS.includes(k));
   }
 
   /* ======================================================================
-   * 5. 信号灯：模板给三盏固定容器（relay/upstream/cred），clash / cc 由这里造，
-   *    造完按清单 lamps 的顺序摆进 .lamps 栅格里
+   * 4. 视图切换（URL hash：#/console · #/cred · #/fo · #/settings）
    * ==================================================================== */
-  const LAMP_DEFS = {
-    relay: { box: "lampRelay", name: "nameRelay", led: "ledRelay", txt: "txtRelay", sub: "subRelay" },
-    upstream: { box: "lampUp", name: "nameUp", led: "ledUp", txt: "txtUp", sub: "subUp" },
-    cred: { box: "lampTok", name: "nameTok", led: "ledTok", txt: "txtTok", sub: "subTok" },
-    cc: { led: "ledCc", txt: "txtCc", sub: "subCc" },
-    ccswitch: { led: "ledCc", txt: "txtCc", sub: "subCc" },
-    clash: { led: "ledClash", txt: "txtClash", sub: "subClash" },
-  };
-  const lampList = () => (Array.isArray(P.lamps) && P.lamps.length ? P.lamps : ["relay", "upstream", "cred"]);
+  let currentView = (VIEWS[0] || {}).id || null;
+  function viewFromHash() {
+    const raw = String(location.hash || "").replace(/^#\/?/, "").trim();
+    const hit = VIEWS.find((v) => v && v.id === raw);
+    return hit ? hit.id : ((VIEWS[0] || {}).id);
+  }
+  function viewOf(id) { return VIEWS.find((v) => v && v.id === id) || null; }
 
-  function ensureLamp(id) {
-    const d = LAMP_DEFS[id];
-    if (!d) return null;
-    if (d.box && $(d.box)) return $(d.box);
-    if ($(d.led)) return $(d.led).closest(".lamp");
-    const wrap = document.createElement("div");
-    wrap.className = "lamp";
-    wrap.dataset.lamp = id;
-    const nm = document.createElement("div");
-    nm.className = "name";
-    nm.textContent = (P.lampNames && P.lampNames[id]) || "";
-    const val = document.createElement("div");
-    val.className = "val";
-    const led = document.createElement("span");
-    led.className = "led"; led.id = d.led;
-    const txt = document.createElement("span");
-    txt.id = d.txt; txt.textContent = "—";
-    val.append(led, txt);
-    const sub = document.createElement("div");
-    sub.className = "sub"; sub.id = d.sub; sub.title = "";
-    if (P.lampSubs && P.lampSubs[id] != null) sub.textContent = P.lampSubs[id];
-    wrap.append(nm, val, sub);
-    /* 先在插槽里造（模板给的插槽是官方构造点），再挪进 .lamps 栅格 */
-    const slot = $("slot-lamps") || q(".lamps");
-    if (slot) slot.appendChild(wrap);
-    return wrap;
+  function setView(id, push) {
+    const v = viewOf(id);
+    if (!v) return;
+    currentView = v.id;
+    for (const vv of VIEWS) {
+      const box = $(vv.dom);
+      if (box) box.classList.toggle("on", vv.id === v.id);
+    }
+    for (const b of qa("#navViews [data-view]")) {
+      const on = b.getAttribute("data-view") === v.id;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-selected", String(on));
+    }
+    if (push !== false) {
+      const want = "#/" + v.id;
+      if (location.hash !== want) history.replaceState(null, "", want);
+    }
+    mountCardsFor(v.id);
   }
 
-  function buildLamps() {
-    const grid = q(".lamps");
-    const want = lampList().map((id) => (id === "ccswitch" ? "cc" : id));
-    const boxes = {};
-    for (const id of want) {
-      const el = ensureLamp(id);
-      if (!el) continue;
-      boxes[id] = el;
-      const d = LAMP_DEFS[id];
-      const nm = el.querySelector(".name");
-      if (nm && P.lampNames && P.lampNames[id]) nm.textContent = P.lampNames[id];
-      const sub = $(d.sub);
-      if (sub && P.lampSubs && P.lampSubs[id] != null) sub.textContent = P.lampSubs[id];
-    }
-    if (grid) for (const id of want) if (boxes[id]) grid.appendChild(boxes[id]);   // appendChild 即移动，按清单顺序排
-    /* 清单没点名的固定容器藏起来（B.AI / SenseNova 没有凭据灯） */
-    for (const id in LAMP_DEFS) {
-      const b = LAMP_DEFS[id].box && $(LAMP_DEFS[id].box);
-      if (b) showEl(b, want.includes(id));
-    }
-  }
-
-  function paintRelay(s, S) {
-    const relay = S.relay || {};
-    setLed($("ledRelay"), relay && relay.up ? "g pulse" : "r");
-    $("txtRelay").textContent = relay && relay.up ? "运行中" : "已停止";
-    const rl = S.relayLast || {};
-    const fresh = rl.at && Date.now() - new Date(rl.at).getTime() < 30 * 60000;
-    /* 没有最近错误时，副行显示「:端口 → ……」；尾巴取清单 lampSubs.relay 里
-       冒号端口之后的那截（sn 是「→ 上游」，wb/zen/qd 多一层「协议桥」）。 */
-    let tail = "";
-    const t0 = String((P.lampSubs && P.lampSubs.relay) || "");
-    const m = t0.match(/^:\s*\d+/);
-    if (m) tail = t0.slice(m[0].length);
-    $("subRelay").textContent = fresh ? `最近错误·${rl.kind}: ${rl.message}` : ":" + (relay.port || "—") + tail;
-    $("subRelay").title = fresh ? `${rl.at}\n${rl.message}` : "";
-  }
-  function paintUpstream(s, S) {
-    const up = S.upstream || {};
-    if (S.recent && S.recent.tier) {
-      const fresh = S.recent.observedAt && (Date.now() - new Date(S.recent.observedAt).getTime() < 30 * 60000);
-      if (up.tested === true) { setLed($("ledUp"), "g"); $("txtUp").textContent = `${up.model} ${up.ms}ms`; }
-      else if (up.tested === false) { setLed($("ledUp"), "r"); $("txtUp").textContent = "测试失败"; }
-      else { setLed($("ledUp"), fresh ? "g" : "a"); $("txtUp").textContent = fresh ? "正常" : "待测试"; }
-      $("subUp").textContent = fresh
-        ? `使用中: ${S.recent.label}${LABEL_SUFFIX}`
-        : (up.error || opt("noCallHint") || "尚未观察到 Claude 调用");
-    } else {
-      setLed($("ledUp"), up.tested === true ? "g" : up.tested === false ? "r" : "a");
-      $("txtUp").textContent = up.tested === true ? `正常 ${up.ms}ms` : up.tested === false ? "失败" : "未测试";
-      $("subUp").textContent = up.tested === true ? (up.model || "") : (up.error || "点「测试连通」检查");
-    }
-  }
-  function paintCred(s, S) {
+  /* ======================================================================
+   * 5. 渠道的「就绪 / 需留意 / 故障 / 未配置」判定
+   *    只看本机当下真实读到的字段；读不到就说读不到，不做乐观假设。
+   * ==================================================================== */
+  function credState(key) {
+    const P = MANIFEST[key] || {};
+    const kind = (P.credential || {}).kind || "none";
+    if (kind === "none") return { s: "idle", txt: "不适用", detail: "不是本台渠道" };
+    const S = stOf(key);
     const t = S.token || {};
-    const ready = typeof t.configured === "boolean" ? t.configured : S.keyConfigured === true;
-    const days = t.expiresInDays;
-    if (!ready) {
-      setLed($("ledTok"), "r");
-      $("txtTok").textContent = CRED.txtNone || "未配置";
-      $("subTok").textContent = CRED.subNone || (P.settingsTitle ? `在下方「${P.settingsTitle}」里填` : "");
-    } else if (days != null && days <= 7) {
-      setLed($("ledTok"), "a pulse");
-      $("txtTok").textContent = `剩 ${days} 天`;
-      $("subTok").textContent = t.hasRefresh ? "将自动续期" : (CRED.subNoRefresh || "无刷新令牌，到期需重新捕获");
-    } else {
-      setLed($("ledTok"), "g");
-      $("txtTok").textContent = days != null ? `剩 ${days} 天` : (CRED.txtOk || "已配置");
-      $("subTok").textContent = t.expAt
-        ? "有效期至 " + new Date(t.expAt).toLocaleDateString("zh-CN")
-        : (CRED.subOk || "");
+    if (typeof t.configured === "boolean") {
+      if (!t.configured) return { s: "idle", txt: "未配置", detail: (P.credential || {}).label || "凭据未就绪" };
+      /* 轮换型令牌（jobToken）：令牌文件还在 ≠ 还在用。客户端没找到 = 上一次运行
+         留下的陈旧文件，中转读到它只会 401 —— 这种要说"需留意"而不是"已就绪"。 */
+      const p = S.patch || null;
+      if (p && p.found === false) {
+        return { s: "warn", txt: "令牌陈旧", detail: "本机没找到客户端安装目录，读到的是上次运行留下的文件" };
+      }
+      if (p && p.tokenFresh === false) {
+        return { s: "warn", txt: "令牌未刷新", detail: "客户端没开或没发过带鉴权的请求" };
+      }
+      const days = t.expiresInDays;
+      if (keyCount(t) > 1) {
+        return { s: "ok", txt: `${t.keyCount} 把 key`, detail: t.keys.filter((k) => k.active).map((k) => k.fp).join(" · ") || "" };
+      }
+      if (days != null && days <= 7) return { s: "warn", txt: `剩 ${days} 天`, detail: t.hasRefresh ? "将自动续期" : "无刷新令牌，到期需重新获取" };
+      return { s: "ok", txt: "已就绪", detail: t.expAt ? "有效期至 " + new Date(t.expAt).toLocaleDateString("zh-CN") : "" };
     }
+    if (typeof S.keyConfigured === "boolean") {
+      return S.keyConfigured
+        ? { s: "ok", txt: "已就绪", detail: "" }
+        : { s: "idle", txt: "未配置", detail: (P.credential || {}).label || "凭据未就绪" };
+    }
+    const C = cfgOf(key);
+    if (C.apiKey) return { s: "ok", txt: "已就绪", detail: "指纹 " + fp(C.apiKey) };
+    return { s: "idle", txt: "未配置", detail: (P.credential || {}).label || "凭据未就绪" };
   }
-  function paintCc(s) {
-    setLed($("ledCc"), s.ccswitch && s.ccswitch.running ? "a" : "g");
-    $("txtCc").textContent = s.ccswitch && s.ccswitch.running ? "运行中" : "未运行";
+  const keyCount = (t) => (typeof t.keyCount === "number" ? t.keyCount : 0);
+
+  /* 密钥指纹：只显示头尾，绝不回显明文（页面上任何位置都不出现明文密钥）。 */
+  function fp(s) {
+    const v = String(s == null ? "" : s);
+    if (!v) return "";
+    if (v.length <= 8) return v.slice(0, 2) + "…";
+    return v.slice(0, 4) + "…" + v.slice(-4);
   }
-  function paintClash(s) {
-    setLed($("ledClash"), s.clash && s.clash.alive ? "g" : "r");
-    $("txtClash").textContent = s.clash && s.clash.alive ? "正常" : "不可用";
-    $("subClash").textContent = (s.clash && s.clash.alive)
-      ? `${s.proxy || "直连"} · ${s.clash.ms}ms`
-      : "未检测到可用通道（点下方「检测」自动寻找）";
+
+  /* 综合一格的状态：先看中转起没起，再看凭据。两者都好才算就绪。 */
+  function channelState(key) {
+    const P = MANIFEST[key] || {};
+    if (P.chainable !== true) {
+      const running = status && status.ccswitch && status.ccswitch.running;
+      return running
+        ? { s: "warn", txt: "运行中", detail: "可能随时把配置改回它自己的端口" }
+        : { s: "ok", txt: "未运行", detail: "配置可以安全地放在路由台上" };
+    }
+    const S = stOf(key);
+    const cred = credState(key);
+    const relayUp = !!(S.relay && S.relay.up);
+    const up = S.upstream || {};
+    const wired = wiredTo(key);
+    if (!relayUp) return { s: "err", txt: "中转未起", detail: cred.detail };
+    if (cred.s === "idle") return { s: "idle", txt: "凭据未配", detail: cred.detail };
+    if (up.tested === false) return { s: "err", txt: "上游不可用", detail: up.error || "" };
+    if (cred.s === "warn") return { s: "warn", txt: cred.txt, detail: cred.detail };
+    if (up.tested === true) return { s: "ok", txt: wired ? "已接入" : "就绪", detail: up.model ? `${up.model} ${up.ms}ms` : "" };
+    return { s: "ok", txt: wired ? "已接入" : "就绪", detail: cred.detail };
   }
-  const LAMP_PAINTERS = {
-    relay: paintRelay, upstream: paintUpstream, cred: paintCred, cc: paintCc, ccswitch: paintCc, clash: paintClash,
-  };
-  const activeLamps = () => lampList().map((id) => (id === "ccswitch" ? "cc" : id)).filter((id) => LAMP_DEFS[id]);
+  const wiredTo = (key) => !!status && ((status.cli && status.cli.mode === key) || (status.desktop && status.desktop.mode === key));
 
   /* ======================================================================
-   * 6. renderStatus：服务灯 + 信号灯 + 接线徽章 + 提示条
+   * 6. 状态带：六个单元 + 一句人话总结 + 三个主动作
    * ==================================================================== */
+  /* 出海代理格：模板给的是占位 markup（<span class="led"></span><span>—</span>），
+     整块换掉再填，否则会出现 "— ● 正常" 这种半截旧值。 */
+  function ensureClashUnit() {
+    const box = $("lampClash");
+    if (!box || $("txtClash")) return;
+    const val = q(".val", box);
+    if (!val) return;
+    val.innerHTML = "";
+    const led = document.createElement("span"); led.className = "led"; led.id = "ledClash";
+    const txt = document.createElement("span"); txt.id = "txtClash"; txt.textContent = "—";
+    val.append(led, txt);
+    const sub = document.createElement("div"); sub.className = "sub"; sub.id = "subClash";
+    box.appendChild(sub);
+  }
+
+  function paintBand(s) {
+    const up = !!(s.service && s.service.up);
+    setLed($("ledRelay"), up ? "ok" : "err", false);
+    const selPort = selected ? ((stOf(selected).relay || {}).port) : null;
+    $("txtRelay").textContent = up ? "运行中" : "已停止";
+    const rl = (selected ? stOf(selected).relayLast : null) || {};
+    const fresh = rl.at && Date.now() - new Date(rl.at).getTime() < 30 * 60000;
+    $("subRelay").textContent = fresh
+      ? `最近错误·${rl.kind}: ${rl.message}`
+      : `中转 :${selPort || "—"} / 面板 :${(s.panel || {}).port || "—"}`;
+    $("subRelay").title = fresh ? `${rl.at}\n${rl.message}` : "";
+
+    ensureClashUnit();
+    const cl = s.clash || {};
+    setLed($("ledClash"), cl.alive ? "ok" : "err", false);
+    $("txtClash").textContent = cl.alive ? "正常" : "不可用";
+    $("subClash").textContent = cl.alive ? `${s.proxy || "直连"} · ${cl.ms || "?"}ms` : "未检测到可用通道";
+
+    /* 本台凭据：看的是"当前接线那家"的凭据；没接线就看选中那家 */
+    const tk = selected ? credState(selected) : { s: "idle", txt: "—" };
+    setLed($("ledTok"), tk.s, false);
+    $("txtTok").textContent = tk.txt;
+    $("subTok").textContent = tk.detail || ((P_credLabel(selected)) || "");
+
+    /* 可用渠道：数一数有多少家处于 ok */
+    const states = CHAIN_KEYS.map(channelState);
+    const okN = states.filter((x) => x.s === "ok").length;
+    const warnN = states.filter((x) => x.s === "warn").length;
+    const errN = states.filter((x) => x.s === "err").length;
+    const idleN = states.filter((x) => x.s === "idle").length;
+    const bandS = errN ? "err" : (okN ? "ok" : (warnN ? "warn" : "idle"));
+    setLed($("ledUp"), bandS, false);
+    $("txtUp").textContent = `${okN}/${CHAIN_KEYS.length} 可用`;
+    /* 这行塞在 min-width 132px 的格子里，写长了会折行把整行仪表撑不齐，用短词。 */
+    $("subUp").textContent = `就绪 ${okN} · 留意 ${warnN} · 故障 ${errN} · 未配 ${idleN}`;
+
+    if (has("patchTime")) {
+      $("patchTime").textContent = "检查于 " + new Date(s.now).toLocaleTimeString("zh-CN", { hour12: false });
+    }
+    /* 顶栏那颗服务胶囊。端口只来自 /api/status 的数字字段，用 textContent 拼，
+       不走 innerHTML —— 免得把接口返回值当标记解析。 */
+    const svc = $("svc");
+    if (svc) {
+      svc.textContent = "";
+      const b = document.createElement("b");
+      b.textContent = up ? "●" : "○";
+      if (!up) b.className = "off";
+      svc.append("服务 ", b, ` :${selPort || "—"} / :${(s.panel || {}).port || "—"}`);
+    }
+    paintSentence(s, okN, warnN, errN, idleN);
+  }
+  const P_credLabel = (key) => {
+    const p = key ? (MANIFEST[key] || {}) : null;
+    return p ? ((p.credential || {}).label || "") : "";
+  };
+
+  /* 一句话总结：照设计稿句式，数据缺失就说缺失，不乐观。 */
+  function paintSentence(s, okN, warnN, errN, idleN) {
+    const el = $("statusSentence");
+    if (!el) return;
+    const cl = s.clash || {};
+    const bits = [];
+    bits.push(s.service && s.service.up ? "路由台在跑" : "路由台已停止");
+    bits.push(cl.alive ? "出海通道正常" : "出海通道不可用（境内渠道不受影响）");
+    const cli = s.cli || {}, desk = s.desktop || {};
+    const ends = [cli, desk].filter((x) => x && x.mode);
+    if (!ends.length) bits.push("两端都还没接线");
+    else {
+      const modes = Array.from(new Set(ends.map((e) => e.mode)));
+      bits.push(`当前接线：${modes.map((m) => (MANIFEST[m] ? nameOf(m) : (MODE_TXT[m] || m))).join(" + ")}`);
+      const mismatch = ends.some((e) => e.mode === selected && keyMatchOf(e, selected) === false);
+      if (mismatch) bits.push("面板里的凭据与实际生效的不一致，需重开对应端");
+    }
+    if (s.ccswitch && s.ccswitch.running) bits.push("配置交还工具正在运行，它可能随时改回自己的配置");
+    /* 四类都要说到：只报"0 家可用 · 5 家还没配凭据"会把那 1 家"需留意"的吞掉，
+       用户数格子时对不上账。 */
+    const parts = [];
+    if (okN) parts.push(`${okN} 家可用`);
+    if (warnN) parts.push(`${warnN} 家需留意`);
+    if (errN) parts.push(`${errN} 家故障`);
+    if (idleN) parts.push(`${idleN} 家还没配凭据`);
+    bits.push(parts.join(" · ") || "暂无可用渠道");
+    el.textContent = bits.join("；") + "。";
+  }
+
+  /* 两端接线徽章：接的是谁 + 实际生效的凭据指纹（明文永不出现）。 */
   function paintBadges(s) {
-    const paint = (el, m) => {
-      if (!el || !m) return;
-      const mine = m.mode === key;
-      el.className = "badge " + (mine ? "mine" : m.mode === "unknown" ? "unk" : "other");
+    const paint = (badgeId, m, patchId) => {
+      const el = $(badgeId), patch = $(patchId);
+      if (!el || !m || !m.mode) return;
+      const mine = m.mode === selected;
+      el.className = "badge " + (mine ? "mine" : (MANIFEST[m.mode] ? "other" : "unk"));
       el.textContent = MODE_TXT[m.mode] || m.mode;
       el.title = m.baseUrl || "";
-      const patch = el === $("cliBadge") ? $("patchCli") : $("patchDesk");
       if (!patch) return;
       clsx(patch, mine, "state-mine");
-      clsx(patch, !mine && (window.baiIsOurs(m.mode) || m.mode === "ccswitch"), "state-other");
-      /* 实际生效的凭据指纹：与本页不一致时标红（中转是透传客户端那把 key） */
-      let kf = patch.querySelector(".keyfp");
+      clsx(patch, !mine && !!MANIFEST[m.mode], "state-other");
+      let kf = q(".keyfp", patch);
       if (m.keyFp) {
         if (!kf) {
           kf = document.createElement("span");
           kf.className = "keyfp";
-          patch.querySelector(".who").appendChild(kf);
+          const who = q(".who", patch);
+          if (who) who.appendChild(kf);
         }
-        const ok = !mine || m[window.baiKeyMatchField(key)] !== false;
-        kf.textContent = (ok ? "🔑" : "⚠️") + m.keyFp;
+        const ok = !mine || keyMatchOf(m, selected) !== false;
+        kf.textContent = (ok ? "🔑 " : "⚠️ ") + m.keyFp;
         kf.style.color = ok ? "var(--dim)" : "var(--err)";
-        kf.title = mine
-          ? (ok
-            ? `此端实际使用的凭据：${m.keyFp}（与本页一致）`
-            : `此端凭据(${m.keyFp}) 与本页凭据不一致！重开对应终端/桌面版，或重新点「${primaryBtn}」。`)
-          : `此端实际使用的凭据：${m.keyFp}（未接 ${SHORT}，本页不比对）`;
+        kf.title = ok ? `此端实际使用的凭据：${m.keyFp}` : `此端凭据(${m.keyFp}) 与面板里的不一致！重开对应端，或重新接通 ${nameOf(selected || "")}`;
         kf.style.display = "";
       } else if (kf) kf.style.display = "none";
     };
-    paint($("cliBadge"), s.cli);
-    paint($("deskBadge"), s.desktop);
-    applyText("patchTime", "检查于 " + new Date(s.now).toLocaleTimeString("zh-CN", { hour12: false }));
-  }
-
-  /* 提示条：keyMismatch（红色）/ 别的自家渠道 / 两端都在 CC Switch / CC Switch 在跑。
-   * 清单 notices 里 {btn} 会被换成 primaryBtn；B.AI 页对 WorkBuddy 另有一句 onWb。 */
-  function paintNotice(s) {
-    const n = q(".notice") || $("notice");
-    if (!n) return;
-    n.classList.remove("show", "err");
-    const NT = P.notices || {};
-    const ends = [s.cli, s.desktop].filter(Boolean);
-    const other = ends.find((e) => window.baiIsOurs(e.mode) && e.mode !== key);
-    const kf = window.baiKeyMatchField(key);
-    let txt = "", err = false;
-    if (ends.some((e) => e.mode === key && e[kf] === false) && NT.keyMismatch) {
-      txt = fill(NT.keyMismatch, {}); err = true;
-    } else if (other) {
-      txt = fill(NT[other.mode] || NT.other || NT.stale, {});
-    } else if (NT.ccBoth && s.cli && s.desktop && s.cli.mode === "ccswitch" && s.desktop.mode === "ccswitch") {
-      // 只有 bai 定义了 ccBoth；缺这条判断时 fill(undefined) 得到空串，
-      // `if (!txt) return` 会把后面「CC Switch 正在运行」那条整条吞掉（四页都受影响）。
-      txt = fill(NT.ccBoth, {});
-    } else if (s.ccswitch && s.ccswitch.running) {
-      txt = fill(NT.ccSwitch, {});
-    }
-    if (!txt) return;
-    n.textContent = txt;
-    n.classList.add("show");
-    if (err) n.classList.add("err");
-  }
-
-  function renderStatus(s) {
-    status = s;
-    const S = st();
-    $("svc").innerHTML = `服务 <b class="${s.service && s.service.up ? "" : "off"}">●</b> :${(S.relay || {}).port || "—"} / :${s.panel.port}`;
-    for (const id of activeLamps()) {
-      if ($(LAMP_DEFS[id].txt)) LAMP_PAINTERS[id](s, S);
-    }
-    /* 状态派生的设置字段（Qoder 那只读令牌框）——跟着状态走，别等下一次读配置 */
-    if (has("fTokenView")) {
-      const t = S.token || {};
-      $("fTokenView").value = t.configured ? (CRED.preview || "jt-…（已就绪）") : "";
-    }
-    paintBadges(s);
-    paintNotice(s);
+    paint("cliBadge", s.cli, "patchCli");
+    paint("deskBadge", s.desktop, "patchDesk");
   }
 
   /* ======================================================================
-   * 7. renderRoute：四档 Claude 档位 → 目标模型 → 界面显示名
+   * 7. 渠道矩阵（八格：六家 + 交还区 + 转移链格。格序 = 转移链顺序）
    * ==================================================================== */
-  function prettyName(id) {
+  const primaryText = (key) => `一键接入 ${nameOf(key)}`;
+
+  function buildMatrix() {
+    const grid = $("matrixGrid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    for (const key of chainOf().length ? chainOf() : CHAIN_KEYS) {
+      grid.appendChild(cellFor(key));
+    }
+    for (const key of HANDOFF_KEYS) grid.appendChild(cellFor(key));
+    grid.appendChild(chainCell());
+    paintMatrix();
+  }
+
+  function cellFor(key) {
+    const P = MANIFEST[key] || {};
+    const el = document.createElement("div");
+    el.className = "cell";
+    el.dataset.k = key;
+    el.setAttribute("role", "button");
+    el.tabIndex = 0;
+    el.innerHTML = `
+      <div class="celltop">
+        <span class="letter">${esc(P.letter || "")}</span>
+        <span class="cbadge ${esc((P.badge || {}).kind || "neutral")}">${esc((P.badge || {}).text || "")}</span>
+      </div>
+      <div class="cname">${esc(nameOf(key))}${P.path ? `<span class="cpath">${esc(P.path)}</span>` : ""}</div>
+      <div class="ctag">${esc(P.tagline || "")}</div>
+      <div class="cmap"></div>
+      <div class="crelay"></div>
+      <div class="cfoot"></div>`;
+    el.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      selectChannel(key);
+    });
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectChannel(key); }
+    });
+    return el;
+  }
+
+  function chainCell() {
+    const el = document.createElement("div");
+    el.className = "cell chaincell";
+    el.dataset.k = "__chain";
+    el.innerHTML = `
+      <div class="celltop"><span class="letter">FO</span><span class="cbadge neutral">顺序</span></div>
+      <div class="cname">故障转移链</div>
+      <div class="ctag">额度用光或上游挂掉时，中转按这个顺序自己换人</div>
+      <div class="chainlist"></div>
+      <div class="cfoot"><button class="btn sm ghost" type="button" data-go="fo">调整顺序 →</button></div>`;
+    const btn = q("button", el);
+    if (btn) btn.addEventListener("click", () => setView("fo"));
+    return el;
+  }
+
+  function paintMatrix() {
+    const grid = $("matrixGrid");
+    if (!grid) return;
+    for (const el of qa(".cell", grid)) {
+      const key = el.dataset.k;
+      if (hasBusyIn(el)) continue;          // 这格里有按钮正在动作，别把它重建掉
+      if (key === "__chain") {
+        const box = q(".chainlist", el);
+        if (box) {
+          const f = (status && status.failover) || {};
+          const list = chainOf();
+          box.innerHTML = !list.length
+            ? '<span class="dim">转移链为空</span>'
+            : list.map((k, i) => {
+              const st = channelState(k);
+              return `<span class="chitem"><i class="dot ${st.s}"></i><b>${i + 1}</b> ${esc(nameOf(k))}</span>`;
+            }).join("") + (f.enabled ? "" : '<span class="chainoff">当前已关闭</span>');
+        }
+        continue;
+      }
+      const st = channelState(key);
+      el.dataset.state = st.s;
+      clsx(el, key === selected, "sel");
+      const P = MANIFEST[key] || {};
+      const cm = q(".cmap", el);
+      if (cm) {
+        if (P.chainable !== true) {
+          cm.innerHTML = '<span class="dim">配置交还给它，它自己管端口与凭据</span>';
+        } else {
+          const C = cfgOf(key);
+          const map = C.mapping || {};
+          cm.innerHTML = TIERS.map((t) => {
+            const m = map[t.key] || {};
+            return `<span class="mrow"><i class="t">${esc(t.short)}</i><i class="v">${esc(m.label || m.target || "未设")}</i></span>`;
+          }).join("");
+        }
+      }
+      const cr = q(".crelay", el);
+      if (cr) {
+        if (P.chainable !== true) {
+          cr.innerHTML = status && status.ccswitch && status.ccswitch.running
+            ? '<span class="rl warn">正在运行</span>'
+            : '<span class="rl idle">未运行</span>';
+        } else {
+          const C = cfgOf(key);
+          cr.innerHTML = `<span class="rl">中转 :${C.relayPort || "—"}</span><span class="rl2">${esc((P.credential || {}).label || "")}</span>`;
+        }
+      }
+      const foot = q(".cfoot", el);
+      if (foot) {
+        if (P.chainable !== true) {
+          foot.innerHTML = `<button class="btn sm" type="button" data-act="restore">接回 ${esc(nameOf(key))}</button>`;
+        } else {
+          foot.innerHTML = `<button class="btn sm primary" type="button" data-act="apply" ${st.s === "idle" ? "disabled" : ""}>${esc(primaryText(key))}</button>`
+            + `<span class="cstate ${st.s}">${esc(st.txt)}</span>`;
+        }
+        const btn = q("button", foot);
+        if (btn) btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (btn.dataset.act === "apply") applyChannel(key);
+          else restoreExternal();
+        });
+      }
+    }
+  }
+
+  /* ======================================================================
+   * 8. 映射编辑区（当前选中渠道的四档）
+   * ==================================================================== */
+  function prettyName(key, id) {
+    const BRANDS = (MANIFEST[key] || {}).brands || {};
     return String(id).split("-").map((seg) => {
       const low = seg.toLowerCase();
       if (BRANDS[low]) return BRANDS[low];
-      if (/^[0-9]/.test(seg)) return seg;                 // 版本号段原样
-      const ver = low.match(/^([a-z]+)([0-9].*)$/);       // vision2 / v4 之类拆分 capitalize 前缀
+      if (/^[0-9]/.test(seg)) return seg;
+      const ver = low.match(/^([a-z]+)([0-9].*)$/);
       if (ver && BRANDS[ver[1]]) return BRANDS[ver[1]] + ver[2];
       return seg.charAt(0).toUpperCase() + seg.slice(1);
     }).join("-");
   }
-  /* 下拉里显示的名字：model-catalog 卡把 /api/models 的 labels 暂存在这儿
-     （Qoder 的 lite → 「Qwen3.8-Flash · 免费档」），value 仍是原始 key。 */
+  /* 下拉里的显示名：model-catalog 卡把 /api/models 的 labels 暂存在这里 */
   const optText = (m) => {
     const L = window.BAI_MODEL_LABELS;
     return (L && L[m]) || m;
@@ -1036,11 +887,35 @@
   function renderRoute() {
     const tb = $("routeBody");
     if (!tb) return;
-    const S = slice();
-    const list = S.availableModels || [];
+    const badge = $("mapBadge"), title = $("mapTitle"), sub = $("mapSub");
+    if (!selected) {
+      tb.innerHTML = '<tr><td colspan="3" class="dim">先在上面的矩阵里选一个渠道</td></tr>';
+      if (badge) badge.textContent = "—";
+      return;
+    }
+    const P = MANIFEST[selected] || {};
+    if (P.chainable !== true) {
+      tb.innerHTML = `<tr><td colspan="3" class="dim">${esc(nameOf(selected))}不是本台渠道，没有映射编辑区。去矩阵里选一家要接的。</td></tr>`;
+      if (badge) badge.textContent = P.letter || "";
+      if (title) title.textContent = nameOf(selected);
+      if (sub) sub.textContent = P.tagline || "";
+      showEl($("btnSave"), false); showEl($("btnTest"), false);
+      showEl($("btnModels"), false); showEl($("btnResetModels"), false);
+      return;
+    }
+    showEl($("btnSave"), true); showEl($("btnTest"), true);
+    showEl($("btnModels"), (P.models || []).length > 0);
+    showEl($("btnResetModels"), (P.defaultModels || []).length > 0);
+
+    if (badge) badge.textContent = P.letter || "";
+    if (title) title.textContent = `${nameOf(selected)} · 模型映射`;
+    if (sub) sub.textContent = `${(P.models || []).length} 个可选模型 · 四档全部指向本渠道自己的模型名`;
+
+    const C = cfgOf(selected);
+    const list = Array.isArray(C.availableModels) && C.availableModels.length ? C.availableModels : (P.models || []);
     tb.innerHTML = "";
     for (const t of TIERS) {
-      const m = (S.mapping || {})[t.key] || { target: "", label: t.zh };
+      const m = (C.mapping || {})[t.key] || {};
       const isCustom = !!m.target && !list.includes(m.target);
       const tr = document.createElement("tr");
       tr.innerHTML = `
@@ -1055,194 +930,522 @@
         else { op.value = o; op.textContent = optText(o); op.title = o; }
         sel.appendChild(op);
       }
-      sel.value = isCustom ? "__custom__" : m.target;
+      sel.value = isCustom ? "__custom__" : (m.target || "");
       const lbl = document.createElement("input");
       lbl.type = "text"; lbl.className = "lbl"; lbl.dataset.tier = t.key; lbl.dataset.role = "label";
-      lbl.value = m.label; lbl.placeholder = "显示名";
+      lbl.value = m.label || ""; lbl.placeholder = "显示名";
       const cus = document.createElement("input");
       cus.type = "text"; cus.className = "custom"; cus.dataset.tier = t.key; cus.dataset.role = "custom";
       cus.value = isCustom ? m.target : ""; cus.placeholder = "输入模型名";
       cus.style.display = isCustom ? "" : "none";
-      cus.style.marginTop = "4px";
       sel.addEventListener("change", () => {
-        tr.querySelector('[data-role="custom"]').style.display = sel.value === "__custom__" ? "" : "none";
+        cus.style.display = sel.value === "__custom__" ? "" : "none";
         const target = sel.value === "__custom__" ? (cus.value || "") : sel.value;
-        if (target) lbl.value = prettyName(target);
+        if (target) lbl.value = prettyName(selected, target);
       });
       cus.addEventListener("input", () => {
-        if (sel.value === "__custom__" && cus.value) lbl.value = prettyName(cus.value);
+        if (sel.value === "__custom__" && cus.value) lbl.value = prettyName(selected, cus.value);
       });
       tr.children[1].append(sel, cus);
       tr.children[2].appendChild(lbl);
       tb.appendChild(tr);
     }
-  }
-
-  /* ======================================================================
-   * 8. renderSys：设置卡回填（凭据输入框由 cards/*.js 自己管，见 wire()）
-   * ==================================================================== */
-  const SYS_FIELDS = [
-    ["fUpstream", "upstream"], ["fRelayPort", "relayPort"],
-    ["fProxy", "proxy"], ["fPanelPort", "panelPort"], ["fApiKey", "apiKey"],
-  ];
-  function renderSys() {
-    const S = slice();
-    for (const [id, field] of SYS_FIELDS) {
-      const el = $(id);
-      if (!el) continue;
-      el.value = S[field] || "";
-      if (el.id === "fUpstream" && !el.placeholder) el.placeholder = S.upstream || "";
-    }
-    if (has("ckUseProxy")) $("ckUseProxy").checked = S.useProxy === true;
-    if (has("fModels")) $("fModels").value = (S.availableModels || []).join("\n");
-    /* 路由卡里的密钥行（B.AI / SenseNova）——旧页面是在 renderRoute 里回填的 */
-    const ak = $("apiKey");
-    if (ak) ak.value = S.apiKey || "";
+    const hint = $("patchHint");
+    if (hint) hint.textContent = P.conclusion || "";
     const hr = $("hintRelayPort");
-    if (hr) hr.textContent = ":" + (S.relayPort || String(P.relayHint || "").replace(":", ""));
+    if (hr) hr.textContent = ":" + (C.relayPort || "—");
   }
 
-  /* 令牌体检条：只有共享层自己管凭据输入框时才有（WorkBuddy 那张卡自己管） */
-  function jwtExp(tok) {
+  /* ======================================================================
+   * 9. 凭据视图：每家一行，按清单 credential.kind 分派
+   * ==================================================================== */
+  function buildCredList() {
+    const box = $("credList");
+    if (!box) return;
+    box.innerHTML = "";
+    for (const key of ALL_KEYS) {
+      const P = MANIFEST[key] || {};
+      const C = P.credential || {};
+      const row = document.createElement("div");
+      row.className = "credrow";
+      row.dataset.k = key;
+      row.innerHTML = `
+        <div class="cl">
+          <span class="letter">${esc(P.letter || "")}</span>
+          <div class="clname">${esc(nameOf(key))}<span class="cpath">${esc(P.path || "本台交还区")}</span></div>
+        </div>
+        <div class="ck"><span class="kindbadge">${esc(C.label || "凭据")}</span><span class="chint">${esc(C.hint || "")}</span></div>
+        <div class="cs"></div>
+        <div class="ca"></div>
+        <div class="crow" data-role="detail"></div>`;
+      q(".cs", row).setAttribute("data-role", "state");
+      q(".ca", row).setAttribute("data-role", "act");
+      q(".cl", row).addEventListener("click", () => selectChannel(key));
+      box.appendChild(row);
+    }
+    paintCredList();
+  }
+
+  function paintCredList() {
+    const box = $("credList");
+    if (!box) return;
+    for (const row of qa(".credrow", box)) {
+      const key = row.dataset.k;
+      if (hasBusyIn(row)) continue;        // 同上：行内有动作在飞就别重建
+      const P = MANIFEST[key] || {};
+      const kind = (P.credential || {}).kind || "none";
+      const st = credState(key);
+      const stBox = q('[data-role="state"]', row);
+      const act = q('[data-role="act"]', row);
+      clsx(row, key === selected, "sel");
+
+      if (kind === "apiKey") {
+        const C = cfgOf(key);
+        const shown = C.apiKey ? esc(fp(C.apiKey)) : "";
+        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
+          + (shown ? `<span class="fp mono">${shown}</span>` : "");
+        act.innerHTML = `<input type="password" class="keyinput" autocomplete="off" placeholder="${esc(C.hint || "")}" data-role="key">`
+          + `<button class="btn sm" type="button" data-act="savekey">保存</button>`
+          + `<button class="btn sm ghost" type="button" data-act="toggle">显示</button>`;
+      } else if (kind === "jwt") {
+        const S = stOf(key);
+        const t = S.token || {};
+        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
+          + (S.edition ? `<span class="fp">版别 ${esc(S.edition)}</span>` : "")
+          + (t.expAt ? `<span class="fp">有效期至 ${esc(new Date(t.expAt).toLocaleDateString("zh-CN"))}</span>` : "");
+        act.innerHTML = `<button class="btn sm primary" type="button" data-act="capture">一键获取令牌</button>`
+          + `<button class="btn sm ghost" type="button" data-act="manual">手动填写</button>`;
+      } else if (kind === "jobToken") {
+        const S = stOf(key);
+        const p = S.patch || {};
+        const t = S.token || {};
+        /* 徽章走 credState：不能在这里写死"已读到令牌"——令牌文件还在 ≠ 还在用。
+           客户端没找到时那是上一次运行留下的陈旧文件，写成"已读到"会与状态带矛盾。 */
+        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
+          + (st.detail ? `<span class="fp">${esc(st.detail)}</span>` : "")
+          + (p.found && p.tokenFresh === false ? '<span class="fp">客户端没开或没发过带鉴权的请求</span>' : "")
+          + (t.tokenFile ? `<span class="fp">令牌文件：${esc(t.tokenFile)}</span>` : "");
+        act.innerHTML = `<button class="btn sm primary" type="button" data-act="patch" ${p.ready ? "disabled" : ""}>一键装补丁</button>`
+          + `<button class="btn sm ghost" type="button" data-act="revert">还原客户端</button>`;
+      } else if (kind === "keys3") {
+        const t = (stOf(key).token) || {};
+        const keys = Array.isArray(t.keys) ? t.keys : [];
+        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
+          + (keys.length
+            ? `<span class="fp mono">${keys.map((k) => esc(k.fp) + (k.active ? " ◂ 在用" : "")).join(" · ")}</span>`
+            : `<span class="fp">一把都没有</span>`);
+        if (!q(".keybox", act)) {
+          act.innerHTML = `<button class="btn sm" type="button" data-act="keys">编辑三把 key</button>`
+            + `<button class="btn sm ghost" type="button" data-act="quota">刷新免费目录与额度</button>`;
+        }
+      } else {
+        stBox.innerHTML = `<span class="pill idle">不适用</span><span class="fp">不是本台渠道</span>`;
+        act.innerHTML = "";
+      }
+
+      /* 通用按钮接线。轮换区编辑器打开时，它的按钮已各自单独接过分派，
+         这里必须跳过，否则每轮 poll 都会再叠一个监听器（点一次发两次请求）。 */
+      const btn = q("button[data-act]", act);
+      if (btn && !q(".keybox", act)) btn.addEventListener("click", () => credAction(key, btn));
+      const tg = q('button[data-act="toggle"]', act);
+      if (tg) tg.addEventListener("click", () => {
+        const inp = q(".keyinput", act);
+        if (!inp) return;
+        const showNow = inp.type === "password";
+        inp.type = showNow ? "text" : "password";
+        tg.textContent = showNow ? "隐藏" : "显示";
+      });
+    }
+  }
+
+  /* 令牌捕获的流程所有者登记表。
+     共享层按 credential.kind 画出「一键获取令牌」按钮，但驱动它的流程可能属于卡片
+     （token-capture 卡有等待面板要逐级刷新、还要轮询后端阶段文案）。卡片在 mount 时
+     registerCapture(key, fn) 接管自己那一行；没注册的行由下面的兜底实现直接调接口。
+     两者只会有一个跑——credistAction 里先查表再决定，不会双跑。 */
+  const captureHandlers = {};
+  const registerCapture = (key, fn) => { captureHandlers[key] = fn; };
+
+  async function credAction(key, btn) {
+    const act = btn.dataset.act;                 // 动作名（字符串）
+    const row = q(`.credrow[data-k="${CSS.escape(key)}"]`);
+    /* 行内的操作区容器。**别和上面的 act 混**：act 是字符串，
+       下面要往操作区里塞编辑器、还要在里面 querySelector——用 act 当容器用会炸成
+       "(root || document).querySelector is not a function"。 */
+    const actBox = row ? q('[data-role="act"]', row) : null;
+    const P = MANIFEST[key] || {};
+    const kind = (P.credential || {}).kind || "none";
     try {
-      const seg = String(tok || "").split(".")[1];
-      if (!seg) return null;
-      const p = JSON.parse(atob(seg.replace(/-/g, "+").replace(/_/g, "/")));
-      return typeof p.exp === "number" ? p.exp : null;
-    } catch { return null; }
-  }
-  let ownsTokStat = false;
-  function renderTokStat() {
-    if (!ownsTokStat) return;
-    const stat = $("tokStat");
-    if (!stat) return;
-    const S = slice(), t = st().token || {};
-    if (t.tokenFile || CRED.kind === "file") {
-      stat.innerHTML = t.configured
-        ? `<span style="color:var(--ok)">✔ 已读到令牌</span>　<span class="mono">${esc(t.tokenFile || "")}</span>`
-        : `<span style="color:var(--err)">✘ 未读到令牌</span>　${esc(CRED.notReady || "请先启动对应客户端")}`;
-      return;
+      if (act === "savekey") {
+        const inp = q(".keyinput", row);
+        const val = inp ? inp.value.trim() : "";
+        if (!val) { showResult($("applyResult"), "没有输入密钥。", false); return; }
+        await withBusy(btn, async () => {
+          await postJSON("/api/config", { provider: key, apiKey: val });
+          if (inp) inp.value = "";
+          await refreshConfig();
+          poll();
+        }, $("applyResult"));
+        showResult($("applyResult"), `✔ ${nameOf(key)} 的密钥已保存（明文只落在本机 config.json，页面不回显）。`, true);
+      } else if (act === "capture") {
+        const h = captureHandlers[key];
+        if (typeof h === "function") { await h(btn); return; }   // 卡片接管（token-capture）
+        await withBusy(btn, async () => {
+          const r = await postJSON("/api/wb/capture", {});
+          if (!r.ok) throw new Error(r.error || "未捕获到令牌");
+        }, $("applyResult"));
+        await refreshConfig(); poll();
+        showResult($("applyResult"), `✔ ${nameOf(key)} 令牌已捕获并写入配置。到期后点「一键获取令牌」重取。`, true);
+      } else if (act === "patch" || act === "revert") {
+        let o = null;   // 只在**真的成功**之后才赋值；保持 null 就是给 withBusy 报错的信号
+        await withBusy(btn, async () => {
+          const url = act === "patch" ? "/api/qd/patch/apply" : "/api/qd/patch/revert";
+          const r = await postJSON(url, {});
+          if (r && r.error) throw new Error(r.error);
+          /* 判成败**不能看 r.ok**：服务端回的是 `{ ok: r.fail === 0, ...r }`，
+             而补丁函数自己返回的 `ok` 是「成功装了几个」的**计数**——展开写在后面，
+             把前面那个布尔值盖掉了。所以 ok 实际是数字：0 既是"一个都没装上"，
+             也是"本机根本没找到安装目录"。拿它当布尔判，会把"什么都没做"
+             显示成"✔ 补丁已装"。这里只用语义明确的 total / fail / already。 */
+          const total = Number(r.total) || 0;
+          const fail = Number(r.fail) || 0;
+          const done = (Number(r.ok) || 0) + (Number(r.already) || 0);
+          if (act === "revert") { o = { act, total, fail, done }; return; }
+          if (total === 0) throw new Error(`本机没找到 ${nameOf(key)} 客户端的安装目录，什么都没改（先装好桌面端再试）`);
+          if (fail > 0) throw new Error(`${fail}/${total} 个 worker 副本补丁失败`);
+          o = { act, total, fail, done };
+        }, $("applyResult"));
+        if (!o) return;                       // withBusy 已把失败原因写进结果行
+        await refreshConfig(); poll();
+        showResult($("applyResult"), o.act === "revert"
+          ? `✔ ${nameOf(key)} 客户端已还原（补丁移除${o.total ? `：${o.total} 份` : "：本机没有找到已打补丁的副本"}）。`
+          : `✔ 补丁已装到 ${nameOf(key)} 的 ${o.total} 个 worker 副本（本次生效 ${o.done} 个）。请确认桌面端正在运行——令牌每次启动会轮换。`, true);
+      } else if (act === "keys") {
+        /* 明文读不回来（服务端只回显指纹），所以编辑 = 重填三把。
+           语义必须说清楚：保存会用这里填的**整体替换**现有轮换区，留空的格子会被删掉。
+           因此这里绝不预填、也不允许一次空提交——那等于清空用户的 key。 */
+        actBox.innerHTML = `
+          <div class="keybox">
+            <span class="kn">1</span><input type="password" class="keyinput" autocomplete="off" placeholder="sk-or-v1…（留空=不这把）">
+          </div>
+          <div class="keybox">
+            <span class="kn">2</span><input type="password" class="keyinput" autocomplete="off" placeholder="sk-or-v1…">
+          </div>
+          <div class="keybox">
+            <span class="kn">3</span><input type="password" class="keyinput" autocomplete="off" placeholder="sk-or-v1…">
+          </div>
+          <div class="keynote">保存会用这里填的三把**整体替换**现有轮换区——明文读不回来，
+            所以没填的格子等于删除。要保留旧 key 就得把它重新填一遍。</div>
+          <button class="btn sm primary" type="button" data-act="keysave">保存三把</button>
+          <button class="btn sm ghost" type="button" data-act="keycancel">取消</button>`;
+        q('button[data-act="keysave"]', actBox).addEventListener("click", () => credAction(key, q('button[data-act="keysave"]', actBox)));
+        q('button[data-act="keycancel"]', actBox).addEventListener("click", () => paintCredList());
+      } else if (act === "keysave") {
+        const vals = qa(".keyinput", actBox).map((i) => i.value.trim());
+        if (!vals.some(Boolean)) {
+          showResult($("applyResult"),
+            "三格都空着——真要清空轮换区的话，这会删掉全部已存的 key，请确认后再点一次。", false);
+          return;
+        }
+        if (!confirm("保存会用这里填的 key 整体替换现有轮换区，没填的格子会被删除。确定？")) return;
+        await withBusy(btn, async () => {
+          const r = await postJSON("/api/or/keys", { keys: vals });
+          if (r && r.error) throw new Error(r.error);
+        });
+        await refreshConfig(); poll();
+        showResult($("applyResult"), `✔ ${nameOf(key)} 轮换区已更新。`, true);
+      } else if (act === "quota") {
+        await withBusy(btn, async () => { await postJSON("/api/or/refresh", {}); }, $("applyResult"));
+        await refreshConfig(); poll();
+        showResult($("applyResult"),
+          "已按 pricing 全 0 重筛免费模型目录并重查额度。非免费档账号的用量接口读不到——"
+          + "页面上会如实说「上游不提供」，不会编数字。", true);
+      } else if (act === "manual") {
+        showResult($("applyResult"),
+          "手动填写需要把浏览器开发者工具里的鉴权请求头逐条粘回来。这条路很长，"
+          + "平时用「一键获取令牌」就够了；确实要用时按 F12 → Network → 任一对话请求，"
+          + "把 Authorization / X-Refresh-Token / X-Device-Token / X-User-Id 对应填进本机 config.json。", true);
+      }
+    } catch (e) {
+      showResult($("applyResult"), "✘ " + e.message, false);
     }
-    const exp = jwtExp(S.accessToken);
-    if (!S.accessToken) { stat.innerHTML = `<span>访问令牌：<b class="warn">未配置</b></span>`; return; }
-    const days = exp ? Math.max(0, Math.round((exp * 1000 - Date.now()) / 86400000)) : null;
-    stat.innerHTML =
-      `<span>访问令牌：<b>已配置</b></span>` +
-      (exp
-        ? `<span>有效期至 <b>${new Date(exp * 1000).toLocaleDateString("zh-CN")}</b>（剩 ${days} 天）</span>`
-        : `<span>有效期：<b>无法解析</b></span>`) +
-      `<span>刷新令牌：<b>${S.refreshToken ? "有（自动续期）" : "无"}</b></span>` +
-      `<span>设备令牌：<b>${S.deviceToken ? "有" : "无"}</b></span>` +
-      `<span>用户 ID：<b>${S.userId ? "有" : "无"}</b></span>`;
   }
 
   /* ======================================================================
-   * 9. renderSteps：两步引导的状态机（凭据就绪 → 已接线）
+   * 10. 诊断抽屉：只呈现本机当前已知问题，绝不编造历史错误 / 错误数 / 时间线
    * ==================================================================== */
-  function credReady() {
-    const S = slice(), t = st().token;
-    if (t && typeof t.configured === "boolean") return t.configured;
-    if (P.credField) return !!S[P.credField];
-    return !!(S.accessToken || S.apiKey);
-  }
-  const wiredToMe = () => !!status && (status.cli.mode === key || status.desktop.mode === key);
+  function buildDiag() {
+    const list = $("diagList");
+    if (!list) return;
+    const items = [];
 
-  function renderSteps() {
-    if (!HAS_GUIDE) return;
-    const s1 = $("step1"), s2 = $("step2");
-    if (!s1) return;
-    const cred = credReady(), wired = wiredToMe();
-    s1.classList.toggle("done", cred);
-    s1.classList.toggle("active", !cred);
-    $("state1").textContent = cred ? "✓ 已完成" : "待完成";
-    if (s2) {
-      s2.classList.toggle("done", cred && wired);
-      s2.classList.toggle("active", cred && !wired);
-      s2.classList.toggle("locked", !cred);
-      const b = $("btnApply");
-      if (b) b.disabled = !cred || busy;
-      $("state2").textContent = !cred ? "等待步骤一完成" : (wired ? "✓ 已接入" : "待完成");
-      $("state2").style.color = (!cred) ? "" : (wired ? "var(--ok)" : "var(--accent)");
+    /* ① 路由台自身 */
+    if (status && !status.service) items.push({ s: "err", t: "状态接口没有返回服务信息", m: "面板与中转可能已断开，刷新页面重试。" });
+    else if (status && !(status.service || {}).up) items.push({ s: "err", t: "路由台服务已停止", m: "所有中转都已停止。重新启动路由台。" });
+
+    /* ② 出海代理 */
+    const cl = (status && status.clash) || {};
+    if (status && cl.alive === false && CHAIN_KEYS.some((k) => credState(k).s !== "idle")) {
+      const needProxy = CHAIN_KEYS.filter((k) => credState(k).s !== "idle" && (cfgOf(k).useProxy === true));
+      items.push(needProxy.length
+        ? { s: "err", t: "出海通道不可用，但有渠道勾选了「走本机代理」", m: `${needProxy.map(nameOf).join("、")} 会因此连不上。到设置视图关掉勾选，或换一个可用节点。` }
+        : { s: "warn", t: "出海通道不可用", m: "目前没有渠道依赖它，境内渠道不受影响；要用海外渠道时先解决代理。" });
     }
-    applyText("guideAux", (cred && wired) ? "全部就绪" : (cred ? "还差第 2 步" : "从第 1 步开始"));
+
+    /* ③ 逐渠道：凭据 / 上游 / 中转 */
+    for (const key of chainOf().length ? chainOf() : CHAIN_KEYS) {
+      const P = MANIFEST[key] || {};
+      const st = channelState(key);
+      const S = stOf(key);
+      const up = S.upstream || {};
+      const rl = S.relayLast || {};
+      const fresh = rl.at && Date.now() - new Date(rl.at).getTime() < 30 * 60000;
+
+      if (st.s === "idle") {
+        items.push({ s: "idle", t: `${nameOf(key)}：${P.conclusion || ""}`.trim(), m: P.remedy || "" });
+        continue;
+      }
+      if (up.tested === false) {
+        items.push({ s: "err", t: `${nameOf(key)} 上游连不上：${up.error || "未知错误"}`, m: P.remedy || "" });
+      } else if (fresh && rl.message) {
+        items.push({ s: "err", t: `${nameOf(key)} 最近一次请求失败（${rl.kind || "未知"}）`, m: `${rl.message}\n（${rl.at}）` });
+      } else if (st.s === "warn") {
+        items.push({ s: "warn", t: `${nameOf(key)}：${st.txt}`, m: st.detail || P.remedy || "" });
+      } else if (up.tested === true) {
+        items.push({ s: "ok", t: `${nameOf(key)} 上游正常`, m: `${up.model || ""} ${up.ms || "?"}ms · ${P.conclusion || ""}`.trim() });
+      } else {
+        items.push({ s: "ok", t: `${nameOf(key)} 凭据就绪、上游未测过`, m: `未探测过只算「未验」，不算故障。${P.remedy || ""}`.trim() });
+      }
+    }
+
+    /* ④ 交还区 */
+    if (status && status.ccswitch && status.ccswitch.running) {
+      items.push({ s: "warn", t: "配置交还工具正在运行", m: "它可能随时把配置改回自己的端口。想让它退场：点「一键最优」或从任意渠道接通。" });
+    }
+
+    /* ⑤ 额度余量：上游不提供就如实说没有，不编数字（真实数据源留给阶段二） */
+    items.push({ s: "idle", t: "额度余量：暂无数据", m: "上游没有给本路由台可读的额度接口，页面上不显示任何估算数字。" });
+
+    list.innerHTML = items.map((it) => `
+      <div class="ditem ${it.s}">
+        <span class="dot ${it.s}"></span>
+        <div class="dx">
+          <div class="dt">${esc(it.t)}</div>
+          ${it.m ? `<div class="dm">${esc(it.m)}</div>` : ""}
+        </div>
+      </div>`).join("");
+
+    const bad = items.filter((i) => i.s === "err").length;
+    const warn = items.filter((i) => i.s === "warn").length;
+    const sum = $("diagSum"), mini = $("diagMini");
+    if (sum) sum.textContent = bad ? `${bad} 条故障 · ${warn} 条留意` : (warn ? `${warn} 条需留意` : "没有观察到失败");
+    if (mini) mini.textContent = `${items.length} 条结论`;
   }
 
   /* ======================================================================
-   * 10. 轮询 / 配置 / 忙碌包装
+   * 11. 设置视图
    * ==================================================================== */
-  async function refreshConfig() {
-    cfg = await api("/api/config");
-    renderRoute();
-    renderSys();
-    renderTokStat();
-    renderSteps();
+  /* 平铺渠道时替「走本机代理」勾选框的那行说明（勾选框隐藏后总得说清楚去哪看）。 */
+  let proxyNote = null;
+  function ensureProxyNote() {
+    if (proxyNote && proxyNote.isConnected) return proxyNote;
+    const ck = $("ckUseProxy");
+    if (!ck) return null;
+    const label = ck.closest("label");
+    proxyNote = document.createElement("div");
+    proxyNote.className = "hint proxynote";
+    if (label && label.parentNode) label.parentNode.insertBefore(proxyNote, label.nextSibling);
+    return proxyNote;
   }
 
-  /* 失败信息的落点：按钮所在卡片末尾的 .result（契约：每张卡的 .body 末尾恰好一个），
-     找不到才退回 #applyResult。旧实现无条件写 #applyResult，于是 SenseNova 点
-     「刷新模型列表」失败时，错误冒到页面顶部不相干的「当前接线」卡里，按钮旁边一片空白。
-     卡片内的落点由 DOM 结构决定，调用点不必各自声明；确实需要时可传第三参显式覆盖。
-     槽在点按钮时就取定（而非报错后才找），避免 fn() 里的重绘改变判断依据。 */
+  /* 用户正在改的输入框不许被轮询覆盖。设置视图的字段每 5 秒就会被回填一次，
+     从前没有这层判断——在「上游地址」里打一半字，光标一移开内容就被抹掉。
+     判定：正被聚焦，或者动过但还没保存（data-dirty，保存成功后清掉）。 */
+  function markDirtyInputs() {
+    for (const id of ["fUpstream", "fRelayPort"]) {
+      const el = $(id);
+      if (el && !el.dataset.wired) {
+        el.dataset.wired = "1";
+        el.addEventListener("input", () => { el.dataset.dirty = "1"; });
+        el.addEventListener("blur", () => { if (el.value === "") delete el.dataset.dirty; });
+      }
+    }
+  }
+  /* 勾选框也要认「动过但没保存」：change 事件打 dirty，保存成功后清掉。 */
+  function wireProxyCheckbox() {
+    const ck = $("ckUseProxy");
+    if (ck && !ck.dataset.wired) {
+      ck.dataset.wired = "1";
+      ck.addEventListener("change", () => { ck.dataset.dirty = "1"; });
+    }
+  }
+  function clearDirtyInputs() {
+    for (const id of ["fUpstream", "fRelayPort"]) {
+      const el = $(id);
+      if (el) delete el.dataset.dirty;
+    }
+    const ck = $("ckUseProxy");
+    if (ck) delete ck.dataset.dirty;
+  }
+
+  function renderSys() {
+    if (!selected) return;
+    const P = MANIFEST[selected] || {};
+    if (P.chainable !== true) return;
+    const C = cfgOf(selected);
+    const SL = P.settingsLabels || {};
+    markDirtyInputs();
+    wireProxyCheckbox();
+    const setV = (id, v) => {
+      const el = $(id);
+      if (!el) return;
+      if (el === document.activeElement || el.dataset.dirty === "1") return;
+      el.value = v == null ? "" : v;
+    };
+    setV("fUpstream", C.upstream);
+    setV("fRelayPort", C.relayPort);
+    if (has("lblUpstream")) $("lblUpstream").textContent = SL.upstream || "上游地址";
+    if (has("lblRelayPort")) $("lblRelayPort").textContent = SL.relayPort || "中转端口";
+
+    /* 「走本机代理」这个开关只对**嵌套**渠道有意义：服务端 /api/config 明确写了
+       `if (P !== "bai" && typeof b.useProxy === "boolean")`——最早那家走的是**进程级**
+       的 cfg.proxy 字段（改它要重启），没有 per-channel 的 useProxy。
+       若照样画勾选框，用户勾上、点保存、页面回一句"✔ 设置已保存"，而配置里根本没
+       这个字段——这是最坏的一种"成功"：看起来生效了，其实没有。
+       平铺与否运行时判定（sliceOf 返回根对象即平铺），不写渠道名。 */
+    const flat = cfg != null && cfgOf(selected) === cfg;
+    const ckRow = has("ckUseProxy") ? $("ckUseProxy").closest("label") : null;
+    showEl($("ckUseProxy"), !flat);
+    showEl(ckRow, !flat);
+    /* 勾选框同理：轮询不能把用户刚点上的状态弹回去（点完还没按保存就变回去，
+       用户会以为自己没点上）。 */
+    if (has("ckUseProxy") && !flat) {
+      const ck = $("ckUseProxy");
+      if (ck !== document.activeElement && ck.dataset.dirty !== "1") ck.checked = C.useProxy === true;
+    }
+
+    const note = ensureProxyNote();
+    if (note) {
+      note.style.display = flat ? "" : "none";
+      if (flat) {
+        note.textContent =
+          `本渠道走进程级代理：${(status && status.proxy) || "直连"}——由启动自检自动挑选，`
+          + "不是这一家的开关（其余渠道才有「让本渠道也走本机代理」）。";
+      }
+    }
+
+    showEl($("btnDeploy"), P.chainable === true);
+
+    const box = $("setChannels");
+    if (box && !q(".chntable", box)) {
+      const rows = chainOf().length ? chainOf() : CHAIN_KEYS;
+      const t = document.createElement("div");
+      t.className = "chntable";
+      t.innerHTML = `<table class="route"><thead><tr><th>渠道</th><th>中转端口</th><th>上游</th><th>走代理</th></tr></thead><tbody>${
+        rows.map((k) => `<tr data-k="${esc(k)}"><td class="zh">${esc(nameOf(k))}</td>`
+          + `<td class="mono"></td><td class="mono dim"></td><td class="zh"></td></tr>`).join("")
+      }</tbody></table>`;
+      box.appendChild(t);
+    }
+    if (box) {
+      for (const tr of qa(".chntable tbody tr", box)) {
+        const C2 = cfgOf(tr.dataset.k);
+        const tds = tr.children;
+        tds[1].textContent = ":" + (C2.relayPort || "—");
+        tds[2].textContent = C2.upstream || "—";
+        tds[2].title = C2.upstream || "";          // 表格里截断了，完整地址放 title
+        tds[3].textContent = C2.useProxy === true ? "走代理" : "直连";
+        clsx(tds[3], C2.useProxy === true, "warncell");
+      }
+    }
+  }
+
+  /* ======================================================================
+   * 12. 动作
+   * ==================================================================== */
   function errSlotOf(btn, explicit) {
     if (explicit) return explicit;
-    const card = btn && btn.closest ? btn.closest(".card") : null;
-    return (card && q(".result", card)) || $("applyResult");
+    const box = btn && btn.closest ? btn.closest(".view") : null;
+    return (box && q(".result", box)) || $("applyResult");
   }
+  /* 容器里有没有正在动作的按钮？有就别重绘这个容器——
+     重建 innerHTML 会把那个按钮连同它的 disabled 状态一起换掉，
+     动作还在飞、界面上的按钮却已经能再点一次。 */
+  const hasBusyIn = (el) => !!(el && el.querySelector("[data-busy]"));
 
   async function withBusy(btn, fn, errSlot) {
     const slot = errSlotOf(btn, errSlot);
     busy = true;
     const old = btn ? btn.textContent : "";
-    if (btn) { btn.disabled = true; btn.textContent = "处理中…"; }
+    /* 长动作要给人看得见的进展：按钮上走秒。测试连通在慢网络下能跑两分多钟，
+       只写一个"处理中…"用户无从判断是卡住了还是还在跑。 */
+    let tick = null;
+    if (btn) {
+      btn.dataset.busy = "1";
+      btn.disabled = true;
+      btn.textContent = "处理中… 0s";
+      const t0 = Date.now();
+      tick = setInterval(() => {
+        if (!btn.isConnected) { clearInterval(tick); tick = null; return; }
+        btn.textContent = `处理中… ${Math.round((Date.now() - t0) / 1000)}s`;
+      }, 1000);
+    }
     try { await fn(); } catch (e) { showResult(slot, "出错了：" + e.message, false); }
     finally {
-      if (btn) { btn.disabled = false; btn.textContent = old; }
+      if (tick) clearInterval(tick);
+      if (btn) {
+        delete btn.dataset.busy;
+        btn.disabled = false;
+        btn.textContent = old;
+      }
       busy = false;
       poll();
     }
   }
 
-  async function poll() {
-    if (busy) return;
-    try {
-      const s = await api("/api/status");
-      renderStatus(s);
-      renderSteps();
-      renderTokStat();
-      for (const c of cards) {
-        try { if (c.update) c.update(s, cfg); } catch (e) { console.warn("[card] " + c.name, e); }
-      }
-    } catch {
-      $("svc").innerHTML = `服务 <b class="off">○</b> 已停止`;
-      setLed($("ledRelay"), "r");
-      $("txtRelay").textContent = "已停止";
-    }
-  }
-  const refreshCards = () => {
-    for (const c of cards) { try { if (c.refresh) c.refresh(); } catch (e) { console.warn("[card] " + c.name, e); } }
-  };
-
-  /* ======================================================================
-   * 11. 动作接线（一律"存在即接"；cards/*.js 造出来的元素共享层不再接管）
-   * ==================================================================== */
   function onClick(id, fn) {
     const el = $(id);
     if (el) el.addEventListener("click", fn);
   }
 
-  async function applyMe() {
-    if (HAS_GUIDE && !credReady()) {
-      showResult($("applyResult"), fill(opt("step1Hint") || "请先完成第 1 步。", {}), false);
-      return;
-    }
-    const r = await postJSON("/api/apply", {
-      provider: key, cli: $("ckCli").checked, desktop: $("ckDesk").checked,
-    });
+  async function applyChannel(key) {
+    const r = await postJSON("/api/apply", { provider: key });
     showResult($("applyResult"),
-      (P.applyDone || `✔ 已${P.accentLabel || "接入"} ${SHORT}（切换前配置已自动快照）`)
+      `✔ 已接入 ${nameOf(key)}（切换前配置已自动快照）`
       + "\n" + (r.warnings || []).map((w) => "· " + w).join("\n"), true);
-    const msg = opt("applyInfoMsg");
-    if (msg) showInfo(P.applyInfoTitle || "接入完成", msg);
+    selectChannel(key);
+    poll();
+  }
+
+  async function restoreExternal() {
+    const r = await postJSON("/api/restore", {});
+    showResult($("applyResult"),
+      "✔ 已接回配置交还工具\n"
+      + [].concat(r.messages || [], r.hints || []).map((m) => "· " + m).join("\n"), true);
+    poll();
+  }
+
+  /* 「一键最优」：沿转移链找第一家凭据就绪且中转在跑的，接通它。
+     一家都找不到就如实说没有，不硬接。 */
+  async function bestChannel() {
+    const list = chainOf().length ? chainOf() : CHAIN_KEYS;
+    for (const k of list) {
+      const st = channelState(k);
+      if (st.s === "ok" || st.s === "warn") return k;
+    }
+    return null;
+  }
+  function applyBest() {
+    withBusy($("btnBest"), async () => {
+      const k = await bestChannel();
+      if (!k) {
+        showResult($("applyResult"),
+          "没有一家渠道处于可用状态——先去凭据视图把至少一家的凭据配好。", false);
+        return;
+      }
+      await applyChannel(k);
+      showResult($("applyResult"), `✔ 已按转移链顺序选中并接入 ${nameOf(k)}。`, true);
+    }, $("applyResult"));
   }
 
   async function saveMapping() {
@@ -1255,50 +1458,65 @@
       const target = sel.value === "__custom__" ? (cus ? cus.value : "") : sel.value;
       mapping[t.key] = { target: (target || "").trim().toLowerCase(), label: lbl ? lbl.value : "" };
     }
-    const body = { provider: key, mapping };
-    /* B.AI / SenseNova 的密钥行在路由卡里，「保存映射」顺手一起存（旧页行为） */
-    if (has("apiKey")) body.apiKey = $("apiKey").value;
-    const r = await postJSON("/api/config", body);
+    const r = await postJSON("/api/config", { provider: selected, mapping });
     showResult($("testResult"), "✔ 映射已保存并生效\n" + (r.hints || []).map((h) => "· " + h).join("\n"), true);
     await refreshConfig();
   }
 
   async function testTiers() {
     const all = has("ckAllTiers") && $("ckAllTiers").checked;
-    const r = await postJSON("/api/test", all ? { provider: key, all: true } : { provider: key });
+    const r = await postJSON("/api/test", all ? { provider: selected, all: true } : { provider: selected });
     const single = !!r.active && !all;
-    const note = opt("testNote") || {};
     const lines = (r.tiers || []).map((t) => {
-      const name = t.label + LABEL_SUFFIX;
       const who = single ? "当前使用：" : (TIER_ZH[t.tier] || t.tier) + "：";
-      return t.ok ? `✔ ${who}${name} · ${t.ms}ms` : `✘ ${who}${name} · 失败：${t.error}`;
+      return t.ok ? `✔ ${who}${t.label} · ${t.ms}ms` : `✘ ${who}${t.label} · 失败：${t.error}`;
     });
-    const tail = single ? (note.single || "") : (note.all || "（最近 30 分钟没观察到真实对话流量，已测全部四档）");
+    const tail = single ? "" : "（最近 30 分钟没观察到真实对话流量，已测全部四档）";
     showResult($("testResult"), lines.join("\n") + (tail ? "\n" + tail : ""), !!r.ok);
   }
 
   async function refreshModels() {
-    const r = await api(P.modelsEndpoint || "/api/models?p=" + key);
-    const S = slice();
+    const P = MANIFEST[selected] || {};
+    const r = await api("/api/models?p=" + selected);
+    const C = cfgOf(selected);
     const curTargets = TIERS
-      .map((t) => String(((S.mapping || {})[t.key] || {}).target || "").toLowerCase())
+      .map((t) => String(((C.mapping || {})[t.key] || {}).target || "").toLowerCase())
       .filter(Boolean);
     const merged = [...new Set([...(r.models || []), ...curTargets])];
-    await postJSON("/api/config", { provider: key, availableModels: merged });
+    await postJSON("/api/config", { provider: selected, availableModels: merged });
     await refreshConfig();
     refreshCards();
-    showResult($("testResult"),
-      fill(opt("modelsRefreshMsg") || "✔ 已拉取模型 {count} 个\n下拉框已更新（映射目标强制保留）", { count: r.count }), true);
+    showResult($("testResult"), `✔ ${nameOf(selected)} 已拉取模型 ${r.count} 个\n下拉框已更新（映射目标强制保留）`, true);
+    if (r.note) showInfo(nameOf(selected), r.note, 0);
+    if (P.models && P.models.length) {
+      /* 清单与实时目录有出入时据实提醒（发布机上的出厂清单 vs 本机实际可用） */
+      const extra = merged.filter((m) => !P.models.includes(m));
+      const gone = P.models.filter((m) => !merged.includes(m));
+      if (extra.length || gone.length) {
+        showResult($("testResult"),
+          `✔ ${nameOf(selected)} 已拉取模型 ${r.count} 个\n下拉框已更新（映射目标强制保留）`
+          + "\n注意：本机实际目录与发布时清单不一致——多出 " + extra.length + " 个、少了 " + gone.length
+          + " 个。清单是出厂默认值，实际可用以上游为准。", true);
+      }
+    }
+  }
+
+  async function resetModels() {
+    const P = MANIFEST[selected] || {};
+    const defs = P.defaultModels || [];
+    if (!defs.length) return;
+    await postJSON("/api/config", { provider: selected, availableModels: defs });
+    await refreshConfig();
+    showResult($("sysResult"), `✔ ${nameOf(selected)} 已恢复默认模型：${defs.join("、")}`, true);
   }
 
   async function saveSys() {
-    const body = { provider: key };
-    for (const [id, field] of SYS_FIELDS) {
+    const body = { provider: selected };
+    for (const [id, field] of [["fUpstream", "upstream"], ["fRelayPort", "relayPort"]]) {
       const el = $(id);
-      if (el && el.value.trim()) body[field] = el.value.trim();   // 空值不下发：apiKey 空串服务端会忽略
+      if (el && el.value.trim()) body[field] = el.value.trim();
     }
-    if (has("ckUseProxy")) body.useProxy = $("ckUseProxy").checked;
-    if (has("fModels")) body.availableModels = $("fModels").value.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+    if (has("ckUseProxy") && cfgOf(selected) !== cfg) body.useProxy = $("ckUseProxy").checked;
     const r = await postJSON("/api/config", body);
     const lines = ["✔ 设置已保存", ...(r.messages || []), ...(r.hints || [])];
     if (r.needRestart) {
@@ -1314,15 +1532,8 @@
     } else {
       showResult($("sysResult"), lines.join("\n"), true);
     }
+    clearDirtyInputs();
     await refreshConfig();
-  }
-
-  async function resetModels() {
-    if (!DEFAULT_MODELS.length) return;
-    await postJSON("/api/config", { provider: key, availableModels: DEFAULT_MODELS });
-    await refreshConfig();
-    showResult($("sysResult"),
-      fill(opt("resetModelsMsg") || "✔ 已恢复默认模型：{list}", { list: DEFAULT_MODELS.join("、") }), true);
   }
 
   async function deployLocal() {
@@ -1331,83 +1542,113 @@
     showResult($("sysResult"), "✔ 部署完成\n" + (r.messages || [r.error || ""]).join("\n"), !!r.ok);
   }
 
-  async function detectProxy() {
-    const b = $("btnProxyDetect");
-    b.disabled = true; b.textContent = "检测中…";
-    try {
-      const r = await api("/api/proxy-detect", { method: "POST" });
-      if (window.baiDesktop) showInfo(r.applied ? "代理已自动切换" : "代理检测", r.message, r.applied ? 0 : 5000);
-      else alert(r.message);
-      await refreshConfig();
-      poll();
-    } catch (e) {
-      if (window.baiDesktop) showInfo("检测失败", e.message, 5000);
-      else alert("检测失败：" + e.message);
-    } finally { b.disabled = false; b.textContent = "自动检测代理"; }
+  /* ======================================================================
+   * 13. 轮询 / 配置
+   * ==================================================================== */
+  async function refreshConfig() {
+    cfg = await api("/api/config");
+    renderRoute();
+    renderSys();
+    paintMatrix();
   }
 
-  function wire() {
-    /* 卡挂载在前：它们造出来的 #cardTok / #tokStat / #tokToggle / #btnSaveTok 归卡自己管 */
-    ownsTokStat = !has("tokStat");
-
-    onClick("btnApply", () => withBusy($("btnApply"), applyMe));
-    onClick("btnRestore", () => withBusy($("btnRestore"), async () => {
-      const r = await postJSON("/api/restore", { cli: $("ckCli").checked, desktop: $("ckDesk").checked });
-      showResult($("applyResult"),
-        "✔ 已接回 CC Switch\n" + r.messages.map((m) => "· " + m).concat(r.hints.map((h) => "· " + h)).join("\n"), true);
-    }));
-    onClick("btnSave", () => withBusy($("btnSave"), saveMapping));
-    onClick("btnTest", () => withBusy($("btnTest"), testTiers));
-    onClick("btnModels", () => withBusy($("btnModels"), refreshModels));
-    onClick("btnSaveSys", () => withBusy($("btnSaveSys"), saveSys));
-    onClick("btnResetModels", () => withBusy($("btnResetModels"), resetModels));
-    onClick("btnDeploy", () => withBusy($("btnDeploy"), deployLocal));
-    onClick("btnProxyDetect", detectProxy);
-
-    /* 凭据四件套（没有 token-capture 卡时由共享层兜底） */
-    if (ownsTokStat) {
-      const TOK_FIELDS = [["accessToken", "accessToken"], ["refreshToken", "refreshToken"],
-        ["deviceToken", "deviceToken"], ["userId", "userId"]];
-      onClick("btnSaveTok", () => withBusy($("btnSaveTok"), async () => {
-        const body = { provider: key };
-        for (const [id, f] of TOK_FIELDS) if ($(id)) body[f] = $(id).value.trim();
-        const r = await postJSON("/api/config", body);
-        showResult($("tokResult"), "✔ 令牌已保存\n" + (r.hints || []).map((h) => "· " + h).join("\n"), true);
-        await refreshConfig();
-        poll();
-      }));
-      onClick("tokToggle", () => {
-        const els = ["accessToken", "refreshToken", "deviceToken"].map($).filter(Boolean);
-        if (!els.length) return;
-        const showing = els[0].type === "text";
-        els.forEach((el) => { el.type = showing ? "password" : "text"; });
-        $("tokToggle").textContent = showing ? "显示" : "隐藏";
-      });
+  async function poll() {
+    /* 轮询**不再**被 busy 拦住。
+       从前这里是 `if (busy) return`，本意是防止重绘把正在点的按钮换掉（矩阵与凭据行
+       每次都重建 innerHTML），代价却是：任何一个长动作期间（测试连通在这类网络下
+       能跑两分多钟）整个 5 秒轮询停摆，状态带与诊断抽屉一起冻结，用户除了按钮上的
+       "处理中…" 之外什么都看不到，以为面板死了。
+       现在改成各管各的：
+         · 重入保护交给 polling —— 两次轮询不该叠在一起，这是它本来的职责；
+         · 重绘安全交给 withBusy 给按钮打的 [data-busy] 标记 —— 画到带这个标记的
+           容器就跳过，动作结束后 withBusy 的 finally 会补一次 poll()，状态自然刷新。 */
+    if (polling) return;
+    polling = true;
+    try {
+      const s = await api("/api/status");
+      status = s;
+      if (!selected) { pickInitial(s); applySelectionUi(); }
+      paintBand(s);
+      paintBadges(s);
+      paintMatrix();
+      buildDiag();
+      renderSys();
+      for (const c of cards) {
+        try { if (c.update) c.update(s, cfg); } catch (e) { console.warn("[card] " + c.name, e); }
+      }
+    } catch {
+      const el = $("svc");
+      if (el) el.innerHTML = `服务 <b class="off">○</b> 已停止`;
+      setLed($("ledRelay"), "err", false);
+      const txt = $("txtRelay");
+      if (txt) txt.textContent = "已停止";
+    } finally {
+      polling = false;
     }
-    onClick("keyToggle", () => {
-      const k = $("apiKey") || $("fApiKey");
-      if (!k) return;
-      const show = k.type === "password";
-      k.type = show ? "text" : "password";
-      $("keyToggle").textContent = show ? "隐藏" : "显示";
-    });
+  }
+  const refreshCards = () => {
+    for (const c of cards) { try { if (c.refresh) c.refresh(); } catch (e) { console.warn("[card] " + c.name, e); } }
+  };
+
+  /* ======================================================================
+   * 14. 选中渠道 / 视图切换的接线
+   * ==================================================================== */
+  function pickInitial(s) {
+    const fromUrl = keyFromPath(location.pathname);
+    if (fromUrl) { selected = fromUrl; fromPath = true; return; }
+    /* 根路径 /：选中当前接线的那家；都没接线就选转移链首位 */
+    const ends = [s.cli, s.desktop].filter(Boolean).map((e) => e.mode);
+    const wired = ends.find((m) => m && MANIFEST[m] && MANIFEST[m].chainable === true);
+    selected = wired || (chainOf()[0] || CHAIN_KEYS[0] || null);
+  }
+
+  /* 选中渠道后的 UI 回灌。抽出来是因为「首次从 status 判定出渠道」与「用户点卡片」
+     是同一条路径，只是后者多一步滚动高亮。 */
+  function applySelectionUi() {
+    const P = MANIFEST[selected] || {};
+    document.title = P.title || "路由台";
+    const t = $("h1Text");
+    if (t) t.textContent = selected ? nameOf(selected) : "路由台";
+    renderRoute();
+    renderSys();
+    paintMatrix();
+    paintCredList();
+    buildDiag();
+  }
+
+  function selectChannel(key) {
+    if (!MANIFEST[key]) return;
+    selected = key;
+    clearDirtyInputs();      // 换渠道 = 换一份配置，未保存的半截字不带过去
+    applySelectionUi();
+    const cell = q(`.cell[data-k="${CSS.escape(key)}"]`, $("matrixGrid"));
+    if (cell) {
+      cell.classList.add("flash");
+      cell.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+    refreshCards();
   }
 
   /* ======================================================================
-   * 12. 主题 / 窗口控制 / 折叠卡
+   * 15. 主题 / 窗口控制 / 折叠
    * ==================================================================== */
   function wireTheme() {
     const TKEY = "bai.theme";
     const apply = (t) => {
-      document.documentElement.setAttribute("data-theme", t);
+      const root = document.documentElement;
+      /* 换肤那一帧把过渡全关掉（CSS 里 html.no-trans 有对应规则）。
+         颜色属性带 transition 时换肤会拖尾；在不产帧的环境里还会永远停在旧值。
+         用 setTimeout 而不是双 rAF —— 隐藏窗口不触发 rAF，那条路会卡住不上。 */
+      root.classList.add("no-trans");
+      root.setAttribute("data-theme", t);
+      setTimeout(() => root.classList.remove("no-trans"), 0);
       const i = $("themeIcon"), x = $("themeText");
       if (i) i.textContent = t === "light" ? "☀" : "☾";
       if (x) x.textContent = t === "light" ? "亮色" : "暗色";
     };
     let t = null;
-    try { t = localStorage.getItem(TKEY); } catch { }
+    try { t = localStorage.getItem(TKEY); } catch { /* 无痕模式读不到，走系统 */ }
     if (!t) {
-      /* 没选过 → 跟随系统；系统也没说就保持暗色（与历史表现一致） */
       try { t = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"; }
       catch (e) { t = "dark"; }
     }
@@ -1415,7 +1656,7 @@
     const btn = $("themeBtn");
     if (btn) btn.addEventListener("click", () => {
       t = (document.documentElement.getAttribute("data-theme") === "light") ? "dark" : "light";
-      try { localStorage.setItem(TKEY, t); } catch { }
+      try { localStorage.setItem(TKEY, t); } catch { /* 写不进去也不影响本次切换 */ }
       apply(t);
     });
     window.addEventListener("storage", (e) => { if (e.key === TKEY && e.newValue) apply(e.newValue); });
@@ -1436,15 +1677,13 @@
     on("winClose", () => D.winClose());
     const syncMax = (s) => { const b = $("winMax"); if (b && s) b.title = s.maximized ? "向下还原" : "最大化"; };
     if (D.onWindowState) D.onWindowState(syncMax);
-    /* 双击标题栏空白处 = 最大化/还原 */
     const hd = document.querySelector("header");
     if (hd) hd.addEventListener("dblclick", (e) => {
-      if (e.target.closest(".winCtrls") || e.target.closest(".prov-tab") || e.target.closest("button")) return;
+      if (e.target.closest(".winCtrls") || e.target.closest(".tabs") || e.target.closest("button")) return;
       D.winToggleMaximize();
     });
   }
 
-  /* 通用折叠卡（记忆展开状态；清单 foldKey 沿用旧页面的 localStorage 键） */
   function fold(cardId, headId, storeKey, startCollapsed) {
     const card = $(cardId), head = $(headId);
     if (!card || !head) return;
@@ -1460,7 +1699,7 @@
     const toggle = () => {
       const col = card.classList.toggle("collapsed");
       head.setAttribute("aria-expanded", String(!col));
-      try { localStorage.setItem(storeKey, col ? "0" : "1"); } catch { }
+      try { localStorage.setItem(storeKey, col ? "0" : "1"); } catch { /* 记不住也不该报错 */ }
     };
     head.addEventListener("click", toggle);
     head.addEventListener("keydown", (e) => {
@@ -1469,35 +1708,55 @@
   }
 
   /* ======================================================================
-   * 13. 页脚 + 桌面事件
+   * 16. 页脚 + 桌面事件
    * ==================================================================== */
   function wireFooter() {
+    if (has("verTxt") && window.baiDesktop) {
+      api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
+    } else if (has("verTxt")) {
+      api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
+    }
+    if (has("footPaths")) {
+      $("footPaths").textContent = ALL_KEYS
+        .filter((k) => MANIFEST[k].path)
+        .map((k) => MANIFEST[k].path).join("  ");
+    }
     if (window.baiDesktop) {
-      if (has("verTxt")) api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
-      const T = P.eventTitles || {};
       window.baiDesktop.onAppEvent((ev) => {
         if (!ev) return;
-        if (ev.kind === "recovered") showInfo(T.recovered || "服务恢复", ev.text);
-        else if (ev.kind === "check") showInfo(T.check || "路由台", ev.text, ev.sticky ? 0 : 6000);
-        else if (ev.kind === "deployed") showInfo(T.deployed || "已自动部署", ev.text, 8000);
+        if (ev.kind === "recovered") showInfo("服务恢复", ev.text);
+        else if (ev.kind === "check") showInfo("路由台", ev.text, ev.sticky ? 0 : 6000);
+        else if (ev.kind === "deployed") showInfo("已自动部署", ev.text, 8000);
       });
     }
   }
 
   /* ======================================================================
-   * 14. extraCards 插槽：依次 /cards/<name>.js，再调 window.BAI_CARDS[name].mount(ctx)
-   *     mount 可返回 { update(), refresh() }；update 每轮 poll 调一次。
+   * 17. 卡片挂载：按视图（BAI_VIEWS[].cards）而不是按渠道（extraCards）
+   *     卡片属于视图而不属于渠道——旧架构同一张卡在总览页挂一份、各家页挂另一份，
+   *     漂移就是这么来的。
    * ==================================================================== */
+  /* 凭据视图里的卡片按 credential.kind 自认领自己的行——不写渠道名，
+     新增一家同类型的渠道时卡片自动跟过去，不必改卡也不用改渲染层。 */
+  function rowsOfKind(kind) {
+    const box = $("credList");
+    if (!box) return [];
+    const keys = ALL_KEYS.filter((k) => ((MANIFEST[k].credential || {}).kind || "none") === kind);
+    return keys.map((k) => {
+      const row = q(`.credrow[data-k="${CSS.escape(k)}"]`, box);
+      return row ? q('[data-role="detail"]', row) : null;
+    }).filter(Boolean);
+  }
+
   const ctx = {
-    key, PROVIDER: key, P,
     get cfg() { return cfg; },
     get status() { return status; },
-    get slice() { return slice(); },
-    get st() { return st(); },
-    slot: $("slot-extra"),
-    $, q, api, postJSON, showInfo, showResult, setLed, withBusy, esc,
-    poll, refreshConfig, renderStatus, renderRoute, renderSys, renderSteps,
-    fold, loadScript, TIERS, MODE_TXT, SHORT, fill,
+    get channel() { return selected; },
+    get view() { return currentView; },
+    channels: ALL_KEYS,
+    nameOf, cfgOf, stOf, sliceOf, channelState, credState, chainOf, rowsOfKind, TIERS, TIER_ZH, MODE_TXT, esc, cap,
+    $, q, qa, api, postJSON, showInfo, showResult, setLed, withBusy, poll, refreshConfig,
+    renderRoute, selectChannel, setView, fp, registerCapture,
   };
 
   function loadScript(src, ms) {
@@ -1511,34 +1770,92 @@
     });
   }
 
-  async function mountCards() {
-    const names = Array.isArray(P.extraCards) ? P.extraCards : [];
-    for (const name of names) {
+  const mountedFor = new Map();
+  async function mountCardsFor(viewId) {
+    const v = viewOf(viewId);
+    if (!v) return;
+    if (mountedFor.get(viewId)) { refreshCards(); return; }
+    mountedFor.set(viewId, true);
+    for (const name of (v.cards || [])) {
       try {
         await loadScript("/cards/" + name + ".js");
         const mod = (window.BAI_CARDS || {})[name];
         if (!mod || typeof mod.mount !== "function") { console.warn("[card] " + name + " 未导出 mount()"); continue; }
-        const view = mod.mount(ctx) || {};
-        cards.push({ name, update: view.update, refresh: view.refresh });
+        /* 卡片落点：优先该视图里的 #foPanel / #credList 一类插槽，否则落进视图容器末尾 */
+        const host = q(`#${v.dom} [data-cardhost]`) || $(v.dom) || $("slot-extra");
+        const view = mod.mount(Object.assign({}, ctx, { slot: host, view: v.id })) || {};
+        cards.push({ name, view: v.id, update: view.update, refresh: view.refresh });
       } catch (e) {
         console.warn("[card] " + name, e);
       }
     }
+    refreshCards();
   }
 
   /* ======================================================================
-   * 15. 启动
+   * 18. 启动
    * ==================================================================== */
-  applyManifest();
-  buildLamps();
-  wireTheme();
-  wireWindowCtrls();
-  mountCards().finally(() => {
-    fold("cardSys", "headSys", P.foldKey || ("bai.fold." + key));
+  function wire() {
+    for (const b of qa("#navViews [data-view]")) {
+      b.addEventListener("click", () => setView(b.getAttribute("data-view")));
+    }
+    onClick("btnBest", applyBest);
+    onClick("btnRestore2", () => withBusy($("btnRestore2"), restoreExternal, $("applyResult")));
+    onClick("btnRestore", () => withBusy($("btnRestore"), restoreExternal, $("applyResult")));
+    onClick("btnSave", () => withBusy($("btnSave"), saveMapping, $("testResult")));
+    onClick("btnTest", () => withBusy($("btnTest"), testTiers, $("testResult")));
+    onClick("btnModels", () => withBusy($("btnModels"), refreshModels, $("testResult")));
+    onClick("btnResetModels", () => withBusy($("btnResetModels"), resetModels, $("sysResult")));
+    onClick("btnSaveSys", () => withBusy($("btnSaveSys"), saveSys, $("sysResult")));
+    onClick("btnDeploy", () => withBusy($("btnDeploy"), deployLocal, $("sysResult")));
+
+    const db = $("diagBar"), dd = $("diagDrawer");
+    if (db && dd) {
+      const toggle = () => {
+        const open = dd.classList.toggle("open");
+        db.setAttribute("aria-expanded", String(open));
+        if (open) buildDiag();
+      };
+      db.addEventListener("click", toggle);
+      onClick("btnDiag", toggle);
+      const setOpen = (on) => { dd.classList.toggle("open", on); db.setAttribute("aria-expanded", String(on)); if (on) buildDiag(); };
+      if (db.dataset.open === "1") setOpen(true);
+    }
+  }
+
+  function boot() {
+    /* data-provider 只用于微调底色温度，配色不再按渠道切换（模板引导脚本已设，这里兜底） */
+    const root = document.documentElement;
+    if (!root.getAttribute("data-provider")) {
+      root.setAttribute("data-provider", (keyFromPath(location.pathname)) || "home");
+    }
+    applyTextOrNull("h1Text", selected ? nameOf(selected) : "路由台");
+
+    setView(viewFromHash(), false);
+    buildMatrix();
+    buildCredList();
+    wireTheme();
+    wireWindowCtrls();
     wire();
-    wireFooter();
+
     poll();
     refreshConfig().catch((e) => showResult($("applyResult"), "配置加载失败：" + e.message, false));
     setInterval(poll, 5000);
-  });
+    wireFooter();
+    setTimeout(() => {
+      if (selected && fromPath) {
+        const cell = q(`.cell[data-k="${CSS.escape(selected)}"]`, $("matrixGrid"));
+        if (cell) { cell.scrollIntoView({ block: "center", behavior: "smooth" }); cell.classList.add("flash"); }
+      }
+    }, 350);
+
+    window.addEventListener("hashchange", () => setView(viewFromHash(), false));
+  }
+
+  function applyTextOrNull(id, text) {
+    const el = $(id);
+    if (el && text != null) el.textContent = text;
+  }
+
+  boot();
 })();

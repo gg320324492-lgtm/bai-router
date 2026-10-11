@@ -28,13 +28,13 @@ window.BAI_CARDS["model-sync"] = {
     const $ = ctx.$ || ((id) => document.getElementById(id));
     const esc = ctx.esc || ((s) => String(s == null ? "" : s));
 
-    /* 提供方名单一律从清单取（顺序 = providers.js 里的书写顺序），
-       不在本文件里另抄一份 key 数组：改名/加家时只改清单一处就够了。 */
+    /* 可刷目录的渠道：清单里 chainable 的那些（交还区不是本台渠道，没有模型目录）。
+       顺序按清单书写序，与转移链默认序一致。 */
     const MANIFEST = window.BAI_PROVIDERS || {};
-    const ORDER = Object.keys(MANIFEST);
+    const ORDER = Object.keys(MANIFEST).filter((k) => MANIFEST[k] && MANIFEST[k].chainable === true);
     const nameOf = (k) => {
       const P = MANIFEST[k] || {};
-      return P.shortName || P.tab || P.h1 || k;
+      return P.name || P.shortName || P.tab || P.h1 || k;
     };
 
     let state = null;          // { providers:[…], applied:boolean }
@@ -43,8 +43,10 @@ window.BAI_CARDS["model-sync"] = {
     let btnLabel = "";         // 按钮文案缓存，供 5 秒一次的 update() 比对
 
     /* ------------------------------------------------------------------
-     * A. 头部按钮：插在页签导航之后、.svc 之前。
-     *    门禁 C9 只数 <a class="prov-tab">，插一个 <button> 它看不见；
+     * A. 状态带上的按钮。
+     *    v17 单页改版后没有 .prov-tab 页签导航了，按钮改挂在状态带的动作行
+     *    （#btnBest / #btnRestore2 / #btnDiag 那一排）——它本来就是顶栏级的动作。
+     *    门禁 C9 只数 navViews 里的 data-view，插一个 button 它看不见；
      *    header * 已经是 -webkit-app-region:no-drag，拖窗口照常。
      * ------------------------------------------------------------------ */
     let btn = $("btnModelSync");
@@ -52,13 +54,13 @@ window.BAI_CARDS["model-sync"] = {
       btn = document.createElement("button");
       btn.id = "btnModelSync";
       btn.type = "button";
-      btn.className = "btn-ghost btn-sm msync-nav";
+      btn.className = "btn ghost sm";
       btn.textContent = "刷新全部模型";
-      btn.title = "依次拉取六家提供方的模型目录，与当前配置对比后给出增删摘要；确认后才写入配置";
-      const nav = $("provNav");
-      const host = (nav && nav.parentNode) || document.querySelector("header") || document.body;
-      if (nav) nav.insertAdjacentElement("afterend", btn);
-      else host.appendChild(btn);
+      btn.title = "依次拉取各家渠道的模型目录，与当前配置对比后给出增删摘要；确认后才写入配置";
+      const acts = document.querySelector("#statusBand .acts");
+      const hint = acts ? acts.querySelector(".hintx") : null;
+      if (acts) { if (hint) hint.before(btn); else acts.appendChild(btn); }
+      else document.body.appendChild(btn);
       btnLabel = btn.textContent;
 
       btn.addEventListener("click", () => {
@@ -207,11 +209,15 @@ window.BAI_CARDS["model-sync"] = {
 
     /* 合并后的完整清单 = 现有 − 移除 + 新增。
        服务端还会再兜一次映射目标（那几档 Claude 不能被删掉），这里按自己的算法发，
-       让用户看到/算到的就是我们要写下去的那一份。 */
+       让用户看到/算到的就是我们要写下去的那一份。
+       取当前清单走 ctx.sliceOf：最早那家在 /api/config 里是**平铺**的（顶层就是它
+       自己的字段），其余家在同名子对象下——v17 清单不再有 shape 字段，由共享层
+       运行时探测，v1.0.x 之前那种 `MANIFEST[k].shape === "flat"` 的写法会让
+       那一家读成空对象、进而被静默跳过「应用变更」。 */
     function mergeFor(p) {
       const cfg = ctx.cfg;
       if (!cfg) return null;
-      const blk = (MANIFEST[p.key] || {}).shape === "flat" ? cfg : (cfg[p.key] || {});
+      const blk = typeof ctx.sliceOf === "function" ? ctx.sliceOf(cfg, p.key) : (cfg[p.key] || cfg);
       const cur = Array.isArray(blk.availableModels) ? blk.availableModels : [];
       if (!cur.length) return null;                 // 没有现有名单，合并会误删，不做
       const rm = new Set(p.removed);

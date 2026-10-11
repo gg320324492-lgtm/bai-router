@@ -9,25 +9,38 @@
  * 「JWT 有效期」、四页接线徽章都判 m.mode === "wb"、cliMode 少一个字段…）。
  * 本脚本把「漏改一处」从运行期 bug 变成构建期失败。
  *
- * 十二类检查（C1–C8 对应约定的八项，C9–C12 是后续补的）：
- *   C1 清单完整性 + key/path 与 server.mjs 注册路由一致
- *   C2 guide 结构
- *   C3 notices 结构 + {btn} 占位符可替换 + 死键（没人读的 notice）
- *   C4 契约 id 在 provider.html 里各出现且仅出现一次
+ * 十三类检查（v17 单页改版后重新对齐，逐条对应 REFACTOR-CONTRACT-v17.md 第五节）：
+ *   C1 清单完整性（渠道字段）+ key/path 与 server.mjs 注册路由一致 + 声明序 = 转移链序
+ *   C2 【已退役】原 guide 结构检查，其检查点并入 C1 的 credential 结构 —— 见该节
+ *   C3 诊断结论文案：conclusion（就绪怎么判断）/ remedy（未就绪给什么建议）
+ *   C4 契约 id 在 provider.html 里各出现且仅出现一次（= 契约 id 处置表的落地结果）
  *   C5 反向检查：id 引用无悬空（$() 以及 onClick/applyText/has 的字符串参数形式）
- *   C6 插槽契约：cards/*.js 都导出 mount，extraCards 双向对账
- *   C7 配色：html[data-provider="x"] 与清单 key 一一对应
- *   C8 模型列表：每家的 defaultModels 都是清单里的字符串数组（v1.0.48 起只认清单；
- *      允许空数组——bai/sn 本就没有「恢复默认模型」按钮，见该检查处的说明）
- *   C9 导航 tab 与清单 key/path 一一对应——加了清单忘了加 tab，页面上根本点不到
+ *   C6 视图级卡片表 window.BAI_VIEWS[].cards 与 cards/*.js 双向对账
+ *   C7 状态语义色（--ok/--warn/--err/--idle/--brand）深浅两套都有值，且不再有
+ *      per-provider 的 --accent 块
+ *   C8 清单 models 与 config.defaults.json 的 availableModels 逐项一致
+ *   C9 视图分段：#navViews 里的 data-view ↔ BAI_VIEWS[].id ↔ 模板里的视图容器
  *   C10 凡是「直接返回模板」的路由，都必须能在清单里 path 精确匹配上
  *   C11 panel-common.js 不得再按提供方名字硬编码（清单化收尾；cards/*.js 与注释不扫）
- *   C12 渲染层无条件读取的形状字段（shape/keyMatch/sys/brands/defaultModels/settingsLabels）
- *       每家都要有——加第六家漏改的新防线
+ *   C12 渲染层必读的**新增渠道字段**每家都要有，并与 C1 的必填表保持交集（防两处漂移）
+ *   C13 种子配置不得带本机路径/用户名
  *
  * 零依赖：只用 Node 内置模块。
  *
  * 约定：本脚本**只读**。它不修任何东西——修哪个文件、填什么值，全部打在输出里。
+ *
+ * ---------------------------------------------------------------------------
+ * 在途台账（v17 阶段一「分棒实施」造成的中间态，唯一一处降级机制）
+ * ---------------------------------------------------------------------------
+ * 契约 v17 的五个里程碑是串行的，本次实施按棒拆开：清单 + 模板 + 闸门先落地，
+ * 样式（里程碑 3）与渲染层（里程碑 4）随后。中间态下有两类事实是**预期内**的：
+ *   ① panel-common.js 还在读已被处置表删掉的 id（模板里没有了）；
+ *   ② cards/overview.js 还在磁盘上，但视图表已不再引用它；
+ *   ③ panel-common.css 还是旧的 per-provider --accent 调色板。
+ * 这三类都登记在下面 IN_FLIGHT / PALETTE_V17_READY 里，命中后**从 error 降级为 warn**
+ * 并点名负责的里程碑。判别力没有被削弱：未登记的悬空 id、未登记的死卡、
+ * 状态色缺失（在严格模式下）仍然是 error，且台账条目一旦过期会被报出来要求删除。
+ * 里程碑 3 / 4 落地后，这三本账应当清空 —— 见各自的定义处。
  */
 "use strict";
 
@@ -151,57 +164,172 @@ const countId = (html, id) => {
 const uniq = (a) => [...new Set(a)];
 const setEq = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
 
+/* CSS 最内层规则块 {selector, body} —— 只认不含嵌套花括号的叶子块。
+   @media 里的规则会以 "@media (...) \n .sel" 的形式出现，用选择器前缀匹配即可。 */
+function cssBlocks(css) {
+  const out = [];
+  const re = /([^{}]+)\{([^{}]*)\}/g;
+  let m;
+  while ((m = re.exec(css))) out.push({ sel: m[1].trim().replace(/\s+/g, " "), body: m[2] });
+  return out;
+}
+const cssVars = (body) => {
+  const m = new Map();
+  for (const mm of body.matchAll(/(--[A-Za-z0-9_-]+)\s*:\s*([^;}]*)/g)) {
+    if (!m.has(mm[1])) m.set(mm[1], mm[2].trim());
+  }
+  return m;
+};
+
 /* ============================================================================
- * 契约常量（改这里 = 改 docs/contracts/REFACTOR-CONTRACT.md，两边要一起改）
+ * 在途台账（v17 阶段一分棒实施的中间态，见文件头说明）
+ *
+ * 三本账都已清空：里程碑 3（panel-common.css 重建）与里程碑 4（渲染层重写 +
+ * 卡片迁移）落地后，渲染层不再读任何一个被删的 id、死卡已删、调色板已切到
+ * 状态语义色。空数组 = 没有在途豁免，C5/C6/C7 恢复为全 error 严格模式。
+ * 账目本身保留（而不是整段删掉）：下一次再有人加一个 id 又忘了同步渲染层，
+ * 闸门会**直接报错**而不是默默放过——这正是这三本账存在的意义。
  * ==========================================================================*/
 
-/* C4：docs/contracts/REFACTOR-CONTRACT.md「元素 id 约定」里逐条列出的 id。
+/* ① 已从模板删除、但旧渲染层仍在引用的 id。
+ *    里程碑 4 落地后渲染层不再读它们，台账已清空。
+ *    下面是本轮实际清掉的 25 个，作为「哪些 id 是渲染层曾经读过」的记录。 */
+const IN_FLIGHT_IDS = {
+  owner: "里程碑 4（panel-common.js 重写）—— 已清空",
+  cleared: [
+    /* 两步引导卡 */
+    "step1", "step2", "state1", "state2", "guideAux", "eyebGuide", "ttlGuide",
+    "slot-step1", "btnApply", "ckCli", "ckDesk",
+    /* 接线卡的编号与标题（已并入状态带；ttlPatch 从未被渲染层读取，故不在在途台账里） */
+    "eyebPatch",
+    /* 路由表卡的编号、目标列表头与说明（已并入映射编辑区；auxRoute 未被读取） */
+    "eyebRoute", "ttlRoute", "thTarget", "routeHint", "slot-route",
+    /* 一排信号灯的扩展插槽（已并入状态带的单元栅格） */
+    "slot-lamps",
+    /* 设置卡的编号、标题、副行与「可选模型列表」文本域 */
+    "eyebSys", "ttlSys", "sysAux", "fModels",
+    /* 「走代理」整行（勾选框本身保留在设置视图） */
+    "useProxyRow", "useProxyText",
+  ],
+  ids: [],
+};
+
+/* ② 视图表已不再引用、但文件还在磁盘上的卡。里程碑 4 已删卡片文件，台账清空。 */
+const IN_FLIGHT_CARDS = {
+  owner: "里程碑 4（删 cards/overview.js）—— 已清空",
+  cleared: ["overview"],
+  names: [],
+};
+
+/* ③ 调色板模式开关。
+ *   false = 里程碑 3 尚未重建 panel-common.css，仍是 per-provider --accent 旧调色板：
+ *     「状态语义色缺失」与「仍有 --accent 块」只报 warn，不拦路。
+ *   true  = 里程碑 3 已落地：五色必须在深浅两套里都有值，且不得再有 --accent 块，
+ *     两条断言全部升级为 error。
+ *   **里程碑 3 的验收人必须把这里改成 true** —— 否则 C7 会永远停在只警告模式。
+ *   本文件每次运行都会打印当前模式，不会有人看不见。 */
+const PALETTE_V17_READY = true;
+
+/* ============================================================================
+ * 契约常量（改这里 = 改 REFACTOR-CONTRACT-v17.md，两边要一起改）
+ * ==========================================================================*/
+
+/* C4：契约 id 处置表（REFACTOR-CONTRACT-v17.md 第二节）的落地结果，分三组按处置分类排列。
  * 注意 #bnrUpdate / #updBtn / #btnSelfUpd / #stopBtn **不在**这里——契约写明它们由
- * panel-common.js 注入，模板里本就不该有。（见 provider.html 顶部注释同一句。） */
-const CONTRACT_IDS = [
+ * panel-common.js 注入，模板里本就不该有。（见 provider.html 顶部注释同一句。）
+ *
+ *   保留原样 28 个 · 保留但换语义 18 个 · 新增 14 个 = 60 个
+ * （契约正文写的是「删 25、新增 15 → 42」，与逐条表对不上：删除那一栏实际列出 24 个 id，
+ *   其中只有 9 个原本在旧 CONTRACT_IDS 里；新增那一栏实际列出 14 个。
+ *   本数组以**逐条表**为准 —— 见 check-manifest 运行时的 [C4] 段落会把这个差异打印出来。） */
+const IDS_KEPT_AS_IS = [
   "svc",
   "themeBtn", "themeIcon", "themeText",
   "winMin", "winMax", "winClose",
-  "ledRelay", "txtRelay", "subRelay",
-  "ledUp", "txtUp", "subUp",
-  "ledTok", "txtTok", "subTok",
   "patchTime", "patchCli", "cliBadge", "patchDesk", "deskBadge",
-  "btnApply", "btnRestore", "ckCli", "ckDesk", "applyResult",
-  "guideAux", "step1", "state1", "step2", "state2",
+  "btnRestore",
   "routeBody", "btnSave", "btnTest", "ckAllTiers", "testResult",
-  "slot-extra",
-  "cardSys", "headSys", "fUpstream", "fRelayPort", "fModels", "ckUseProxy",
-  "btnSaveSys", "btnDeploy", "sysResult",
+  "cardSys", "headSys", "sysResult",
   "footPaths", "verTxt",
   "bnrInfo", "bnrInfoTitle", "bnrInfoMsg", "bnrInfoX",
+  "slot-extra",
+];
+const IDS_KEPT_NEW_MEANING = [
+  "ledRelay", "txtRelay", "subRelay",          // → 状态带「服务」单元
+  "ledUp", "txtUp", "subUp",                  // → 状态带「可用渠道」单元
+  "ledTok", "txtTok", "subTok",               // → 状态带「接线 / 凭据」单元
+  "applyResult",                              // → 状态带下方的结果行
+  "fUpstream", "fRelayPort", "lblUpstream", "lblRelayPort", "ckUseProxy",   // → 设置视图
+  "btnSaveSys", "btnDeploy",                  // → 设置视图
+  "btnResetModels",                           // → 映射编辑区
+];
+const IDS_NEW = [
+  "navViews", "statusBand", "statusSentence", "btnBest", "btnRestore2", "btnDiag",
+  "viewConsole", "viewCred", "viewFo", "viewSettings",
+  "matrixGrid", "mapPanel", "diagBar", "diagList",
+];
+const CONTRACT_IDS = [...IDS_KEPT_AS_IS, ...IDS_KEPT_NEW_MEANING, ...IDS_NEW];
+
+/* C4：处置表「删除」一栏的原样转录（契约第二节，24 个，顺序即表内顺序）。
+ * 与 IN_FLIGHT_IDS 的区别：那是「渲染层还在读、等待里程碑 4 删除」的**在途引用**清单
+ * （因此多了 eyebGuide/ttlGuide 两个从未进过 CONTRACT_IDS 的旧 id，又少了
+ * auxRoute/ttlPatch 两个从来没人读的）；本表是**契约的删除清单**，一字不差。
+ * C4 的「不得少删也不许多删」用它对账，IN_FLIGHT_IDS 只服务 C5 的降级。 */
+const DELETED_IDS = [
+  "step1", "state1", "step2", "state2", "guideAux",
+  "btnApply", "ckCli", "ckDesk",
+  "auxRoute", "thTarget", "routeHint", "slot-route", "slot-lamps", "slot-step1",
+  "eyebPatch", "ttlPatch", "fModels",
+  "eyebRoute", "ttlRoute", "eyebSys", "ttlSys",
+  "sysAux", "useProxyRow", "useProxyText",
 ];
 
-/* C1：清单必填字段。type 见 typeOf() 的返回风格。 */
+/* C1/C12：Claude 四档档位 id（panel-common.js 的 TIERS、config.defaults.json 的 mapping
+ * 键、清单 mappingDefaults 的键，三处必须是同一组）。 */
+const TIER_KEYS = ["claude-fable-5", "claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"];
+
+/* C1：渠道字段必填表。type 见 typeOf() 的返回风格。
+ * path 允许 null，但只允许 chainable:false 的条目（目前只有交还区 ccswitch）——
+ * 它不是独立页面，不该有 URL。 */
 const REQUIRED_FIELDS = [
   { name: "key", type: "str" },
-  { name: "path", type: "str" },
+  { name: "path", type: "pathOrNull" },
   { name: "tab", type: "str" },
   { name: "h1", type: "str" },
-  { name: "sub", type: "str" },
   { name: "title", type: "str" },
-  { name: "accentLabel", type: "str" },
-  { name: "targetName", type: "str" },
-  { name: "lamps", type: "strArr" },
-  { name: "guide", type: "any" },        // 结构另由 C2 把关
-  { name: "notices", type: "obj" },     // 结构另由 C3 把关
-  { name: "extraCards", type: "strArr" },  // 允许为空数组
-  { name: "settingsTitle", type: "str" },
+  { name: "shortName", type: "str" },
+  { name: "letter", type: "str" },
+  { name: "name", type: "str" },
+  { name: "tagline", type: "str" },
+  { name: "badge", type: "obj" },
+  { name: "chainable", type: "bool" },
+  { name: "credential", type: "obj" },
+  { name: "models", type: "strArr" },
+  { name: "mappingDefaults", type: "obj" },
+  { name: "brands", type: "obj" },
+  { name: "defaultModels", type: "strArr" },
+  { name: "settingsLabels", type: "obj" },
 ];
 
-const EXPECTED_PATHS = { home: "/", bai: "/bai", sn: "/sn", wb: "/wb", zen: "/zen", qd: "/qd", or: "/or" };
+/* C1 并入的 credential 结构检查（原 C2 guide 检查的归宿，契约第五节明写）。
+ * kind 是**分派开关**：凭据视图按它决定给输入框、给状态+重取、还是给三行指纹，
+ * 渲染层因此不需要认识任何渠道名（C11 的前提就是这里枚举封闭）。 */
+const CRED_KINDS = ["apiKey", "jwt", "jobToken", "keys3", "none"];
+const BADGE_KINDS = ["free", "paid", "cn", "intl", "neutral"];
+
+/* 规范路径（七个 URL 全部保留，见契约第一节的产品决策 1）。 */
+const EXPECTED_PATHS = { bai: "/bai", sn: "/sn", wb: "/wb", zen: "/zen", qd: "/qd", or: "/or" };
+const ROOT_PATH = "/";
 
 /* ============================================================================
  * 载入
  * ==========================================================================*/
 
-let manifest, html, htmlNoComment, commonJs, commonCss, serverJs, defaults;
+let manifest, views, html, htmlNoComment, commonJs, commonCss, serverJs, defaults;
 try {
-  manifest = evalInSandbox(F.providers).window.BAI_PROVIDERS;
+  const sandbox = evalInSandbox(F.providers);
+  manifest = sandbox.window.BAI_PROVIDERS;
+  views = sandbox.window.BAI_VIEWS;
   if (!manifest || typeof manifest !== "object") throw new Error("providers.js did not set window.BAI_PROVIDERS");
   html = read(F.html); htmlNoComment = stripHtmlComments(html);
   commonJs = read(F.commonJs);
@@ -219,17 +347,15 @@ if (!keys.length) {
   console.log("check-manifest: FATAL window.BAI_PROVIDERS is empty in src/server/providers.js");
   process.exit(1);
 }
-
-/* primaryBtn 的算法与 panel-common.js 逐字一致（SHORT = shortName || lampNames.relay），
- * 否则 C3 会用错误的按钮名去验 {btn} 替换。 */
-const primaryBtnOf = (key) => {
-  const P = manifest[key];
-  const SHORT = P.shortName || String((P.lampNames && P.lampNames.relay) || "");
-  return P.primaryBtn || `${P.accentLabel || "接通"} ${SHORT}`;
-};
+if (!Array.isArray(views) || !views.length) {
+  console.log("check-manifest: FATAL window.BAI_VIEWS is missing or empty in src/server/providers.js");
+  console.log("  it is the view-level card table consumed by C6/C9 (single-page console)");
+  process.exit(1);
+}
 
 /* ============================================================================
- * C1 清单完整性 + key/path 与 server.mjs 注册路由一致
+ * C1 渠道字段完整性 + key/path 与 server.mjs 注册路由一致 + 声明序 = 转移链序
+ *   （原 C2「guide 结构」的检查点已并入本节的 credential 结构）
  * ==========================================================================*/
 setCheck("C1");
 const C1_START = findings.length;
@@ -242,7 +368,7 @@ const C1_START = findings.length;
       continue;
     }
 
-    /* 对象键与 key 字段必须一致——加第六家最容易在这里只改一半 */
+    /* 对象键与 key 字段必须一致——加第七家最容易在这里只改一半 */
     if (P.key !== key) {
       err(`${key}: field "key" is ${show(P.key)} -- expected "${key}" (the manifest object key; rename both together)`);
     }
@@ -253,9 +379,13 @@ const C1_START = findings.length;
         if (typeof v !== "string" || !v.trim()) {
           err(`${key}: field "${f.name}" is ${typeOf(v)} -- expected a non-empty string`);
         }
+      } else if (f.type === "pathOrNull") {
+        if (v !== null && (typeof v !== "string" || !v.trim())) {
+          err(`${key}: field "path" is ${typeOf(v)} -- expected a non-empty string, or null for a channel with no URL of its own`);
+        }
       } else if (f.type === "strArr") {
         if (!Array.isArray(v)) {
-          err(`${key}: field "${f.name}" is ${typeOf(v)} -- expected an array of non-empty strings (may be empty for extraCards)`);
+          err(`${key}: field "${f.name}" is ${typeOf(v)} -- expected an array of non-empty strings (may be empty)`);
         } else if (v.some((x) => typeof x !== "string" || !x.trim())) {
           err(`${key}: field "${f.name}" is ${typeOf(v)} -- expected every item to be a non-empty string`);
         }
@@ -263,158 +393,217 @@ const C1_START = findings.length;
         if (!v || typeof v !== "object" || Array.isArray(v)) {
           err(`${key}: field "${f.name}" is ${typeOf(v)} -- expected a plain object`);
         }
+      } else if (f.type === "bool") {
+        if (typeof v !== "boolean") {
+          err(`${key}: field "${f.name}" is ${typeOf(v)} -- expected true or false`);
+        }
       }
     }
 
-    /* path 形状：home 是 "/"，其余（含 bai）都是 "/" + key */
-    if (typeof P.path === "string" && P.path) {
-      const want = key === "home" ? "/" : "/" + key;
-      const shapeOk = P.path === want;
-      if (!shapeOk) {
-        err(`${key}: field "path" is ${show(P.path)} -- expected "${want}"`);
+    /* path 形状：key 即路径（/bai…）；null 只留给「没有自己 URL 的渠道」，即交还区。
+       这条规则是 C7/C9/C10 都依赖的地基，形状过了才查硬编码表，免得同一处报两遍。 */
+    if (P.path === null) {
+      if (P.chainable !== false) {
+        err(`${key}: field "path" is null but "chainable" is ${show(P.chainable)} -- only a non-chainable channel (the hand-back cell) may have no URL of its own`);
+      }
+    } else if (typeof P.path === "string" && P.path) {
+      const want = ROOT_PATH + key;
+      if (P.path !== want) {
+        err(`${key}: field "path" is ${show(P.path)} -- expected "${want}" (key 即路径)`);
       } else if (EXPECTED_PATHS[key] && P.path !== EXPECTED_PATHS[key]) {
-        /* EXPECTED_PATHS 是本轮定下的五家硬约定；形状规则已过才查它，免得同一处报两遍 */
         err(`${key}: field "path" is ${show(P.path)} -- expected ${show(EXPECTED_PATHS[key])} (hard-coded contract in check-manifest.cjs)`);
       }
       if (seenPath.has(P.path)) {
-        err(`${key}: field "path" is ${show(P.path)} -- already used by "${seenPath.get(P.path)}"; two providers on one route`);
+        err(`${key}: field "path" is ${show(P.path)} -- already used by "${seenPath.get(P.path)}"; two channels on one route`);
       } else seenPath.set(P.path, key);
+
+      /* path 必须在 server.mjs 的 GET 路由里真的注册，否则打开就是 404 */
+      const routeRe = new RegExp("u\\.pathname\\s*===\\s*[\"']" + P.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[\"']");
+      if (!routeRe.test(serverJs)) {
+        err(`${key}: path ${show(P.path)} is not registered in server.mjs (no 'u.pathname === "${P.path}"' branch) -- the page would 404`);
+      }
     }
 
-    /* path 必须在 server.mjs 的 GET 路由里真的注册，否则打开就是 404 */
-    const routeRe = new RegExp("u\\.pathname\\s*===\\s*[\"']" + P.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[\"']");
-    if (!routeRe.test(serverJs)) {
-      err(`${key}: path ${show(P.path)} is not registered in server.mjs (no 'u.pathname === "${P.path}"' branch) -- the page would 404`);
+    /* letter：卡片左上角的字母徽标。
+       契约第一节写的是「2 字」，但已采纳的设计稿（a-console.html）对这两家用的是
+       BAI / ZEN 三个字母 —— 砍成 BA / ZE 会把两家标错，所以这里放行 2–3 个字母。
+       真正的坑是长度不齐导致徽标宽度跳变，所以上下界都卡死。 */
+    if (typeof P.letter === "string" && !/^[A-Za-z]{2,3}$/.test(P.letter)) {
+      err(`${key}: field "letter" is ${show(P.letter)} -- expected 2 or 3 letters (matrix cell badge; the accepted design mock uses BAI / ZEN, hence 3 is allowed)`);
+    }
+
+    /* badge：{text, kind}，kind 落在封闭枚举里（矩阵格与状态带的着色靠它） */
+    const B = P.badge;
+    if (B && typeof B === "object" && !Array.isArray(B)) {
+      if (typeof B.text !== "string" || !B.text.trim()) {
+        err(`${key}: badge.text is ${typeOf(B.text)} -- expected a non-empty string`);
+      }
+      if (!BADGE_KINDS.includes(B.kind)) {
+        err(`${key}: badge.kind is ${show(B.kind)} -- expected one of ${BADGE_KINDS.join("/")}`);
+      }
+      const extra = Object.keys(B).filter((k) => k !== "text" && k !== "kind");
+      if (extra.length) err(`${key}: badge has unexpected key(s) ${extra.join(",")} -- only text+kind are read`);
+    }
+
+    /* credential：原 C2 的检查点并到这里。kind 是渲染层的分派开关，必须封闭。 */
+    const C = P.credential;
+    if (C && typeof C === "object" && !Array.isArray(C)) {
+      if (!CRED_KINDS.includes(C.kind)) {
+        err(`${key}: credential.kind is ${show(C.kind)} -- expected one of ${CRED_KINDS.join("/")} (the credential view dispatches on this; an unknown kind renders nothing and, worse, would force a provider name into panel-common.js)`);
+      }
+      for (const f of ["label", "hint"]) {
+        if (typeof C[f] !== "string" || !C[f].trim()) {
+          err(`${key}: credential.${f} is ${typeOf(C[f])} -- expected a non-empty string`);
+        }
+      }
+      const extra = Object.keys(C).filter((k) => !["kind", "label", "hint"].includes(k));
+      if (extra.length) err(`${key}: credential has unexpected key(s) ${extra.join(",")} -- only kind/label/hint are read`);
+    }
+
+    /* mappingDefaults：可接通渠道必须覆盖四档（面板「恢复默认」的种子）；
+       不可接通的（交还区）必须为空对象——它没有映射编辑区。 */
+    const MD = P.mappingDefaults;
+    if (MD && typeof MD === "object" && !Array.isArray(MD)) {
+      const mdKeys = Object.keys(MD);
+      if (P.chainable === false) {
+        if (mdKeys.length) {
+          err(`${key}: mappingDefaults has ${mdKeys.length} entr(ies) but the channel is not chainable (no mapping editor on that cell) -- expected {}`);
+        }
+      } else {
+        const miss = TIER_KEYS.filter((t) => !(t in MD));
+        const extraT = mdKeys.filter((t) => !TIER_KEYS.includes(t));
+        if (miss.length) err(`${key}: mappingDefaults is missing tier(s) ${miss.join(",")} -- expected exactly the four ${TIER_KEYS.join(", ")}`);
+        if (extraT.length) err(`${key}: mappingDefaults has unknown tier key(s) ${extraT.join(",")} -- panel-common.js only renders ${TIER_KEYS.join(", ")}`);
+        for (const t of mdKeys) {
+          if (typeof MD[t] !== "string" || !MD[t].trim()) {
+            err(`${key}: mappingDefaults["${t}"] is ${typeOf(MD[t])} -- expected a non-empty default label`);
+          }
+        }
+      }
+    }
+
+    /* 真实映射值只来自 config.json；清单里出现 URL / 绝对路径 / 疑似密钥一律拦下。 */
+    for (const f of ["tagline", "name", "title", "h1"]) {
+      const v = P[f];
+      if (typeof v !== "string") continue;
+      if (/https?:\/\//i.test(v)) err(`${key}: ${f} contains a URL ("${show(v)}") -- upstream addresses are read from config at runtime, never written into the manifest`);
+      if (/[A-Za-z]:[\\/]/.test(v)) err(`${key}: ${f} contains a drive-absolute path ("${show(v)}") -- machine-specific paths must never ship in the manifest`);
+      if (/\b(?:sk|oc_sk|jt)-[A-Za-z0-9_-]{6,}/.test(v)) err(`${key}: ${f} looks like it carries a credential ("${show(v)}") -- the manifest ships with the app`);
     }
   }
 
+  /* 根路径 / 仍然是七条 URL 之一（契约：/ 打开单页，默认选中当前接线的那家）。
+     home 条目已删除，所以这条检查落在服务端路由上，而不是清单里。 */
+  if (!/u\.pathname\s*===\s*["']\/["']/.test(serverJs)) {
+    err(`server.mjs no longer serves ${ROOT_PATH} (no 'u.pathname === "/"' branch) -- contract keeps all seven URLs openable`);
+  }
   if (!serverJs.includes("provider.html")) {
     err(`server.mjs never serves provider.html -- the whole page is unreachable`);
   }
+
+  /* 声明序 = 故障转移链序（矩阵格序就是优先顺序）。真实链序的出厂值在
+     config.defaults.json 的 failover.chain，两者漂移就会让「第一格 = 首选」变成假话。 */
+  const declared = keys.filter((k) => manifest[k].chainable !== false);
+  const chain = Array.isArray((defaults.failover || {}).chain) ? defaults.failover.chain : null;
+  if (!chain) {
+    err(`config.defaults.json has no failover.chain -- cannot check that the manifest order matches the failover priority order`);
+  } else {
+    const miss = declared.filter((k) => !chain.includes(k));
+    const extra = chain.filter((k) => !declared.includes(k));
+    if (miss.length || extra.length) {
+      err(`manifest chainable channels [${declared.join(",")}] do not match config.defaults.json failover.chain [${chain.join(",")}]` +
+        (miss.length ? ` -- absent from the chain: ${miss.join(",")}` : "") +
+        (extra.length ? ` -- not in the manifest: ${extra.join(",")}` : ""));
+    } else if (!setEq(declared, chain)) {
+      err(`manifest declaration order [${declared.join(",")}] differs from config.defaults.json failover.chain [${chain.join(",")}] -- the matrix cell order IS the failover priority order (contract 2), so the two must be declared in the same sequence`);
+    } else {
+      ok(`manifest order == failover.chain priority: ${declared.join(" > ")}`);
+    }
+  }
+
   if (!findings.slice(C1_START).some((f) => f.level === "error")) {
-    ok(`${keys.length} providers, ${REQUIRED_FIELDS.length} required fields each; key/path agree with each other and with server.mjs routes`);
+    ok(`${keys.length} channels (${declared.length} chainable), ${REQUIRED_FIELDS.length} required fields each; key/path agree with each other and with server.mjs routes`);
   }
 }
 
 /* ============================================================================
- * C2 guide 结构
+ * C2 【已退役】原 guide 结构检查
+ *   单页取消了「两步引导卡」，guide 字段与其结构检查一并消失；原本由它把关的
+ *   credential 结构（kind ∈ 五值枚举 + label 非空）已并入 C1，见上面的 C1 段。
+ *   这里保留一个可见的空检查，让 C 编号与契约第五节的表格逐行对得上，
+ *   也让「它是被有意退役的、不是被漏掉的」这件事留在输出里。
  * ==========================================================================*/
 setCheck("C2");
 {
-  for (const key of keys) {
-    const g = manifest[key].guide;
-    if (!Array.isArray(g)) { err(`${key}: field "guide" is ${typeOf(g)} -- expected an array`); continue; }
-    if (g.length === 0) {
-      /* 模板只有 #step1/#step2 两步；清单写 [] = 本页没有引导卡，panel-common.js 会
-       * 用 HAS_GUIDE 跳过整张卡（providers.js 里 bai/sn 就是这样）。所以 0 是合法的，
-       * 1 才是「写了一半」的漂移。 */
-      info(`${key}: guide is [] (no guide card on this page -- allowed; panel-common.js hides the card)`);
-      continue;
-    }
-    if (g.length !== 2) {
-      err(`${key}: field "guide" has ${g.length} item(s) -- expected 0 (no guide card) or 2 (template only has #step1/#step2), got ${show(g)}`);
-      continue;
-    }
-    let bad = 0;
-    g.forEach((step, i) => {
-      if (!step || typeof step !== "object" || Array.isArray(step)) {
-        err(`${key}: guide[${i}] is ${typeOf(step)} -- expected { title, desc }`); bad++; return;
-      }
-      for (const f of ["title", "desc"]) {
-        if (typeof step[f] !== "string" || !step[f].trim()) {
-          err(`${key}: guide[${i}].${f} is ${typeOf(step[f])} -- expected a non-empty string`);
-          bad++;
-        }
-      }
-    });
-    if (!bad) ok(`${key}: guide has 2 steps, both with title+desc`);
+  const stillThere = keys.filter((k) => "guide" in manifest[k]);
+  if (stillThere.length) {
+    err(`${stillThere.join(",")}: field "guide" is still present -- the two-step guide card was removed by the single-page redesign; drop the field (step 1/2 of the flow now live in the credential view)`);
+  } else {
+    ok(`retired into C1 (credential.kind ∈ ${CRED_KINDS.join("/")} + non-empty label); no channel declares "guide" any more`);
   }
 }
 
 /* ============================================================================
- * C3 notices 结构 + {btn} 占位符
+ * C3 诊断结论文案：conclusion（就绪怎么判断）/ remedy（未就绪给什么建议）
+ *   旧版这里是 notices 的结构与 {btn} 占位符。单页取消了一排提示条，
+ *   换来诊断抽屉里的「结论 + 建议」——两段必填文案，缺一段抽屉就少一半信息。
  * ==========================================================================*/
 setCheck("C3");
 {
-  /* panel-common.js 读 notice 的两种方式：
-   *   1. 静态键     txt = fill(NT.ccBoth, {}) / NT.keyMismatch / NT.other / NT.ccSwitch / NT.stale
-   *   2. 动态键     txt = fill(NT[other.mode] || NT.other || NT.stale, {}) —— 「另一端接在谁
-   *      身上」就取以那个 provider key 命名的文案。
-   * 所以合法的 notice 键 = 上面那批静态键 ∪ 所有 provider key。写了别的（比如把 onWb 打成
-   * onWbb）就是死键，提示条永远不显示——而这正是「漏改一处」最难自己发现的一类。 */
-  const staticKeys = new Set([...commonJs.matchAll(/\bNT\.([A-Za-z0-9_]+)/g)].map((m) => m[1]));
-  const dynamicLookup = /NT\[\s*other\s*\.\s*mode\s*\]/.test(commonJs);
-
-  /* panel-common.js 按 NT[other.mode] 动态取文案，缺键就掉到通用 stale —— 这本身没问题，
-   * **只要 stale 真的是通用的**。真事故是：bai 的 stale 里装的是 SenseNova 专属文案，于是
-   * 另一端接在 zen/qd 上时也显示「接在 SenseNova 上」，点名了错的一家。
-   * 所以规则是：stale 一旦点了某家的名，就必须为**每一家**都备好分列文案。 */
-  const PROVIDER_WORDS = {
-    bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen", qd: "Qoder",
-  };
-  if (dynamicLookup) {
-    for (const key of keys) {
-      const N = manifest[key].notices || {};
-      const stale = String(N.stale || "");
-      /* stale 里点名了别家（不含自己）→ 说明它不是通用兜底，必须分列齐全 */
-      const named = Object.keys(PROVIDER_WORDS)
-        .filter((k) => k !== key && stale.includes(PROVIDER_WORDS[k]));
-      if (!named.length) continue;
-      const missing = keys
-        .filter((k) => k !== key && !(N[k] && String(N[k]).trim()))
-        .filter((k) => named.includes(k) || true);
-      if (missing.length) {
-        err(`${key}: notices.stale names a specific provider (${named.map((k) => PROVIDER_WORDS[k]).join("/")}) but has no per-channel text for ${missing.join(",")} -- panel-common.js reads NT[other.mode]; those channels would fall back to stale and be told they are on the wrong provider`);
-      }
-    }
-  }
-
   for (const key of keys) {
     const P = manifest[key];
-    const N = P.notices;
-    if (!N || typeof N !== "object" || Array.isArray(N)) { err(`${key}: field "notices" is ${typeOf(N)} -- expected an object with stale + ccSwitch`); continue; }
-    const btn = primaryBtnOf(key);
     let bad = 0;
-    for (const f of ["stale", "ccSwitch"]) {
-      const v = N[f];
+    for (const f of ["conclusion", "remedy"]) {
+      const v = P[f];
       if (typeof v !== "string" || !v.trim()) {
-        err(`${key}: notices.${f} is ${typeOf(v)} -- expected a non-empty string (both notices are rendered on every page)`);
-        bad++; continue;
+        err(`${key}: field "${f}" is ${typeOf(v)} -- expected a non-empty string (${f === "conclusion" ? "how to tell whether this channel is ready" : "what to do when it is not"}; the diagnostic drawer renders both)`);
+        bad++;
+        continue;
       }
-      /* panel-common.js 的 fill() 只替换 {btn}，别的占位符没人管——所以替换后残留 '{'
-       * 就是「写了占位符但渲染层填不上」，页面上会露出一个裸的花括号。 */
-      const filled = v.replace(/\{btn\}/g, btn);
-      const left = filled.match(/\{[^}]*\}/g);
+      /* 占位符没人替换就会在页面上露出裸花括号 */
+      const left = v.match(/\{[^}]*\}/g);
       if (left) {
-        err(`${key}: notices.${f} has unresolved placeholder ${show(uniq(left).join(","))} after {btn} -> "${show(btn)}" -- panel-common.js fill() only substitutes {btn}; write the button text literally or use {btn}`);
+        err(`${key}: ${f} has unresolved placeholder ${show(uniq(left).join(","))} -- nothing substitutes these in the diagnostic drawer; write the text literally`);
         bad++;
       }
     }
-    /* 死键检查：{btn} 残留也照样跑，坏键要一起报出来 */
-    for (const nk of Object.keys(N)) {
-      if (nk === "stale" || nk === "ccSwitch") continue;
-      const readable = staticKeys.has(nk) || (dynamicLookup && keys.includes(nk));
-      if (!readable) {
-        const how = staticKeys.size ? `panel-common.js reads ${[...staticKeys].sort().map((x) => "NT." + x).join("/")}` : "panel-common.js reads no static NT.* keys";
-        warn(`${key}: notices.${nk} is never read -- ${how}${dynamicLookup ? `, plus NT[other.mode] for ${keys.join("/")}` : ""}; rename it to one of those or delete it`);
+    /* 阶段一不编数据：这两段是判据与建议，不是状态快照。 */
+    for (const f of ["conclusion", "remedy"]) {
+      const v = P[f];
+      if (typeof v !== "string") continue;
+      if (/\b\d+\s*(?:分钟前|小时前|天前|次错误|条错误)/.test(v)) {
+        err(`${key}: ${f} states a historical count/time ("${show(v)}") -- stage one has no error-history source; the drawer may only report what is currently known`);
+        bad++;
       }
     }
-    if (!bad) ok(`${key}: notices.stale + notices.ccSwitch present, {btn} -> "${show(btn)}" resolves cleanly`);
+    if (!bad) ok(`${key}: conclusion + remedy present (${String(P.conclusion).length} + ${String(P.remedy).length} chars)`);
   }
 }
 
 /* ============================================================================
- * C4 契约 id：各出现且仅出现一次
+ * C4 契约 id：各出现且仅出现一次（数组 = 契约 id 处置表的落地结果，顺序即核对顺序）
  * ==========================================================================*/
 setCheck("C4");
 {
+  info(`CONTRACT_IDS = ${IDS_KEPT_AS_IS.length} kept-as-is + ${IDS_KEPT_NEW_MEANING.length} kept-with-new-semantics + ${IDS_NEW.length} new = ${CONTRACT_IDS.length}; the contract prose says "52 - 25 + 15 = 42" but its own per-id table lists 24 deletions (only 9 of which were in the old list) and 14 additions -- this array follows the per-id table, do not "fix" it to 42`);
   let bad = 0;
   for (const id of CONTRACT_IDS) {
     const n = countId(htmlNoComment, id);
-    if (n === 0) { err(`id "${id}" (docs/contracts/REFACTOR-CONTRACT.md "element id" list) is missing from provider.html -- panel-common.js reads it, the element would be null`); bad++; }
+    if (n === 0) { err(`id "${id}" (REFACTOR-CONTRACT-v17.md id 处置表) is missing from provider.html -- panel-common.js reads it, the element would be null`); bad++; }
     else if (n > 1) { err(`id "${id}" appears ${n} times in provider.html -- expected exactly 1 (getElementById returns only the first)`); bad++; }
   }
-  if (!bad) ok(`${CONTRACT_IDS.length} contract ids, each exactly once in provider.html`);
+  if (bad) {
+    err(`CONTRACT_IDS currently has ${CONTRACT_IDS.length} entries and at least one id failed the presence/uniqueness check -- if that is because the array itself was edited, remember the disposition table in REFACTOR-CONTRACT-v17.md 第二节, not the "42" in the prose`);
+  }
+  /* 处置表明确删掉的 id 必须真的不在模板里（红线：只许按那张表删，不许少删也不许多删）。
+     用 DELETED_IDS（契约删除栏的原样转录）而不是 IN_FLIGHT_IDS：后者是 C5 的在途引用
+     清单，范围与契约表不完全一致（多两个从未被契约追踪的旧 id，少两个从没人读的）。 */
+  const ghosts = DELETED_IDS.filter((id) => countId(htmlNoComment, id) > 0);
+  if (ghosts.length) {
+    err(`id(s) ${ghosts.join(", ")} are on the disposition table's DELETE list but still present in provider.html -- the table is the only sanctioned removal list; either delete them here or amend the table in REFACTOR-CONTRACT-v17.md`);
+    bad++;
+  }
+  if (!bad) ok(`${CONTRACT_IDS.length} contract ids, each exactly once in provider.html; none of the ${DELETED_IDS.length} deleted ids is present`);
 }
 
 /* ============================================================================
@@ -453,6 +642,8 @@ setCheck("C5");
     [/\b(?:onClick|applyText|has|on)\(\s*["']([A-Za-z0-9_-]+)["']\s*[,)]/g, "helper(\"id\", …)"],
   ];
   let bad = 0, tolerated = 0, scanned = 0;
+  const inFlight = new Set(IN_FLIGHT_IDS.ids);
+  const hitInFlight = new Set();
   for (const [name, src] of sources) {
     for (const [re, form] of CALL_FORMS) {
       for (const m of src.matchAll(re)) {
@@ -460,21 +651,35 @@ setCheck("C5");
         scanned++;
         if (htmlIds.has(id) || created.has(id)) continue;
         if (optional.has(id)) { tolerated++; continue; }
+        /* 在途：处置表已把这个 id 从模板里删掉，但里程碑 4 还没跟上渲染层的删除。
+           降级为 warn 并点名负责人 —— 未登记的悬空引用仍然是 error，判别力不变。 */
+        if (inFlight.has(id)) { hitInFlight.add(id); continue; }
         err(`${name}: ${form.replace("$(\"id\")", '$("' + id + '")').replace("helper(\"id\", …)", id + " (string arg)")} targets an id that exists in neither provider.html nor any JS-injected markup -- dangling reference, the call is a silent no-op`);
         bad++;
       }
     }
   }
-  if (!bad) ok(`every id reference in panel-common.js / provider.html resolves (${scanned} scanned, ${tolerated} guarded by a "querySelector || $()" fallback)`);
+  if (hitInFlight.size) {
+    warn(`${hitInFlight.size} in-flight reference(s) to id(s) removed by the disposition table: ${[...hitInFlight].sort().join(", ")} -- ${IN_FLIGHT_IDS.owner} must stop reading them; delete them from IN_FLIGHT_IDS once it does`);
+  }
+  /* 台账本身也要体检：登记了却没人引用的条目是过期豁免，会让闸门白白松一块，必须报出来。 */
+  const staleLedger = IN_FLIGHT_IDS.ids.filter((id) => !hitInFlight.has(id) && !htmlIds.has(id));
+  if (staleLedger.length) {
+    warn(`IN_FLIGHT_IDS lists ${staleLedger.join(", ")} but nothing references them any more -- stale exemption, remove them from the ledger (check-manifest.cjs)`);
+  }
+  if (!bad) ok(`every id reference in panel-common.js / provider.html resolves (${scanned} scanned, ${tolerated} guarded by a "querySelector || $()" fallback, ${hitInFlight.size} in-flight per IN_FLIGHT_IDS)`);
 }
 
 /* ============================================================================
- * C6 插槽契约：cards/*.js 都导出 mount；extraCards 双向对账
+ * C6 视图级卡片表 ↔ cards/*.js 双向对账
+ *   旧架构每页一份 extraCards，同一张卡在总览页挂一份、各家页挂另一份，天然会漂移。
+ *   单页改版后卡片属于**视图**：window.BAI_VIEWS[].cards 是唯一清单。
  * ==========================================================================*/
 setCheck("C6");
+const C6_START = findings.length;
 {
   const cardFiles = fs.existsSync(CARDS_DIR) ? fs.readdirSync(CARDS_DIR).filter((f) => f.endsWith(".js")).sort() : [];
-  if (!cardFiles.length) { err(`src/server/cards/ is missing or empty -- extraCards slots have nothing to load`); }
+  if (!cardFiles.length) { err(`src/server/cards/ is missing or empty -- the view card slots have nothing to load`); }
   const exportsOf = new Map();
   for (const f of cardFiles) {
     const name = f.replace(/\.js$/, "");
@@ -488,11 +693,11 @@ setCheck("C6");
     const C = (sandbox.window && sandbox.window.BAI_CARDS) || {};
     const mod = C[name];
     if (!mod) {
-      err(`cards/${f}: does not register window.BAI_CARDS["${name}"] -- the file name and the registry key must match (panel-common.js loads /cards/${name}.js then reads BAI_CARDS["${name}"])`);
+      err(`cards/${f}: does not register window.BAI_CARDS["${name}"] -- the file name and the registry key must match (the renderer loads /cards/${name}.js then reads BAI_CARDS["${name}"])`);
       exportsOf.set(name, { ok: false }); continue;
     }
     if (typeof mod.mount !== "function") {
-      err(`cards/${f}: window.BAI_CARDS["${name}"].mount is ${typeOf(mod.mount)} -- expected a function (panel-common.js calls it as mount(ctx))`);
+      err(`cards/${f}: window.BAI_CARDS["${name}"].mount is ${typeOf(mod.mount)} -- expected a function (the renderer calls it as mount(ctx))`);
       exportsOf.set(name, { ok: false }); continue;
     }
     /* 服务端 /cards/<name>.js 有白名单，卡名必须是小写 kebab，否则线上 400 */
@@ -504,101 +709,224 @@ setCheck("C6");
     ok(`cards/${f}: exports window.BAI_CARDS["${name}"].mount`);
   }
 
-  /* 清单侧：引用的名字必须有文件 */
-  const referenced = new Map();   // name -> [keys]
-  for (const key of keys) {
-    const ec = manifest[key].extraCards;
-    if (!Array.isArray(ec)) continue;
-    for (const c of ec) {
-      if (typeof c !== "string" || !c.trim()) continue;
+  /* 清单侧：视图表引用的名字必须有文件、必须是合法字符串、不得跨视图重复挂载 */
+  const referenced = new Map();   // name -> [viewId]
+  const viewIds = new Set();
+  for (const v of views) {
+    if (!v || typeof v !== "object" || Array.isArray(v)) { err(`BAI_VIEWS entry is ${typeOf(v)} -- expected { id, nav, dom, cards }`); continue; }
+    if (typeof v.id !== "string" || !v.id.trim()) { err(`BAI_VIEWS entry has id ${typeOf(v.id)} -- expected a non-empty string`); continue; }
+    if (viewIds.has(v.id)) { err(`BAI_VIEWS has two entries with id "${v.id}" -- view ids double as the URL hash segment`); }
+    viewIds.add(v.id);
+    const cs = v.cards;
+    if (!Array.isArray(cs)) { err(`BAI_VIEWS[${v.id}].cards is ${typeOf(cs)} -- expected an array of card names (may be empty)`); continue; }
+    for (const c of cs) {
+      if (typeof c !== "string" || !c.trim()) { err(`BAI_VIEWS[${v.id}].cards contains ${typeOf(c)} -- expected non-empty card names`); continue; }
       if (!referenced.has(c)) referenced.set(c, []);
-      referenced.get(c).push(key);
+      if (referenced.get(c).includes(v.id)) {
+        err(`BAI_VIEWS lists card "${c}" twice in view "${v.id}" -- it would be mounted twice`);
+      }
+      referenced.get(c).push(v.id);
       if (!exportsOf.has(c)) {
-        err(`${key}: extraCards references "${c}" but src/server/cards/${c}.js does not exist -- the slot would silently render nothing`);
+        err(`BAI_VIEWS[${v.id}].cards references "${c}" but src/server/cards/${c}.js does not exist -- the slot would silently render nothing`);
       }
     }
   }
-  /* 反向：文件在、没人引用 -> 只提示（可能是有意留下的公共模块） */
+
+  /* 反向：文件在、没人引用 = 死卡。里程碑 4 待删的已登记在 IN_FLIGHT_CARDS，降级为 warn。 */
+  const retired = new Set(IN_FLIGHT_CARDS.names);
   for (const name of exportsOf.keys()) {
-    if (!referenced.has(name)) {
-      warn(`cards/${name}.js is never referenced by any provider's extraCards -- dead card, or a provider forgot to list it`);
+    if (referenced.has(name)) {
+      ok(`card "${name}" is mounted by view(s) ${uniq(referenced.get(name)).join(", ")}`);
+      continue;
     }
+    if (retired.has(name)) {
+      warn(`cards/${name}.js is referenced by no view and is registered in IN_FLIGHT_CARDS -- ${IN_FLIGHT_CARDS.owner}; delete the file and the ledger entry together`);
+    } else {
+      err(`cards/${name}.js is referenced by no view in BAI_VIEWS -- dead card, or a view forgot to list it`);
+    }
+  }
+  const staleCards = IN_FLIGHT_CARDS.names.filter((n) => !exportsOf.has(n) || referenced.has(n));
+  if (staleCards.length) {
+    warn(`IN_FLIGHT_CARDS lists ${staleCards.join(", ")} but ${staleCards.map((n) => (exportsOf.has(n) ? "it is now referenced by a view" : "the file is already gone")).join("; ")} -- stale exemption, remove it from the ledger`);
+  }
+  if (!findings.slice(C6_START).some((f) => f.level === "error")) {
+    ok(`view card table and cards/ agree: ${views.length} views, ${referenced.size} mounted card(s), ${exportsOf.size} file(s) on disk`);
   }
 }
 
 /* ============================================================================
- * C7 配色：html[data-provider="x"] 与清单 key 一一对应
+ * C7 状态语义色：深浅两套主题都必须定义五色，且不得再有 per-provider 的 --accent 块
+ *   旧版这里是「html[data-provider="x"] 配色块与清单 key 一一对应」——每家一套强调色。
+ *   单页改版取消了它：颜色只承载状态（--ok 就绪 / --warn 需留意 / --err 故障 /
+ *   --idle 未配置）与「本台自己的品牌 + 当前选中」（--brand）。
+ *   html[data-provider] 属性本身保留（模板引导脚本仍在设它），只是不再定义 accent。
  * ==========================================================================*/
 setCheck("C7");
+const C7_START = findings.length;
 {
-  const cssProviders = uniq([...commonCss.matchAll(/html\[[^\]]*data-provider\s*=\s*["']([A-Za-z0-9_-]+)["'][^\]]*\]/g)].map((m) => m[1]));
+  const SEMANTIC = ["--ok", "--warn", "--err", "--idle", "--brand"];
+  const blocks = cssBlocks(commonCss);
+  const themeVars = (re) => {
+    const m = new Map();
+    for (const b of blocks) if (re.test(b.sel)) for (const [k, v] of cssVars(b.body)) if (!m.has(k)) m.set(k, v);
+    return m;
+  };
+  /* 深色 = :root（默认那一套）；浅色 = html[data-theme="light"]。两套都要自己给全五色。 */
+  const darkVars = themeVars(/^:root$|^html\[data-theme=["']?dark/);
+  const lightVars = themeVars(/^html\[data-theme=["']light/);
 
-  for (const key of keys) {
-    const dark = new RegExp('html\\[data-provider="' + key + '"\\]\\s*\\{([^}]*)\\}').exec(commonCss);
-    if (!dark) {
-      err(`no html[data-provider="${key}"] block in panel-common.css -- this page falls back to the default palette silently (palette blocks currently defined: ${cssProviders.length ? cssProviders.join(", ") : "none"})`);
-    } else if (!/--accent\s*:/.test(dark[1])) {
-      err(`html[data-provider="${key}"] defines no --accent -- the page would render with an undefined accent color`);
+  const report = (themeName, vars) => {
+    const missing = SEMANTIC.filter((c) => !vars.has(c) || !String(vars.get(c)).trim());
+    if (!missing.length) return true;
+    const what = `panel-common.css defines no value for ${missing.join(", ")} in the ${themeName} theme`;
+    if (PALETTE_V17_READY) err(`${what} -- every state colour must exist in BOTH themes (contract 3: 状态语义色 + 品牌色)`);
+    else warn(`${what} -- ${PALETTE_V17_READY ? "" : "milestone 3 (panel-common.css rebuild) has not landed yet, so this only warns; flip PALETTE_V17_READY to true in check-manifest.cjs when it has"}`);
+    return false;
+  };
+  const darkOk = report("dark (:root)", darkVars);
+  const lightOk = report("light (html[data-theme=\"light\"])", lightVars);
+
+  /* 反向断言：不得再有 per-provider 的强调色块 */
+  const accentBlocks = blocks.filter((b) => /data-provider\s*=/.test(b.sel) && /--accent\s*:/.test(b.body));
+  if (accentBlocks.length) {
+    const who = uniq(accentBlocks.map((b) => (b.sel.match(/data-provider=["']([A-Za-z0-9_-]+)["']/) || [])[1] || b.sel)).join(", ");
+    if (PALETTE_V17_READY) {
+      err(`panel-common.css still defines --accent inside ${accentBlocks.length} html[data-provider=…] block(s) (${who}) -- the per-provider accent palette is cancelled (contract 3); colour now carries state only`);
     } else {
-      const light = new RegExp('html\\[data-theme="light"\\]\\[data-provider="' + key + '"\\]\\s*\\{').test(commonCss);
-      if (!light) warn(`no html[data-theme="light"][data-provider="${key}"] block -- light theme keeps the dark accent`);
-      else ok(`html[data-provider="${key}"] (dark + light) present`);
+      warn(`panel-common.css still defines --accent inside ${accentBlocks.length} html[data-provider=…] block(s) (${who}) -- legacy palette; milestone 3 removes it, then flip PALETTE_V17_READY to true`);
     }
   }
-  for (const p of cssProviders) {
-    if (!keys.includes(p)) {
-      err(`panel-common.css has html[data-provider="${p}"] but no provider "${p}" in providers.js -- orphaned palette (renamed provider? stale block?)`);
-    }
+
+  const strict = PALETTE_V17_READY;
+  if (darkOk && lightOk) {
+    ok(strict
+      ? `status semantic colours ${SEMANTIC.join(" ")} defined in both themes; no per-provider --accent block`
+      : `status semantic colours ${SEMANTIC.join(" ")} (transition mode: warnings only until PALETTE_V17_READY is flipped by milestone 3)`);
   }
-  if (setEq(keys, cssProviders)) ok(`palette blocks match manifest keys exactly: ${keys.join(", ")}`);
+  if (!strict && !findings.slice(C7_START).some((f) => f.level === "error")) {
+    info(`C7 is in TRANSITION mode (PALETTE_V17_READY=false): missing state colours and leftover --accent blocks warn instead of failing. Milestone 3 must set it to true.`);
+  }
 }
 
 /* ============================================================================
- * C8 模型列表：每家都能拿到非空列表
+ * C8 模型清单：providers.js 的 models 与 config.defaults.json 的 availableModels 逐项一致
+ *   旧版只查 defaultModels 是不是个合法字符串数组。清单驱动之后，映射编辑区的下拉
+ *   直接以清单 models 为准 —— 它与种子配置漂移，就等于「面板上写着一个种子配置里
+ *   不存在的模型」。深色浅色不存在两套模型，所以「深浅与 qd 都不例外」在这里没有
+ *   额外维度；真正不能例外的是**每一个渠道**（含默认模型为空的 bai/sn 与交还区）。
  * ==========================================================================*/
 setCheck("C8");
 {
-  /* v1.0.48：panel-common.js 的 FB 兜底表已删，defaultModels 只认清单。
-     契约原文要求「非空数组」，但 bai/sn 本就没有固定默认清单（FB 里也没有 defaultModels，
-     旧页的「恢复默认模型」按钮对这两家一直是隐藏的）。为不改用户可见行为，这里放宽为
-     **必须存在且是合法字符串数组（允许为空 []）**：[] 表示本页没有「恢复默认模型」按钮，
-     与旧行为一致；真正要防的是「加第六家漏写这个字段」。 */
+  const missingCfg = [];
   for (const key of keys) {
     const P = manifest[key];
+    const models = P.models;
+    if (!Array.isArray(models)) { err(`${key}: field "models" is ${typeOf(models)} -- expected an array`); continue; }
+    if (new Set(models).size !== models.length) {
+      err(`${key}: field "models" has duplicate entries -- every id appears at most once in the dropdown`);
+      continue;
+    }
+    /* bai 是 flat 形状：它的 availableModels 在种子配置顶层。
+       不可接通的渠道（交还区）没有种子块，也就没有可比对的清单 —— 那是合法的。 */
+    if (P.chainable === false) {
+      if (models.length) {
+        err(`${key}: field "models" has ${models.length} entries but the channel is not chainable (it has no mapping editor and no config block) -- expected []`);
+      } else {
+        ok(`${key}: not chainable, models = [] (no seed config block to reconcile against)`);
+      }
+      continue;
+    }
+    const cfgBlock = key === "bai" ? defaults : (defaults[key] || null);
+    if (!cfgBlock || !Array.isArray(cfgBlock.availableModels)) {
+      missingCfg.push(key);
+      continue;
+    }
+    const cfgModels = cfgBlock.availableModels;
+    const onlyManifest = models.filter((m) => !cfgModels.includes(m));
+    const onlyCfg = cfgModels.filter((m) => !models.includes(m));
+    if (onlyManifest.length || onlyCfg.length) {
+      err(`${key}: models disagree with config.defaults.json${key === "bai" ? "" : "." + key}.availableModels` +
+        (onlyManifest.length ? ` -- in the manifest only: ${show(onlyManifest.join(","))}` : "") +
+        (onlyCfg.length ? ` -- in the seed config only: ${show(onlyCfg.join(","))}` : "") +
+        `. The mapping dropdown renders the manifest list, so a model offered here could not be routed`);
+    } else {
+      ok(`${key}: ${models.length} model(s) identical to config.defaults.json${key === "bai" ? "" : "." + key}.availableModels`);
+    }
+    /* 「恢复默认模型」的种子必须来自同一份清单，否则按钮会把下拉里没有的模型装上去 */
     const dm = P.defaultModels;
     if (!Array.isArray(dm)) {
-      err(`${key}: field "defaultModels" is ${typeOf(dm)} -- expected an array of non-empty model ids in providers.js (may be [] when the page has no reset-defaults button; panel-common.js reads it directly, the fallback table FB is gone)`);
-    } else if (dm.some((x) => typeof x !== "string" || !x.trim())) {
-      err(`${key}: field "defaultModels" is ${typeOf(dm)} -- expected every item to be a non-empty string`);
+      err(`${key}: field "defaultModels" is ${typeOf(dm)} -- expected an array of model ids (may be [] when the channel has no reset button)`);
     } else {
-      const fromManifest = Array.isArray(P.availableModels) && P.availableModels.length
-        && P.availableModels.every((x) => typeof x === "string" && x.trim()) ? P.availableModels : null;
-      if (P.availableModels !== undefined && !fromManifest) {
-        err(`${key}: field "availableModels" is ${typeOf(P.availableModels)} -- expected a non-empty array of non-empty model ids`);
+      const stray = dm.filter((m) => !models.includes(m));
+      if (stray.length) {
+        err(`${key}: defaultModels ${show(stray.join(","))} not present in its own models list -- "reset to defaults" would install an un-routable target`);
       }
-      const cfgBlock = key === "bai" ? defaults : (defaults[key] || {});
-      const cfgModels = Array.isArray(cfgBlock.availableModels) ? cfgBlock.availableModels : null;
-      const sources = [
-        fromManifest && "providers.js:availableModels",
-        "providers.js:defaultModels",
-        cfgModels && `config.defaults.json:${key === "bai" ? "" : key + "."}availableModels`,
-      ].filter(Boolean);
-      ok(`${key}: defaultModels from providers.js (${dm.length}: ${show(dm.join(","))}); model list also from ${sources.join(" + ")}`);
     }
+  }
+  if (missingCfg.length) {
+    err(`config.defaults.json has no availableModels for chainable channel(s) ${missingCfg.join(", ")} -- the manifest list cannot be reconciled against the seed (${missingCfg.map((k) => `config.defaults.json.${k}`).join(", ")} missing)`);
   }
 }
 
 /* ============================================================================
- * C9（附加）导航 tab 与清单 key/path 一一对应
- *   加了第六家却忘了在模板里加 .prov-tab -> 页面上根本点不到，而所有检查都还是绿的
+ * C9（附加）视图分段：#navViews 的 data-view ↔ BAI_VIEWS[].id ↔ 模板里的视图容器
+ *   单页改版后顶栏从 7 个页签变成 4 个视图分段。清单里少一个视图 = 那个视图的卡片
+ *   永远不会被挂载；模板里少一个 data-view = 那一屏点不进去。三边必须一一对应。
  * ==========================================================================*/
+setCheck("C9");
+{
+  const navEl = /<nav\b[^>]*\bid=["']navViews["'][^>]*>/.exec(htmlNoComment);
+  if (!navEl) {
+    err(`provider.html has no <nav id="navViews"> -- the view segment control is missing, so no view is reachable`);
+  } else {
+    /* 只取 navViews 容器内部（到匹配的 </nav> 为止）的 data-view，别把别处的 data-view 算进来 */
+    const from = navEl.index + navEl[0].length;
+    const inner = htmlNoComment.slice(from, from + (htmlNoComment.slice(from).indexOf("</nav>") + 6));
+    const segs = [...inner.matchAll(/data-view\s*=\s*["']([A-Za-z0-9_-]+)["']/g)].map((m) => m[1]);
+    const segLabels = [...inner.matchAll(/<button\b[^>]*data-view\s*=\s*["'][A-Za-z0-9_-]+["'][^>]*>([\s\S]*?)<\/button>/g)]
+      .map((m) => m[1].replace(/<[^>]*>/g, "").trim());
+    const dup = segs.filter((s, i) => segs.indexOf(s) !== i);
+    if (dup.length) err(`navViews has duplicate data-view segment(s): ${uniq(dup).join(", ")} -- one click would land on two views`);
+
+    const viewIds = views.map((v) => v && v.id).filter(Boolean);
+    for (const id of viewIds) {
+      if (!segs.includes(id)) {
+        err(`BAI_VIEWS declares view "${id}" but navViews has no data-view="${id}" segment -- that view is unreachable from the header`);
+      }
+    }
+    for (const s of segs) {
+      if (!viewIds.includes(s)) {
+        err(`navViews has a data-view="${s}" segment but BAI_VIEWS has no "${s}" entry -- clicking it would render an empty view`);
+      }
+    }
+    /* 顶栏的中文标签也来自清单，两处各写一遍就会漂移 */
+    views.forEach((v, i) => {
+      if (!v || !v.id || !segs.includes(v.id)) return;
+      const label = segLabels[segs.indexOf(v.id)];
+      if (label !== undefined && v.nav !== undefined && label !== v.nav) {
+        err(`nav segment data-view="${v.id}" shows "${show(label)}" but BAI_VIEWS[${v.id}].nav is ${show(v.nav)} -- the header label is written twice`);
+      }
+    });
+
+    /* 每个视图都必须有对应的 DOM 容器，且容器里不能塞别的视图的内容 */
+    const htmlIds = new Set([...htmlNoComment.matchAll(/id\s*=\s*["']([A-Za-z0-9_-]+)["']/g)].map((m) => m[1]));
+    for (const v of views) {
+      if (!v || !v.id) continue;
+      const dom = v.dom || v.id;
+      if (!htmlIds.has(dom)) {
+        err(`BAI_VIEWS[${v.id}].dom is ${show(dom)} but provider.html has no id="${dom}" -- the view has no container to render into`);
+      }
+    }
+    if (setEq(viewIds, uniq(segs))) ok(`view segments match: navViews [${segs.join(", ")}] == BAI_VIEWS [${viewIds.join(", ")}], each with a DOM container`);
+  }
+}
+
 /* ============================================================================
  * C10（附加）凡是「直接返回模板」的路由，都必须能在清单里 path 精确匹配上
- *   panel-common.js 认页面靠 `normPath(MANIFEST[k].path) === location.pathname`，
- *   对不上就在 `if (!P ...) return` 处整个退出 —— 页面只剩外壳，导航和底栏在、
- *   所有交互都不在，且没有任何提示。这比 404 难查得多。
- *   真发生过：重构初期 15 条路径里有 10 条（含 /index.html、/sensenova…）都直接发模板，
- *   其中 10 条变成半死页。现在别名一律 302 重定向，这条检查用来防它复发。
+ *   panel-common.js 认页面靠清单 path 匹配当前 pathname，对不上就在入口处整个退出
+ *   —— 页面只剩外壳，导航和底栏在、所有交互都不在，且没有任何提示。这比 404 难查得多。
+ *   真发生过：重构初期 15 条路径里有 10 条都直接发模板，其中 10 条变成半死页。
+ *   现在别名一律 302 重定向，这条检查用来防它复发。
  * ==========================================================================*/
 setCheck("C10");
 {
@@ -626,32 +954,10 @@ setCheck("C10");
   if (missing.length) err(`canonical path(s) ${missing.join(",")} are neither served nor reachable via an alias`);
 }
 
-setCheck("C9");
-{
-  const tabs = [...htmlNoComment.matchAll(/<a\s[^>]*class="[^"]*prov-tab[^"]*"[^>]*>/g)].map((m) => m[0]);
-  const tabKeys = tabs.map((t) => (t.match(/data-key\s*=\s*["']([A-Za-z0-9_-]+)["']/) || [])[1]).filter(Boolean);
-  const tabHrefs = tabs.map((t) => (t.match(/href\s*=\s*["']([^"']*)["']/) || [])[1]).filter(Boolean);
-
-  for (const key of keys) {
-    if (!tabKeys.includes(key)) {
-      err(`provider.html has no <a class="prov-tab" data-key="${key}"> -- the page exists but is unreachable from the nav bar`);
-    } else {
-      const href = tabHrefs[tabKeys.indexOf(key)];
-      if (href !== manifest[key].path) {
-        err(`nav tab data-key="${key}" has href="${show(href)}" -- expected the manifest path "${show(manifest[key].path)}"`);
-      }
-    }
-  }
-  for (const k of tabKeys) {
-    if (!keys.includes(k)) err(`provider.html has a nav tab data-key="${k}" but providers.js has no "${k}" entry -- clicking it would render a blank page`);
-  }
-  if (setEq(keys, uniq(tabKeys))) ok(`nav tabs match manifest keys and hrefs: ${tabKeys.join(", ")}`);
-}
-
 /* ============================================================================
  * C11 渲染层不得再按提供方名字硬编码（v1.0.48 清单化收尾）
- *   panel-common.js 是五页共用渲染层，它一旦出现 `key === "bai"` 这类提供方字面量
- *   等值判断，就意味着「加第六家会漏改一处」的老毛病没根除——本轮就是来拔掉它们的。
+ *   panel-common.js 是全渠道共用渲染层，它一旦出现 `key === "bai"` 这类渠道字面量
+ *   等值判断，就意味着「加第七家会漏改一处」的老毛病没根除——本轮就是来拔掉它们的。
  *   白名单：cards/*.js 不扫（卡的 PROVIDER 判断是它自己的事）；注释先剥掉再扫。
  * ==========================================================================*/
 setCheck("C11");
@@ -685,20 +991,28 @@ setCheck("C11");
 }
 
 /* ============================================================================
- * C12 每家必须给出渲染层依赖的形状字段（加第六家漏改的新防线）
- *   C11 保证渲染层不认识提供方名字，代价是「清单漏字段」不再报错、只是静默不渲染。
- *   C12 把 panel-common.js 无条件读取的那批字段补回来：缺了就是加第六家时的漏改。
+ * C12 渲染层必读的**新增渠道字段**每家都要有（清单化收尾的最后一层）
+ *   C11 保证渲染层不认识渠道名，代价是「清单漏字段」不再报错、只是静默不渲染。
+ *   C12 把里程碑 1 新增的那批字段补回来：缺一个就是矩阵格少一块、凭据行少一栏。
+ *   同时断言这份表是 C1 必填表的**子集** —— 两处各写一份字段名时，漂移是最容易发生的。
  * ==========================================================================*/
 setCheck("C12");
 {
   const NEEDED = [
-    { name: "shape", test: (v) => v === "flat" || v === "nested", want: '"flat" or "nested"' },
-    { name: "keyMatch", test: (v) => typeof v === "string" && v.trim() !== "", want: "non-empty string (status field to compare credentials)" },
-    { name: "sys", test: (v) => v && typeof v === "object" && !Array.isArray(v), want: "plain object (button/field visibility switches)" },
-    { name: "brands", test: (v) => v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0, want: "non-empty object (model-prefix -> display name)" },
-    { name: "defaultModels", test: (v) => Array.isArray(v) && v.every((x) => typeof x === "string" && x.trim()), want: "string array (may be empty; [] = no reset-defaults button)" },
-    { name: "settingsLabels", test: (v) => v && typeof v === "object" && typeof v.relayPort === "string" && v.relayPort.trim() !== "", want: "object with a non-empty relayPort label" },
+    { name: "letter", test: (v) => typeof v === "string" && /^[A-Za-z]{2,3}$/.test(v), want: '2 or 3 letters ("QD" / "BAI")' },
+    { name: "name", test: (v) => typeof v === "string" && !!v.trim(), want: "non-empty string (matrix cell title)" },
+    { name: "tagline", test: (v) => typeof v === "string" && !!v.trim(), want: "non-empty string (one-line subtitle)" },
+    { name: "badge", test: (v) => v && typeof v === "object" && !Array.isArray(v) && typeof v.text === "string" && !!v.text.trim() && BADGE_KINDS.includes(v.kind), want: `{ text, kind } with kind ∈ ${BADGE_KINDS.join("/")}` },
+    { name: "chainable", test: (v) => typeof v === "boolean", want: "boolean (is it in the failover chain?)" },
+    { name: "credential", test: (v) => v && typeof v === "object" && !Array.isArray(v) && CRED_KINDS.includes(v.kind) && typeof v.label === "string" && !!v.label.trim(), want: `{ kind ∈ ${CRED_KINDS.join("/")}, label, hint }` },
+    { name: "models", test: (v) => Array.isArray(v) && v.every((x) => typeof x === "string" && x.trim()), want: "string array (may be empty for a non-chainable cell)" },
+    { name: "mappingDefaults", test: (v) => v && typeof v === "object" && !Array.isArray(v), want: `object keyed by the four tiers (${TIER_KEYS.join(", ")})` },
   ];
+  /* 防漂移：C12 的每一项都必须同时是 C1 的必填字段，否则两处会各说各话 */
+  const notInC1 = NEEDED.map((f) => f.name).filter((n) => !REQUIRED_FIELDS.some((g) => g.name === n));
+  if (notInC1.length) {
+    err(`C12 requires ${notInC1.join(", ")} but C1's REQUIRED_FIELDS does not list ${notInC1.length === 1 ? "it" : "them"} -- the two field tables drifted; a channel could pass one check and fail the other for the same field`);
+  }
   for (const key of keys) {
     const P = manifest[key];
     const miss = [];
@@ -706,9 +1020,9 @@ setCheck("C12");
       if (!f.test(P[f.name])) miss.push(`${f.name} (${typeOf(P[f.name])}; want ${f.want})`);
     }
     if (miss.length) {
-      err(`${key}: renderer-critical manifest field(s) missing or malformed -- ${miss.join("; ")}. panel-common.js reads these unconditionally; a 6th provider that omits one renders silently wrong`);
+      err(`${key}: renderer-critical manifest field(s) missing or malformed -- ${miss.join("; ")}. The renderer reads these unconditionally; a 7th channel that omits one renders silently wrong`);
     } else {
-      ok(`${key}: shape/keyMatch/sys/brands/defaultModels/settingsLabels all present`);
+      ok(`${key}: letter/name/tagline/badge/chainable/credential/models/mappingDefaults all present and well-formed`);
     }
   }
 }
@@ -799,18 +1113,18 @@ setCheck("C13");
  * ==========================================================================*/
 
 const CHECK_TITLES = {
-  C1: "manifest completeness + key/path vs server.mjs routes",
-  C2: "guide structure",
-  C3: "notices structure + {btn} placeholder",
-  C4: "contract ids in provider.html (exactly once each)",
+  C1: "channel manifest completeness + key/path vs server.mjs routes + declaration order == failover chain",
+  C2: "guide structure (RETIRED -- folded into C1's credential structure check)",
+  C3: "diagnostic conclusion + remedy text",
+  C4: "contract ids in provider.html (exactly once each; = the id disposition table)",
   C5: "reverse check: no dangling id reference ($ / onClick / applyText / has)",
-  C6: "card slot contract (cards/*.js export mount)",
-  C7: "palette: html[data-provider] blocks vs manifest keys",
-  C8: "model list available for every provider",
-  C9: "nav tabs vs manifest keys/paths",
+  C6: "view card table (BAI_VIEWS[].cards) vs cards/*.js",
+  C7: "status semantic colours in both themes + no per-provider --accent blocks",
+  C8: "manifest models == config.defaults.json availableModels",
+  C9: "view segments: navViews data-view vs BAI_VIEWS[].id vs DOM containers",
   C10: "every server route that renders the template has a matching manifest path",
-  C11: "panel-common.js must not hard-code provider names",
-  C12: "renderer-critical manifest fields present for every provider",
+  C11: "panel-common.js must not hard-code channel names",
+  C12: "renderer-critical channel fields present for every channel",
   C13: "seed config must not carry machine-specific paths/usernames",
 };
 const ORDER = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13"];

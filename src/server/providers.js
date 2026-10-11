@@ -1,474 +1,278 @@
-/* providers.js —— 五个提供方页面的「清单」（纯数据，无逻辑）。
+/* providers.js —— 路由台的「渠道清单」（纯数据，无逻辑）。
  *
  * 由 provider.html 先加载，panel-common.js 再按 key 取用。
- * 文案全部从重构前的 ui.html / sn.html / wb.html / zen.html / qd.html 逐字搬过来，
- * 不要顺手改措辞：本轮刚修过一批复制粘贴留下的错配。
+ *
+ * v17 起清单的语义变了：**条目是「渠道」，不是「页面」**（契约 REFACTOR-CONTRACT-v17 第一节）。
+ * 七个 URL 全部保留，但它们都渲染同一张单页；清单里多了一个不对应独立 URL 的
+ * ccswitch 条目（矩阵上的「交还区」），原先的 home 条目已删除——根路径 / 现在只是
+ * 「不预选中任何渠道」的默认视图，不再是清单实体。
+ *
+ * 声明顺序 = 故障转移链顺序（契约第二节：矩阵格序 = 转移链顺序），
+ * ccswitch 固定排在链尾之后。真实链序以 config.json 的 failover.chain 为准，
+ * 清单顺序是它的出厂默认值，C1 会拿两者对账。
  *
  * 约定：
- *  - null = 该页没有这块内容，渲染层请判空后再写进 DOM（不要直接 innerHTML = null）。
- *  - {btn} 会被替换成 primaryBtn（主按钮的完整文字）。
- *  - 下面标注「契约外补充」的字段，是契约 schema 里没有、但文案无法由其它字段推导出来的，
- *    不写就会丢字；panel-common.js 需要读它们。
+ *  - null = 该渠道没有这块内容，渲染层请判空后再写进 DOM（不要直接 innerHTML = null）。
+ *  - **不许出现真实密钥、真实用户名、本机绝对路径**；真实映射值只来自
+ *    %APPDATA%\bai-router\config.json（cfg[channel].mapping），本文件里的
+ *    mappingDefaults 只是「恢复默认」的种子。
+ *  - models 与 src/server/config.defaults.json 的 availableModels 逐项一致，
+ *    C8 两边对账；深浅主题与 qd 都不例外。
+ *  - 文案全部沿用重构前的原句，不要顺手改措辞：本轮刚修过一批复制粘贴留下的错配。
  *
- * v1.0.48 起，此前散落在 panel-common.js 的 FB 兜底表与形状开关也搬进来了。判据是
- * 「panel-common.js 里不再出现任何提供方名字」，所以本清单必须为每家提供：
- *  - brands / defaultModels / labelSuffix / noCallHint / testNote / modelsRefreshMsg /
- *    applyInfoMsg / resetModelsMsg / step1Hint / eventTitles / cred / sys：原先的 FB 字段
- *  - shape："flat"（本家数据在 /api/config 与 /api/status 顶层，只有 bai）或 "nested"
- *    （在同名子对象里）。config 与 status 的形状在本项目里总是相同，故合并成一个字段。
- *  - keyMatch：/api/status 里本页该比对的凭据字段（server.mjs 的 keyMatch/keyMatchSn/…）。
- *  - modelsEndpoint：拉模型目录的路由；null = 按默认 "?p=<key>" 拼接。
- *  - settingsLabels：设置卡里可被覆盖的标签（relayPort 必须有，否则回退到通用拼接）。
- *  - sys.*：按钮/字段显隐开关（deploy / modelsRefresh / useProxyRow / proxy / panelPort /
- *    proxyDetect / tokenView / apiKey）。
+ * 字段分组（渲染层读得到哪些，见 CONTRACT-v17 里程碑 1 的字段表）：
+ *   定位     key / path / tab / h1 / title / shortName
+ *   卡片     letter / name / tagline / badge / chainable
+ *   凭据     credential { kind, label, hint }        ← 凭据视图按 kind 分派，渲染层不许出现渠道名
+ *   模型     models（可选清单）/ brands（模型 id → 人话）/ defaultModels（恢复默认的种子）
+ *             / mappingDefaults（四档 → 默认显示名）
+ *   诊断     conclusion（就绪怎么判断）/ remedy（未就绪给什么建议）  ← C3 把关
+ *   本机     settingsLabels（设置视图里的字段标签）
+ *
+ * window.BAI_VIEWS 是**视图级卡片表**（四视图各挂哪些 cards/*.js），不在本文件顶层的
+ * 渠道条目里 —— 卡片属于视图而不属于渠道。C6 拿它与 cards/ 目录双向对账。
  */
 window.BAI_PROVIDERS = {
 
-  /* ================= 总览（/）—— 公共功能主界面 =================
-   * 定位（用户原话）：「故障转移、接回 CC Switch 这些公共功能单独做一个主界面」。
-   * 本页没有任何「可接通的对象」，也没有模型映射——那些去各家页签。
-   * hideApply / hideCards 是本页的清单开关：panel-common.js 按字段分支，
-   * **不得**因此出现 provider 字面量（C11 会拦）。 */
-  home: {
-    key: "home",
-    path: "/",
-    tab: "总览",
-    h1: "路由台总览",
-    sub: "公共功能 · 六家免费渠道",
-    title: "路由台总览 · B.AI 路由台",
-    /* C1 的 REQUIRED_FIELDS 要求 accentLabel / targetName / settingsTitle 三者都是非空
-       字符串，而本页这三处原样写 null/""。这里填的就是渲染层原本的兜底值（panel-common.js
-       的 `P.accentLabel || "接通"`、`applyText("thTarget", null)` 后模板自带的「→ 模型」、
-       `applyText("ttlSys", null)` 后模板自带的「本机设置」），所以**页面显示一个字节都没变**：
-       接线卡没有「接通」按钮、路由表整卡隐藏，这三个字段谁都读不到。 */
-    accentLabel: "接通",                // 本页没有「接通」动作（值只是渲染层兜底，按钮已被 hideApply 收掉）
-    primaryBtn: "",                     // hideApply=true，渲染层不会用它
-    targetName: "模型",                 // 本页没有路由表（hideCards 含 "route"，整卡隐藏）
-    relayHint: null,
-    guide: [],                          // 无两步引导（C2 合法值：0 或 2）
-    hint: null,
-    settingsTitle: "本机设置", settingsAux: null, settingsEyebrow: null,
-    foldKey: "bai.homesec3",
-    lamps: ["clash", "relay", "cc"],    // 全局视角三盏：出海代理 / 中转服务 / CC Switch
-    lampNames: { clash: "本机代理", relay: "中转服务", cc: "CC Switch" },
-    // 副行不写死端口：paintRelay() 会剥掉开头的「:数字」并用 status 里的真实 relayPort 拼上，
-      // 后缀原样保留（panel-common.js paintRelay）。原来写「:15723 面板端口」会被显示成
-      // 「:15722 面板端口」——中转端口号配着「面板端口」字样，语义打架（v1.0.61 渲染截图时发现）。
-      // 所以这里只留 cc 的副行；relay 副行由 paintRelay 生成「:<中转端口>」。
-      lampSubs: { cc: "配置接管状态" },
-    extraCards: ["failover", "model-sync", "overview"],
-    footNote: "本页管公共功能（故障转移 / 接回 CC Switch / 全部刷新）；改模型映射请去上方对应提供方页签",
-    footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 本页管公共功能，模型映射在各家页签",
-    cardEyebrow: "状态",
-    routeEyebrow: null, routeTitle: null,
-    routeKey: null,
-    wireHint: "这里显示 Claude Code（终端 + 桌面版）当前接在哪家；「接回 CC Switch」随时把配置还给 CC Switch。四档模型映射与免费模型选择，请去上方对应的提供方页签。",
-    /* ---- 本页专属开关（清单驱动；C12 要求的字段仍在下方） ---- */
-    hideApply: true,                    // 接线卡不显示「接通」按钮（本页没有可接通的对象）
-    hideCards: ["route", "settings"],   // 本页不渲染路由表与本机设置卡
-    /* ---- v1.0.48 清单化字段（C12 强制：全部必须存在且合形） ---- */
-    brands: { free: "免费" },           // C12 要非空对象；本页无路由表，overview 卡实际读各家的 brands
-    defaultModels: [],                  // 本页没有「恢复默认模型」按钮（[] 合法）
-    applyInfoMsg: null, resetModelsMsg: null, step1Hint: null,
-    keyMatch: "keyMatch",               // C12 要非空字符串；本页无凭据灯，该字段不会被读到
-    shape: "flat",                      // 与 bai 同为顶层形状：灯/接线语义正是全局视角
-    sys: {},                            // C12 要对象；本页无刷新/部署/保存按钮
-    modelsEndpoint: null,
-    settingsLabels: { relayPort: "中转端口" },
-    notices: {
-      stale: "当前有一端接在本路由台的某个渠道上。想换渠道去上方对应页签；想把配置还给 CC Switch，点下方「接回 CC Switch」。",
-      ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若某个渠道突然失效，去对应页签重新接通即可。",
-    },
-    // 别从灯名反推简称。
-    shortName: "路由台",
-  },
-
-  /* ================= B.AI（/） ================= */
-  bai: {
-    key: "bai",
-    path: "/bai",
-    tab: "B.AI",
-    h1: "B.AI 路由台",
-    sub: "MODEL ROUTER",
-    title: "B.AI 路由台",
-    accentLabel: "接通",
-    primaryBtn: "接通 B.AI",                  // 契约外补充：主按钮完整文字
-    targetName: "B.AI 模型",                  // 路由表第二列表头
-    relayHint: null,                          // 本页接线卡没有那句带端口的提示
-    guide: [],                                // 本页没有两步引导卡
-    hint: null,                               // 路由表下方没有说明
-    settingsTitle: "本机设置",
-    settingsAux: "换电脑 / 换代理时改这里",
-    settingsEyebrow: "03",                    // 契约外补充
-    foldKey: "bai.sec3",                      // 契约外补充：折叠状态记忆
-    lamps: ["clash", "relay", "upstream", "cc"],
-    lampNames: {                              // 契约外补充：四盏灯的名字（逐字）
-      clash: "Clash 代理",
-      relay: "本地中转",
-      upstream: "B.AI 上游",
-      cc: "CC Switch",
-    },
-    lampSubs: {                               // 契约外补充：副行初始文字
-      clash: ":7890 → 外网",
-      relay: ":15722 → 上游",
-    },
-    extraCards: [],                     // 公共卡（故障转移 / 刷新全部模型）已收缩到总览页，本页不再挂
-    footNote: "数据保存在 %APPDATA%\\bai-router · 切换前自动快照到 backups/",
-    footNoteAlt: null,                        // 本页没有浏览器直开时的分支
-    cardEyebrow: "01",                        // 契约外补充：「当前接线」卡的编号
-    routeEyebrow: "02",                       // 契约外补充：「路由表」卡的编号
-    routeTitle: "路由表 · 模型映射",
-    routeKey: { label: "API Key", placeholder: "" },   // 契约外补充：路由表里的密钥行
-    wireHint: null,                           // 契约外补充：本页接线卡没有说明句
-
-    /* ---- v1.0.48 清单化：原先散在 panel-common.js 的 FB 兜底表与形状开关 ---- */
-    brands: { qwen: "Qwen", glm: "GLM", deepseek: "DeepSeek", hy: "HY", mimo: "MiMo", kimi: "Kimi", minimax: "MiniMax" },
-    defaultModels: [],                        // 本页没有「恢复默认模型」按钮（无固定清单）
-    labelSuffix: " 1M",
-    noCallHint: "尚未观察到 Claude Code 调用",
-    testNote: {
-      single: "（测试的就是你 Claude Code 里显示的那个模型，名字完全一致）",
-      all: "（最近 30 分钟没观察到真实对话流量，已测全部四档；在 Claude Code 发条消息后再点，会自动对准当前档位）",
-    },
-    modelsRefreshMsg: "✔ 已拉取上游模型目录 {count} 个\n已更新可选模型列表（四个映射目标强制保留）",
-    eventTitles: { check: "检查更新 / 部署" },
-    keyMatch: "keyMatch",                     // status 里本页该比对的凭据字段
-    shape: "flat",                            // /api/config 与 /api/status 里本家数据在顶层
-    sys: { proxy: true, panelPort: true, proxyDetect: true, useProxyRow: false, deploy: true, modelsRefresh: true },
-    modelsEndpoint: "/api/models",            // 本页拉模型目录的路由不带 ?p=
-    settingsLabels: { relayPort: "中转端口" },   // 本页不加提供方前缀（旧三元表达式 key === "bai" ? "" : …）
-        notices: {
-      // 通用兜底：另一端接在本路由台的任一渠道上。措辞与其余四页一致。
-      stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
-      // 以下按「另一端具体接在哪家」分列——panel-common.js 取值是 NT[other.mode]，
-      // 缺哪个 mode 就会落到通用 stale 上，于是显示成别的家名字。
-      sn: "有一端当前接在 SenseNova 上（见顶部「SenseNova」页）。点本页「{btn}」可把它换回来；两方映射互相独立，切换只动接线不动对方配置。",
-      wb: "有一端当前接在 WorkBuddy 上（见顶部「WorkBuddy」页）。点本页「{btn}」可把它换回来；各提供方映射互相独立，切换只动接线不动对方配置。",
-      zen: "有一端当前接在 OpenCode Zen 上（见顶部「OpenCode Zen」页）。点本页「{btn}」可把它换回来；各提供方映射互相独立，切换只动接线不动对方配置。",
-      qd: "有一端当前接在 Qoder 上（见顶部「Qoder」页）。点本页「{btn}」可把它换回来；各提供方映射互相独立，切换只动接线不动对方配置。",
-      or: "有一端当前接在 OpenRouter 上（见顶部「OpenRouter」页）。点本页「{btn}」可把它换回来；各提供方映射互相独立，切换只动接线不动对方配置。",
-      ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 B.AI 突然失效，回到这里点「{btn}」一键恢复即可。",
-      keyMismatch: "⚠ 有客户端正在用的密钥和面板里填的不一致——中转是按请求自带 key 计费的，面板改了 key 不会自动更新已接线的客户端。请重开对应终端/桌面版，或重新点「{btn}」。",
-      ccBoth: "检测到配置在 CC Switch 手里。点「{btn}」切换；想用 CC Switch 就保持现状。",
-    },
-    // 别从灯名反推简称：「本地中转」会反推成「本地」、「Zen 中转」会丢掉「OpenCode」。
-    shortName: "B.AI",
-  },
-
-  /* ================= SenseNova（/sn） ================= */
-  sn: {
-    key: "sn",
-    path: "/sn",
-    tab: "SenseNova",
-    h1: "SenseNova 路由",
-    sub: "商汤 · 日日新",
-    title: "SenseNova 路由 · B.AI 路由台",
-    accentLabel: "接通",
-    primaryBtn: "接通 SenseNova",
-    targetName: "SenseNova 模型",
-    relayHint: ":15732",
-    guide: [],
-    hint: null,
-    settingsTitle: "SenseNova 设置",
-    settingsAux: "上游 / 中转端口 / 通道",
-    settingsEyebrow: "03",
-    foldKey: "bai.snsec3",
-    lamps: ["relay", "upstream", "cc"],       // 3 盏，没有凭据灯
-    lampNames: {
-      relay: "SenseNova 中转",
-      upstream: "SenseNova 上游",
-      cc: "CC Switch",
-    },
-    lampSubs: { relay: ":15732 → 上游" },
-    extraCards: [],                     // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
-    footNote: "SenseNova 与 B.AI 各自独立配置，共用同一个路由台服务",
-    footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
-    cardEyebrow: "01",
-    routeEyebrow: "02",
-    routeTitle: "路由表 · 模型映射",
-    routeKey: { label: "API Key", placeholder: "sk-…（SenseNova token-plan 密钥）" },
-    wireHint: "SenseNova 是境内服务，CLI 直连、不需要 Clash；桌面版经由本地中转 <span id=\"hintRelayPort\">:15732</span>。切到 SenseNova 会顶掉当前 B.AI 接线，随时可「接回 CC Switch」或用 B.AI 页重新接通。",
-
-    /* ---- v1.0.48 清单化 ---- */
-    brands: { sensenova: "SenseNova", deepseek: "DeepSeek", glm: "GLM", kimi: "Kimi", neo: "Neo", u: "U" },
-    defaultModels: [],                        // 本页没有「恢复默认模型」按钮
-    testNote: { all: "（最近 30 分钟没观察到真实对话流量，已测全部四档；SenseNova 有 TPM 限流，429 稍候再测即可）" },
-    modelsRefreshMsg: "✔ 已拉取可对话模型 {count} 个（图像模型已自动排除）\n下拉框已更新（映射目标强制保留）",
-    keyMatch: "keyMatchSn",
-    shape: "nested",
-    sys: { modelsRefresh: true },
-    modelsEndpoint: null,                     // 默认按 ?p=<key> 拼接
-    settingsLabels: { relayPort: "SenseNova 中转端口" },
-    notices: {
-      stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
-      ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 SenseNova 突然失效，回到这里点「{btn}」恢复。",
-    },
-    // 别从灯名反推简称：「本地中转」会反推成「本地」、「Zen 中转」会丢掉「OpenCode」。
-    shortName: "SenseNova",
-  },
-
-  /* ================= WorkBuddy（/wb） ================= */
-  wb: {
-    key: "wb",
-    path: "/wb",
-    tab: "WorkBuddy",
-    h1: "WorkBuddy 路由",
-    sub: "腾讯 · 免费模型",
-    title: "WorkBuddy 路由 · B.AI 路由台",
-    accentLabel: "接入",
-    primaryBtn: "一键接入 WorkBuddy",
-    targetName: "WorkBuddy 模型",
-    relayHint: ":15742",
-    guide: [
-      {
-        title: "一键获取令牌",
-        desc: "自动从本机 WorkBuddy 客户端取登录令牌（令牌只存内存，必须取一次）。",
-        act: "一键获取令牌",                  // 契约外补充：第 1 步自带按钮（其余页没有）
-      },
-      {
-        title: "接入 WorkBuddy",
-        desc: "把 Claude Code（终端 + 桌面版）接到 WorkBuddy 的三款免费模型。",
-      },
-    ],
-    guideEyebrow: "用法",                     // 契约外补充
-    guideTitle: "两步开始使用（新电脑照做即可）",
-    hint: "三款均为 WorkBuddy 账号下 0 积分不限量的免费模型：DeepSeek-V4.1-Flash（100 万上下文）、Hy4-Preview-F（100 万上下文）、HY3（19.2 万上下文）。促销结束后若恢复计费，WorkBuddy 客户端里会显示需积分的模型。",
-    settingsTitle: "WorkBuddy 设置",
-    settingsAux: "上游 / 中转端口 / 通道",
-    settingsEyebrow: "设置",
-    foldKey: "bai.wbsec4",
-    lamps: ["relay", "upstream", "cred"],
-    lampNames: {
-      relay: "WorkBuddy 中转",
-      upstream: "WorkBuddy 上游",
-      cred: "访问令牌",
-    },
-    lampSubs: { relay: ":15742 → 协议桥 → 上游", cred: "JWT 有效期" },
-    // 旧 wb 页未配置时副行是「在下方粘贴访问令牌」；缺这项会落到通用兜底
-    // 「在下方「WorkBuddy 设置」里填」，与旧文案不一致。
-    cred: { subNone: "在下方粘贴访问令牌" },
-    extraCards: ["token-capture"],      // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
-    footNote: "WorkBuddy 与 B.AI/SenseNova 各自独立配置，共用同一个路由台服务",
-    footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
-    cardEyebrow: "状态",
-    routeEyebrow: "模型",
-    routeTitle: "路由表 · 模型映射（三款免费模型）",
-    routeKey: null,                           // 路由表里没有密钥行，凭据在「手动填写令牌」卡里
-    wireHint: "接通后：终端 CLI 与桌面版都指向本地协议桥 <span id=\"hintRelayPort\">:15742</span>（CLI 讲 Anthropic 协议、WorkBuddy 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。",
-
-    /* ---- v1.0.48 清单化 ---- */
-    brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
-    defaultModels: ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"],
-    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 WorkBuddy 的三款免费模型了。",
-    resetModelsMsg: "✔ 已恢复为三款免费模型：{list}",
-    step1Hint: "请先完成第 1 步「一键获取令牌」。",
-    keyMatch: "keyMatchWb",
-    shape: "nested",
-    sys: {},
-    modelsEndpoint: null,
-    settingsLabels: { relayPort: "WorkBuddy 中转端口" },
-    notices: {
-      // 注意：wb.html 原文这里写的是「接通 WorkBuddy」，而按钮文字是「一键接入 WorkBuddy」。
-      // 按契约统一用 {btn}，因此渲染出来会变成「一键接入 WorkBuddy」——见交付说明，待确认。
-      stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
-      ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 WorkBuddy 突然失效，回到这里点「{btn}」恢复。",
-    },
-    // 别从灯名反推简称：「本地中转」会反推成「本地」、「Zen 中转」会丢掉「OpenCode」。
-    shortName: "WorkBuddy",
-  },
-
-  /* ================= OpenCode Zen（/zen） ================= */
-  zen: {
-    key: "zen",
-    path: "/zen",
-    tab: "OpenCode Zen",
-    h1: "OpenCode Zen",
-    sub: "Zen · 免费模型",
-    title: "OpenCode Zen 路由 · B.AI 路由台",
-    accentLabel: "接入",
-    primaryBtn: "一键接入 OpenCode Zen",
-    targetName: "Zen 模型",
-    relayHint: ":15752",
-    guide: [
-      {
-        title: "填写 API Key",
-        desc: "在 <b>opencode.ai/console</b> 生成 API Key（形如 <span class=\"mono\">oc_sk_…</span>），填到下方「Zen 设置」保存即可。",
-      },
-      {
-        title: "一键接入",
-        desc: "把 Claude Code（终端 + 桌面版）接到 Zen 的免费模型。",
-      },
-    ],
-    guideEyebrow: "用法",
-    guideTitle: "接入 OpenCode Zen",
-    hint: null,                               // 路由表下方那句说明已并进「模型目录」卡（cards/model-catalog.js）
-    settingsTitle: "Zen 设置",
-    settingsAux: "API Key / 上游 / 中转端口",
-    settingsEyebrow: "设置",
-    foldKey: "bai.wbsec4",
-    lamps: ["relay", "upstream", "cred"],
-    lampNames: {
-      relay: "Zen 中转",
-      upstream: "Zen 上游",
-      cred: "API Key",
-    },
-    lampSubs: { relay: ":15752 → 协议桥 → 上游", cred: "oc_sk_… 密钥" },
-    extraCards: ["model-catalog"],      // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
-    footNote: "OpenCode Zen 与 B.AI/SenseNova/WorkBuddy 各自独立配置，共用同一个路由台服务",
-    footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
-    cardEyebrow: "状态",
-    routeEyebrow: "模型",
-    routeTitle: "路由表 · 模型映射",
-    routeKey: null,                           // 密钥填在「Zen 设置」里
-    wireHint: "接通后：终端 CLI 与桌面版都指向本地协议桥 <span id=\"hintRelayPort\">:15752</span>（CLI 讲 Anthropic 协议、Zen 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。",
-
-    /* ---- v1.0.48 清单化 ---- */
-    brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
-    // 原先抄的是 WorkBuddy 的三款（deepseek-v4.1-flash/hy4-preview-f/hy3）——
-    // Zen 免费档里唯一能外部调用的是 space-bunny-free。
-    defaultModels: ["space-bunny-free"],
-    cred: { txtOk: "已配置", subOk: "在下方「Zen 设置」管理", subNone: "在下方「Zen 设置」填 oc_sk_ 密钥" },
-    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 Zen 的免费模型了。",
-    resetModelsMsg: "✔ 已恢复为 Zen 免费模型：{list}",
-    step1Hint: "请先完成第 1 步：在下方「Zen 设置」填入 API Key 并保存。",
-    keyMatch: "keyMatchZen",
-    badgeText: "ZEN",                         // 本页徽章写 ZEN（其余家 = tab 大写）
-    shape: "nested",
-    sys: { apiKey: true },
-    modelsEndpoint: null,
-    settingsLabels: { relayPort: "OpenCode Zen 中转端口" },
-    notices: {
-      stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
-      ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 OpenCode Zen 突然失效，回到这里点「{btn}」恢复。",
-    },
-    // 别从灯名反推简称：「本地中转」会反推成「本地」、「Zen 中转」会丢掉「OpenCode」。
-    shortName: "OpenCode Zen",
-  },
-
-  /* ================= Qoder（/qd） ================= */
+  /* ================= Qoder（/qd）—— 转移链第 1 位 =================
+   * 账号额度型：补丁把登录令牌实时写进临时目录，中转每次请求现读，手上不需要任何明文密钥。 */
   qd: {
     key: "qd",
     path: "/qd",
     tab: "Qoder",
     h1: "Qoder",
-    sub: "Qoder · 免费 + 付费档",
     title: "Qoder 路由 · B.AI 路由台",
-    accentLabel: "接入",
-    primaryBtn: "一键接入 Qoder",
-    targetName: "Qoder 模型",
-    relayHint: ":15762",
-    guide: [
-      {
-        title: "装补丁并启动 Qoder 桌面端",
-        desc: "新电脑先展开下方「令牌从哪来」卡片，点<b>「一键装补丁」</b>（路由台内置，无需装 Python）；然后登录 Qoder 桌面端并保持运行。补丁会在它的 worker 里挂一个钩子，把当前 <span class=\"mono\">jt-…</span> 令牌实时写到 <span class=\"mono\">%TEMP%/qoder-token.json</span>，本中转每次请求现读——<b>无需任何手动粘贴</b>。令牌每次 Qoder 启动会轮换，中转自动跟随。",
-      },
-      {
-        title: "一键接入",
-        desc: "把 Claude Code（终端 + 桌面版）接到 Qoder 账号额度。默认四档都走 <b>免费档</b>，不会自动烧积分；要用付费模型就在下方路由表里主动选（下拉里已标出倍率）。",
-      },
-    ],
-    guideEyebrow: "用法",
-    guideTitle: "接入 Qoder",
-    hint: "下拉里的模型按 Qoder 的 <span class=\"mono\">price_factor</span> 如实标注：<b>免费</b>不扣积分，其余标注倍率（如 0.8×积分）。默认映射与「恢复默认模型」都只用免费档 <b>lite</b>。<br><b>ultimate</b> 为 Qoder 服务端侧的间歇性故障（其 AWS Bedrock 权限报错，非本机问题），面板下拉里已注明；命中时会由故障转移自动换渠道。",
-    settingsTitle: "Qoder 设置",
-    settingsAux: "API Key / 上游 / 中转端口",
-    settingsEyebrow: "设置",
-    foldKey: "bai.wbsec4",
-    lamps: ["relay", "upstream", "cred"],
-    lampNames: {
-      relay: "Qoder 中转",
-      upstream: "Qoder 上游",
-      cred: "访问令牌",
-    },
-    lampSubs: { relay: ":15762 → 协议桥 → 上游", cred: "读取自 Qoder 客户端" },
-    extraCards: ["model-catalog"],      // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
-    footNote: "Qoder 与 B.AI/SenseNova/WorkBuddy/Zen 各自独立配置，共用同一个路由台服务",
-    footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
-    cardEyebrow: "状态",
-    routeEyebrow: "模型",
-    routeTitle: "路由表 · 模型映射",
-    routeKey: null,                           // 令牌由补丁实时写入，没有手填框
-    wireHint: "接通后：终端 CLI 与桌面版都指向本地协议桥 <span id=\"hintRelayPort\">:15762</span>（CLI 讲 Anthropic 协议、Qoder 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。",
-
-    /* ---- v1.0.48 清单化 ---- */
-    brands: { lite: "Qoder Lite", auto: "Qoder Auto" },
-    // 「恢复默认模型」的目标清单：只含免费档 auto（0.5×）之外的东西一律不进来——
-    // 按这个按钮不该让用户开始烧积分。付费档在下拉里可选，但不会被"恢复默认"装上。
-    defaultModels: ["lite"],
-    cred: { kind: "file", txtOk: "已就绪", subOk: "随 Qoder 启动自动轮换", txtNone: "未读到", subNone: "未装补丁或 Qoder 未启动", preview: "jt-…（已就绪）" },
-    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 Qoder 的模型了（默认走免费档 lite）。",
-    resetModelsMsg: "✔ 已恢复为 Qoder 默认模型（免费档）：{list}",
-    step1Hint: "请先完成第 1 步：在「令牌从哪来」卡片点「一键装补丁」，再启动 Qoder 桌面端并保持运行（令牌会自动写入 %TEMP%/qoder-token.json）。",
-    keyMatch: "keyMatchQd",
-    shape: "nested",
-    sys: { tokenView: true },
-    modelsEndpoint: null,
-    settingsLabels: { relayPort: "Qoder 中转端口" },
-    notices: {
-      stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
-      ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 Claude Code 突然失效，回到这里点「{btn}」恢复。",
-    },
-    // 别从灯名反推简称：「本地中转」会反推成「本地」、「Zen 中转」会丢掉「OpenCode」。
     shortName: "Qoder",
+
+    letter: "QD",
+    name: "Qoder",
+    tagline: "账号额度 · 免费档 + 付费档",
+    badge: { text: "免费", kind: "free" },
+    chainable: true,
+    credential: {
+      kind: "jobToken",
+      label: "访问令牌",
+      hint: "补丁从 Qoder 客户端抓取，启动即轮换",
+    },
+
+    models: [
+      "lite", "auto", "performance", "ultimate",
+      "qmodel", "kmodel", "dmodel", "mmodel", "gmodel",
+    ],
+    brands: { lite: "Qoder Lite", auto: "Qoder Auto", performance: "Qoder Performance", ultimate: "Qoder Ultimate", qmodel: "Qoder Q-Model", kmodel: "Qoder K-Model", dmodel: "Qoder D-Model", mmodel: "Qoder M-Model", gmodel: "Qoder G-Model" },
+    /* 「恢复默认模型」只装免费档 lite：按这个按钮不该让用户开始烧积分。 */
+    defaultModels: ["lite"],
+    mappingDefaults: {
+      "claude-fable-5": "Qoder Lite",
+      "claude-sonnet-5": "Qoder Lite",
+      "claude-opus-5": "Qoder Lite",
+      "claude-haiku-4-5": "Qoder Lite",
+    },
+
+    conclusion: "补丁已装 + Qoder 客户端在跑、令牌文件是新鲜的，就算就绪；四档默认全走免费档 lite。",
+    remedy: "先点「一键装补丁」再启动 Qoder 桌面端并保持运行。令牌每次客户端启动会轮换，中转自动跟随，无需手动粘贴。",
+
+    settingsLabels: { relayPort: "Qoder 中转端口" },
   },
 
-  /* ================= OpenRouter（/or）—— 免费兜底区（第 6 个提供方） =================
-   * 定位（用户原话）：「没有任何模型可用时的兜底」——所以在故障转移链里排最后。
-   * 与前五家的差别：凭据是**最多三个 key 的轮换区**，模型是**按 pricing 全 0 筛出来的
-   * 免费目录**；429 分两种（limit_source），分别换模型 / 换 key。这些逻辑在 server.mjs，
-   * 本条目只管这一页显示什么。 */
+  /* ================= B.AI（/bai）—— 转移链第 2 位 =================
+   * 主力 API 站。上游本身兼容 Anthropic 协议，不需要协议桥，CLI 可直连。 */
+  bai: {
+    key: "bai",
+    path: "/bai",
+    tab: "B.AI",
+    h1: "B.AI 路由台",
+    title: "B.AI 路由台",
+    shortName: "B.AI",
+
+    letter: "BAI",
+    name: "B.AI",
+    tagline: "主力 API 站 · 国内外模型都有",
+    badge: { text: "付费", kind: "paid" },
+    chainable: true,
+    credential: {
+      kind: "apiKey",
+      label: "API Key",
+      hint: "在上游控制台生成，形如 sk-…",
+    },
+
+    models: [
+      "claude-fable-5", "claude-fable-5.1", "claude-haiku-4.5",
+      "claude-opus-4.5", "claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5",
+      "claude-sonnet-4.5", "claude-sonnet-4.6", "claude-sonnet-5",
+      "deepseek-v4-pro", "deepseek-v4.1-flash",
+      "gemini-3-flash", "gemini-3.1-pro", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+      "gemini-3.6-flash", "gemini-3.8-flash",
+      "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
+      "gpt-5-mini", "gpt-5-nano", "gpt-5.2",
+      "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro",
+      "gpt-5.5", "gpt-5.5-instant",
+      "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+      "gpt-6-astra", "hy3", "hy4-preview",
+      "kimi-k2.6", "kimi-k3",
+      "mimo-v2.5", "mimo-v2.5-pro",
+      "minimax-m2.7", "minimax-m3",
+      "qwen3.8-27b", "qwen3.8-flash", "qwen3.8-max",
+      "claude-haiku-5.5", "claude-opus-5.5", "claude-sonnet-5.5",
+      "glm-5.3-flashx",
+      "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol",
+      "gpt-image-2", "jev-1.13.0", "jev-latest",
+      "kimi-k2.8-preview", "mimo-v2.6-flash", "mimo-v2.6-pro",
+    ],
+    brands: { qwen: "Qwen", glm: "GLM", deepseek: "DeepSeek", hy: "HY", mimo: "MiMo", kimi: "Kimi", minimax: "MiniMax" },
+    defaultModels: [],                 // 本渠道没有「恢复默认模型」按钮（无固定清单）
+    mappingDefaults: {
+      "claude-fable-5": "Qwen3.8-Flash",
+      "claude-sonnet-5": "HY3",
+      "claude-opus-5": "HY3",
+      "claude-haiku-4-5": "MiMo-V2.5",
+    },
+
+    conclusion: "面板里填了 API Key、且本地中转起得来，就算就绪；上游没探测过只算「未验」，不算故障。",
+    remedy: "先点「测试连通」探一次上游。中转按请求自带的 key 计费，面板改过 key 不会自动更新已接线的客户端 —— 要重开对应终端/桌面版。",
+
+    settingsLabels: { relayPort: "B.AI 中转端口" },
+  },
+
+  /* ================= SenseNova（/sn）—— 转移链第 3 位 =================
+   * 境内服务：CLI 直连、不需要出海代理；桌面版经由本地中转。上游兼容 Anthropic 协议。 */
+  sn: {
+    key: "sn",
+    path: "/sn",
+    tab: "SenseNova",
+    h1: "SenseNova 路由",
+    title: "SenseNova 路由 · B.AI 路由台",
+    shortName: "SenseNova",
+
+    letter: "SN",
+    name: "SenseNova",
+    tagline: "商汤日日新 · 境内直连",
+    badge: { text: "境内付费", kind: "cn" },
+    chainable: true,
+    credential: {
+      kind: "apiKey",
+      label: "API Key",
+      hint: "token-plan 密钥，形如 sk-…",
+    },
+
+    models: [
+      "deepseek-v4-flash", "glm-5.2", "kimi-k3",
+      "sensenova-6.8-flash-lite", "deepseek-flash", "deepseek-v4.1-flash",
+    ],
+    brands: { sensenova: "SenseNova", deepseek: "DeepSeek", glm: "GLM", kimi: "Kimi", neo: "Neo", u: "U" },
+    defaultModels: [],
+    mappingDefaults: {
+      "claude-fable-5": "SenseNova-6.8-Flash-Lite",
+      "claude-sonnet-5": "DeepSeek-V4-Flash",
+      "claude-opus-5": "GLM-5.2",
+      "claude-haiku-4-5": "Kimi-K3",
+    },
+
+    conclusion: "填了 token-plan 密钥、且本地中转起得来，就算就绪；境内直连，出海代理不可用不影响它。",
+    remedy: "先点「测试连通」探一次上游。SenseNova 有 TPM 限流，429 稍候再测即可；刷新模型列表时图像模型已自动排除。",
+
+    settingsLabels: { relayPort: "SenseNova 中转端口" },
+  },
+
+  /* ================= OpenCode Zen（/zen）—— 转移链第 4 位 ================= */
+  zen: {
+    key: "zen",
+    path: "/zen",
+    tab: "OpenCode Zen",
+    h1: "OpenCode Zen",
+    title: "OpenCode Zen 路由 · B.AI 路由台",
+    shortName: "OpenCode Zen",
+
+    letter: "ZEN",
+    name: "OpenCode Zen",
+    tagline: "免费模型 · 接入需自备 Key",
+    badge: { text: "免费 · 海外", kind: "intl" },
+    chainable: true,
+    credential: {
+      kind: "apiKey",
+      label: "API Key",
+      hint: "opencode.ai/console 生成，形如 oc_sk_…",
+    },
+
+    models: ["space-bunny-free"],
+    brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
+    /* 免费档里唯一能外部调用的就是 space-bunny-free，所以四档全部指向它。 */
+    defaultModels: ["space-bunny-free"],
+    mappingDefaults: {
+      "claude-fable-5": "Space-Bunny-Free",
+      "claude-sonnet-5": "Space-Bunny-Free",
+      "claude-opus-5": "Space-Bunny-Free",
+      "claude-haiku-4-5": "Space-Bunny-Free",
+    },
+
+    conclusion: "填了 oc_sk_ 密钥就算就绪；免费档只有一个模型，四档全部指向它，接通即代表四档都可用。",
+    remedy: "先在上游控制台生成 API Key 再保存。额度用尽会返回 429，由故障转移自动换渠道。",
+
+    settingsLabels: { relayPort: "OpenCode Zen 中转端口" },
+  },
+
+  /* ================= WorkBuddy（/wb）—— 转移链第 5 位 =================
+   * 凭据是从本机客户端抓的登录令牌（JWT，只存内存），上游只讲 OpenAI 协议，需要协议桥。 */
+  wb: {
+    key: "wb",
+    path: "/wb",
+    tab: "WorkBuddy",
+    h1: "WorkBuddy 路由",
+    title: "WorkBuddy 路由 · B.AI 路由台",
+    shortName: "WorkBuddy",
+
+    letter: "WB",
+    name: "WorkBuddy",
+    tagline: "腾讯 · 三款 0 积分模型",
+    badge: { text: "0 积分", kind: "cn" },
+    chainable: true,
+    credential: {
+      kind: "jwt",
+      label: "访问令牌",
+      hint: "从本机 WorkBuddy 客户端一键捕获，只存内存",
+    },
+
+    models: ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"],
+    brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
+    defaultModels: ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"],
+    mappingDefaults: {
+      "claude-fable-5": "DeepSeek-V4.1-Flash",
+      "claude-sonnet-5": "Hy4-Preview-F",
+      "claude-opus-5": "HY3",
+      "claude-haiku-4-5": "DeepSeek-V4.1-Flash",
+    },
+
+    conclusion: "捕获到 JWT 且未过期就算就绪；本渠道不比对 key（令牌由客户端带、中转只转发）。",
+    remedy: "点「一键获取令牌」重取。没有刷新令牌，到期需重新捕获；国内版与国际版按登录域名自动判定。",
+
+    settingsLabels: { relayPort: "WorkBuddy 中转端口" },
+  },
+
+  /* ================= OpenRouter（/or）—— 转移链第 6 位（兜底） =================
+   * 凭据是最多三把 key 的轮换区，模型是按 pricing 全 0 筛出来的免费目录。
+   * 429 分两种（limit_source），分别换模型 / 换 key。这些逻辑在 server.mjs。 */
   or: {
     key: "or",
     path: "/or",
     tab: "OpenRouter",
     h1: "OpenRouter 免费流水区",
-    sub: "OR · 免费模型",
     title: "OpenRouter 路由 · B.AI 路由台",
-    accentLabel: "接入",
-    primaryBtn: "一键接入 OpenRouter",
-    targetName: "OpenRouter 模型",
-    relayHint: ":15772",
-    guide: [
-      {
-        title: "填写 OpenRouter API Key",
-        desc: "在 <b>openrouter.ai/keys</b> 生成 API Key（形如 <span class=\"mono\">sk-or-v1…</span>），最多可填 <b>3 个</b>——三把 key 在下方「OpenRouter 免费流水区」里保存，页面只显示指纹、不回显明文。",
-      },
-      {
-        title: "一键接入",
-        desc: "把 Claude Code（终端 + 档位映射都指向免费模型）接到 OpenRouter 免费流水区；免费额度用尽时自动换模型、再用尽换 key。",
-      },
-    ],
-    guideEyebrow: "用法",
-    guideTitle: "接入 OpenRouter 免费兜底",
-    hint: "下拉里的模型按 OpenRouter 的 <span class=\"mono\">pricing.prompt/completion 全为 0</span> 实测筛出（<b>不能只看 <span class=\"mono\">:free</span> 后缀</b>——inclusionai/ling-3.1-flash 没有后缀但免费）。四档默认指向 <b>openrouter/free</b>（自动路由到当前可用的免费模型）；模型级限流会自动换下一个免费模型，账号级 50 次/天用尽会自动换下一把 key。",
-    settingsTitle: "OpenRouter 设置",
-    settingsAux: "上游 / 中转端口 / 通道",
-    settingsEyebrow: "设置",
-    foldKey: "bai.orsec3",
-    lamps: ["relay", "upstream", "cred"],
-    lampNames: {
-      relay: "OpenRouter 中转",
-      upstream: "OpenRouter 上游",
-      cred: "API Key",
-    },
-    lampSubs: { relay: ":15772 → 协议桥 → 上游", cred: "sk-or-v1… 密钥" },
-    extraCards: ["or-rotation"],        // 「刷新全部模型」已收缩到总览页（model-sync 只挂总览一处）
-    footNote: "OpenRouter 与 B.AI/SenseNova/WorkBuddy/Zen/Qoder 各自独立配置，共用同一个路由台服务",
-    footNoteAlt: "数据保存在 %APPDATA%\\bai-router · 与 B.AI 页共用配置存储",
-    cardEyebrow: "状态",
-    routeEyebrow: "模型",
-    routeTitle: "路由表 · 模型映射",
-    routeKey: null,                           // 密钥填在「免费流水区」卡里（三个 key 的轮换区）
-    wireHint: "接通后：终端 CLI 与桌面版都指向本地协议桥 <span id=\"hintRelayPort\">:15772</span>（CLI 讲 Anthropic 协议、OpenRouter 上游只讲 OpenAI，桥负责双向翻译）。四档 Claude 档位映射见下方路由表，模型菜单里即点即换；切换前自动快照，随时可「接回 CC Switch」或回 B.AI 页重新接通。",
+    shortName: "OpenRouter",
 
-    /* ---- v1.0.48 清单化字段（C12 强制） ---- */
-    // brand 表用于路由表里把模型 id 显示成人话（openrouter/free → Openrouter Free…）
-    brands: { openrouter: "OpenRouter", inclusionai: "InclusionAI", nvidia: "NVIDIA", google: "Google", cohere: "Cohere", thinkingmachines: "Thinking Machines", poolside: "Poolside", dots: "Dots", liquid: "Liquid", apodex: "Apodex" },
-    defaultModels: [
-      "openrouter/free",
+    letter: "OR",
+    name: "OpenRouter",
+    tagline: "免费流水区 · 两层轮换兜底",
+    badge: { text: "免费 · 海外", kind: "intl" },
+    chainable: true,
+    credential: {
+      kind: "keys3",
+      label: "API Key 轮换区",
+      hint: "最多 3 把，429 时自动换下一把",
+    },
+
+    models: [
       "inclusionai/ling-3.1-flash",
       "apodex/apodex-1.1-mini:free",
-      "inclusionai/ling-3.0-flash-sante:free",
       "dots-studio/dots-3-note-preview:free",
       "liquid/lfm-2.5-2.6b:free",
       "nvidia/nemotron-3.5-lightning:free",
@@ -483,21 +287,70 @@ window.BAI_PROVIDERS = {
       "google/gemma-4-26b-a4b-it:free",
       "google/gemma-4-31b-it:free",
       "nvidia/nemotron-3-super-120b-a12b:free",
+      "openrouter/free",
     ],
-    cred: { txtOk: "已配置", subOk: "在下方「免费流水区」管理 3 把 key", txtNone: "未配置", subNone: "在下方「免费流水区」粘贴 sk-or-v1 密钥（最多 3 把）" },
-    applyInfoMsg: "现在可以在 Claude Code 的模型菜单里选择 OpenRouter 的免费模型了（四档默认都指向 openrouter/free）。",
-    resetModelsMsg: "✔ 已恢复为发布机默认的 OpenRouter 免费模型：{list}",
-    step1Hint: "请先完成第 1 步：在下方「OpenRouter 免费流水区」里填入至少 1 个 API Key 并保存。",
-    keyMatch: "keyMatchOr",
-    shape: "nested",
-    sys: { modelsRefresh: true },             // 「刷新模型列表」→ /api/models?p=or 按 pricing 重筛免费目录
-    modelsEndpoint: null,
-    settingsLabels: { relayPort: "OpenRouter 中转端口" },
-    notices: {
-      stale: "当前有一端接在本路由台的其他渠道上——点「{btn}」会把它换过来（切换前自动快照，可一键接回）。",
-      ccSwitch: "CC Switch 正在运行——它可能随时把配置改回 15721。若 OpenRouter 突然失效，回到这里点「{btn}」恢复。",
+    brands: { openrouter: "OpenRouter", inclusionai: "InclusionAI", nvidia: "NVIDIA", google: "Google", cohere: "Cohere", thinkingmachines: "Thinking Machines", poolside: "Poolside", dots: "Dots", liquid: "Liquid", apodex: "Apodex" },
+    defaultModels: ["openrouter/free"],
+    mappingDefaults: {
+      "claude-fable-5": "OpenRouter Free",
+      "claude-sonnet-5": "OpenRouter Free",
+      "claude-opus-5": "OpenRouter Free",
+      "claude-haiku-4-5": "OpenRouter Free",
     },
-    // 别从灯名反推简称：「本地中转」会反推成「本地」、「Zen 中转」会丢掉「OpenCode」。
-    shortName: "OpenRouter",
+
+    conclusion: "至少配了 1 把 key 就算就绪；三把全在冷却才算不可用。额度接口对非免费档账号读不到用量，页面上如实说没有。",
+    remedy: "三把都冷却时会如实失败并给出重置时间，不会空转重试；可点「刷新额度」查看账号级用量，或「刷新免费模型目录」按 pricing 全 0 重筛。",
+
+    settingsLabels: { relayPort: "OpenRouter 中转端口" },
+  },
+
+  /* ================= CC Switch —— 矩阵上的「交还区」，不是本台渠道 =================
+   * 它没有独立 URL（path: null）、不进转移转移链（chainable: false）、没有凭据要配
+   * （credential.kind: "none"）。它存在的意义是：配置随时可以还回去给它。 */
+  ccswitch: {
+    key: "ccswitch",
+    path: null,                      // 不对应独立 URL，只出现在矩阵的交还区格子里
+    tab: "CC Switch",
+    h1: "CC Switch",
+    title: "CC Switch · B.AI 路由台",
+    shortName: "CC Switch",
+
+    letter: "CC",
+    name: "CC Switch",
+    tagline: "你已有的第三方配置管理器 · 配置交还的去处",
+    badge: { text: "非本台渠道", kind: "neutral" },
+    chainable: false,
+    credential: {
+      kind: "none",
+      label: "非本台渠道",
+      hint: "它自己管配置，本路由台不持有它的凭据",
+    },
+
+    models: [],                      // 不是本台渠道，没有可选模型清单
+    brands: {},                      // 同上
+    defaultModels: [],
+    mappingDefaults: {},             // 没有映射编辑区
+
+    conclusion: "它不参与本台的状态判定，只看当前是否在运行：运行中就随时可能把配置改回它自己的端口。",
+    remedy: "想让它退场：点顶部「一键最优」，或从任意渠道卡点接通；原来的接线已自动快照，随时能接回来。",
+
+    settingsLabels: { relayPort: "中转端口" },
   },
 };
+
+/* ============================================================================
+ * 视图级卡片表：四个视图各挂哪些 cards/*.js。
+ *
+ * 卡片属于**视图**而不属于渠道（旧架构的 extraCards 是每页一份，才会出现同一张卡
+ * 在总览页挂一份、各家页挂另一份的漂移）。C6 拿本表与 cards/ 目录双向对账：
+ * 本表引用了不存在的文件 = 错；目录里有文件没人引用 = 死卡。
+ *
+ * 视图 id 必须同时是三样东西：#navViews 里的 data-view、URL hash 段（#/console）、
+ * 以及本表的 id（DOM 容器 id 在 dom 字段）。C9 逐个核对。
+ * ========================================================================== */
+window.BAI_VIEWS = [
+  { id: "console", nav: "控制台", dom: "viewConsole", hint: "渠道矩阵 · 映射编辑 · 诊断抽屉", cards: ["model-sync"] },
+  { id: "cred", nav: "凭据", dom: "viewCred", hint: "每家渠道各自要的东西", cards: ["token-capture", "model-catalog", "or-rotation"] },
+  { id: "fo", nav: "故障转移", dom: "viewFo", hint: "开关 · 顺序 · 冷却", cards: ["failover"] },
+  { id: "settings", nav: "设置", dom: "viewSettings", hint: "代理 · 端口 · 更新 · 数据目录", cards: [] },
+];
