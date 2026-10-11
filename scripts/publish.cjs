@@ -60,16 +60,26 @@ try {
       const curOr = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
       if (curOr.or) def.or = { ...curOr.or, keys: [] };
     }
-    // failover（自动故障转移）：本机配置通常没有这个块（默认关闭），而快照是整体拷贝
-    // 本机 config 去覆盖 defaults.json 的——不显式保留的话，每次发布都会把它从随包快照里
-    // 冲掉。chain 顺带收敛到已知提供方（or 与 loadCfg 语义一致：兜底恒在末尾）。
+    // failover（自动故障转移）：**一律以仓库里的 config.defaults.json 为准**，不从发布机快照取。
+    // 原实现是 `def.failover || curFo.failover`——发布机的设置只要存在就赢。而「这台机器
+    // 勾没勾故障转移」是**用户偏好**，不是出厂默认：一旦发布机关着开关，每次发布都会把
+    // 随包快照里的 enabled 改成 false，发给所有新用户，等于替他们做了决定。
+    // chain 仍顺带收敛到已知提供方（与 loadCfg 语义一致：兜底恒在末尾）——仓库里写错也拦得住。
     {
       const curFo = JSON.parse(fs.readFileSync(path.join(ROOT, "src", "server", "config.defaults.json"), "utf8"));
-      const srcFo = def.failover || curFo.failover;
-      if (srcFo) {
-        const chain = (srcFo.chain || []).filter((x) => ["bai", "sn", "wb", "zen", "qd", "or"].includes(x));
-        if (chain.length && !chain.includes("or")) chain.push("or");
-        def.failover = { ...srcFo, chain };
+      if (curFo.failover) {
+        const fo = { ...curFo.failover };
+        const chain = (fo.chain || []).filter((x) => ["bai", "sn", "wb", "zen", "qd", "or"].includes(x));
+        /* 收敛后为空就原样保留仓库里写的 chain：这一段只做"剔除未知渠道 / 兜底垫末尾"，
+           不该把一份完整的出厂默认改写成空链。 */
+        if (chain.length) {
+          if (!chain.includes("or")) chain.push("or");
+          fo.chain = chain;
+        }
+        def.failover = fo;
+        console.log(`» failover 取自仓库 defaults（不跟发布机走）: enabled=${fo.enabled} chain=${(fo.chain || []).join(">")}`);
+      } else {
+        delete def.failover;   // 仓库里没写这个块，就别把发布机的带进随包快照
       }
     }
     // qd（Qoder）块：token 是手动兜底用的 jt- jobToken，绝不进快照
