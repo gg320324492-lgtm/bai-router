@@ -30,11 +30,28 @@
   const showEl = (el, on) => { if (el) el.style.display = on ? "" : "none"; };
   const cap = (s) => String(s || "").charAt(0).toUpperCase() + String(s || "").slice(1);
 
+  /* 超时是**必需的**：fetch 不自带超时，接口一慢（取上游目录首访能到 1.6s，
+     网络不好时更久）就会无限期挂着 —— 界面于是永远停在「正在读取…」，用户分不清
+     是加载慢还是已经死了。
+     opt.timeoutMs 可覆盖；默认 12s：实测 /api/status 常态 0.4s、首访取目录 1.6s，
+     12s 留足了余量又不至于让人干等到放弃。 */
   async function api(path, opts) {
-    const r = await fetch(path, opts);
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-    return j;
+    const o = opts || {};
+    const ms = o.timeoutMs || 12000;
+    try {
+      const r = await fetch(path, { ...o, signal: AbortSignal.timeout(ms) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      return j;
+    } catch (e) {
+      // 超时要能和服务故障区分开：前者是「慢」，后者是「没了」——
+      // 两者都报「已停止」是把加载慢说成崩溃，用户会白重启一次。
+      const timedOut = e && (e.name === "TimeoutError" || e.name === "AbortError");
+      const err = new Error(timedOut ? `读取超时（超过 ${Math.round(ms / 1000)} 秒）` : String((e && e.message) || e));
+      err.timedOut = !!timedOut;
+      err.path = path;
+      throw err;
+    }
   }
   const postJSON = (path, body) => api(path, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
@@ -1667,6 +1684,20 @@
            容器就跳过，动作结束后 withBusy 的 finally 会补一次 poll()，状态自然刷新。 */
     if (polling) return;
     polling = true;
+    /* 「正在读…」持续多久就说多久。骨架态下顶栏只剩一个 `—`，看起来和"没响应"
+       一模一样；超过 5 秒就明说是慢、以及卡在哪一步，用户不用干等着猜。 */
+    const slowTimer = setTimeout(() => {
+      /* 只看「本次 poll 还没回来」，**不看** status 有没有旧值。
+       * 原来判的是 !status —— 首次加载才有提示，之后每轮 poll 因为 status 早已有值而
+       * 永远不提示。可慢提示最该出现的恰恰是后者：界面还挂着**旧**数据，这次又没刷上来，
+       * 用户分不清"这就是最新的"还是"卡住了"。 */
+      const el = $("statusSentence");
+      if (el) el.textContent = status
+        ? "正在刷新本机状态…已超过 5 秒（页面显示的仍是上一次的结果）。多半是某个上游接口慢"
+        : "仍在读取本机状态…已超过 5 秒。本机实测约需 0.5 秒，若长时间不动多半是某个上游接口慢（点「诊断抽屉」可看）";
+      const svc = $("svc");
+      if (svc) svc.innerHTML = status ? '服务 <b class="off">…</b> 刷新中' : '服务 <b class="off">…</b> 读取中';
+    }, 5000);
     try {
       const s = await api("/api/status");
       status = s;
@@ -1679,13 +1710,29 @@
       for (const c of cards) {
         try { if (c.update) c.update(s, cfg); } catch (e) { console.warn("[card] " + c.name, e); }
       }
-    } catch {
-      const el = $("svc");
-      if (el) el.innerHTML = `服务 <b class="off">○</b> 已停止`;
-      setLed($("ledRelay"), "err", false);
-      const txt = $("txtRelay");
-      if (txt) txt.textContent = "已停止";
+    } catch (e) {
+      /* 超时 ≠ 服务已停。原来这里是裸 catch，一律画成「已停止」——把「慢」说成
+         「崩溃」，用户会照着提示去重启一次，而重启解决不了一个慢接口。 */
+      if (e && e.timedOut) {
+        const el = $("statusSentence");
+        // e.message 已经是「读取超时（超过 12 秒）」，不要再套一层造成「读取超时（读取超时…」
+        if (el) el.textContent = `${e.message}。服务可能仍在运行，只是某个接口没响应——先别急着重启，等下一轮轮询或点「诊断抽屉」`;
+        const svc = $("svc");
+        if (svc) svc.innerHTML = '服务 <b class="off">…</b> 读取超时';
+        setLed($("ledRelay"), "warn", true);
+        const txt = $("txtRelay");
+        if (txt) txt.textContent = "读取超时";
+      } else {
+        const el = $("svc");
+        if (el) el.innerHTML = `服务 <b class="off">○</b> 已停止`;
+        setLed($("ledRelay"), "err", false);
+        const txt = $("txtRelay");
+        if (txt) txt.textContent = "已停止";
+        const sent = $("statusSentence");
+        if (sent) sent.textContent = "连不上本机服务（" + String((e && e.message) || e) + "）";
+      }
     } finally {
+      clearTimeout(slowTimer);
       polling = false;
     }
   }
