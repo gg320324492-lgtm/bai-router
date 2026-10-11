@@ -1146,7 +1146,7 @@
           <div class="keybox">
             <span class="kn">3</span><input type="password" class="keyinput" autocomplete="off" placeholder="sk-or-v1…">
           </div>
-          <div class="keynote">保存会用这里填的三把**整体替换**现有轮换区——明文读不回来，
+          <div class="keynote">保存会用这里填的三把「整体替换」现有轮换区——明文读不回来，
             所以没填的格子等于删除。要保留旧 key 就得把它重新填一遍。</div>
           <button class="btn sm primary" type="button" data-act="keysave">保存三把</button>
           <button class="btn sm ghost" type="button" data-act="keycancel">取消</button>`;
