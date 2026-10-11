@@ -555,6 +555,18 @@ const SU_EXE = path.join(SU_DIR, "setup.exe");
 /* 签名校验的重试次数——理由见 downloadLatestInstaller 里那段注释（实测间歇性失败，
  * 连挂两次才通过）。3 次全败才判签名不可信。 */
 const SU_SIG_PROBE_TRIES = 3;
+/* 下载的停滞看门狗 / 重试参数。
+ *
+ * 实测（v1.0.71 升 1.0.71 时）：下载到 81MB/111MB 停住，**290 秒零进展**，界面一直
+ * 显示「下载中」，既不报错也不超时。那是因为 AbortSignal.timeout(15 分钟) 管的是
+ * **整个 fetch 含读流**，连接半死不活时它不主动中止。curl 独立复现也是随机中断
+ * （300 秒超时处只下了 10MB），断点不固定。
+ *
+ * 30 秒没新数据就掐掉重试：正常下载是 MB/s 级，30 秒零字节已经明确是死了；
+ * 掐早了最多多一次 Range 请求（几秒），掐晚了用户就一直干等。 */
+const SU_DL_STALL_MS = 30 * 1000;
+const SU_DL_ATTEMPTS = 5;
+const SU_DL_RETRY_MS = 1500;
 /* PowerShell 的 stderr 带 ANSI 颜色码，直接塞进错误信息会显示成一串 [31;1m。剥掉。 */
 const suPlain = (s) => String(s || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
 
@@ -571,37 +583,110 @@ async function downloadLatestInstaller() {
   if (!rel || !rel.tag_name) throw new Error("查询最新 release 失败（多为 GitHub 不可达，开代理后重试）");
   const asset = (rel.assets || []).find((a) => /^BARRouter-Setup-.+\.exe$/.test(a.name));
   if (!asset) throw new Error("release 里没有安装包资产");
-  suState({ phase: "downloading", version: rel.tag_name, file: asset.name, got: 0, total: asset.size || 0, percent: 0 });
-  const fr = await fetch(asset.browser_download_url, {
-    headers: { "user-agent": "bai-router-selfupdate" },
-    signal: AbortSignal.timeout(15 * 60 * 1000),
-  });
-  if (!fr.ok || !fr.body) throw new Error("下载失败 HTTP " + fr.status);
+  const total = Number(asset.size) || 0;
   const { Readable } = await import("node:stream");
-  const { createHash } = await import("node:crypto");
-  const hash = createHash("sha512");
-  const total = Number(fr.headers.get("content-length") || asset.size || 0);
-  let got = 0, lastTick = 0;
-  const ws = createWriteStream(SU_EXE);
-  try {
-    for await (const chunk of Readable.fromWeb(fr.body)) {
-      if (!ws.write(chunk)) await new Promise((r) => ws.once("drain", r));
-      hash.update(chunk);
-      got += chunk.length;
-      if (Date.now() - lastTick > 500) {
-        lastTick = Date.now();
-        suState({ phase: "downloading", version: rel.tag_name, file: asset.name, got, total, percent: total ? Math.floor((got / total) * 100) : 0 });
+
+  /* 下载：带停滞看门狗 + 断点续传 + 重试（v1.0.71 实测修）。
+   *
+   * 原实现是 `fetch(url, { signal: AbortSignal.timeout(15 分钟) })` 然后一路 for await。
+   * 那个 15 分钟覆盖的是**整个 fetch 含读流**，不是只管响应头——连接半死不活时
+   * （上游不再发数据、TCP 没断、也没报错）它不主动中止，要等流自己结束。
+   * 实测踩到：下载到 81MB / 111MB 时停住，**290 秒零进展**，界面一直显示「下载中」，
+   * 不报错也不超时，能一直挂下去。用 curl 独立复现也是随机中断（300 秒超时处只下了 10MB），
+   * 中断点不固定——是网络对大文件的随机掐断，不是某个特定问题。
+   *
+   * 三件事一起上：
+   *   · 停滞看门狗：连续 SU_DL_STALL_MS 没收到新数据就主动掐掉本次请求，
+   *     而不是等那个 15 分钟的大超时。
+   *   · 断点续传：重试时带 Range 从已有字节继续（实测有效，靠它 6 次续传才拼完 106MB）。
+   *   · 重试 SU_DL_ATTEMPTS 次；每次失败在状态里如实说明，不让界面干等着。
+   */
+  const dlOne = async (from) => {
+    const ctl = new AbortController();
+    const headers = { "user-agent": "bai-router-selfupdate" };
+    if (from > 0) headers.Range = `bytes=${from}-`;
+    const fr = await fetch(asset.browser_download_url, { headers, signal: ctl.signal });
+    if (fr.status === 200 && from > 0) throw new Error("HTTP 200");  // 服务端无视了 Range → 本次白来，重新从头
+    if (fr.status !== 200 && fr.status !== 206) throw new Error("下载失败 HTTP " + fr.status);
+    if (!fr.body) throw new Error("下载失败：响应没有内容");
+    const got0 = from;
+    let got = got0, lastTick = 0;
+    /* 停滞看门狗：**独立定时器**，不是 for-await 循环里的一个 if。
+     *
+     * 这是本次修复里最要紧的一处。第一版把检测写进循环体、只在收到 chunk 时判断，
+     * 结果真停滞（上游一个字节都不再发）时循环根本不产出 → 检测永远不触发 →
+     * 又变回"永远挂着等 15 分钟"。是本地 HTTP 服务真造了一次停滞才发现的。
+     *
+     * 定时器跑在事件循环上，与有没有数据无关：到点没被清掉就说明确实卡住了。 */
+    let stalled = false;
+    let lastData = Date.now();   // 定时器闭包要用，必须先声明
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastData > SU_DL_STALL_MS) {
+        stalled = true;
+        ctl.abort();
+      }
+    }, Math.min(2000, SU_DL_STALL_MS / 4));
+    const ws = createWriteStream(SU_EXE, { flags: from > 0 ? "a" : "w" });
+    try {
+      for await (const chunk of Readable.fromWeb(fr.body)) {
+        if (!ws.write(chunk)) await new Promise((r) => ws.once("drain", r));
+        got += chunk.length;
+        lastData = Date.now();
+        if (Date.now() - lastTick > 500) {
+          lastTick = Date.now();
+          suState({ phase: "downloading", version: rel.tag_name, file: asset.name, got, total, percent: total ? Math.floor((got / total) * 100) : 0 });
+        }
+      }
+    } catch (e) {
+      if (stalled) throw new Error(`停滞超过 ${Math.round(SU_DL_STALL_MS / 1000)} 秒（停在 ${Math.floor((got / 1048576))}MB）`);
+      throw e;
+    } finally {
+      clearInterval(watchdog);
+      ws.end();
+    }
+    await new Promise((r) => ws.once("close", r));
+    return got;
+  };
+
+  // 从头开始（上一轮可能留了半截）
+  try { rmSync(SU_EXE, { force: true }); } catch { /* 没有旧文件就没什么可清 */ }
+  suState({ phase: "downloading", version: rel.tag_name, file: asset.name, got: 0, total, percent: 0 });
+  let got = 0;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= SU_DL_ATTEMPTS; attempt++) {
+    try {
+      got = await dlOne(got);
+      if (!total || got >= total) break;
+      lastErr = new Error(`只收到 ${got}/${total} 字节`);
+    } catch (e) {
+      lastErr = e;
+      const msg = String((e && e.message) || e).slice(0, 140);
+      log(`备用升级：下载中断（第 ${attempt}/${SU_DL_ATTEMPTS} 次）：${msg}`);
+      // 断点就是当前已落盘的字节数；拿不到就退回去读文件大小
+      let onDisk = 0;
+      try { onDisk = statSync(SU_EXE).size; } catch { }
+      got = onDisk;
+      if (attempt < SU_DL_ATTEMPTS) {
+        suState({
+          phase: "downloading", version: rel.tag_name, file: asset.name, got, total,
+          percent: total ? Math.floor((got / total) * 100) : 0,
+          retryIn: SU_DL_RETRY_MS,
+        });
+        await new Promise((r) => setTimeout(r, SU_DL_RETRY_MS));
       }
     }
-  } finally {
-    ws.end();
   }
-  await new Promise((r) => ws.once("close", r));
+  if (total && got < total) {
+    throw new Error(`下载未完成（${Math.floor(got / 1048576)}MB / ${Math.floor(total / 1048576)}MB，`
+      + `已重试 ${SU_DL_ATTEMPTS} 次）：${String((lastErr && lastErr.message) || lastErr || "").slice(0, 120)}`);
+  }
   suState({ phase: "verifying", version: rel.tag_name, percent: 100, got, total });
-  // ① sha512 与 release feed（latest.yml）比对
+  // ① sha512 与 release feed（latest.yml）比对。**对已落盘的整份文件算**——
+  //    分段续传时 hash 必须最后一次性算，否则跨段拼不出正确的摘要。
+  const { createHash } = await import("node:crypto");
   const yml = await (await fetch(`https://github.com/${SU_REPO}/releases/latest/download/latest.yml`, { signal: AbortSignal.timeout(20000) })).text();
   const mm = String(yml).match(/^sha512:\s*(.+)$/m);
-  const digest = hash.digest("base64");
+  const digest = createHash("sha512").update(readFileSync(SU_EXE)).digest("base64");
   if (mm && digest !== mm[1].trim()) throw new Error("安装包 sha512 校验不匹配");
   // ② Authenticode 发布者校验（只取 Subject 字符串，不走 JSON——避开 electron-updater 同款深度截断坑）
   /* v1.0.68 实测这段**间歇性**失败，代码与环境都相同：已装版 + 已装版 Electron 连挂两次、
