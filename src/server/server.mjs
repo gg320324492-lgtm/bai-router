@@ -25,6 +25,8 @@ const DATA_DIR = process.env.BAI_DATA_DIR || HERE;
 const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 const LOG_FILE = path.join(DATA_DIR, "server.log");
 const APP_VERSION = process.env.APP_VERSION || "dev";
+/* 自己这个文件跑在哪 —— 面板与日志靠它回答"现在服务我的是哪一份代码"。 */
+const SERVER_SELF = fileURLToPath(import.meta.url);
 try { mkdirSync(DATA_DIR, { recursive: true }); } catch { }
 // 首启：用户目录还没有 config → 从随包默认配置（或绿色模式旧 config）复制一份
 try {
@@ -4317,7 +4319,21 @@ async function statusPayload() {
   const orKeysNow = orKeys(cfg);
   return {
     now: new Date().toISOString(),
-    service: { up: true, uptimeSec: Math.floor((Date.now() - BOOT) / 1000), pid: process.pid },
+    /* 自报身份：版本 + 实际跑的是哪个文件。
+     *
+     * 为什么要这个：本项目可以同时存在「已安装版」和「源码构建」，两者共用同一个
+     * 单实例锁，**后启动的那个会静默退出**，面板却由先跑的那个继续服务。于是
+     * 「我明明在跑源码，怎么行为像旧版」就成了只能靠猜的事——v1.0.67 实测就栽在
+     * 这里：源码实例被已安装版挤掉，之后所有请求都打在 v1.0.64 上，面板看着一切正常。
+     *
+     * script 是**决定性**证据：已安装版是 …\Programs\B.AI Router\resources\server\server.mjs，
+     * 源码构建是 <仓库>\src\server\server.mjs，一眼可分。version 则说明它落后几版。 */
+    service: {
+      up: true, uptimeSec: Math.floor((Date.now() - BOOT) / 1000), pid: process.pid,
+      version: APP_VERSION,
+      script: SERVER_SELF,
+      build: /[\\/]resources[\\/]server[\\/]/i.test(SERVER_SELF) ? "installed" : "source",
+    },
   failover: { enabled: cfg.failover?.enabled === true, chain: cfg.failover?.chain || [], cooling: failoverSnapshot() },
     panel: { port: cfg.panelPort, up: true },
     clash,

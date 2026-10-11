@@ -72,6 +72,70 @@ const startMin = process.argv.includes("--min");
 
 // ---------- 单实例 ----------
 // BAI_SELFHEAL=1 的子进程（从旧副本一键切到正式版）会等旧实例退出后再拿锁
+
+/* 输掉单实例锁时，把「谁赢了」查出来如实说，然后才退出。
+ *
+ * 原来这里是 `app.quit()`，一句话都没有——本机实测踩出来的后果是：已安装版先跑、
+ * 源码构建后启，源码静默退出（exit 0），面板继续由已安装版服务。之后所有操作
+ * （含注入客户端脚本那种会改磁盘的）都打在旧版上，而面板看着一切正常，
+ * 要到行为对不上时才会发现，而那时已经很难想起是"我启动了两个"。
+ *
+ * Electron 的单实例锁不暴露持有者是谁，但对面那个实例的 /api/status 自报身份
+ * （版本 + 实际跑的是哪个文件），够用了。查不到就照旧静默退出——宁可少说一句，
+ * 也不能弹一个说错话的框。
+ *
+ * **必须等它走完再退出**：`/api/status` 是异步的，而 dialog 必须在这个进程还活着时
+ * 才弹得出来。第一版写成 `tellWhoWonTheLock(); app.quit();`，结果 quit 先跑，
+ * 框一次都没出现过——是起第二个实例实测抓到的（进程立刻消失，不是等用户点）。
+ * 所以返回 Promise，调用方 await 完（或超时兜底）再 quit。
+ */
+function tellWhoWonTheLock() {
+  let panelPort2 = panelPort;
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "config.json"), "utf8"));
+    if (c && c.panelPort) panelPort2 = c.panelPort;
+  } catch { /* 用默认值即可 */ }
+  const fallback = "本次启动已放弃；面板与中转仍由那个实例提供。";
+  const show = (detail) => new Promise((resolve) => {
+    // showMessageBox 不带 parent 时是异步的，必须显式等它关掉，否则 quit 会把它一起带走
+    try {
+      const r = dialog.showMessageBox(
+        { type: "info", title: "已经有另一个 B.AI 路由台在运行", message: "已经有另一个 B.AI 路由台在运行", detail, buttons: ["知道了"] },
+        () => resolve()
+      );
+      if (r && typeof r.then === "function") r.then(() => resolve(), () => resolve());
+    } catch { resolve(); }
+    setTimeout(resolve, 20000);   // 兜底：绝不能因为弹框异常而卡住不退出
+  });
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (detail) => { if (settled) return; settled = true; show(detail).then(resolve); };
+    try {
+      const req = require("http");
+      const rq = req.get({ host: "127.0.0.1", port: panelPort2, path: "/api/status", timeout: 2500 }, (res) => {
+        let buf = "";
+        res.on("data", (d) => { buf += d; });
+        res.on("end", () => {
+          try {
+            const sv = (JSON.parse(buf).service) || {};
+            const build = sv.build === "source" ? "源码构建" : "安装版";
+            finish(
+              "本次启动已放弃——面板与中转仍由那个实例提供，你看到的一切都属于它。\n\n"
+              + "它正在跑的版本：" + (sv.version || "(未知)") + "（" + build + "）\n"
+              + "它跑的文件：" + (sv.script || "(未知)") + "\n"
+              + "进程 PID：" + (sv.pid || "?") + "\n\n"
+              + "如果那是旧版：把它完全退出（托盘图标右键退出）再启动这一份；"
+              + "如果是另一份构建：两者只能留一个，中转端口和配置目录都是共用的。"
+            );
+          } catch { finish(fallback); }
+        });
+      });
+      rq.on("error", () => finish(fallback));
+      rq.on("timeout", () => { try { rq.destroy(); } catch { } finish(fallback); });
+    } catch { finish(fallback); }
+  });
+}
+
 function startApp() {
   app.on("second-instance", () => showWindow());
   main().catch((e) => { dialog.showErrorBox("B.AI 路由台启动失败", String((e && e.stack) || e)); app.quit(); });
@@ -84,7 +148,8 @@ if (!app.requestSingleInstanceLock()) {
       else if (++lockTries >= 40) { clearInterval(lockTimer); app.quit(); }
     }, 500);
   } else {
-    app.quit();
+    // 必须 await：弹框要在这个进程还活着时才有意义，先 quit 就一次都弹不出来。
+    Promise.resolve(tellWhoWonTheLock()).then(() => app.quit(), () => app.quit());
   }
 } else {
   startApp();

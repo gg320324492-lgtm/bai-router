@@ -1803,10 +1803,22 @@
    * 16. 页脚 + 桌面事件
    * ==================================================================== */
   function wireFooter() {
-    if (has("verTxt") && window.baiDesktop) {
-      api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
-    } else if (has("verTxt")) {
-      api("/api/version").then((v) => { $("verTxt").textContent = "v" + v.version; }).catch(() => { });
+    /* 页脚版本号改从 /api/status 的 service 取，不再单走 /api/version——
+     * 多带出「这份代码跑在哪、是安装版还是源码构建」。
+     *
+     * 为什么值得占一行：已安装版与源码构建共用同一个单实例锁，后启动的那个**静默退出**，
+     * 面板由先跑的那个继续服务，两边看着都正常。v1.0.67 实测就栽在这儿——源码实例被
+     * 已安装版挤掉，之后所有请求都打在旧版上，页脚却只是「v1.0.64」，
+     * 不刻意去比对根本发现不了。鼠标悬停给出完整脚本路径，那才是决定性证据。 */
+    if (has("verTxt")) {
+      api("/api/status").then((s) => {
+        const sv = (s && s.service) || {};
+        if (!sv.version) return;
+        const isSrc = sv.build === "source";
+        $("verTxt").textContent = "v" + sv.version + (isSrc ? " · 源码" : " · 安装版");
+        $("verTxt").title = "正在服务本面板的进程：\n" + (sv.script || "(未知)")
+          + "\nPID " + (sv.pid || "?") + " · 已运行 " + (sv.uptimeSec || 0) + " 秒";
+      }).catch(() => { });
     }
     if (has("footPaths")) {
       $("footPaths").textContent = ALL_KEYS
