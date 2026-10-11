@@ -1217,6 +1217,29 @@
         items.push({ s: "idle", t: `${nameOf(key)}：${P.conclusion || ""}`.trim(), m: P.remedy || "" });
         continue;
       }
+      /* 令牌归属不符：**最高优先级**，排在"上游连不上"之前。
+       * 这类错配其它信号全都指错方向——版别判定读的是本版登录文件（对的），
+       * 令牌取自 config.json（历史遗留的另一版令牌，没人核对），
+       * 而"能拉到 N 个模型"也证明不了什么：/v3/config 不校验令牌。
+       * 结果面板一片正常，实际每次请求都被上游网关 401。 */
+      const own = (S.token || {}).ownership || null;
+      if (own && own.state === "mismatch") {
+        /* 去哪一版重抓由清单给（counterpart），渲染层不写死渠道名——C11 就是管这个的。 */
+        const cpKey = P.counterpart || "";
+        const cp = cpKey ? MANIFEST[cpKey] : null;
+        items.push({
+          s: "err",
+          t: `${nameOf(key)} 装的是另一个账号的令牌`,
+          m: `配置里的令牌自称属于账号 ${own.tokenSub}…，`
+            + `而本版登录文件（${own.authFile}）里的账号是 ${own.authUid}…——两者对不上。\n`
+            + `这个渠道的每次请求都会被上游网关拒绝（401），但面板此前看不出来：`
+            + `版别判定读的是本版登录文件、判出来是对的；"能拉到模型列表"也证明不了什么，`
+            + `因为模型目录接口根本不校验令牌。\n`
+            + (cp ? `怎么办：打开「${cp.shortName || cp.name || cpKey}」客户端，到本页点「一键获取令牌」重新抓一次`
+                   + `（两版登录文件不同，别抓错版）。` : `怎么办：到本页点「一键获取令牌」重新抓一次。`),
+        });
+        continue;
+      }
       if (up.tested === false) {
         items.push({ s: "err", t: `${nameOf(key)} 上游连不上：${up.error || "未知错误"}`, m: P.remedy || "" });
       } else if (fresh && rl.message) {

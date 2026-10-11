@@ -217,6 +217,9 @@ window.BAI_PROVIDERS = {
    * 国际版是下一条 wbai，两版各自独立的中转端口与独立的令牌，不要互相自愈。 */
   wb: {
     key: "wb",
+    // 同一产品的另一版别。令牌归属对不上时要提示"去另一版重抓"，
+    // 而渲染层不许写死渠道名（C11），所以这条指向关系写在清单里。
+    counterpart: "wbai",
     path: "/wb",
     tab: "WorkBuddy",
     h1: "WorkBuddy 路由",
@@ -257,6 +260,7 @@ window.BAI_PROVIDERS = {
    * **不要把这里的三个 id 当成真实目录**。 */
   wbai: {
     key: "wbai",
+    counterpart: "wb",        // 见 wb.counterpart
     path: "/wbai",
     tab: "WorkBuddy AI",
     h1: "WorkBuddy AI 路由",
@@ -288,7 +292,7 @@ window.BAI_PROVIDERS = {
     // caveat：卡片上直接显示的限制提示（短句版）。完整解释在 conclusion/remedy 里。
     // 闸门 C1/C12 只校验必填字段的**存在**，不禁止额外字段，所以加这个是安全的。
     caveat: "国际版上游对 Claude Code 的长 system 做了内容风控：目录/倍率/切换正常，真实对话可能被拒（400）",
-    remedy: "先启动**国际版**客户端（国内版那个不行，两者令牌文件不同）再点「一键获取令牌」。没有刷新令牌，到期需重新捕获。模型清单以面板「刷新模型列表」从上游拉到的为准，本格出厂的三项只是兜底。真实对话若报上面那个 400，是上游风控而非本机配置问题——国内版 WorkBuddy（/wb）没有此限制，可用。",
+    remedy: "先启动「国际版」客户端（国内版那个不行，两者令牌文件不同）再点「一键获取令牌」。没有刷新令牌，到期需重新捕获。模型清单以面板「刷新模型列表」从上游拉到的为准，本格出厂的三项只是兜底。真实对话若报上面那个 400，是上游风控而非本机配置问题——国内版 WorkBuddy（/wb）没有此限制，可用。",
 
     settingsLabels: { relayPort: "WorkBuddy AI 中转端口" },
   },

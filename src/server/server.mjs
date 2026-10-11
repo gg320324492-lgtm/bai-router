@@ -302,11 +302,14 @@ function wbEditionOfDomain(domain) {
   return host === "workbuddy.ai" || host.endsWith(".workbuddy.ai") ? "intl" : "cn";
 }
 
-// 纯函数：在候选目录里读**指定版别**的登录文件（契约 v18 里程碑 1b：各读各的，不再二选一）。
-// 只认精确文件名 <id>.info——`*.logged-out`（已登出）与 `<id>.<ISO时间戳>….info`
-// （历史快照，本机实测各有其例）一律排除。
-// 返回 { id, file, domain } 或 null；文件损坏就顺位试下一个候选目录。
-function wbReadAuthDomain(authDirs, id) {
+/* 纯函数：在候选目录里读**指定版别**的登录文件（契约 v18 里程碑 1b：各读各的，不再二选一）。
+ * 只认精确文件名 <id>.info——`*.logged-out`（已登出）与 `<id>.<ISO时间戳>….info`
+ * （历史快照，本机实测各有其例）一律排除。
+ * 返回 { id, file, domain, uid } 或 null；文件损坏就顺位试下一个候选目录。
+ * uid 是这份登录态所属的账号（account.uid），令牌归属核对要用它。
+ * 只读 domain 与 uid 两个字段——accessToken 是 {$wbEncrypted:1, envelope:…} 加密信封，
+ * 这个文件里取不到明文，也不需要取。 */
+function wbReadAuthFile(authDirs, id) {
   if (!authDirs || !authDirs.length) return null;
   const base = id + ".info";
   for (const dir of authDirs) {
@@ -318,7 +321,8 @@ function wbReadAuthDomain(authDirs, id) {
     try {
       const j = JSON.parse(readFileSync(f, "utf8"));
       const d = j && j.auth && typeof j.auth.domain === "string" ? j.auth.domain.trim() : "";
-      return { id, file: f, domain: d || null };
+      const u = j && j.account && typeof j.account.uid === "string" ? j.account.uid.trim() : "";
+      return { id, file: f, domain: d || null, uid: u || null };
     } catch { /* 这份坏了就试下一个目录 */ }
   }
   return null;
@@ -334,11 +338,12 @@ function wbDetectAuth(p) {
   const now = Date.now();
   const hit = wbAuthCache.get(key);
   if (hit && now - hit.at < 1500) return hit.res;
-  const found = wbReadAuthDomain(dirs, id);
+  const found = wbReadAuthFile(dirs, id);
   const res = {
     authDir: found ? path.dirname(found.file) : dirs[0],
     file: found ? found.file : null,
     domain: found ? found.domain : null,
+    uid: found ? found.uid : null,
     // "cn" | "intl" | null。判据仍是登录域名（.ai → intl，其余 → cn），
     // 但**只读本版那一份文件**——另一版的登录态不该影响本渠道。
     edition: found && found.domain ? wbEditionOfDomain(found.domain) : null,
@@ -346,6 +351,37 @@ function wbDetectAuth(p) {
   wbAuthCache.set(key, { at: now, res });
   if (wbAuthCache.size > 8) wbAuthCache.clear();
   return res;
+}
+
+/* 令牌归属核对：配置里的令牌**自称属于哪个账号**，对不对得上这一版登录文件里的账号。
+ *
+ * 为什么需要它（v1.0.67 实测踩出来的）：wb 槽位里装的是**国际版**的令牌，
+ * 而面板当时报的是 `token.configured=true, expiresInDays=360`——看着一切正常。
+ * 实际上国内所有主机对它的请求都是网关 401，这个渠道从来没通过过。
+ *
+ * 为什么这种错配能一路溜过去：三个信号全都指错方向——
+ *   ① 版别判定读的是**国内登录文件**，判出 `edition:"cn"`，对的；
+ *   ② 令牌取自 **config.json**，而那份是历史遗留的国际版令牌，没人核对过；
+ *   ③ "能拉到 N 个模型"也证明不了什么——`/v3/config` **不校验令牌**，
+ *      拿国际版令牌打国内、拿国内令牌打国际，都返回 200 code=0。
+ * 三个信号互不交叉，于是"就绪"是假的。
+ *
+ * 判据：JWT 的 sub（令牌自称的签发对象） vs 登录文件的 account.uid。
+ * 任一侧读不到就报 unknown 而不是 match——读不到不等于对得上。 */
+function wbTokenOwnership(p, cfg) {
+  const c = cfg || loadCfg();
+  const w = (p === "wbai" ? c.wbai : c.wb) || {};
+  const auth = wbDetectAuth(p);
+  const sub = wbTokenSub(w.accessToken);
+  const uid = auth && auth.uid;
+  const base = {
+    tokenSub: sub ? sub.slice(0, 8) : null,
+    authUid: uid ? uid.slice(0, 8) : null,
+    authFile: auth && auth.file ? path.basename(auth.file) : null,
+  };
+  if (!w.accessToken) return { state: "no-token", ...base };
+  if (!sub || !uid) return { state: "unknown", ...base };
+  return { state: sub === uid ? "match" : "mismatch", ...base };
 }
 
 // 自愈覆盖（供 loadCfg 的两条返回路径共用）：**仅当当前 upstream 恰好等于另一版的默认值**
@@ -1041,13 +1077,27 @@ function directHttp(target, { method, headers, body, timeoutMs }) {
 // WorkBuddy 上游（www.workbuddy.ai/v2/chat/completions）只讲 OpenAI 协议且仅支持流式；
 // 这里把 Claude Code 的 /v1/messages 请求翻译过去，再把 OpenAI SSE 流翻回 Anthropic SSE。
 
-function wbTokenExp(tok) {
+/* 解 JWT 载荷（**不验签**，只取声明里的字段做诊断）。
+ * 验不验签跟我们要回答的问题无关：要判断的是「这串令牌是谁的」，
+ * 而 sub 是令牌自己声明的签发对象——要的正是"它自称是谁"，
+ * 拿去和登录文件里的 account.uid 对一下即可。 */
+function wbJwtPayload(tok) {
   try {
-    const seg = String(tok).split(".")[1];
+    const seg = String(tok || "").split(".")[1];
     if (!seg) return null;
     const p = JSON.parse(Buffer.from(seg.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
-    return typeof p.exp === "number" ? p.exp : null;
+    return p && typeof p === "object" ? p : null;
   } catch { return null; }
+}
+function wbTokenExp(tok) {
+  const p = wbJwtPayload(tok);
+  return p && typeof p.exp === "number" ? p.exp : null;
+}
+/** 令牌自称的账号 id（JWT 的 sub）。不是 JWT / 取不到就 null。 */
+function wbTokenSub(tok) {
+  const p = wbJwtPayload(tok);
+  const s = p && p.sub;
+  return typeof s === "string" && s ? s : null;
 }
 async function readAllBody(r) {
   if (!r || !r.body) return "";
@@ -4312,6 +4362,9 @@ async function statusPayload() {
         expAt: wbExp ? new Date(wbExp * 1000).toISOString() : null,
         expiresInDays: wbExp ? Math.max(0, Math.round((wbExp * 1000 - Date.now()) / 86400000)) : null,
         hasRefresh: !!cfg.wb?.refreshToken,
+        // 令牌自称的账号 vs 国内登录态里的账号。不一致 = 装错了频道的令牌，
+        // 而这种错配其它信号全都指错方向（见 wbTokenOwnership 的注释）。
+        ownership: wbTokenOwnership('wb', cfg),
       },
     },
     // WorkBuddy 国际版（wbai，里程碑 1b 新增）：与 wb 结构完全对称，但读**自己的**登录文件
@@ -4326,6 +4379,7 @@ async function statusPayload() {
         expAt: wbaiExp ? new Date(wbaiExp * 1000).toISOString() : null,
         expiresInDays: wbaiExp ? Math.max(0, Math.round((wbaiExp * 1000 - Date.now()) / 86400000)) : null,
         hasRefresh: !!cfg.wbai?.refreshToken,
+        ownership: wbTokenOwnership('wbai', cfg),
       },
     },
     // OpenRouter（第 6 家）：三盏灯 + 两层轮换状态 + 额度真相（「免费流水区」卡读这里）
