@@ -6,7 +6,7 @@ import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync, createWriteStream, readdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, copyFileSync, renameSync, statSync, createWriteStream, readdirSync, rmSync } from "node:fs";
 import { promises as fsPromises } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,16 +78,52 @@ const resolveChannelKey = (raw) => (CHANNELS.includes(raw) ? raw : "bai");
 const PASS_HEADERS = ["authorization", "content-type", "anthropic-version", "anthropic-beta", "x-api-key", "accept", "user-agent"];
 
 const BOOT = Date.now();
+
+/* 日志轮转：按大小滚动，保留一份 .old，超出就截断。
+ *
+ * 三处日志（server.log / server-child.log / app.log）原来各自为政，都有问题：
+ *   · server.log      超过 256KB 就清空 —— 而且**每写一行都把整个文件读进内存再重写一遍**，
+ *                      144KB 的文件意味着每次 log() 都是一次全量读写；
+ *   · server-child.log 子进程 stdout/stderr 裸 fd 追加，**完全没有上限**（实测涨到 1.5MB+）；
+ *   · app.log         同样没有上限。
+ * 三者共同点是只增不减，跑久了就成死重量。
+ *
+ * 方案选「保留一份 .old」而不是删掉最旧一段：日志的价值几乎全在最近一次事故里，
+ * 保留上一份旧文能在「本轮已经把现场刷掉」时还看得到之前发生了什么。两份加起来
+ * 有界（上限约 2×ROTATE_BYTES），且 .old 由本进程自己写，不会被第二个实例并发追加。
+ *
+ * 阈值只在**追加前**查一次大小：statSync 比读全文便宜，且日志本身不是关键路径，
+ * 多几 KB 无所谓——要的是有界，不是精确。
+ */
+const ROTATE_BYTES = 1024 * 1024;   // 1MB：比原来的 256KB 宽松，够装几十次完整事故
+const ROTATE_KEEP = 1;              // 保留几份旧文（1 = 只留上一份）
+/** 第 i 份旧文的名字：i=1 → `.old`，i=2 → `.old.1`（数字越小越新，与主流程读法一致）。 */
+const oldName = (file, i) => (i === 1 ? file + ".old" : `${file}.old.${i - 1}`);
+/** 需要时滚动。返回 true 表示调用方接下来该新建当前文件。 */
+function rotateIfNeeded(file) {
+  try {
+    if (!existsSync(file)) return false;
+    if (statSync(file).size < ROTATE_BYTES) return false;
+    // 从最旧的那份开始腾位置，否则 rename 会把旧内容覆盖掉
+    for (let i = ROTATE_KEEP; i >= 1; i--) {
+      const from = i === 1 ? file : oldName(file, i - 1);
+      const to = oldName(file, i);
+      if (existsSync(from)) { try { rmSync(to, { force: true }); } catch { } renameSync(from, to); }
+    }
+    return true;
+  } catch { return false; }
+}
+/** 追加一行，必要时先滚动。**不读全文**。 */
+function appendLog(file, line) {
+  try {
+    if (rotateIfNeeded(file)) writeFileSync(file, "");   // 滚动完就开新的
+    appendFileSync(file, line + "\n");
+  } catch { /* 日志写不出去不该影响主流程 */ }
+}
 function log(...a) {
   const line = `[${new Date().toISOString()}] ${a.join(" ")}`;
-  try { appendLine(); } catch {}
+  appendLog(LOG_FILE, line);
   console.log(line);
-  function appendLine() {
-    try {
-      if (existsSync(LOG_FILE) && statSync(LOG_FILE).size > 262144) writeFileSync(LOG_FILE, "");
-      writeFileSync(LOG_FILE, readFileSync(LOG_FILE, "utf8") + line + "\n");
-    } catch { writeFileSync(LOG_FILE, line + "\n"); }
-  }
 }
 
 // ---------- 配置 ----------

@@ -259,8 +259,17 @@ function spawnServer() {
     APP_VERSION: app.getVersion(),
   };
   // 子进程 stdout/stderr 落盘（server-child.log）——崩溃原因不再丢失
+  // 滚动放在 spawn 之前：追加发生在**子进程**里（stdio 直通 fd），主进程这边
+  // 只能在"开句柄"这一瞬间干预。窗口是每次服务重启，不是每行日志——够用。
   let fd = null;
-  try { fd = fs.openSync(path.join(DATA_DIR, "server-child.log"), "a"); } catch { }
+  try {
+    const childLog = path.join(DATA_DIR, "server-child.log");
+    if (fs.existsSync(childLog) && fs.statSync(childLog).size >= 1024 * 1024) {
+      try { fs.rmSync(childLog + ".old", { force: true }); } catch { }
+      fs.renameSync(childLog, childLog + ".old");
+    }
+    fd = fs.openSync(childLog, "a");
+  } catch { }
   const born = Date.now();
   try {
     if (runtimeSystem && runtimeNodePath) child = spawn(runtimeNodePath, [SERVER_JS], { cwd: path.dirname(SERVER_JS), env, stdio: ["ignore", fd, fd], windowsHide: true });
@@ -304,7 +313,18 @@ function spawnServer() {
 let lastSpawnError = null;
 let lastRecoverNoticeAt = 0;
 function logMain(msg) {
-  try { fs.appendFileSync(path.join(DATA_DIR, "app.log"), `[${new Date().toISOString()}] ${msg}\n`); } catch { }
+  try {
+    // 与 server.mjs 的 appendLog 同一套阈值/保留策略（两处刻意重复，不共享模块：
+    // main.js 是 CJS、server.mjs 是 ESM，硬要共用得再加一层转译，不值当）。
+    const f = path.join(DATA_DIR, "app.log");
+    try {
+      if (fs.existsSync(f) && fs.statSync(f).size >= 1024 * 1024) {
+        try { fs.rmSync(f + ".old", { force: true }); } catch { }
+        fs.renameSync(f, f + ".old");
+      }
+    } catch { }
+    fs.appendFileSync(f, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch { }
 }
 
 async function respawnWithNotice() {
@@ -902,10 +922,11 @@ ipcMain.handle("diag-info", () => ({
   dataDir: DATA_DIR,
   childLog: path.join(DATA_DIR, "server-child.log"),
   appLog: path.join(DATA_DIR, "app.log"),
+  // 带上 .old：轮转之后最近一次事故往往在上一份里，只读当前文件会正好错过它。
   logs: {
-    server: tailOf(path.join(DATA_DIR, "server.log")),
-    child: tailOf(path.join(DATA_DIR, "server-child.log")),
-    app: tailOf(path.join(DATA_DIR, "app.log")),
+    server: tailOf(path.join(DATA_DIR, "server.log")) + tailOf(path.join(DATA_DIR, "server.log.old")),
+    child: tailOf(path.join(DATA_DIR, "server-child.log")) + tailOf(path.join(DATA_DIR, "server-child.log.old")),
+    app: tailOf(path.join(DATA_DIR, "app.log")) + tailOf(path.join(DATA_DIR, "app.log.old")),
   },
   panel: PANEL,
   win: require("os").release(),
