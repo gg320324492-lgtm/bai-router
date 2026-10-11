@@ -40,9 +40,13 @@ try {
     // sn（SenseNova）块：发布机 config 可能还没有（旧版未写入）或残留密钥——一律以代码默认+脱敏为准
     if (def.sn) { def.sn = { ...def.sn, apiKey: "" }; }
     else if (CUR.sn) { def.sn = { ...CUR.sn, apiKey: "" }; }
-    // wb（WorkBuddy）块：JWT 令牌绝不进发布机快照；发布机没配过就沿用代码默认（同样脱敏）
-    if (def.wb) { def.wb = { ...def.wb, accessToken: "", refreshToken: "", deviceToken: "" }; }
-    else if (CUR.wb) { def.wb = { ...CUR.wb, accessToken: "", refreshToken: "", deviceToken: "" }; }
+    // wb / wbai（WorkBuddy 两版）块：JWT 令牌绝不进发布机快照；发布机没配过就沿用代码默认（同样脱敏）
+    // 两版凭据彼此独立，必须各清各的 —— 漏掉 wbai 就等于把国际版的 1411 字符 JWT 随安装包发给所有机器。
+    const WBD = { accessToken: "", refreshToken: "", deviceToken: "" };
+    if (def.wb) { def.wb = { ...def.wb, ...WBD }; }
+    else if (CUR.wb) { def.wb = { ...CUR.wb, ...WBD }; }
+    if (def.wbai) { def.wbai = { ...def.wbai, ...WBD }; }
+    else if (CUR.wbai) { def.wbai = { ...CUR.wbai, ...WBD }; }
     // zen（OpenCode Zen）块：API Key 同样绝不进快照
     if (def.zen) { def.zen = { ...def.zen, apiKey: "" }; }
     else if (CUR.zen) { def.zen = { ...CUR.zen, apiKey: "" }; }
@@ -69,7 +73,10 @@ try {
        ════════════════════════════════════════════════════════════════════ */
     if (CUR.failover) {
       const fo = { ...CUR.failover };
-      const chain = (fo.chain || []).filter((x) => ["bai", "sn", "wb", "zen", "qd", "or"].includes(x));
+      /* 允许清单要跟着 providers.js 走。漏一个渠道的后果是静默的：仓库 defaults 里
+         明明写了 wbai（v1.0.65 加的第 7 家），这里会被当"未知渠道"剔掉，
+         随包快照的故障转移链就少了国际版，且没有任何报错。 */
+      const chain = (fo.chain || []).filter((x) => ["bai", "sn", "wb", "wbai", "zen", "qd", "or"].includes(x));
       /* 收敛后为空就原样保留仓库里写的 chain：这段只做"剔除未知渠道 / 兜底垫末尾"，
          不该把一份完整的出厂默认改写成空链。 */
       if (chain.length) {

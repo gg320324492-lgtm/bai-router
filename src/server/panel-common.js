@@ -770,6 +770,7 @@
       </div>
       <div class="cname">${esc(nameOf(key))}${P.path ? `<span class="cpath">${esc(P.path)}</span>` : ""}</div>
       <div class="ctag">${esc(P.tagline || "")}</div>
+      ${P.caveat ? `<div class="ccaveat" title="${esc(P.caveat)}">⚠ ${esc(P.caveat)}</div>` : ""}
       <div class="cmap"></div>
       <div class="crelay"></div>
       <div class="cfoot"></div>`;

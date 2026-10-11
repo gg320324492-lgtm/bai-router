@@ -870,3 +870,13 @@ footer .paths { flex: 1; min-width: 200px; }
   margin: 10px 0 2px; padding: 7px 10px; font-size: 11px; line-height: 1.7;
   background: var(--idle-soft); border-radius: 7px; color: var(--ink2);
 }
+
+/* 渠道卡片上的限制提示（清单的 caveat 字段）。
+   用语义色体系里现成的 --warn，不引入新概念——颜色在这套 UI 里只承载状态，
+   而"这条路有坑"正是 warn 的语义。 */
+.ccaveat {
+  margin: 0 14px 8px; padding: 5px 9px;
+  font-size: 10.5px; line-height: 1.6;
+  color: var(--warn); background: var(--warn-soft);
+  border-radius: 7px; cursor: help;
+}

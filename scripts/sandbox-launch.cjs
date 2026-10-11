@@ -29,10 +29,11 @@ const meta = path.join(HOME, "AppData", "Local", "Claude-3p", "configLibrary", "
 if (!fs.existsSync(meta)) fs.writeFileSync(meta, JSON.stringify({ appliedId: applied, entries: [{ id: applied, name: "CC Switch" }] }, null, 2));
 const desk = path.join(HOME, "AppData", "Local", "Claude-3p", "configLibrary", applied + ".json");
 if (!fs.existsSync(desk)) fs.writeFileSync(desk, JSON.stringify({ inferenceProvider: "gateway", inferenceGatewayBaseUrl: "http://127.0.0.1:15721/claude-desktop", inferenceGatewayApiKey: "ccs-x", inferenceModels: [] }, null, 2));
-/* 沙箱专用的七个监听口。号段与正式实例逐一对应（正式 15722/15732/… → 沙箱 16722/16732/…），
-   一眼能对上是谁。bai 是平铺在顶层的（没有 BAI.bai 子对象），单独列。 */
-const PORTS = { bai: 16722, panel: 16723, sn: 16732, zen: 16742, wb: 16752, qd: 16762, or: 16772 };
-const CHANNELS = ["sn", "zen", "wb", "qd", "or"];
+/* 沙箱专用的监听口。号段与正式实例逐一对应（正式 15722/15732/… → 沙箱 16722/16732/…），
+   一眼能对上是谁。bai 是平铺在顶层的（没有 BAI.bai 子对象），单独列。
+   wbai = WorkBuddy 国际版（契约 v18 里程碑 1b 新增渠道），对应正式的 15782。 */
+const PORTS = { bai: 16722, panel: 16723, sn: 16732, zen: 16742, wb: 16752, wbai: 16782, qd: 16762, or: 16772 };
+const CHANNELS = ["sn", "zen", "wb", "wbai", "qd", "or"];
 
 /* 种子配置**从 config.defaults.json 派生**，不再手写。
    手写那份只覆盖了 bai/sn 两家、模型清单还截断成 1~5 项；默认值里本来就有完整的
@@ -139,6 +140,9 @@ function computeNoProxy(cfg) {
   add(hostOf(WB_UPSTREAM_INTL), wbUseProxy);
   add(hostOf(WB_UPSTREAM_CN), wbUseProxy);
   add(hostOf(cfg.wb && cfg.wb.upstream), wbUseProxy);
+  /* wbai（国际版）：与 server.mjs computeNoProxy 逐行对应，位置也一样（wb 之后、sn 之前）。
+     漏一行 → NO_PROXY 漂移 → 服务自检重启（BAI_ENV_FIXED=1 兜底只告警，但会刷屏）。 */
+  add(hostOf(cfg.wbai && cfg.wbai.upstream), !!(cfg.wbai && cfg.wbai.useProxy));
   for (const k of ["sn", "zen", "qd", "or"]) {
     add(hostOf(cfg[k] && cfg[k].upstream), !!(cfg[k] && cfg[k].useProxy));
   }

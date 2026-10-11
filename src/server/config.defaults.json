@@ -153,6 +153,7 @@
       "sn",
       "zen",
       "wb",
+      "wbai",
       "or"
     ]
   },
@@ -225,6 +226,39 @@
     "refreshToken": "",
     "deviceToken": "",
     "userId": "1a358c7d-a663-430a-a21e-ac4300486075",
+    "useProxy": false
+  },
+  "wbai": {
+    "relayPort": 15782,
+    "upstream": "https://www.workbuddy.ai",
+    "defaultModel": "deepseek-v4.1-flash",
+    "availableModels": [
+      "deepseek-v4.1-flash",
+      "hy4-preview-f",
+      "hy3"
+    ],
+    "mapping": {
+      "claude-fable-5": {
+        "target": "deepseek-v4.1-flash",
+        "label": "DeepSeek-V4.1-Flash"
+      },
+      "claude-sonnet-5": {
+        "target": "hy4-preview-f",
+        "label": "Hy4-Preview-F"
+      },
+      "claude-opus-5": {
+        "target": "hy3",
+        "label": "HY3"
+      },
+      "claude-haiku-4-5": {
+        "target": "deepseek-v4.1-flash",
+        "label": "DeepSeek-V4.1-Flash"
+      }
+    },
+    "accessToken": "",
+    "refreshToken": "",
+    "deviceToken": "",
+    "userId": "",
     "useProxy": false
   },
   "or": {

@@ -46,6 +46,33 @@ const TIERS = [
   { key: "claude-opus-5", envKey: "ANTHROPIC_DEFAULT_OPUS_MODEL", zh: "Opus" },
   { key: "claude-haiku-4-5", envKey: "ANTHROPIC_DEFAULT_HAIKU_MODEL", zh: "Haiku" },
 ];
+/* ---------- 渠道清单（数据驱动，契约 v18 里程碑 1a）----------
+ *
+ * **唯一的渠道集合来源**。此前的六家（bai/sn/wb/zen/qd/or）散落在至少 8 处硬编码
+ * 别名判断/数组/六位置参数里，加第七家要挨个改。现在全部由本常量推导。
+ *
+ * 为什么用**显式常量数组**，而不是 `Object.keys(cfg)` 推导：
+ *   cfg 里既有渠道键也有一堆非渠道键（proxy / failover / panelPort / defaultModel /
+ *   availableModels / mapping …），而且 **bai 是「扁平」的**——它的字段直接摊在 cfg
+ *   顶层，没有 cfg.bai 子对象；其余五家才有 cfg.sn / cfg.zen / …。想从 Object.keys(cfg)
+ *   认出渠道，就得维护一张「非渠道键」排除表，那等于把硬编码从一个地方搬到另一个地方，
+ *   而且方向是反的（默认全算渠道、逐个排除），加一个非渠道字段就会误判成渠道。
+ *   显式列出渠道，加渠道时只动这一行，判断依据一目了然。
+ *
+ * 顺序 = 面板展示序 = 故障转移链默认序（与 providers.js 的声明序、config.defaults.json
+ * 的 failover.chain 保持一致，check-manifest.cjs 的 C1 会对账后两者）。
+ *
+ * PROVIDERS（展示名）与 RELAY_LABELS（中转错误前缀用的展示名）合并为同一张表——
+ * 它们本来就逐字节相同，两份各自维护只会漂移。 */
+const CHANNELS = ["bai", "sn", "wb", "wbai", "zen", "qd", "or"];
+const CHANNEL_LABELS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", wbai: "WorkBuddy AI", zen: "OpenCode Zen", qd: "Qoder", or: "OpenRouter" };
+// cliMode/desktopMode 返回体里 keyMatch* 字段名（bai 是历史遗留的无后缀名，不能改）
+const KEYMATCH_FIELDS = { bai: "keyMatch", sn: "keyMatchSn", wb: "keyMatchWb", zen: "keyMatchZen", qd: "keyMatchQd", or: "keyMatchOr" };
+/* 把请求里的 provider 参数收敛成渠道键：认识的渠道原样返回，其余（含缺省 "bai"、未知值）
+   一律落到 "bai"。三条路由（/api/models、/api/config、/api/apply、/api/test）此前各写了
+   一串等价的三元链，此处统一。 */
+const resolveChannelKey = (raw) => (CHANNELS.includes(raw) ? raw : "bai");
+
 const PASS_HEADERS = ["authorization", "content-type", "anthropic-version", "anthropic-beta", "x-api-key", "accept", "user-agent"];
 
 const BOOT = Date.now();
@@ -103,7 +130,8 @@ const DEFAULTS = {
     enabled: false,
     // 转移顺序（当前提供方永远排第一，手动选的才是首选）。未配置凭据的会被自动跳过。
     // or（OpenRouter）**永远排最后**：用户原话「没有任何模型可用时的兜底」。
-    chain: ["qd", "bai", "sn", "zen", "wb", "or"],
+    // wbai 紧跟 wb：两版 WorkBuddy 在链上各占一位（契约 v18 §4.2），且同族相邻更好读。
+    chain: ["qd", "bai", "sn", "zen", "wb", "wbai", "or"],
   },
 
   // Qoder（qoder.com 桌面端附带的 Free 套餐）—— 第五个可路由提供方。
@@ -128,13 +156,15 @@ const DEFAULTS = {
     modelsFile: path.join(os.tmpdir(), "qoder-models.json"),
     useProxy: false,
   },
-  // WorkBuddy（腾讯 WorkBuddy AI 客户端附带的免费模型）—— 第三个可路由提供方。
+  // WorkBuddy 国内版（腾讯 WorkBuddy 客户端附带的免费模型）—— 第三个可路由提供方。
   // 上游只讲 OpenAI Chat Completions（且仅流式），中转内置 Anthropic↔OpenAI 协议桥；
   // 认证不是 sk- 密钥，而是从 WorkBuddy 客户端捕获的 JWT 三件套（访问/刷新/设备令牌），
   // 过期由 refreshToken 自动续期（有效期约一年，通常无感）。
+  // **v1.0.65 起本格钉死国内版 www.workbuddy.cn**（里程碑 1b）：国际版拆到 wbai 那一条去了。
+  // 这里以前写的是 .ai，再靠 wbHealUpstream 按登录域名翻转——现在两版各钉各的，不再互翻。
   wb: {
     relayPort: 15742,
-    upstream: "https://www.workbuddy.ai",
+    upstream: "https://www.workbuddy.cn",
     defaultModel: "deepseek-v4.1-flash",
     // 三款 0 积分免费模型（product config credits=x0.00）：DeepSeek-V4.1-Flash（1M ctx）、
     // 混元 Hy4-Preview-F（1M ctx）、混元 HY3（192k ctx）
@@ -150,6 +180,32 @@ const DEFAULTS = {
     deviceToken: "",
     userId: "",
     useProxy: false, // www.workbuddy.ai 直连即可；仅当直连被拦时开启
+  },
+
+  // WorkBuddy 国际版（wbai）—— 契约 v18 里程碑 1b：国内版与国际版**拆成两个渠道**。
+  // 实测 2026-10-11：两版是两套东西——目录不同（CLI 形态 22 vs 32 个模型）、定价不同、
+  // 凭据文件不同（workbuddy-desktop-ai.info vs workbuddy-desktop.info）。
+  // 本块是 wb 的完整镜像，只换三处：端口（15782，不与任何现有中转撞号）、上游（.ai 钉死）、
+  // 以及那一份独立的令牌。**不做版别自愈**（wb 有 wbHealUpstream，这里刻意不加）：
+  // 两版既然是两条链上的格子，就该各自固定，用户想要哪版接哪版。
+  wbai: {
+    relayPort: 15782,
+    upstream: "https://www.workbuddy.ai",
+    defaultModel: "deepseek-v4.1-flash",
+    // 出厂兜底清单（与 wb 相同的三个 id）。**真实目录来自上游 /v3/config**，
+    // 面板「刷新模型列表」会覆盖它——别把这份兜底当成国际版的实际模型清单。
+    availableModels: ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"],
+    mapping: {
+      "claude-fable-5": { target: "deepseek-v4.1-flash", label: "DeepSeek-V4.1-Flash" },
+      "claude-sonnet-5": { target: "hy4-preview-f", label: "Hy4-Preview-F" },
+      "claude-opus-5": { target: "hy3", label: "HY3" },
+      "claude-haiku-4-5": { target: "deepseek-v4.1-flash", label: "DeepSeek-V4.1-Flash" },
+    },
+    accessToken: "",
+    refreshToken: "",
+    deviceToken: "",
+    userId: "",
+    useProxy: false,
   },
 
   // OpenRouter（v1.0.59）—— 第六个可路由提供方，**免费兜底区**（用户原话：没有任何
@@ -200,18 +256,36 @@ const DEFAULTS = {
 // <authentication.id>.info 的 auth.domain。本机只**读**该目录判版，绝不写（契约硬约束）；
 // 注意 accessToken 落盘是 {$wbEncrypted:1, envelope:…} 加密信封，读盘取明文此路不通，
 // 令牌仍走注入捕获——这里只取 domain 判版，不碰任何令牌字段。
-const WB_UPSTREAM_INTL = "https://www.workbuddy.ai"; // 国际版默认（= DEFAULTS.wb.upstream，两处同步）
-const WB_UPSTREAM_CN = "https://www.workbuddy.cn";    // 国内版默认
-const WB_AUTH_IDS = ["workbuddy-desktop-ai", "workbuddy-desktop"]; // 两版 authentication.id
+const WB_UPSTREAM_INTL = "https://www.workbuddy.ai"; // 国际版默认（= DEFAULTS.wbai.upstream，两处同步）
+const WB_UPSTREAM_CN = "https://www.workbuddy.cn";    // 国内版默认（= DEFAULTS.wb.upstream，两处同步）
+/* 两版各自的 authentication.id（契约 v18 里程碑 1b）。
+   **不再二选一**：v1.0.59 时代这里是「两版里取 mtime 最新的那个」，本机两个版别都装了，
+   于是 wb 会被二选一判成其中一版、另一版的登录态**永远读不到**。现在改成各读各的——
+   wb 只认 workbuddy-desktop.info，wbai 只认 workbuddy-desktop-ai.info。 */
+const WB_AUTH_ID_CN = "workbuddy-desktop";
+const WB_AUTH_ID_INTL = "workbuddy-desktop-ai";
+const WB_AUTH_IDS = [WB_AUTH_ID_INTL, WB_AUTH_ID_CN]; // 保留旧名（诊断/日志用），顺序同旧实现
 
-// auth 目录（可注入）：测试用 BAI_WB_AUTH_DIR 指向临时伪造目录即可做双向版别验证，
-// 真实 auth 目录永远只读。
-function wbAuthDir() {
+/* auth 目录候选（可注入）：测试用 BAI_WB_AUTH_DIR 指向临时伪造目录即可做双向版别验证，
+   真实 auth 目录永远只读。
+   **两处都探**：只探 %LOCALAPPDATA% 是 v1.0.59 的疏漏——插件实测旧版客户端把登录文件写在
+   Roaming（%APPDATA%）下。只探 Local 的机器上，旧版安装的用户会一直读不到登录态。
+   顺序 Local → Roaming：新版在 Local，先命中它。 */
+function wbAuthDirs() {
   const inject = String(process.env.BAI_WB_AUTH_DIR || "").trim();
-  if (inject) return inject;
-  const local = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
-  return path.join(local, "CodeBuddyExtension", "Data", "Public", "auth");
+  if (inject) return [inject];
+  const out = [];
+  const push = (base) => {
+    if (!base) return;
+    const d = path.join(base, "CodeBuddyExtension", "Data", "Public", "auth");
+    if (!out.includes(d)) out.push(d);
+  };
+  push(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"));
+  push(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"));
+  return out;
 }
+function wbAuthDir() { return wbAuthDirs()[0]; }   // 兼容旧调用名：主目录（Local）
+
 
 // 纯函数：登录域名 → 版别。语义对齐 product.json 的 external/internalDomain 分流：
 //   *.workbuddy.ai（含 www.workbuddy.ai）→ "intl"；
@@ -228,56 +302,61 @@ function wbEditionOfDomain(domain) {
   return host === "workbuddy.ai" || host.endsWith(".workbuddy.ai") ? "intl" : "cn";
 }
 
-// 纯函数：读指定 auth 目录里「活跃」的登录文件（两版 id 都试）。
+// 纯函数：在候选目录里读**指定版别**的登录文件（契约 v18 里程碑 1b：各读各的，不再二选一）。
 // 只认精确文件名 <id>.info——`*.logged-out`（已登出）与 `<id>.<ISO时间戳>….info`
-// （历史快照，本机实测各有其例）一律排除；两版同时活跃时取 mtime 更新的那个（谁在用听谁的）。
-// 返回 { id, file, domain } 或 null；文件损坏时顺位试下一个，都坏则 null。
-function wbReadAuthDomain(authDir) {
-  if (!authDir) return null;
-  let names;
-  try { names = readdirSync(authDir); } catch { return null; }
-  const cands = [];
-  for (const id of WB_AUTH_IDS) {
-    const base = id + ".info";
-    if (!names.includes(base)) continue;
-    const f = path.join(authDir, base);
-    try { cands.push({ id, f, mtime: statSync(f).mtimeMs }); } catch { /* 读不到就跳过 */ }
-  }
-  if (!cands.length) return null;
-  cands.sort((a, b) => b.mtime - a.mtime);
-  for (const c of cands) {
+// （历史快照，本机实测各有其例）一律排除。
+// 返回 { id, file, domain } 或 null；文件损坏就顺位试下一个候选目录。
+function wbReadAuthDomain(authDirs, id) {
+  if (!authDirs || !authDirs.length) return null;
+  const base = id + ".info";
+  for (const dir of authDirs) {
+    let f;
     try {
-      const j = JSON.parse(readFileSync(c.f, "utf8"));
+      if (!readdirSync(dir).includes(base)) continue;
+      f = path.join(dir, base);
+    } catch { continue; }
+    try {
+      const j = JSON.parse(readFileSync(f, "utf8"));
       const d = j && j.auth && typeof j.auth.domain === "string" ? j.auth.domain.trim() : "";
-      return { id: c.id, file: c.f, domain: d || null };
-    } catch { /* 这份坏了就试下一份 */ }
+      return { id, file: f, domain: d || null };
+    } catch { /* 这份坏了就试下一个目录 */ }
   }
   return null;
 }
 
-// 版别检测入口（带 1.5s 进程内缓存：loadCfg 每请求都走到这里，别为判版反复打磁盘）
-let wbAuthCache = { at: 0, dir: null, res: null };
-function wbDetectAuth(authDir) {
-  const dir = authDir || wbAuthDir();
+// 版别检测入口（带 1.5s 进程内缓存：loadCfg 每请求都走到这里，别为判版反复打磁盘）。
+// p 指定读哪一版：wb → workbuddy-desktop.info，wbai → workbuddy-desktop-ai.info。
+let wbAuthCache = new Map();
+function wbDetectAuth(p) {
+  const id = p === "wbai" ? WB_AUTH_ID_INTL : WB_AUTH_ID_CN;
+  const dirs = wbAuthDirs();
+  const key = id + "|" + dirs.join("|");
   const now = Date.now();
-  if (wbAuthCache.res && wbAuthCache.dir === dir && now - wbAuthCache.at < 1500) return wbAuthCache.res;
-  const hit = wbReadAuthDomain(dir);
+  const hit = wbAuthCache.get(key);
+  if (hit && now - hit.at < 1500) return hit.res;
+  const found = wbReadAuthDomain(dirs, id);
   const res = {
-    authDir: dir,
-    file: hit ? hit.file : null,
-    domain: hit ? hit.domain : null,
-    edition: hit && hit.domain ? wbEditionOfDomain(hit.domain) : null, // "cn" | "intl" | null
+    authDir: found ? path.dirname(found.file) : dirs[0],
+    file: found ? found.file : null,
+    domain: found ? found.domain : null,
+    // "cn" | "intl" | null。判据仍是登录域名（.ai → intl，其余 → cn），
+    // 但**只读本版那一份文件**——另一版的登录态不该影响本渠道。
+    edition: found && found.domain ? wbEditionOfDomain(found.domain) : null,
   };
-  wbAuthCache = { at: now, dir, res };
+  wbAuthCache.set(key, { at: now, res });
+  if (wbAuthCache.size > 8) wbAuthCache.clear();
   return res;
 }
 
 // 自愈覆盖（供 loadCfg 的两条返回路径共用）：**仅当当前 upstream 恰好等于另一版的默认值**
 // 才翻转——用户显式改成过别的地址（自建中转等）一律不碰，与 fixQdFile「尊重用户设置」
 // 同一哲学。只改内存里的合并结果，不主动回写 config.json；判不出版别（null）时保持原值。
-function wbHealUpstream(w) {
+//
+// p 决定读哪一版的登录态：wb 只看 workbuddy-desktop.info，wbai 只看 workbuddy-desktop-ai.info
+// （里程碑 1b 之前这里是两版二选一，本机两个都装了 → 另一版的登录态永远读不到）。
+function wbHealUpstream(w, p) {
   if (!w || typeof w !== "object") return w;
-  const ed = wbDetectAuth().edition;
+  const ed = wbDetectAuth(p).edition;
   if (ed === "cn" && w.upstream === WB_UPSTREAM_INTL) w.upstream = WB_UPSTREAM_CN;
   else if (ed === "intl" && w.upstream === WB_UPSTREAM_CN) w.upstream = WB_UPSTREAM_INTL;
   return w;
@@ -308,6 +387,13 @@ function loadCfg() {
       mapping: { ...DEFAULTS.wb.mapping, ...(wbIn.mapping || {}) },
       availableModels: Array.isArray(wbIn.availableModels) && wbIn.availableModels.length ? wbIn.availableModels : [...DEFAULTS.wb.availableModels],
     };
+    // wbai 深合并（国际版，里程碑 1b 新增）：与 wb 同构，各自独立
+    const wbaiIn = c.wbai || {};
+    merged.wbai = {
+      ...DEFAULTS.wbai, ...wbaiIn,
+      mapping: { ...DEFAULTS.wbai.mapping, ...(wbaiIn.mapping || {}) },
+      availableModels: Array.isArray(wbaiIn.availableModels) && wbaiIn.availableModels.length ? wbaiIn.availableModels : [...DEFAULTS.wbai.availableModels],
+    };
     // failover 深合并
     merged.failover = { ...DEFAULTS.failover, ...(c.failover || {}) };
     if (!Array.isArray(merged.failover.chain) || !merged.failover.chain.length) {
@@ -319,6 +405,16 @@ function loadCfg() {
     // 追加它对存量行为零影响。
     if (Array.isArray(merged.failover.chain) && !merged.failover.chain.includes("or")) {
       merged.failover.chain = [...merged.failover.chain, "or"];
+    }
+    // wbai（国际版）同理补一个，但**插在 wb 后面而不是末尾**（契约 v18 §4.2：两版各占一位）。
+    // or 必须永远排最后（用户原话「兜底」），所以不能无脑 push 到尾部——
+    // 那样链会变成 [..., wbai, or] 之外还可能把 or 挤走，用 insert 定位在 wb 之后。
+    // 未配令牌时 wbai 与 or 一样会被自动跳过，对存量行为零影响。
+    if (Array.isArray(merged.failover.chain) && !merged.failover.chain.includes("wbai")) {
+      const ch = [...merged.failover.chain];
+      const at = ch.indexOf("wb");
+      ch.splice(at < 0 ? ch.length : at + 1, 0, "wbai");
+      merged.failover.chain = ch;
     }
     // or 深合并（同上：旧 config.json 没有 or 块时整块补默认）
     const orIn = c.or || {};
@@ -353,12 +449,14 @@ function loadCfg() {
     merged.qd.tokenFile = fixQdFile(merged.qd.tokenFile, "qoder-token.json");
     merged.qd.modelsFile = fixQdFile(merged.qd.modelsFile, "qoder-models.json");
     // 版别自愈（v1.0.59）：按登录域名把 wb.upstream 拨到对应版别的默认端点
-    wbHealUpstream(merged.wb);
+    wbHealUpstream(merged.wb, "wb");
+    wbHealUpstream(merged.wbai, "wbai");
     return merged;
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
-    const fallback = { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] }, or: { ...DEFAULTS.or, mapping: { ...DEFAULTS.or.mapping }, availableModels: [...DEFAULTS.or.availableModels], keys: [] }, failover: { ...DEFAULTS.failover, chain: [...DEFAULTS.failover.chain] } };
-    wbHealUpstream(fallback.wb);
+    const fallback = { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, wbai: { ...DEFAULTS.wbai, mapping: { ...DEFAULTS.wbai.mapping }, availableModels: [...DEFAULTS.wbai.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] }, or: { ...DEFAULTS.or, mapping: { ...DEFAULTS.or.mapping }, availableModels: [...DEFAULTS.or.availableModels], keys: [] }, failover: { ...DEFAULTS.failover, chain: [...DEFAULTS.failover.chain] } };
+    wbHealUpstream(fallback.wb, "wb");
+    wbHealUpstream(fallback.wbai, "wbai");
     return fallback;
   }
 }
@@ -473,12 +571,16 @@ function computeNoProxy(cfg) {
   // v1.0.59：wb 上游按登录版别在 .ai/.cn 之间自愈（loadCfg 的 wbHealUpstream），NO_PROXY 把
   // 两个版别的默认域**都**收进来——否则切到国内版后实际打的 www.workbuddy.cn 不在表里、
   // 直连语义失效；也免得 main.js（读原始 config）与本函数（读自愈结果）各算一张不一样的表。
-  // 这三行 add 与 src/main.js 的 addNoProxyHost 三行**逐字同步**（顺序也要一致：先 intl、
+  // 这几行 add 与 src/main.js 的 addNoProxyHost 几行**逐字同步**（顺序也要一致：先 intl、
   // 再 cn、再当前 upstream 值），否则精确比对判定漂移 → 警告/重启风险（历史事故同款）。
+  // v1.0.65：wbai 是独立渠道，自带独立的 upstream 与 useProxy，得自己占一行，
+  // 否则国际版切了自建中转就不在 NO_PROXY 表里。src/main.js 同步加了同一行。
   const wbUseProxy = cfg.wb?.useProxy === true;
   add(hostOf(WB_UPSTREAM_INTL), wbUseProxy);
   add(hostOf(WB_UPSTREAM_CN), wbUseProxy);
   add(hostOf(cfg.wb?.upstream || DEFAULTS.wb.upstream), wbUseProxy);
+  const wbaiUseProxy = cfg.wbai?.useProxy === true;
+  add(hostOf(cfg.wbai?.upstream || DEFAULTS.wbai.upstream), wbaiUseProxy);
   add(hostOf(cfg.sn?.upstream || DEFAULTS.sn.upstream), cfg.sn?.useProxy === true);
   add(hostOf(cfg.zen?.upstream || DEFAULTS.zen.upstream), cfg.zen?.useProxy === true);
   add(hostOf(cfg.qd?.upstream || DEFAULTS.qd.upstream), cfg.qd?.useProxy === true);
@@ -726,6 +828,7 @@ function rejectRelay(req, res, pathOnly, status, msg, tag) {
 const recentCallsBai = [];  // {tier, served, at}
 const recentCallsSn = [];
 const recentCallsWb = [];
+const recentCallsWbai = [];
 const recentCallsZen = [];
 const recentCallsQd = [];
 const recentCallsOr = [];   // OpenRouter（第 6 家）
@@ -746,6 +849,7 @@ const relayErrors = {
   bai: { kind: null, message: null, at: null },
   sn: { kind: null, message: null, at: null },
   wb: { kind: null, message: null, at: null },
+  wbai: { kind: null, message: null, at: null },
   zen: { kind: null, message: null, at: null },
   qd: { kind: null, message: null, at: null },
   or: { kind: null, message: null, at: null },
@@ -951,20 +1055,25 @@ async function readAllBody(r) {
   for await (const c of r.body) out.push(typeof c === "string" ? Buffer.from(c) : c);
   return Buffer.concat(out).toString("utf8");
 }
-let wbRefreshLock = null;
+// 令牌续期锁：**按渠道各一把**（里程碑 1b）。以前是单个模块级变量，wb 与 wbai 共用——
+// 两版令牌不通用，并发续期会互相把对方的锁清掉。这里改成 Map 逐渠道独立。
+const wbRefreshLocks = new Map();
 // 令牌续期：POST /v2/plugin/auth/token/refresh（刷新令牌放 X-Refresh-Token 头，与 WorkBuddy 客户端一致）
 // 成功后就地写回 config.json（访问/刷新令牌成对滚动，有效期约一年，正常一年才需要续一次）
-function wbRefreshToken(cfg) {
-  const w = cfg.wb;
-  if (!w.refreshToken) throw new Error("WorkBuddy 刷新令牌为空，无法续期——请重新捕获令牌");
-  const base = (w.upstream || DEFAULTS.wb.upstream).replace(/\/+$/, "");
+// p 决定用哪一份配置：wb → cfg.wb，wbai → cfg.wbai（里程碑 1b，两版令牌互不通用）。
+function wbRefreshToken(cfg, p) {
+  const isAi = p === "wbai";
+  const zh = isAi ? "WorkBuddy AI" : "WorkBuddy";
+  const w = isAi ? cfg.wbai : cfg.wb;
+  if (!w || !w.refreshToken) throw new Error(`${zh} 刷新令牌为空，无法续期——请重新捕获令牌`);
+  const base = (w.upstream || (isAi ? DEFAULTS.wbai.upstream : DEFAULTS.wb.upstream)).replace(/\/+$/, "");
   const headers = {
     "content-type": "application/json",
     "x-requested-with": "XMLHttpRequest",
     "x-refresh-token": w.refreshToken,
     authorization: `Bearer ${w.accessToken || ""}`,
     "x-auth-refresh-source": "plugin",
-    "x-domain": hostOf(base) || "www.workbuddy.ai",
+    "x-domain": hostOf(base) || (isAi ? "www.workbuddy.ai" : "www.workbuddy.cn"),
     "user-agent": `B.AI-Router/${APP_VERSION}`,
   };
   const useProxy = w.useProxy === true;
@@ -973,7 +1082,7 @@ function wbRefreshToken(cfg) {
       ? await fetch(base + "/v2/plugin/auth/token/refresh", { method: "POST", headers, body: "{}", signal: AbortSignal.timeout(15000) })
       : await directHttp(base + "/v2/plugin/auth/token/refresh", { method: "POST", headers, body: "{}", timeoutMs: 15000 });
     const txt = await readAllBody(r);
-    if (r.status !== 200) throw new Error(`WorkBuddy 令牌续期失败 HTTP ${r.status}: ${String(txt).slice(0, 160)}`);
+    if (r.status !== 200) throw new Error(`${zh} 令牌续期失败 HTTP ${r.status}: ${String(txt).slice(0, 160)}`);
     let j = {};
     try { j = JSON.parse(txt); } catch { }
     const box = j.data && typeof j.data === "object" ? j.data : j;
@@ -984,23 +1093,25 @@ function wbRefreshToken(cfg) {
     if (typeof nr === "string" && nr.length > 20) w.refreshToken = nr;
     saveCfg(cfg);
     const exp = wbTokenExp(na);
-    log(`WorkBuddy 令牌已自动续期${exp ? "（新有效期至 " + new Date(exp * 1000).toLocaleDateString("zh-CN") + "）" : ""}`);
+    log(`${zh} 令牌已自动续期${exp ? "（新有效期至 " + new Date(exp * 1000).toLocaleDateString("zh-CN") + "）" : ""}`);
     return w.accessToken;
   })();
 }
-async function wbEnsureToken(cfg) {
-  const w = cfg.wb;
-  if (!w.accessToken) throw new Error("WorkBuddy 访问令牌未配置——到面板「WorkBuddy」页粘贴令牌");
+async function wbEnsureToken(cfg, p) {
+  const isAi = p === "wbai";
+  const zh = isAi ? "WorkBuddy AI" : "WorkBuddy";
+  const w = isAi ? cfg.wbai : cfg.wb;
+  if (!w || !w.accessToken) throw new Error(`${zh} 访问令牌未配置——到面板「${zh}」页粘贴令牌`);
   const exp = wbTokenExp(w.accessToken);
   if (exp && exp * 1000 - Date.now() > 120000) return w.accessToken;
   if (!w.refreshToken) {
     if (exp && exp * 1000 > Date.now()) return w.accessToken;
-    throw new Error("WorkBuddy 访问令牌已过期且没有刷新令牌，请重新捕获");
+    throw new Error(`${zh} 访问令牌已过期且没有刷新令牌，请重新捕获`);
   }
-  if (!wbRefreshLock) {
-    wbRefreshLock = wbRefreshToken(cfg).finally(() => { wbRefreshLock = null; });
+  if (!wbRefreshLocks.has(p)) {
+    wbRefreshLocks.set(p, wbRefreshToken(cfg, p).finally(() => { wbRefreshLocks.delete(p); }));
   }
-  return wbRefreshLock;
+  return wbRefreshLocks.get(p);
 }
 
 // ---------- OpenCode Zen 模型目录（v1.0.42）----------
@@ -1024,6 +1135,173 @@ async function zenReadCatalog() {
   } catch {
     return zenCatCache.list;
   }
+}
+
+// ---------- WorkBuddy 模型目录（v1.0.65，契约 v18 里程碑 2/3）----------
+// 旧结论「WorkBuddy 没有公开的模型目录接口」**已被实测推翻**：GET {base}/v3/config
+// 带 Bearer 即可返回真实目录（本机实测 2026-10-11）：
+//   www.workbuddy.ai  CLI 形态 UA → 22 个模型（21 个带 credits，2 个免费）
+//   www.workbuddy.ai  App 形态 UA → 30 个模型 + modelPromotions 3 条
+//   www.workbuddy.cn  CLI 形态 UA → 32 个模型（30 个带 credits，1 个免费）
+//   www.workbuddy.cn  App 形态 UA → 37 个模型（App 形态打国内版 credits 全空）
+//
+// 关键实测事实（与契约 v18 §1 有两处出入，按实测实现）：
+//  ① **UA 才是闸门，不是 Origin/Referer**。缺 Origin/Referer 实测仍返回完整 22 个模型
+//     （21205 字节，与带头部完全一致）；而 UA 不是 `CLI/… CodeBuddy/…` 形态时上游回
+//     400 {"code":12403,"msg":"check ua, get coding copilot version error"}。
+//     「x0.34 credits」这种倍率串只在 CLI 形态 UA 下出现（App 形态的 credits 多为空）。
+//  ② **模型对象里没有 `disabled` 字段**（四套目录实测都没有）。过滤仍保留
+//     `disabled===true` 这一条件作防御，但当前是空操作；真正生效的是 tokens<=0。
+//  ③ 空目录陷阱（契约 §1.1 确认）：坏令牌/无效令牌时上游回 **200 + 252 字节 +
+//     {"code":0,"msg":"OK","data":{"models":null}}**——成功码配空数据。**必须当失败**。
+const WB_CONFIG_PATH = "/v3/config";
+// 两种 UA 形态：CLI 形态拿 credits（倍率），App 形态拿 modelPromotions（促销）。两者互斥，
+// 要两份数据得发两次请求。App 形态的版本号走 wbUa()（运行时读真实客户端版本），
+// 不要在这里写死——写死的那个数一定会过期。
+const WB_UA_CLI = "CLI/2.63.2 CodeBuddy/2.63.2";
+/* 目录缓存与落盘文件都**按渠道各一份**（里程碑 1b）：两版是两套目录、两个上游，
+   共用一份缓存会让 .cn 的结果被当成 .ai 的用（applyToCli 读它显示倍率，错配会显示错的价）。
+   wbCatCache 仍是进程内变量、同步可读——applyToCli 取倍率靠它（契约 v18 里程碑 4）。 */
+const wbCatCaches = {
+  wb: { at: 0, upstream: "", val: null },
+  wbai: { at: 0, upstream: "", val: null },
+};
+const WB_CAT_TTL_MS = 30 * 60 * 1000; // 目录变化慢，30 分钟（与 zenReadCatalog 同策略）
+const wbCatFiles = {
+  wb: path.join(DATA_DIR, "wb-catalog.json"),
+  wbai: path.join(DATA_DIR, "wbai-catalog.json"),
+};   // 上次成功目录落盘，供降级用
+
+// 倍率归一化（契约 §1.3）：上游两种写法 "x0.79" 与 "x0.34 credits"（带后缀），
+// 另有 ""（无信息）、null（部分 App 形态的图片/视频模型）。
+// **必须先把 ` credits` 后缀剥掉**再判免费——否则 "x0.00 credits" 会被漏判为付费。
+function wbNormalizeCredits(raw) {
+  if (raw == null) return undefined;
+  const s = String(raw).trim().replace(/\s*credits\s*$/i, "").trim();
+  return s || undefined;
+}
+// 免费判定：剥离后缀后匹配 /^x?0\.0+$/（x0.00 / x0 / 0.00 / 0 都算）
+function wbIsFreeCredits(raw) {
+  const n = wbNormalizeCredits(raw);
+  return n != null && /^x?0\.0+$/.test(n);
+}
+// 把上游一条模型记录解析成本地条目：{ id, name, credits, free, ... }。
+// 过滤（契约 §2）：disabled===true / maxInputTokens<=0 / maxOutputTokens<=0 一律丢弃。
+function wbMapModel(m) {
+  if (!m || typeof m !== "object") return null;
+  const id = String(m.id || "").trim();
+  if (!id) return null;
+  if (m.disabled === true) return null;                       // 防御：实测当前无此字段
+  if (Number(m.maxInputTokens) <= 0 || Number(m.maxOutputTokens) <= 0) return null;
+  const credits = wbNormalizeCredits(m.credits);
+  return {
+    id,
+    name: String(m.name || id).trim() || id,
+    credits: credits || null,
+    free: wbIsFreeCredits(m.credits),
+    contextWindow: Number(m.contextWindow) || null,
+    supportsImages: m.supportsImages === true,
+    supportsReasoning: m.supportsReasoning === true,
+  };
+}
+// 单次抓取：返回 { ok, models, promotions, error } —— 空目录（含 models:null）算失败。
+// p 决定上游与用哪一份令牌（wb → 国内版配置，wbai → 国际版配置）。
+async function wbFetchConfig(cfg, uaKind, p) {
+  const S = sliceOf(cfg, p);
+  const base = S.upstream || DEFAULTS[p].upstream;
+  let host = "www.workbuddy.ai";
+  try { host = new URL(base).hostname; } catch { /* 非法地址则用默认 host 拼头 */ }
+  let tok;
+  try { tok = await wbEnsureToken(cfg, p); }
+  catch (e) { return { ok: false, error: String((e && e.message) || e).slice(0, 160) }; }
+  const url = base.replace(/\/+$/, "") + WB_CONFIG_PATH;
+  const headers = {
+    authorization: `Bearer ${tok}`,
+    accept: "application/json",
+    // UA 是唯一闸门（实测：UA 前缀不是 WorkBuddy 时上游回 400 code=12403；
+    // 见本文件 WB_UA_CLI 处的实测记录）。形态决定 roster 内容：
+    // CLI 形态带 credits（倍率），App 形态带 modelPromotions（促销），两者互斥。
+    "user-agent": uaKind === "app" ? wbUa() : WB_UA_CLI,
+    // origin/referer：实测对本接口**没有任何作用**（八种增删组合响应逐字节相同）。
+    // 仍然带上——万一上游将来改成按 Origin 分流，这里已经是对的。不是必需项。
+    origin: `https://${host}`,
+    referer: `https://${host}/`,
+  };
+  let r, txt;
+  try {
+    r = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+    txt = await r.text();
+  } catch (e) {
+    return { ok: false, error: `请求 /v3/config 失败：${String((e && e.message) || e).slice(0, 140)}` };
+  }
+  let j = null;
+  try { j = JSON.parse(txt); } catch { /* 非 JSON，下面统一归因 */ }
+  if (!j || typeof j !== "object") {
+    return { ok: false, error: `上游返回的内容不是合法 JSON（HTTP ${r.status}）：${String(txt).slice(0, 100)}` };
+  }
+  if (r.status >= 400 || (typeof j.code === "number" && j.code !== 0)) {
+    // 上游用自己的 code 报错（如 12403 check ua），HTTP 状态可能仍是 200/400
+    const said = upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}`;
+    return { ok: false, error: said };
+  }
+  const d = (j.data && typeof j.data === "object") ? j.data : {};
+  const rawModels = Array.isArray(d.models) ? d.models : null;
+  // **空目录必须当失败**（契约 §1.1 的 252 字节陷阱）：models 为 null 或数组为空，
+  // 一律报「上游没给目录」，绝不显示成「0 个模型」。
+  if (!rawModels || !rawModels.length) {
+    return { ok: false, error: "上游没给模型目录", empty: true };
+  }
+  const models = rawModels.map(wbMapModel).filter(Boolean);
+  if (!models.length) {
+    return { ok: false, error: "上游给了目录但全部模型都被过滤（tokens<=0 或 disabled）", empty: true };
+  }
+  const promos = Array.isArray(d.modelPromotions) ? d.modelPromotions : null;
+  return { ok: true, models, promotions: promos };
+}
+// 读上次成功目录（落盘降级用）。按渠道各读各的文件（里程碑 1b）。
+function wbReadCatDisk(p) {
+  try { return JSON.parse(readFileSync(wbCatFiles[p], "utf8")); } catch { return null; }
+}
+// 内置兜底：读不到上游时用配置里的 availableModels，倍率标 null（未知）
+function wbBuiltinCatalog(cfg, p) {
+  const S = sliceOf(cfg, p);
+  const models = [...new Set((S.availableModels || DEFAULTS[p].availableModels).map((x) => String(x).trim().toLowerCase()).filter(Boolean))]
+    .map((id) => ({ id, name: id, credits: null, free: false, contextWindow: null, supportsImages: false, supportsReasoning: false }));
+  return models;
+}
+// 目录读取入口：实时 → 上次成功（落盘）→ 内置兜底，全程记录来源（契约 §2 降级链）。
+// 返回 { models:[{id,name,credits,free,…}], promotions, source:"live"|"disk"|"builtin", error? }
+// 缓存/落盘/令牌均按渠道 p 隔离（里程碑 1b）。
+async function wbReadCatalog(cfg, p) {
+  const S = sliceOf(cfg, p);
+  const upstream = S.upstream || DEFAULTS[p].upstream;
+  const now = Date.now();
+  const cache = wbCatCaches[p];
+  if (cache.val && cache.upstream === upstream && now - cache.at < WB_CAT_TTL_MS) {
+    return cache.val;
+  }
+  // 两次请求：CLI 形态（倍率）优先；App 形态只补充促销（拿不到不影响大局）。
+  const cli = await wbFetchConfig(cfg, "cli", p);
+  let val;
+  if (cli.ok) {
+    let promotions = null;
+    try {
+      const app = await wbFetchConfig(cfg, "app", p);
+      if (app.ok) promotions = app.promotions || null;
+    } catch { /* App 形态失败无所谓，促销只是附注 */ }
+    val = { models: cli.models, promotions, source: "live", at: new Date().toISOString() };
+    try { writeAtomic(wbCatFiles[p], JSON.stringify(val, null, 2) + "\n"); } catch { /* 落盘失败不影响本次结果 */ }
+  } else {
+    const disk = wbReadCatDisk(p);
+    if (disk && Array.isArray(disk.models) && disk.models.length) {
+      val = { models: disk.models, promotions: disk.promotions || null, source: "disk", at: disk.at || null, error: cli.error };
+    } else {
+      val = { models: wbBuiltinCatalog(cfg, p), promotions: null, source: "builtin", error: cli.error };
+    }
+  }
+  // 只有 live 结果进缓存（降级结果下次请求要重试上游）。逐渠道写回，避免动到另一版的缓存。
+  if (val.source === "live") wbCatCaches[p] = { at: now, upstream, val };
+  return val;
 }
 
 // ---------- Qoder 模型目录（v1.0.41）----------
@@ -1297,6 +1575,66 @@ function wbCandidateBases() {
   }
   return out;
 }
+
+/* 客户端进程是否在本次注入之前就已启动。
+ *
+ * 判据：取该版别客户端**最早**的进程启动时间，与 `wbCapState.startedAt`（=本次注入时刻）
+ * 比较。早于它 ⇒ 那个进程内存里是没有钩子的旧入口脚本，改磁盘对它无效，
+ * 必须完全退出重启。这是 v1.0.65 实测踩出来的：文案说「无需重启」，
+ * 实际用户发三条消息都抓不到，根因就在这里。
+ *
+ * 进程名与目录名同源：国际版 WorkBuddyAI，国内版 WorkBuddy（但 WorkBuddyAI 也含
+ * "WorkBuddy" 子串，所以国际版必须先判、否则会互相误认）。
+ * 取不到 / 没装 PowerShell 时返回 false —— 那就退回原来的提示，不制造假警报。
+ */
+async function wbClientRunningBefore(p) {
+  if (!wbCapState.startedAt) return false;
+  const name = p === "wbai" ? "^WorkBuddyAI$" : "^WorkBuddy$";
+  try {
+    const out = await new Promise((res) => execFile("powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command",
+        `$p=Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '${name}' }`
+        + " | Sort-Object StartTime | Select-Object -First 1;"
+        + " if($p){ [int]$p.StartTime.ToUniversalTime().Subtract([datetime]'1970-01-01').TotalMilliseconds }"],
+      { windowsHide: true, timeout: 8000 },
+      (e, so) => res(e ? null : String(so).trim())));
+    const ms = Number(out);
+    // 留 2 秒容差：进程刚起、秒级取整可能与注入时刻擦边
+    return Number.isFinite(ms) && ms < wbCapState.startedAt - 2000;
+  } catch {
+    return false;
+  }
+}
+
+/* 按版别给候选目录排序：**两版都装了时，必须优先找对应版别的那个。**
+ *
+ * 背景（契约 v18 里程碑 1b 实测踩到）：wbCandidateBases 的第一项恒是 WorkBuddyAI，
+ * findWbCliScript 又不接渠道参数，于是**不管点哪一版的「一键获取令牌」，抓到的都是
+ * 候选表里第一个**。两版都装时，点国际版会把国际版的钩子注进国内版客户端，抓到的令牌
+ * 写进 cfg.wb —— 而 cfg.wbai 仍然是「未配置」，症状与「取不到令牌」完全一样。
+ * （实测日志：请求 wbai 却注进 …\Programs\WorkBuddy\，正是这个错位。）
+ *
+ * 目录名与 auth 文件名同源：国际版 WorkBuddyAI / workbuddy-ai，国内版 WorkBuddy /
+ * workbuddy / CodeBuddy（国内版另有 CodeBuddy 命名的历史，见上面候选表）。
+ *
+ * 排序只是**前置加权**而非硬过滤：候选里仍保留另一版的目录，找不到匹配版别时还能兜底，
+ * 并由 wbCaptureToken 如实打印最终用的是哪个 script 路径（日志里本来就有）。
+ *
+ * 注意 wb 也走排序（而不是保持原顺序）：候选表第一项恒是国际版，若不给 wb 加权，
+ * 注册表查不到时它会兜底到国际版——那正是本条要消除的那类错位。
+ *
+ * 这条对**注册表分支与候选目录分支同时生效**：两版都装了机器上，注册表命中的是
+ * 「按名匹配」的卸载项，不排序就照样错位（实测 wbai 请求注进了国内版目录）。
+ */
+function wbOrderedBases(p, list) {
+  const all = list || wbCandidateBases();
+  if (p !== "wb" && p !== "wbai") return all;
+  const isIntl = (b) => /workbuddy\s*ai|workbuddy-ai/i.test(b);
+  const isCn = (b) => /workbuddy(?!\s*ai)|codebuddy/i.test(b);
+  return p === "wbai"
+    ? [...all.filter(isIntl), ...all.filter(isCn)]
+    : [...all.filter(isCn), ...all.filter(isIntl)];
+}
 const WB_CAPTURE_HOOK = `
 // === BAI-CAPTURE-HOOK (temporary, auto-removed) ===
 try {
@@ -1374,7 +1712,7 @@ try {
 } catch (e) {}
 // === /BAI-CAPTURE-HOOK ===
 `;
-let wbCapState = { active: false, startedAt: null, error: null };
+let wbCapState = { active: false, startedAt: null, error: null, p: "wb" };   // p = 本次捕获写往哪个渠道
 
 // ---------- 备份落盘 + 异常退出自愈（v1.0.58 附带修复） ----------
 // 隐患：捕获中途中转被 taskkill /F → finally 里的还原不跑 → 用户的 WorkBuddy CLI
@@ -1383,7 +1721,7 @@ let wbCapState = { active: false, startedAt: null, error: null };
 // 修法：注入前把干净备份**写到磁盘临时文件**；下次启动发现脚本还带钩子就用它还原。
 const WB_BACKUP_FILE = path.join(os.tmpdir(), "bai-router-wb-codebuddy.bak.json");
 function wbMd5(s) { return createHash("md5").update(Buffer.from(String(s), "utf8")).digest("hex"); }
-function wbCaptureSelfHeal() {
+function wbCaptureSelfHeal(p) {
   try {
     if (!existsSync(WB_BACKUP_FILE)) return;
     const meta = JSON.parse(readFileSync(WB_BACKUP_FILE, "utf8"));
@@ -1510,7 +1848,7 @@ async function wbKickHostSession() {
     const arr = Array.isArray(list) ? list : [];
     const hosts = arr.filter((s) => s && (s.sessionId === WB_HOST_SESSION_PREFIX || String(s.sessionId).startsWith(WB_HOST_SESSION_PREFIX + "-")));
     if (!hosts.length) {
-      return { action: "no_host", detail: `WorkBuddy 后台在运行，但没有常驻会话通道（共 ${arr.length} 个会话）。直接发一条消息即可，无需重启`, sessions: arr.length };
+      return { action: "no_host", detail: `WorkBuddy 后台在运行，但没有常驻会话通道（共 ${arr.length} 个会话）。发一条消息即可抓到令牌`, sessions: arr.length };
     }
     let killed = 0, lastErr = "";
     for (const h of hosts) {
@@ -1534,7 +1872,7 @@ async function wbKickHostSession() {
 }
 
 // 定位 WorkBuddy 的 CLI 启动脚本：① 注册表安装信息（最准，任意盘）→ ② 候选目录 → ③ 同级目录扫描
-function findWbCliScript() {
+function findWbCliScript(p) {
   const tryPath = async (base, rel) => {
     if (!base) return null;
     const p = path.join(base, rel);
@@ -1552,15 +1890,17 @@ function findWbCliScript() {
       (e, so) => resolve(e ? [] : String(so).split(/\r?\n/).map((s) => s.trim()).filter(Boolean)));
   });
   return (async () => {
-    // ① 注册表
-    for (const hit of await fromRegistry()) {
+    // ① 注册表（同样按版别排序——**这是最容易错位的一处**：本机两版都装了，
+    //    WorkBuddy 5.7.7 与 WorkBuddy AI 5.7.6 的卸载项都会命中，
+    //    而注册表返回顺序不保证谁在前。此前 wbai 请求抓到国内版目录就是这里漏的。
+    for (const hit of wbOrderedBases(p, await fromRegistry())) {
       const asDir = await tryPath(hit, WB_CLI_REL);
       if (asDir) return asDir;
       const asExeDir = await tryPath(path.dirname(hit), WB_CLI_REL); // DisplayIcon 给的是 exe 路径
       if (asExeDir) return asExeDir;
     }
     // ② 候选目录
-    for (const base of wbCandidateBases()) {
+    for (const base of wbOrderedBases(p)) {
       const hit = await tryPath(base, WB_CLI_REL);
       if (hit) return hit;
     }
@@ -1592,13 +1932,20 @@ async function wbCaptureRestore() {
   st.wrote = false;
 }
 
-async function wbCaptureToken(timeoutMs = 150000) {
+// 令牌捕获：临时往 WorkBuddy 的 CLI 脚本里注入钩子，等客户端发起带鉴权的请求时把令牌抓回来。
+// p 决定**写进哪一份配置**（里程碑 1b）：wb → cfg.wb，wbai → cfg.wbai。
+// 两版令牌不通用，抓错了写错渠道比抓不到更糟——所以这里必须由调用方明确指定，
+// 缺省仍是 wb（保住旧调用方的行为）。注意钩子本身装在**哪一份** WorkBuddy 程序上
+// 由 findWbCliScript 的候选目录顺序决定（两版都装了时无法从路径可靠区分），
+// 因此调用方应确认用户已启动对应版本的客户端。
+async function wbCaptureToken(timeoutMs = 150000, p = "wb") {
+  const zh = p === "wbai" ? "WorkBuddy AI" : "WorkBuddy";
   if (wbCapState.active) {
     const secs = Math.round((Date.now() - wbCapState.startedAt) / 1000);
-    throw new Error(`上一次获取还在进行中（已等待 ${secs} 秒）。请在 WorkBuddy 客户端里发一条消息，或稍候重试`);
+    throw new Error(`上一次获取还在进行中（已等待 ${secs} 秒）。请在 ${zh} 客户端里发一条消息，或稍候重试`);
   }
-  const script = await findWbCliScript();
-  if (!script) throw new Error("未找到 WorkBuddy 程序（请确认本机已安装国内版 WorkBuddy 或国际版 WorkBuddy AI 客户端）");
+  const script = await findWbCliScript(p);
+  if (!script) throw new Error(`未找到 ${zh} 程序（请确认本机已安装对应版本的客户端）`);
   const outFile = path.join(DATA_DIR, "wb-captured-token.json");
   await fsPromises.rm(outFile, { force: true }).catch(() => { });
   const original = await fsPromises.readFile(script, "utf8");
@@ -1619,20 +1966,41 @@ async function wbCaptureToken(timeoutMs = 150000) {
   const patched = lines[0] + "\n" + hook + "\n" + lines.slice(1).join("\n");
   wbCapState = {
     active: true, startedAt: Date.now(), error: null, script, backup, wrote: false, got: "",
-    phase: "injecting", phaseText: "正在注入临时钩子…", kick: null,
+    phase: "injecting", phaseText: "正在注入临时钩子…", kick: null, p,
   };
   await fsPromises.writeFile(script, patched, "utf8");
   wbCapState.wrote = true;
   wbCapState.phase = "injected";
-  wbCapState.phaseText = "钩子已注入，正在重启 WorkBuddy 的常驻会话通道…";
-  log(`WorkBuddy 令牌捕获：已注入临时钩子（${script}），等待客户端触发…`);
+  /* v1.0.65 实测修正：**改磁盘文件对已在运行的客户端无效**。
+   * Node/Electron 启动时就把入口脚本读进内存了，钩子写进去之后，
+   * 客户端仍按内存里的旧代码发请求 —— 于是「发三条消息都没抓到」。
+   * 实测证据：客户端启动 18:32:31，钩子注入 18:46:13（晚 14 分钟），
+   * kick 报 no_host、界面提示「直接发一条消息即可，无需重启」，全是错的。
+   * 所以注入后立刻比对客户端进程的启动时间：早于本次注入 ⇒ 必须完全退出并重启，
+   * 这时要如实说，而不是让用户白试三次。 */
+  const stale = await wbClientRunningBefore(p);
+  wbCapState.needRestart = stale;
+  if (stale) {
+    wbCapState.phaseText = `钩子已注入 ${zh} 客户端目录，但**该客户端在注入前就已启动**，`
+      + "它用的是内存里的旧代码 —— 改磁盘文件对它无效。请**完全退出该客户端**（含托盘图标）后重新打开，再发一条消息。";
+  } else {
+    wbCapState.phaseText = `钩子已注入 ${zh} 客户端，发一条消息即可抓到令牌。`;
+  }
+  log(`${zh} 令牌捕获：已注入临时钩子（${script}），等待客户端触发…`
+    + (stale ? "（注意：该客户端在注入前已在运行，必须完全退出重启后钩子才会生效）" : ""));
   // 踢侧车必须在注入**之后**：被重启拉起的新 CLI 进程才会读到带钩子的脚本
   try {
     const k = await wbKickHostSession();
     wbCapState.kick = k;
     wbCapState.phase = "waiting";
-    wbCapState.phaseText = `${k.detail}。之后带鉴权的请求一出现就会被自动抓取（最长等 ${Math.round(timeoutMs / 1000)} 秒）`;
-    log(`WorkBuddy 令牌捕获：踢侧车 → ${k.action}：${k.detail}`);
+    /* needRestart 时**不要**用 kick 的文案覆盖：kick 只会说"发一条消息即可"，
+       而此时那个客户端跑的是内存里的旧脚本，发一百条也抓不到。
+       先前就因为这里把上面那句"必须重启"冲掉，界面又回到误导性的提示。 */
+    if (!wbCapState.needRestart) {
+      wbCapState.phaseText = `${k.detail}。之后带鉴权的请求一出现就会被自动抓取（最长等 ${Math.round(timeoutMs / 1000)} 秒）`;
+    }
+    log(`WorkBuddy 令牌捕获：踢侧车 → ${k.action}：${k.detail}`
+      + (wbCapState.needRestart ? "（但客户端在注入前已启动，kick 无效，必须完全退出重启）" : ""));
   } catch (e) {
     wbCapState.kick = { action: "error", detail: String(e.message || e) };
     wbCapState.phase = "waiting";
@@ -1658,19 +2026,21 @@ async function wbCaptureToken(timeoutMs = 150000) {
             // 只要抓到合法访问令牌就可以落盘——它才是真正用来打上游的凭证（有效期约一年）。
             // 刷新令牌的兜底策略（见下），保证「只带 Authorization 的普通请求」也能一次成功。
             const cfg = loadCfg();
-            cfg.wb.accessToken = obj.accessToken;
+            // 写进**本次请求指定的那一份**（wb → cfg.wb，wbai → cfg.wbai，里程碑 1b）。
+            // 写错渠道比抓不到更糟：两版令牌不通用，串了就是 401 且极难自查。
+            cfg[p].accessToken = obj.accessToken;
             // 刷新令牌：优先用本次抓到的；本次没有（大多数情况：普通业务请求只带 Authorization）
             // 就保留配置里已有的，避免把一条好用的刷新令牌覆盖成空。两者都没有则留空
             // （仍可正常用，只是令牌过期后无法自动续期，返回的 hasRefresh/hints 会如实说明）。
-            if (obj.refreshToken) cfg.wb.refreshToken = obj.refreshToken;
-            if (obj.deviceToken) cfg.wb.deviceToken = obj.deviceToken;
-            if (obj.userId) cfg.wb.userId = obj.userId;
+            if (obj.refreshToken) cfg[p].refreshToken = obj.refreshToken;
+            if (obj.deviceToken) cfg[p].deviceToken = obj.deviceToken;
+            if (obj.userId) cfg[p].userId = obj.userId;
             saveCfg(cfg);
             const exp = wbTokenExp(obj.accessToken);
-            const hasRefresh = !!cfg.wb.refreshToken;
+            const hasRefresh = !!cfg[p].refreshToken;
             // 抓到即还原：不等超时，立刻让 WorkBuddy 的脚本恢复原状
             await wbCaptureRestore();
-            log(`WorkBuddy 令牌捕获：成功（钩子已立即还原）${hasRefresh ? "" : "，未含刷新令牌（将沿用配置里已有的，若无则到期需重新获取）"}`);
+            log(`${zh} 令牌捕获：成功（已写入 cfg.${p}，钩子已立即还原）${hasRefresh ? "" : "，未含刷新令牌（将沿用配置里已有的，若无则到期需重新获取）"}`);
             return {
               ok: true,
               masked: keyFp(obj.accessToken),
@@ -1798,7 +2168,15 @@ function wbToOpenAI(j) {
     model: j.model,
     messages: msgs,
     stream: true, // WorkBuddy 网关仅支持流式（非流式请求一律 11101）
-    max_tokens: typeof j.max_tokens === "number" && j.max_tokens >= 3 ? j.max_tokens : 4096,
+    /* 下限抬到 16：实测国际版有一批模型（gpt-6-astra / gpt-5.6-luna 等 gpt-* 系）
+       拒绝 max_tokens < 16，一律回 400 {"code":11133,"msg":"Invalid request parameters"}，
+       而 glm-5.3 / hy3 这类照单全收。同一个值 8 → 拒、16 → 200、32000 → 200，
+       所以这是**数值下限**、不是参数名不兼容（换 max_completion_tokens 同样能过，容易误判成后者）。
+       真实对话发的是 32000 不会踩到，但本项目的「测试连通」探测固定发 max_tokens: 8
+       （见 /api/test），用户把档位指向 gpt-* 模型时会看到一句莫名其妙的
+       "Invalid request parameters"。抬下限一次解决所有小请求路径，
+       且不动 isProbe 的判定（它读的是原始请求体，不是这里的改写结果）。 */
+    max_tokens: typeof j.max_tokens === "number" && j.max_tokens >= 3 ? Math.max(16, j.max_tokens) : 4096,
   };
   if (Array.isArray(j.tools) && j.tools.length) {
     out.tools = j.tools.filter((t) => t && t.name).map((t) => ({
@@ -1830,7 +2208,7 @@ let wbErrPrefix = "WorkBuddy";
 function setErrProvider(name) { wbErrPrefix = name; }
 // 提供方 → 展示名（中转端口自己答错时用：全局 wbErrPrefix 是别的请求留下的，
 // 不重设会把 [Qoder] 的错误挂上 [WorkBuddy] 之类的前缀）
-const RELAY_LABELS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen", qd: "Qoder", or: "OpenRouter" };
+const RELAY_LABELS = CHANNEL_LABELS;   // 与 PROVIDERS 同一张表，见文件头 CHANNELS 处
 function relayLabel(p) { return RELAY_LABELS[p] || p; }
 function wbAnthroError(res, status, msg) {
   if (res.headersSent || res.writableEnded) { try { res.end(); } catch { } return; }
@@ -2137,6 +2515,97 @@ function orParse429(txt, resHeaders) {
 
 /* 两层轮换的决策：给定这次 429 的 limit_source，返回下一个该试的 (key, model)。
  * 返回 {ok:true, keyIdx, key, model} 或 {ok:false, reason, resetAt}（三把 key 全在冷却）。 */
+/* ════════════════════════════════════════════════════════════════════════
+   WorkBuddy 系的「免费额度按模型计」→ 同渠道内换模型（v1.0.65）
+   ════════════════════════════════════════════════════════════════════════
+   实测（2026-10-11 国际版，同一时刻同一令牌）：
+       hy3 → 200   deepseek-v4.1-flash → 429   hy4-preview → 200   glm-5.3-flash → 200
+   hy3 与 deepseek-v4.1-flash 倍率同为 x0.00（都免费），只有后者被限 —— ��明
+   **免费额度按模型独立计**，不是按账号。所以 failover 那套「换渠道」在这里帮不上：
+   同一个渠道内的模型没有退路（failover.mjs 换的是渠道）。
+   这里补的是同渠道内的模型级退路，语义与 OpenRouter 的 orAdvance 一致
+   （限流 → 冷却当前模型 → 挑下一个没冷却的 → 重试）。
+
+   为什么不代劳「切积分」：实测 12 种可能的请求级开关（body 里 useCredit /
+   withCredit / consumeCredit / payWithCredit / credit / usePoints / paid / billing，
+   header 里 X-Use-Credit / X-Pay-With-Credit / X-Credit-Mode / X-Billing-Mode）
+   全部无效，仍回 429 —— 那是客户端侧的账号状态，API 上没有对应参数。
+   要用积分得在 WorkBuddy 客户端里切，我们做不到，也不假装能做到。
+   ──────────────────────────────────────────────────────────────────────── */
+
+// 被限的模型 → 冷却到期时间（上游会带重置时刻，解析不出来就按 10 分钟兜底）
+const WB_MODEL_COOLDOWN_FALLBACK_MS = 10 * 60 * 1000;
+const wbModelCool = new Map();      // "渠道|模型" -> untilMs
+let wbState = { lastSwitch: null, lastLimitAt: 0 };
+
+/* 单次请求最多换几个模型。目录里可用的有 27 个，一次换一个很容易撞上另一个正在
+   冷却的（免费档就 3 个，轮换一圈可能全在冷却），换到 4 次仍不成才如实报错。 */
+const WB_ADVANCE_MAX = 4;
+
+/** 从上游 429 正文里认出「这是免费额度/频率限制」，认不出返回 null（宁可不动也不要瞎换）。 */
+function wbParseLimit(text) {
+  const s = String(text || "");
+  if (!/frequency limit|usage exceeds|rate.?limit|quota|积分|额度/i.test(s)) return null;
+  // 上游文案形如 "…reset at 2026-10-12 15:23:51 UTC+8"；解析不出来就用兜底时长
+  const m = s.match(/reset at\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}(?::\d{2})?)/i);
+  if (m) {
+    const t = Date.parse(m[1].replace(/-/g, "/") + " " + m[2]);
+    if (Number.isFinite(t) && t > Date.now()) return { resetAt: t };
+  }
+  return { resetAt: Date.now() + WB_MODEL_COOLDOWN_FALLBACK_MS };
+}
+
+const wbModelCoolLeft = (key, now) => {
+  const u = wbModelCool.get(key) || 0;
+  return u > now ? Math.ceil((u - now) / 1000) : 0;
+};
+
+/**
+ * 换一个同渠道内、没在冷却的模型。
+ * 候选 = 该渠道的实时目录里 `credits` 最低的几个（免费/极低倍率优先 —— 它们最不容易
+ * 撞限流；实在全限流了就一路往上吃倍率，**付费模型同令牌直接 200，积分链路天然通**，
+ * 不需要任何「用积分」开关）。
+ * `skip` = 本次请求已经试过并失败的模型，避免在循环里来回挑同一个。
+ * 找不到就返回 { ok:false }，由调用方如实把上游的 429 抛给用户。
+ */
+function wbAdvanceModel(p, failedModel, limit, skip) {
+  /* 候选来源按可得性依次退让（冷启动时进程内缓存是空的，这是实测踩到的情况：
+     服务刚起 → 目录还没拉过 → 候选池空 → 误判成「没有其它可选模型」，
+     明明 hy3/hy4-preview 都在线。v1.0.65 实测日志：
+       「WorkBuddy 429 模型级轮换未果（wbai）：no_alternative」）
+     ① 进程内实时目录（有倍率，按倍率从低到高排，优先挑最不容易撞限流的）
+     ② 磁盘上的上次成功目录（重启后仍在）
+     ③ 都没有 → 如实说没有替代，不要瞎换 */
+  const mem = wbCatCaches[p] && wbCatCaches[p].val && Array.isArray(wbCatCaches[p].val.models);
+  const disk = wbReadCatDisk(p);
+  /* ③ 再兜一层：配置里的 availableModels（拿不到倍率，但至少知道有哪些模型可换）。
+     宁可换成倍率未知的另一个模型，也好过把上游的 429 原样甩给用户 ——
+     前者能继续干活，后者什么都干不了。倍率未知只在显示上少个后缀。 */
+  const builtin = wbBuiltinCatalog(loadCfg(), p);
+  const models = (mem && wbCatCaches[p].val.models)
+    || (disk && Array.isArray(disk.models) ? disk.models : null)
+    || builtin;
+  const now = Date.now();
+  const coolKey = (id) => p + "|" + id;
+  if (failedModel) wbModelCool.set(coolKey(failedModel), limit.resetAt);
+
+  const rate = (c) => { const v = parseFloat(String(c == null ? "" : c).replace(/^x/i, "")); return Number.isFinite(v) ? v : Infinity; };
+  const pool = models.slice()
+    .sort((a, b) => rate(a.credits) - rate(b.credits))
+    .map((m) => m.id)
+    .filter((id) => id && id !== failedModel && !(skip && skip.has(id)));
+  if (!pool.length) return { ok: false, reason: "no_alternative" };
+
+  for (const id of pool) {
+    if (!wbModelCoolLeft(coolKey(id), now)) {
+      wbState.lastSwitch = { at: new Date().toISOString(), from: failedModel || "(未知)", to: id, provider: p };
+      return { ok: true, model: id };
+    }
+  }
+  return { ok: false, reason: "all_cooling" };
+}
+
+// OpenRouter 的两层轮换（orAdvance）是本节做法的参照实现。
 function orAdvance(cfg, info) {
   const keys = orKeys(cfg);
   const models = orModelList(cfg);
@@ -2267,7 +2736,7 @@ function catalogError(msg, httpStatus) {
 // 六家的怪癖全封在这里，调用方不必再分叉：
 //   or  —— 网络，按 pricing 全 0 筛免费；失败一律 400
 //   qd  —— 同步读本地明文目录，读不到退回静态内置（带 static:true，永不报错）
-//   wb  —— 没有目录接口，就是把当前配置回显（永远「无变化」）
+//   wb  —— 有目录接口（/v3/config，契约 v18 里程碑 2）；拉不到时降级到落盘/内置并标 static
 //   zen —— 公开目录但只有 space-bunny-free 能外部调用；拉不到时静默返回过期缓存
 //   sn  —— 走 directHttp 境内直连，只留能输出 text 的
 //   bai —— fetch 打上游 /v1/models
@@ -2297,10 +2766,36 @@ async function fetchCatalogFor(p, cfg) {
     return r.ok ? r : qdStaticCatalog(S);
   }
 
-  if (p === "wb") {
-    // WorkBuddy 没有公开的模型目录接口（模型清单随客户端 product config 下发），
-    // 返回当前可选列表即可——三款免费模型由发布机默认随版本推送
-    return { ok: true, count: S.availableModels.length, models: [...S.availableModels], static: true };
+  if (p === "wb" || p === "wbai") {
+    // WorkBuddy **有**公开的模型目录接口：GET {base}/v3/config（契约 v18 里程碑 2）。
+    // 旧结论「没有目录接口、回显配置即可」已被实测推翻（见 wbReadCatalog 顶部）。
+    // 降级链：实时 → 上次成功（落盘）→ 内置兜底，来源如实标注。两版各拉各的（里程碑 1b）。
+    const cat = await wbReadCatalog(cfg, p);
+    const models = cat.models;
+    const freeN = models.filter((m) => m.free).length;
+    const labels = {};
+    for (const m of models) {
+      // 下拉显示名：模型名 · 倍率（免费标「免费」）。倍率未知（兜底/App 形态无 credits）时只留名字。
+      const cost = m.credits == null ? "" : (m.free ? "免费" : m.credits);
+      labels[m.id] = [m.name, cost].filter(Boolean).join(" · ");
+    }
+    const srcZh = { live: "实时目录", disk: "上次成功目录（落盘降级）", builtin: "内置兜底列表" }[cat.source] || cat.source;
+    const who = p === "wbai" ? "WorkBuddy AI" : "WorkBuddy";
+    const note = cat.source === "live"
+      ? `${who} 目录来自上游 ${WB_CONFIG_PATH}（${srcZh}）：共 ${models.length} 个模型，其中 ${freeN} 个 0 倍率免费。`
+      : `未取到 ${who} 实时目录${cat.error ? `（${cat.error}）` : ""}，当前显示${srcZh}——`
+        + `${models.length} 个模型，倍率可能不是最新的；稍后重试可恢复实时目录。`;
+    return {
+      ok: true,
+      count: models.length,
+      models: models.map((m) => m.id),
+      all: models.map((m) => ({ key: m.id, name: m.name, credits: m.credits, free: m.free })),
+      labels, freeCount: freeN, source: cat.source,
+      // 降级到兜底时才标 static，让 scan-all 不动配置（契约：非可信数据不比差异）；
+      // live/disk 都是真实目录，交给 scan-all 正常做 diff。
+      ...(cat.source === "builtin" ? { static: true } : {}),
+      note,
+    };
   }
 
   if (p === "zen") {
@@ -2436,8 +2931,12 @@ function orQuotaSnapshot(cfg) {
   };
 }
 
+// 两版 WorkBuddy 共用这一整套分支：wk(p) 判"是不是 WorkBuddy 家族"，
+// 避免下面每处都写一遍 `p === "wb" || p === "wbai"`（漏一处就是国际版走错上游）。
+const isWk = (p) => p === "wb" || p === "wbai";
+const wkZh = (p) => (p === "wbai" ? "WorkBuddy AI" : "WorkBuddy");
 async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
-  const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : p === "or" ? "OpenRouter" : "WorkBuddy";
+  const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : p === "or" ? "OpenRouter" : wkZh(p);
   setErrProvider(NAME);
   let token;
   if (p === "zen") {
@@ -2451,13 +2950,21 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     try { token = qdEnsureToken(cfg); }
     catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
   } else {
-    try { token = await wbEnsureToken(cfg); }
+    try { token = await wbEnsureToken(cfg, p); }
     catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
   }
 
   const ob = wbToOpenAI(j);
-  const base = (S.upstream || (p === "zen" ? DEFAULTS.zen.upstream : p === "qd" ? DEFAULTS.qd.upstream : p === "or" ? DEFAULTS.or.upstream : DEFAULTS.wb.upstream)).replace(/\/+$/, "");
-  const url = p === "wb" ? base + "/v2/chat/completions" : base + "/chat/completions";
+  const base = (S.upstream || (p === "zen" ? DEFAULTS.zen.upstream : p === "qd" ? DEFAULTS.qd.upstream : p === "or" ? DEFAULTS.or.upstream : DEFAULTS[p].upstream)).replace(/\/+$/, "");
+  // 契约 v18 里程碑 5：发往国内版前删掉 body 里的 reasoning_effort:"off"（插件实测国内版拒该值）。
+  // 注意：wbToOpenAI 是**白名单**构造，当前根本不产出 reasoning_effort —— 这条是防御性兜底，
+  // 将来若加入该字段也不会漏到国内版。本机 intl 实测 reasoning_effort:"off" 被正常接受（200），
+  // 国内版该说法**未能实测**（当时只有 intl 令牌，打 .cn 在到达模型前即 401）。
+  // 判据是**上游 host** 而不是渠道名——用户把某版的 upstream 改成 .cn 时同样要生效。
+  if (isWk(p) && /(^|\.)workbuddy\.cn$/i.test(hostOf(base)) && ob && ob.reasoning_effort === "off") {
+    delete ob.reasoning_effort;
+  }
+  const url = isWk(p) ? base + "/v2/chat/completions" : base + "/chat/completions";
   const mkHeaders = (tok) => {
     if (p === "zen") {
       return {
@@ -2484,17 +2991,37 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
         "user-agent": `B.AI-Router/${APP_VERSION}`,
       };
     }
-    const w = cfg.wb;
+    // 走到这里的一定是 WorkBuddy 家族（zen/or/qd 都已在上面分支返回）。
+    // 取**本渠道**那份配置：wb → cfg.wb，wbai → cfg.wbai（里程碑 1b，两版令牌/用户标识独立）。
+    const w = (p === "wbai" ? cfg.wbai : cfg.wb) || {};
+    const host = hostOf(base) || "www.workbuddy.ai";
+    // 契约 v18 里程碑 5：按真实客户端（app.asar header 构造器）补齐请求头。
+    // 实测：**UA 是唯一闸门**——`B.AI-Router/x.y.z` 会被 400 {"code":12403,"check ua"} 挡掉，
+    // 换成客户端形态 `WorkBuddy/<ver> …` 后 /v3/config 与 /v2/chat 均正常。Origin/Referer
+    // 实测非必需（带与不带一致），但既然无副作用，与真实客户端对齐一并带上。
+    const ua = wbUa();
+    const ver = wbClientVersion() || WB_UA_FALLBACK_VER;
     const h = {
       "content-type": "application/json",
       "x-requested-with": "XMLHttpRequest",
       authorization: `Bearer ${tok}`,
       "x-product": "SaaS",
-      "user-agent": `B.AI-Router/${APP_VERSION}`,
+      "x-private-data": "true",
+      "x-ide-type": "WorkBuddy",
+      "x-ide-name": "WorkBuddy",
+      "x-ide-version": ver,
+      "user-agent": ua,
     };
+    // 无 userId 时带 `X-No-User-Id: true`（**不省略** X-User-Id），与真实客户端一致；
+    // 同理 enterprise/department 的相关头。实测本机 x-no-* 非必需，但形态与客户端对齐。
     if (w.userId) h["x-user-id"] = w.userId;
+    else h["x-no-user-id"] = "true";
     if (w.deviceToken) h["x-device-token"] = w.deviceToken;
-    h["x-domain"] = hostOf(base) || "www.workbuddy.ai";
+    if (!w.enterpriseId) h["x-no-enterprise-id"] = "true";
+    if (!w.departmentInfo) h["x-no-department-info"] = "true";
+    h["x-domain"] = host;
+    h["origin"] = `https://${host}`;
+    h["referer"] = `https://${host}/`;
     return h;
   };
   let bodyStr = JSON.stringify(ob);   // OpenRouter 轮换会改写 model，故为 let
@@ -2547,9 +3074,9 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     }
     // 令牌失效（401/403）→ WorkBuddy 侧可续期并重试一次；Zen 侧 key 失效直接报错；
     // Qoder 侧强制绕过 mtime 缓存重读令牌文件再试一次（Qoder 可能刚轮换过令牌）
-    if ((r.status === 401 || r.status === 403) && p === "wb" && cfg.wb.refreshToken) {
+    if ((r.status === 401 || r.status === 403) && isWk(p) && (p === "wbai" ? cfg.wbai : cfg.wb)?.refreshToken) {
       await readAllBody(r).catch(() => "");
-      try { token = await wbRefreshToken(cfg); r = await doCall(token); }
+      try { token = await wbRefreshToken(cfg, p); r = await doCall(token); }
       catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
     }
     if ((r.status === 401 || r.status === 403) && p === "qd") {
@@ -2558,6 +3085,42 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
         const again = qdEnsureToken(cfg, true);
         if (again && again !== token) { token = again; r = await doCall(token); }
       } catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
+    }
+    // ---- WorkBuddy（wb / wbai）：同渠道内换模型续跑（契约 v18，v1.0.65）----
+    // 实测这两版的限流**按模型独立计**（hy3 与 deepseek-v4.1-flash 同为 x0.00，
+    // 只有后者 429），所以 failover 那套「换渠道」在这里帮不上 —— 同一渠道内没有退路。
+    //
+    // 上游原文是 "usage exceeds frequency limit … your usage will reset at <时刻>"，
+    // 即**限流**而非额度耗尽。解法就是换模型；付费模型用同一令牌直接 200，
+    // **积分链路天然是通的，不需要任何「用积分」开关** —— v1.0.65 曾为此试过 8 个 body
+    // 参数名 + 4 个 header，全部无效，方向本来就错（见 paid.mjs 实测记录）。
+    //
+    // 这里做成循环而不是只换一次：挑中的替代模型自己也可能正在冷却，
+    // 换一次就放弃等于「换个模型也用不了」，达不到「继续消耗积分继续用」。
+    if (p === "wb" || p === "wbai") {
+      const tried = new Set();
+      let advance = 0;
+      while (r.status === 429 && advance < WB_ADVANCE_MAX) {
+        const peek = await readAllBody(r).catch(() => "");
+        const limit = wbParseLimit(peek);
+        // 认不出是限流就不换：瞎换比不换更糟（用户要的模型被换掉他并不知道）
+        if (!limit) { consumedBodyHint = peek; break; }
+        const next = wbAdvanceModel(p, ob.model, limit, tried);
+        if (!next.ok) { consumedBodyHint = peek; break; }
+        tried.add(next.model);
+        const from = ob.model;
+        /* ob 是 const 对象，不能改字段；整体换一个新对象（其余字段原样带走） */
+        bodyStr = JSON.stringify({ ...ob, model: next.model });
+        noteRelayError(p, "rate_limit_quota",
+          `${from} 触发频率限制，已改用 ${next.model} 继续。`);
+        log(`WorkBuddy 限流轮换（${p}）→ ${from} → ${next.model}`);
+        advance++;
+        r = await doCall(token);
+      }
+      /* 换够了仍是 429：正文留给下面的归因，如实把上游的 429 抛给用户，不假装成功 */
+      if (advance > 0 && r.status === 429 && !consumedBodyHint) {
+        consumedBodyHint = await readAllBody(r).catch(() => "");
+      }
     }
     // 探测级小请求遇 429：静默退避重试（与 B.AI/SenseNova 行为一致）
     // OpenRouter 已在上面的两层轮换里重试过（orStop=额度耗尽/429 认不出），这里不再白打上游——
@@ -2820,6 +3383,7 @@ function providerConfigured(provider, cfg) {
   if (provider === "bai") return !!cfg.apiKey;
   if (provider === "sn") return !!cfg.sn?.apiKey;
   if (provider === "wb") return !!cfg.wb?.accessToken;
+  if (provider === "wbai") return !!cfg.wbai?.accessToken;
   if (provider === "zen") return !!cfg.zen?.apiKey;
   if (provider === "or") return orKeys(cfg).length > 0;   // 轮换区：至少 1 把 key 就算配置好
   if (provider === "qd") { try { qdEnsureToken(cfg); return true; } catch { return false; } }
@@ -2831,6 +3395,7 @@ function relaySpec(provider, cfg) {
     bai: ["B.AI", () => true, {}],
     sn: ["SenseNova", () => cfg.sn?.useProxy === true, {}],
     wb: ["WorkBuddy", () => cfg.wb?.useProxy === true, { openai: true }],
+    wbai: ["WorkBuddy AI", () => cfg.wbai?.useProxy === true, { openai: true }],
     zen: ["OpenCode Zen", () => cfg.zen?.useProxy === true, { openai: true }],
     qd: ["Qoder", () => cfg.qd?.useProxy === true, { openai: true }],
     or: ["OpenRouter", () => cfg.or?.useProxy === true, { openai: true }],
@@ -3034,6 +3599,8 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
 const relay = makeRelay("bai", recentCallsBai, (cfg) => ({ upstream: cfg.upstream, mapping: cfg.mapping, defaultModel: cfg.defaultModel, availableModels: cfg.availableModels }), () => true);
 const snRelay = makeRelay("sn", recentCallsSn, (cfg) => ({ upstream: cfg.sn.upstream, mapping: cfg.sn.mapping, defaultModel: cfg.sn.defaultModel, availableModels: cfg.sn.availableModels }), (cfg) => cfg.sn.useProxy === true);
 const wbRelay = makeRelay("wb", recentCallsWb, (cfg) => ({ upstream: cfg.wb.upstream, mapping: cfg.wb.mapping, defaultModel: cfg.wb.defaultModel, availableModels: cfg.wb.availableModels }), (cfg) => cfg.wb.useProxy === true, { openai: true });
+// WorkBuddy 国际版：同一个协议桥、同一套请求头构造，只换上游/端口/令牌三样（里程碑 1b）
+const wbaiRelay = makeRelay("wbai", recentCallsWbai, (cfg) => ({ upstream: cfg.wbai.upstream, mapping: cfg.wbai.mapping, defaultModel: cfg.wbai.defaultModel, availableModels: cfg.wbai.availableModels }), (cfg) => cfg.wbai.useProxy === true, { openai: true });
 // OpenCode Zen：OpenAI 协议，复用同一套桥（apiKey 认证，无令牌续期）
 const zenRelay = makeRelay("zen", recentCallsZen, (cfg) => ({ upstream: cfg.zen.upstream, mapping: cfg.zen.mapping, defaultModel: cfg.zen.defaultModel, availableModels: cfg.zen.availableModels }), (cfg) => cfg.zen.useProxy === true, { openai: true });
 // Qoder：OpenAI 协议，复用同一套桥。认证是轮换的 jt- jobToken（每次请求现读令牌文件），无静态密钥
@@ -3102,6 +3669,17 @@ function sliceOf(cfg, p) {
       useProxy: w.useProxy === true,
     };
   }
+  if (p === "wbai") {
+    // WorkBuddy 国际版（里程碑 1b）：与 wb 同构，独立的端口/上游/令牌。
+    const w = cfg.wbai || {};
+    return {
+      // 同 wb：没有 sk- 密钥，key 用访问令牌充当（供指纹展示与"是否已配置"判断），中转本身不校验
+      p: "wbai", zh: "WorkBuddy AI", key: w.accessToken || "", upstream: w.upstream || DEFAULTS.wbai.upstream,
+      relayPort: w.relayPort || DEFAULTS.wbai.relayPort, defaultModel: w.defaultModel || DEFAULTS.wbai.defaultModel,
+      availableModels: w.availableModels || [...DEFAULTS.wbai.availableModels], mapping: w.mapping || { ...DEFAULTS.wbai.mapping },
+      useProxy: w.useProxy === true,
+    };
+  }
   if (p === "or") {
     const o = cfg.or || {};
     return {
@@ -3120,30 +3698,140 @@ function sliceOf(cfg, p) {
     useProxy: true,
   };
 }
-const PROVIDERS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", zen: "OpenCode Zen", qd: "Qoder", or: "OpenRouter" };
-const isOurs = (mode) => mode === "bai" || mode === "sn" || mode === "wb" || mode === "zen" || mode === "qd" || mode === "or";
+const PROVIDERS = CHANNEL_LABELS;
+const isOurs = (mode) => CHANNELS.includes(mode);
 function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
+
+// ---------- WorkBuddy 客户端版本与 UA（契约 v18 里程碑 5）----------
+// 实测事实（本机 2026-10-11，真实令牌打 /v3/config 与 /v2/chat/completions）：
+//  ① **UA 是唯一闸门**。UA 非 `WorkBuddy/…` 形态时上游回 400 {"code":12403,
+//     "msg":"check ua, get coding copilot version error"}——我们原来发的 `B.AI-Router/x.y.z`
+//     正是被这条挡掉的，连目录都拉不到。
+//  ② **Origin/Referer 不是必需**。带与不带实测返回完全一致（同为 21625 字节）。
+//     契约 §1.1「缺 Origin/Referer → 空目录」与本机实测不符（那是**无鉴权**的表现）。
+//  ③ 真实客户端版本从安装目录读：`resources/install-manifest.json` 的 appVersion，
+//     或 `resources/app.asar` 内 package.json 的 version（两者一致）。读不到如实返回 null。
+//  ④ 上游 roster 由 UA 形态决定：客户端形态 `WorkBuddy/<ver> WorkBuddy/<ver>`（可再缀 ` CLI/<cliVer>`）
+//     返回完整目录；纯 `CLI/<ver> CodeBuddy/<ver>` 返回更小的 22 档目录。我们**发对话请求**
+//     用的是客户端形态（与真实客户端一致）。里程碑 2 的 `/v3/config` 拉目录用的是 CLI 形态，
+//     **两处共用下面的 wbClientVersion()/wbUa()，不各写一份版本逻辑**。
+const WB_CLIENT_DIRS = [
+  // 国际版/国内版常见安装位（与 wbCandidateBases 同源的兜底，不改它的搜索逻辑）
+  path.join(process.env.LOCALAPPDATA || "", "Programs", "WorkBuddyAI"),
+  path.join(process.env.LOCALAPPDATA || "", "Programs", "WorkBuddy"),
+];
+let wbClientVerCache = { at: 0, val: undefined }; // undefined=未查；null=查不到
+// 从安装目录读真实客户端版本。返回字符串版本或 null（**读不到就 null，绝不编造**）。
+function wbClientVersion() {
+  const now = Date.now();
+  if (wbClientVerCache.at && now - wbClientVerCache.at < 10 * 60 * 1000) return wbClientVerCache.val;
+  let ver = null;
+  // 盘符兜底：安装程序可能把 LOCALAPPDATA 重定向到别的盘
+  const dirs = [...WB_CLIENT_DIRS];
+  const user = process.env.USERNAME || "";
+  for (const d of ["C", "D", "E", "F"]) {
+    if (user) {
+      dirs.push(path.join(d + ":", "Users", user, "AppData", "Local", "Programs", "WorkBuddyAI"));
+      dirs.push(path.join(d + ":", "Users", user, "AppData", "Local", "Programs", "WorkBuddy"));
+    }
+  }
+  // ① install-manifest.json（纯文本，最省事）
+  for (const dir of dirs) {
+    try {
+      const j = JSON.parse(readFileSync(path.join(dir, "resources", "install-manifest.json"), "utf8"));
+      const v = String(j.appVersion || "").trim();
+      if (/^\d+\.\d+/.test(v)) { ver = v; break; }
+    } catch { /* 继续下一个位置 */ }
+  }
+  // ② app.asar 内 package.json（上面读不到时）
+  if (!ver) {
+    for (const dir of dirs) {
+      try {
+        const buf = readFileSync(path.join(dir, "resources", "app.asar"));
+        const headerSize = buf.readUInt32LE(12);
+        const hdr = JSON.parse(buf.slice(16, 16 + headerSize).toString("utf8").replace(/\0+$/, ""));
+        const e = hdr.files && hdr.files["package.json"];
+        if (!e) continue;
+        const off = 16 + headerSize + Number(e.offset);
+        const s = buf.slice(off, off + Number(e.size)).toString("utf8");
+        const m = s.match(/"version"\s*:\s*"([^"]+)"/);
+        if (m && /^\d+\.\d+/.test(m[1])) { ver = m[1]; break; }
+      } catch { /* 继续 */ }
+    }
+  }
+  wbClientVerCache = { at: now, val: ver };
+  return ver;
+}
+// 客户端形态 UA。
+// 实测（隔离变量矩阵，2026-10-11）：闸门**只认 `WorkBuddy` 前缀**——版本号、段数、
+// 有没有 "AI" 都不影响结果（`WorkBuddy/1.0.0`、`WorkBuddy/x`、单段、`WorkBuddyAI`
+// 四种变体返回的是逐字节相同的目录）。所以这里不追求"复刻客户端的精确格式"，
+// 只要前缀对、版本号是真的即可。
+// 版本读不到就退回一个已知能过闸的占位值，保证功能可用（但会与客户端真实版本不符）。
+const WB_UA_FALLBACK_VER = "5.7.6";
+function wbUa() {
+  const v = wbClientVersion() || WB_UA_FALLBACK_VER;
+  return `WorkBuddy/${v} WorkBuddy/${v}`;
+}
 
 // CLI 的 ANTHROPIC_BASE_URL 恒为提供方上游本体（B.AI=api.b.ai、sn=token.sensenova.cn），不经本地中转；
 // 只有桌面版走 127.0.0.1:<relay>。故两者用不同的判据。
-function cliMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey, orKey) {
+/* 各家凭据的取法。**每家不一样**（平铺的 apiKey / wb 的 accessToken / qd 的轮换 token /
+   or 的三把轮换 key 里当前那把），以前是六个位置参数硬塞进 cliMode/desktopMode，
+   加一个渠道就得改签名 + 改所有调用点——漏一处就是静默不比对凭据。
+   现在收敛到这一个函数，加渠道只改它一处。 */
+function channelCredentials(c) {
+  c = c || loadCfg();
+  return {
+    bai: c.apiKey,
+    sn: c.sn?.apiKey,
+    wb: c.wb?.accessToken,
+    wbai: c.wbai?.accessToken,
+    zen: c.zen?.apiKey,
+    qd: c.qd?.token || "qd-local",
+    or: orActiveKey(c),
+  };
+}
+
+/* CLI/桌面版里"走本地协议桥"的渠道。applyToCli 用同一个判据决定
+   ANTHROPIC_BASE_URL 写 127.0.0.1 还是上游本体——**必须是同一个函数**，
+   否则会出现"直连上游却写占位符"（上游收不到真凭据，整个渠道 401）。
+   zen 有意不在其中：它的 CLI 直连上游本体，与 qd/wb/wbai/or 不同。 */
+const isBridgeChannel = (p) => p === "wb" || p === "wbai" || p === "qd" || p === "or";
+
+function cliMode(cfg, creds) {
   try {
     const s = readJson(SETTINGS);
     const u = s?.env?.ANTHROPIC_BASE_URL || "";
     const key = s?.env?.ANTHROPIC_AUTH_TOKEN || "";
     const r = { baseUrl: u, keyFp: key ? keyFp(key) : null };
     const c = cfg || loadCfg();
-    if (cfgKey) r.keyMatch = key === cfgKey;
-    if (snKey != null) r.keyMatchSn = key === snKey;
-    if (zenKey != null) r.keyMatchZen = key === zenKey;
-    if (wbKey != null) r.keyMatchWb = key === wbKey;
-    if (qdKey != null) r.keyMatchQd = key === qdKey;
-    if (orKey != null) r.keyMatchOr = key === orKey;
+    const k = creds || channelCredentials(c);
+    /* keyMatch 的跳过条件**各家不同**，这是既有实现的样子（`server.mjs@HEAD` 3136-3141）：
+         bai  是 `if (cfgKey)`         → 空串时整个字段不设
+         其余 `if (xKey != null)`       → 空串**不**跳过，照样得到 false
+       统一成一种判据会改变面板显示（多出或少掉一个"凭据不一致"提示），
+       所以这里照抄这份不一致，并在下面断言它成立——**要修也得单独提，别顺手改**。 */
+    for (const ch of CHANNELS) {
+      const v = k[ch];
+      const skip = ch === CHANNELS[0] ? !v : v == null;
+      if (skip) continue;
+      /* 走本地桥的渠道，applyToCli 写的是占位符 PROXY_MANAGED 而不是真凭据（里程碑 4b）。
+         拿占位符去和配置里的真 key 比**永远不等** → keyMatch 恒为 false → 面板会对每个
+         桥渠道误报「凭据不一致，需重开对应端」。所以把占位符视为一致：桥不校验入站
+         token，本就无从比对；面板该看的是「接的是不是这一家」（下面的 mode），那才有效。
+         桌面版侧（applyToDesktop 仍写真 key）因此不受影响——这里判的是 settings.json。 */
+      const bridged = isBridgeChannel(ch);
+      r["keyMatch" + ch.charAt(0).toUpperCase() + ch.slice(1)] =
+        (bridged && key === PROXY_MANAGED_TOKEN) ? true : key === v;
+    }
     const bh = hostOf(c.upstream || DEFAULTS.upstream), sh = hostOf(c.sn?.upstream || DEFAULTS.sn.upstream);
     if (bh && u.includes(bh)) return { mode: "bai", ...r };
     if (sh && u.includes(sh)) return { mode: "sn", ...r };
     // WorkBuddy 的 CLI 直接指向本地协议桥（CLI 讲 Anthropic，上游讲 OpenAI，必须过桥）
     if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
+    // 国际版同理，且**排在 wb 之后**：两版端口相邻（15742/15782），顺序反了会让 wbai 被 wb 抢走
+    if (u.includes(`:${c.wbai?.relayPort || DEFAULTS.wbai.relayPort}`)) return { mode: "wbai", ...r };
     if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
     // Qoder 同理走本地协议桥；令牌会轮换，故只按端口判据，不做 key 匹配
     if (u.includes(`:${c.qd?.relayPort || DEFAULTS.qd.relayPort}`)) return { mode: "qd", ...r };
@@ -3155,7 +3843,7 @@ function cliMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey, orKey) {
     return { mode: "unknown", baseUrl: "" };
   }
 }
-function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey, orKey) {
+function desktopMode(cfg, creds) {
   try {
     const f = desktopConfigFile();
     if (!f || !existsSync(f)) return { mode: "unknown", baseUrl: "" };
@@ -3164,15 +3852,29 @@ function desktopMode(cfg, cfgKey, snKey, wbKey, zenKey, qdKey, orKey) {
     const key = d?.inferenceGatewayApiKey || "";
     const r = { baseUrl: u, keyFp: key ? keyFp(key) : null };
     const c = cfg || loadCfg();
-    if (cfgKey) r.keyMatch = key === cfgKey;
-    if (snKey != null) r.keyMatchSn = key === snKey;
-    if (zenKey != null) r.keyMatchZen = key === zenKey;
-    if (wbKey != null) r.keyMatchWb = key === wbKey;
-    if (qdKey != null) r.keyMatchQd = key === qdKey;
-    if (orKey != null) r.keyMatchOr = key === orKey;
+    const k = creds || channelCredentials(c);
+    /* keyMatch 的跳过条件**各家不同**，这是既有实现的样子（`server.mjs@HEAD` 3136-3141）：
+         bai  是 `if (cfgKey)`         → 空串时整个字段不设
+         其余 `if (xKey != null)`       → 空串**不**跳过，照样得到 false
+       统一成一种判据会改变面板显示（多出或少掉一个"凭据不一致"提示），
+       所以这里照抄这份不一致，并在下面断言它成立——**要修也得单独提，别顺手改**。 */
+    for (const ch of CHANNELS) {
+      const v = k[ch];
+      const skip = ch === CHANNELS[0] ? !v : v == null;
+      if (skip) continue;
+      /* 走本地桥的渠道，applyToCli 写的是占位符 PROXY_MANAGED 而不是真凭据（里程碑 4b）。
+         拿占位符去和配置里的真 key 比**永远不等** → keyMatch 恒为 false → 面板会对每个
+         桥渠道误报「凭据不一致，需重开对应端」。所以把占位符视为一致：桥不校验入站
+         token，本就无从比对；面板该看的是「接的是不是这一家」（下面的 mode），那才有效。
+         桌面版侧（applyToDesktop 仍写真 key）因此不受影响——这里判的是 settings.json。 */
+      const bridged = isBridgeChannel(ch);
+      r["keyMatch" + ch.charAt(0).toUpperCase() + ch.slice(1)] =
+        (bridged && key === PROXY_MANAGED_TOKEN) ? true : key === v;
+    }
     if (u.includes(`:${c.relayPort || DEFAULTS.relayPort}`)) return { mode: "bai", ...r };
     if (u.includes(`:${c.sn?.relayPort || DEFAULTS.sn.relayPort}`)) return { mode: "sn", ...r };
     if (u.includes(`:${c.wb?.relayPort || DEFAULTS.wb.relayPort}`)) return { mode: "wb", ...r };
+    if (u.includes(`:${c.wbai?.relayPort || DEFAULTS.wbai.relayPort}`)) return { mode: "wbai", ...r };
     if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
     // Qoder 同理走本地协议桥；令牌会轮换，故只按端口判据，不做 key 匹配
     if (u.includes(`:${c.qd?.relayPort || DEFAULTS.qd.relayPort}`)) return { mode: "qd", ...r };
@@ -3205,20 +3907,52 @@ function snapshotExternal() {
   return warns;
 }
 
+// 走本地中转的渠道，CLI 侧写的占位符（里程碑 4b）。
+// 与 FALLBACK_CC_CLI / 沙箱 settings.json 里既有的 "PROXY_MANAGED" 同一个值——
+// 桌面版那边早就这么写了，这里只是让 CLI 侧对齐。
+const PROXY_MANAGED_TOKEN = "PROXY_MANAGED";
+
 // 通用：把一个提供方的映射写进 CLI settings.json
-function applyToCli(S) {
+async function applyToCli(S) {
   let s = {};
   try { s = readJson(SETTINGS); } catch { s = {}; }
   s.env = s.env || {};
   const e = s.env;
-  e.ANTHROPIC_AUTH_TOKEN = S.key || "wb-local";
-  // B.AI 的 CLI 直连上游（靠 proxy env 出海）；SenseNova 境内直连；
-  // WorkBuddy / Qoder / OpenRouter 必须走本地协议桥（CLI 是 Anthropic 协议，上游只讲 OpenAI）
-  e.ANTHROPIC_BASE_URL = (S.p === "wb" || S.p === "qd" || S.p === "or") ? `http://127.0.0.1:${S.relayPort}` : S.upstream;
+  /* 里程碑 4b：**走本地中转的渠道**写占位符，不写真实凭据。
+   *
+   * 以前这里把真实 JWT 明文写进 ~/.claude/settings.json —— 那把令牌与
+   * %APPDATA%\bai-router\config.json 里的是同一字符串（实测同为 1411 字符），
+   * 等于在用户主目录留了一份明文副本。
+   *
+   * 之所以能改成占位符：中转**不信任**客户端送来的这个 token。协议桥
+   * （fo.opts.openai：wb/wbai/qd/or/zen）自己用 wbEnsureToken()/qdEnsureToken()/orPick()
+   * 从配置取真实凭据并自己拼 mkHeaders；PASS_HEADERS 虽收集了 authorization，
+   * 但那条路径只对**非协议桥**渠道生效。
+   *
+   * **直连上游的 bai / sn / zen 必须带真 key**（它们没有中间人，token 就是给上游的）。
+   * 判据与 BASE_URL 完全同源（下面下一行用同一个表达式），两者不会走岔。
+   * 与桌面版既有做法一致（applyToDesktop 之外的 FALLBACK_CC 里就写着 PROXY_MANAGED）。
+   */
+  const viaLocalRelay = isBridgeChannel(S.p);
+  e.ANTHROPIC_BASE_URL = viaLocalRelay ? `http://127.0.0.1:${S.relayPort}` : S.upstream;
+  e.ANTHROPIC_AUTH_TOKEN = viaLocalRelay ? PROXY_MANAGED_TOKEN : (S.key || "wb-local");
   e.ANTHROPIC_MODEL = S.mapping["claude-haiku-4-5"]?.target || S.defaultModel;
+  /* 显示名：只写用户手填的 label，不掺倍率（v1.0.65 撤掉）。
+   *
+   * 仍然不 `delete`：以前是 `delete e[t.envKey + "_NAME"]` —— 我们自己把 Claude Code
+   * 的显示名通道删掉了，于是 /model 里只能看到模型 id。契约 §1.6 实测：
+   * ANTHROPIC_DEFAULT_*_MODEL_NAME 的 label 可塞任意文本，且与模型名是两个独立字段。
+   * 曾经在这里拼过「label · x0.79」（路径 A），实测还有个更麻烦的问题：
+   * 目录里 hy4-preview-f 是 x0.00 而 hy4-preview 是 x0.29，靠前缀回退很容易配错行，
+   * 与其显示一个可能对不上的数字，不如不显示 —— 真实倍率在面板「刷新模型列表」里看。
+   * 模型名（e[t.envKey]）保持上游真名不变，解析链零改动。
+   */
   for (const t of TIERS) {
-    e[t.envKey] = S.mapping[t.key]?.target || S.defaultModel;
-    delete e[t.envKey + "_NAME"];
+    const m = S.mapping[t.key] || {};
+    const target = m.target || S.defaultModel;
+    e[t.envKey] = target;
+    // 用户没填 label 就不写这条（留空反而会让 Claude Code 回退显示模型 id，与旧行为一致）
+    if (m.label) e[t.envKey + "_NAME"] = m.label;
   }
   e.API_TIMEOUT_MS = e.API_TIMEOUT_MS || "3000000";
   e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
@@ -3261,7 +3995,7 @@ function applyToDesktop(S) {
   );
 }
 // 兼容旧调用名
-function applyBaiToCli(cfg) { applyToCli(sliceOf(cfg, "bai")); }
+async function applyBaiToCli(cfg) { await applyToCli(sliceOf(cfg, "bai")); }
 function applyBaiToDesktop(cfg) { applyToDesktop(sliceOf(cfg, "bai")); }
 
 // CC Switch 方案的兜底还原数据（取自用户机器上真实生效过的配置）
@@ -3400,8 +4134,13 @@ async function statusPayload() {
   try { qdTok = qdEnsureToken(cfg); } catch { }
   const wbExp = wbTokenExp(cfg.wb?.accessToken);
   // 版别（v1.0.59）：按登录域名判定 cn/intl（读不到登录文件 → null），面板要能
-  // 一眼看出「现在配的是哪版的通道、实际上游拨到了哪个端点」
-  const wbAuthNow = wbDetectAuth();
+  // 一眼看出「现在配的是哪版的通道、实际上游拨到了哪个端点」。
+  // v1.0.65 起**各读各的登录文件**（里程碑 1b）：wb 看 workbuddy-desktop.info，
+  // wbai 看 workbuddy-desktop-ai.info——两版都装了时不再二选一。
+  const wbAuthNow = wbDetectAuth("wb");
+  const wbaiAuthNow = wbDetectAuth("wbai");
+  const wbaiExp = wbTokenExp(cfg.wbai?.accessToken);
+  const wbaiStatus = providerStatus(cfg, "wbai", recentCallsWbai);
   // OpenRouter 的额度真相（/auth/key）：面板轮询走 60 秒缓存，不打上游
   const orQuota = orQuotaSnapshot(cfg);
   const orKeysNow = orKeys(cfg);
@@ -3413,10 +4152,10 @@ async function statusPayload() {
     clash,
     proxy: cfg.proxy || "直连",
     ccswitch: { running: ccswitch },
-    // 接线状态（两端各自归属哪个提供方）。keyMatch=对 B.AI key 的匹配，
-    // keyMatchSn/keyMatchWb 分别是对 SenseNova / WorkBuddy 凭据的匹配——各页各取各的对比对象。
-    cli: cliMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey, cfg.qd?.token || "qd-local", orActiveKey(cfg)),
-    desktop: desktopMode(cfg, cfg.apiKey, cfg.sn?.apiKey, cfg.wb?.accessToken, cfg.zen?.apiKey, cfg.qd?.token || "qd-local", orActiveKey(cfg)),
+    // 接线状态（两端各自归属哪个提供方）。keyMatch* 是客户端实际用的凭据与本渠道
+    // 凭据的比对结果——客户端送来的 auth token 与我们配置里那把是不是同一把。
+    cli: cliMode(cfg),
+    desktop: desktopMode(cfg),
     // B.AI 灯/接线沿用旧字段名，SenseNova 灯挂 sn 下，WorkBuddy 灯挂 wb 下
     relay: bai.relay, relayLast: bai.relayLast, upstream: bai.upstream, recent: bai.recent,
     sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, useProxy: cfg.sn?.useProxy === true },
@@ -3443,6 +4182,20 @@ async function statusPayload() {
         expAt: wbExp ? new Date(wbExp * 1000).toISOString() : null,
         expiresInDays: wbExp ? Math.max(0, Math.round((wbExp * 1000 - Date.now()) / 86400000)) : null,
         hasRefresh: !!cfg.wb?.refreshToken,
+      },
+    },
+    // WorkBuddy 国际版（wbai，里程碑 1b 新增）：与 wb 结构完全对称，但读**自己的**登录文件
+    // （workbuddy-desktop-ai.info）与自己的令牌——两版同时装时两边都能各自报出就绪状态。
+    wbai: {
+      relay: wbaiStatus.relay, relayLast: wbaiStatus.relayLast, upstream: wbaiStatus.upstream, recent: wbaiStatus.recent,
+      useProxy: cfg.wbai?.useProxy === true,
+      edition: wbaiAuthNow.edition,
+      authDomain: wbaiAuthNow.domain,
+      token: {
+        configured: !!cfg.wbai?.accessToken,
+        expAt: wbaiExp ? new Date(wbaiExp * 1000).toISOString() : null,
+        expiresInDays: wbaiExp ? Math.max(0, Math.round((wbaiExp * 1000 - Date.now()) / 86400000)) : null,
+        hasRefresh: !!cfg.wbai?.refreshToken,
       },
     },
     // OpenRouter（第 6 家）：三盏灯 + 两层轮换状态 + 额度真相（「免费流水区」卡读这里）
@@ -3521,6 +4274,7 @@ const panel = http.createServer(async (req, res) => {
       "/index.html": "/", "/ui.html": "/",
       "/sensenova": "/sn", "/sn.html": "/sn",
       "/workbuddy": "/wb", "/wb.html": "/wb",
+      "/workbuddy-ai": "/wbai", "/wbai.html": "/wbai",
       "/opencode": "/zen", "/zen.html": "/zen",
       "/qoder": "/qd", "/qd.html": "/qd",
       "/openrouter": "/or", "/or.html": "/or",
@@ -3534,7 +4288,7 @@ const panel = http.createServer(async (req, res) => {
     // C10（渲染模板的路径必须有清单 path 匹配）能用字面量 grep 判断。
     if (req.method === "GET" && (
       u.pathname === "/" || u.pathname === "/bai" || u.pathname === "/sn" || u.pathname === "/wb" ||
-      u.pathname === "/zen" || u.pathname === "/qd" || u.pathname === "/or"
+      u.pathname === "/wbai" || u.pathname === "/zen" || u.pathname === "/qd" || u.pathname === "/or"
     )) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "provider.html")));
@@ -3569,8 +4323,12 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.33: 一键捕获 WorkBuddy 令牌（临时注入客户端 CLI 脚本 → 抓取 → 立即还原）
     if (req.method === "POST" && u.pathname === "/api/wb/capture") {
       try {
-        const r = await wbCaptureToken(150000);
-        return json(res, 200, { ok: true, ...r, message: "令牌已自动填入并保存" });
+        // provider 决定抓到的令牌写进哪一份配置（里程碑 1b：wb / wbai，两版令牌不通用）。
+        // 缺省 wb —— 旧调用方行为不变。
+        const body = await readBody(req).catch(() => ({}));
+        const p = (body && body.provider) === "wbai" ? "wbai" : "wb";
+        const r = await wbCaptureToken(150000, p);
+        return json(res, 200, { ok: true, ...r, provider: p, message: "令牌已自动填入并保存" });
       } catch (e) {
         return json(res, 200, { ok: false, error: String((e && e.message) || e) });
       }
@@ -3580,6 +4338,9 @@ const panel = http.createServer(async (req, res) => {
       // 踢侧车结果、还差什么」，超时文案也由后端按卡点分类生成，不再一律转圈。
       return json(res, 200, {
         active: wbCapState.active,
+        provider: wbCapState.p || "wb",   // 本次捕获写往哪个渠道（里程碑 1b）
+        // v1.0.65：客户端在注入前就已启动 ⇒ 内存里是旧入口脚本，必须完全退出重启
+        needRestart: wbCapState.needRestart === true,
         startedAt: wbCapState.startedAt,
         elapsedMs: wbCapState.active ? Date.now() - wbCapState.startedAt : 0,
         gotAccessToken: !!(wbCapState.active && wbCapState.got),
@@ -3623,8 +4384,8 @@ const panel = http.createServer(async (req, res) => {
     // 下拉框不能只靠发布机默认列表；UI 的「刷新模型列表」按钮走这里。
     // v1.0.28: ?p=sn 时从 SenseNova 拉（境内直连，不走代理）；只保留可对话模型（output 含 text）。
     if (req.method === "GET" && u.pathname === "/api/models") {
-      const pRaw = u.searchParams.get("p");
-      const p = pRaw === "sn" ? "sn" : pRaw === "wb" ? "wb" : pRaw === "zen" ? "zen" : pRaw === "qd" ? "qd" : pRaw === "or" ? "or" : "bai";
+      // 渠道键收敛走 resolveChannelKey（认得 wbai，认不得的一律回落到 bai）
+      const p = resolveChannelKey(u.searchParams.get("p"));
       const c2 = loadCfg();
       try {
         return json(res, 200, await fetchCatalogFor(p, c2));
@@ -3637,7 +4398,7 @@ const panel = http.createServer(async (req, res) => {
     }
 
     // v1.0.60：六家提供方的顺序（扫描与批量写入都按这个顺序走，面板展示顺序一致）
-    const ALL_PKEYS = ["bai", "sn", "wb", "zen", "qd", "or"];
+    const ALL_PKEYS = CHANNELS;
 
     /* 一键刷新全部提供方 —— 扫描端。
      *
@@ -3668,7 +4429,7 @@ const panel = http.createServer(async (req, res) => {
         const models = Array.isArray(r.models) ? r.models : [];
         // 状态四选一，让前端能区分「真没变化」和「压根没拿到可信数据」。
         let status = "ok";
-        if (r.static === true) status = "static";        // qd 读不到本地目录退回内置静态表 / wb 本就只是回显配置
+        if (r.static === true) status = "static";        // qd 退回内置静态表 / wb 降级到内置兜底列表
         else if (!models.length) status = "empty";      // zenReadCatalog() 会吞掉错误返回过期空缓存（HTTP 200），空列表是真故障
         // **只有 status==="ok" 才比差异。** 没拿到可信目录时算出来的 added/removed 是假的：
         //   empty —— 上游没给任何模型，「removed」会等于当前整张列表，照着应用就把配置洗成空；
@@ -3678,7 +4439,7 @@ const panel = http.createServer(async (req, res) => {
           return { ...base, status, added: [], removed: [], count: 0,
             ...(r.note ? { note: r.note } : {}) };
         }
-        // 比对一律转小写：POST /api/config 存进去的都是小写，但 wb 是把配置原样回显、
+        // 比对一律转小写：POST /api/config 存进去的都是小写，但 wb 的目录来自上游 id、
         // qd 也未必归一，不转小写会把大小写差异当成模型增减。
         const cur = new Set(haveArr.map((x) => String(x).trim().toLowerCase()));
         const next = new Set(models.map((x) => String(x).trim().toLowerCase()).filter(Boolean));
@@ -3730,7 +4491,7 @@ const panel = http.createServer(async (req, res) => {
       // 不按提供方逐个重写（写六遍同一个目标没有意义，还白白发出一堆外部快照告警）
       const applied = [];
       const curCli = cliMode(cfg).mode, curDesk = desktopMode(cfg).mode;
-      if (done.includes(curCli)) { applyToCli(sliceOf(cfg, curCli)); applied.push("cli"); }
+      if (done.includes(curCli)) { await applyToCli(sliceOf(cfg, curCli)); applied.push("cli"); }
       if (done.includes(curDesk)) { applyToDesktop(sliceOf(cfg, curDesk)); applied.push("desktop"); }
       log(`批量模型列表已写入:`, done.join(",") + (skipped.length ? `（跳过:${skipped.join(",")}）` : ""), "重应用到:", applied.join(",") || "无");
       return json(res, 200, {
@@ -3825,8 +4586,12 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/config") {
       const b = await readBody(req);
       const cfg = loadCfg();
-      const P = ["sn", "zen", "qd", "or"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
-      const sub = P === "sn" ? cfg.sn : P === "wb" ? cfg.wb : P === "zen" ? cfg.zen : P === "qd" ? cfg.qd : P === "or" ? (cfg.or || (cfg.or = { ...DEFAULTS.or })) : cfg; // 共用字段（mapping/upstream/…）落点
+      const P = resolveChannelKey(b.provider);
+      // 落点：bai 是扁平的（字段直接摊在 cfg 顶层），其余各家各有自己的子对象。
+      // P 已经是 resolveChannelKey 收敛过的合法渠道键，故按 CHANNELS 成员关系取子对象即可，
+      // 不必再写一串三元链（加渠道时漏改一处 = 静默把配置写到别家去）。
+      const sub = P === "bai" ? cfg
+        : (P === "or" ? (cfg.or || (cfg.or = { ...DEFAULTS.or })) : (cfg[P] || (cfg[P] = { ...DEFAULTS[P] })));
       // —— API Key（仅 B.AI / SenseNova）——
       if (typeof b.apiKey === "string" && b.apiKey.trim()) {
         const k = b.apiKey.trim();
@@ -3842,7 +4607,7 @@ const panel = http.createServer(async (req, res) => {
       if (P === "bai" && b.failover) {
         if (typeof b.failover.enabled === "boolean") cfg.failover = { ...(cfg.failover || {}), enabled: b.failover.enabled };
         if (Array.isArray(b.failover.chain)) {
-          cfg.failover = { ...(cfg.failover || {}), chain: b.failover.chain.filter((x) => ["bai","sn","wb","zen","qd","or"].includes(x)) };
+          cfg.failover = { ...(cfg.failover || {}), chain: b.failover.chain.filter((x) => CHANNELS.includes(x)) };
         }
       }
       // —— Qoder 令牌（一般不用填：正常由 worker 补丁写入 tokenFile，此处仅手动兜底）——
@@ -3850,11 +4615,12 @@ const panel = http.createServer(async (req, res) => {
         cfg.qd.token = b.token.trim();
       }
       // —— WorkBuddy 令牌（出现字段即写入；空串=清除）——
-      if (P === "wb") {
+      // 两版结构相同、各写各的（里程碑 1b）：wb → cfg.wb，wbai → cfg.wbai。
+      if (P === "wb" || P === "wbai") {
         for (const f of ["accessToken", "refreshToken", "deviceToken", "userId"]) {
-          if (typeof b[f] === "string") cfg.wb[f] = b[f].trim();
+          if (typeof b[f] === "string") cfg[P][f] = b[f].trim();
         }
-        if (cfg.wb.accessToken && cfg.wb.accessToken.split(".").length !== 3) {
+        if (cfg[P].accessToken && cfg[P].accessToken.split(".").length !== 3) {
           return json(res, 400, { error: "访问令牌应是 JWT（三段以 . 分隔）——请从捕获结果完整粘贴" });
         }
       }
@@ -3910,7 +4676,7 @@ const panel = http.createServer(async (req, res) => {
       // 端上已接到该提供方的话，立即同步新映射
       const applied = [];
       const curCli = cliMode(cfg).mode, curDesk = desktopMode(cfg).mode;
-      if (curCli === P) { applyToCli(sliceOf(cfg, P)); applied.push("cli"); }
+      if (curCli === P) { await applyToCli(sliceOf(cfg, P)); applied.push("cli"); }
       if (curDesk === P) { applyToDesktop(sliceOf(cfg, P)); applied.push("desktop"); }
       log(`配置已保存(${P})，重应用到:`, applied.join(",") || "无", needRestart ? "(需重启)" : "");
       return json(res, 200, {
@@ -3930,14 +4696,14 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.28: 一键接线按提供方分流；恢复（接回 CC Switch）在 /api/restore 里保持原样
     if (req.method === "POST" && u.pathname === "/api/apply") {
       const b = await readBody(req);
-      const P = ["sn", "zen", "qd", "or"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
+      const P = resolveChannelKey(b.provider);
       const cfg = loadCfg();
       const S = sliceOf(cfg, P);
       const name = PROVIDERS[P];
       if (!S.key) {
         return json(res, 400, {
-          error: P === "wb"
-            ? "请先在「WorkBuddy」页粘贴访问令牌（JWT）——捕获方法见该页说明"
+          error: P === "wb" || P === "wbai"
+            ? `请先在「${name}」页粘贴访问令牌（JWT）——捕获方法见该页说明`
             : P === "or"
               ? "请先在「OpenRouter」页的「免费流水区」填入至少 1 个 sk-or-v1 API Key（最多 3 把）"
               : `请先在「${name}」路由表里填写 API Key`,
@@ -3955,13 +4721,14 @@ const panel = http.createServer(async (req, res) => {
       const warns = [];
       if (doCli) { const w = snapshotExternal(); warns.push(...w.filter((x) => x.startsWith("桌面"))); }
       if (doDesk) { const w = snapshotExternal(); warns.push(...w.filter((x) => x.startsWith("CLI"))); }
-      if (doCli) applyToCli(S);
+      if (doCli) await applyToCli(S);
       if (doDesk) applyToDesktop(S);
       const ccRunning = await checkCcSwitch();
       if (ccRunning) warns.push("CC Switch 正在运行，它可能随时把配置改回去；切换前建议先退出它");
       warns.push("桌面版需完全退出并重开 Claude 才生效；CLI 新开终端生效");
       if (P === "sn") warns.push("SenseNova 有 TPM/RPM 限流，探测到 429 属正常，稍候即恢复；图像模型不参与对话路由");
-      if (P === "wb") warns.push("WorkBuddy 三款免费模型由 WorkBuddy 客户端账号提供（0 积分不限量）；令牌过期会自动用刷新令牌续期，无需重新接线");
+      if (P === "wb") warns.push("WorkBuddy 国内版：0 积分模型由 WorkBuddy 客户端账号提供；令牌过期会自动用刷新令牌续期，无需重新接线。国际版请到「WorkBuddy AI」格单独接线");
+      if (P === "wbai") warns.push("WorkBuddy AI 国际版：需要国际版客户端的令牌（与国内版不通用）；模型目录与倍率来自上游 /v3/config，未取到时用出厂兜底清单");
       if (P === "zen") warns.push("OpenCode Zen 的免费额度多数限客户端内使用，实测仅 space-bunny-free 可外部调用；购买 Go 订阅后可解锁 Go 通道的 30 个模型");
       if (P === "qd") warns.push("Qoder 走账号的 Free 套餐额度；令牌每次 Qoder 启动会轮换，中转会自动跟随——但 Qoder 客户端必须保持运行，否则中转读不到令牌");
       if (P === "or") warns.push("OpenRouter 免费区：免费模型 50 次/天/把 key，用尽自动换模型、再换 key（最多 3 把）；重置时间看 X-RateLimit-Reset，面板显示倒计时与剩余次数");
@@ -3982,9 +4749,17 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/test") {
       const cfg = loadCfg();
       const b = await readBody(req).catch(() => ({}));
-      const P = ["sn", "zen", "qd", "or"].includes(b.provider) ? b.provider : b.provider === "wb" ? "wb" : "bai";
+      const P = resolveChannelKey(b.provider);
       const S = sliceOf(cfg, P);
-      const store = P === "sn" ? recentCallsSn : P === "wb" ? recentCallsWb : P === "zen" ? recentCallsZen : P === "qd" ? recentCallsQd : P === "or" ? recentCallsOr : recentCallsBai;
+      // 每家一份「最近真实调用」观察表；按渠道键取，不用再写一串三元链
+      // （加渠道时漏改一处 = 测活时用错家的档位历史）。
+      const store = P === "bai" ? recentCallsBai
+        : P === "sn" ? recentCallsSn
+        : P === "wb" ? recentCallsWb
+        : P === "wbai" ? recentCallsWbai
+        : P === "zen" ? recentCallsZen
+        : P === "qd" ? recentCallsQd
+        : recentCallsOr;
       const active = b.all ? null : activeTier(store);
       const targets = active ? [active] : TIERS.map((t) => t.key);
       const tierInfo = (key) => {
@@ -4213,6 +4988,7 @@ listenWithRetry(relay, cfg0.relayPort, "中转");
 wbCaptureSelfHeal();
 listenWithRetry(snRelay, cfg0.sn.relayPort, "SenseNova中转");
 listenWithRetry(wbRelay, cfg0.wb.relayPort, "WorkBuddy中转");
+listenWithRetry(wbaiRelay, cfg0.wbai.relayPort, "WorkBuddyAI中转");
 listenWithRetry(zenRelay, cfg0.zen.relayPort, "OpenCodeZen中转");
 listenWithRetry(qdRelay, cfg0.qd.relayPort, "Qoder中转");
 listenWithRetry(orRelay, cfg0.or.relayPort, "OpenRouter中转");

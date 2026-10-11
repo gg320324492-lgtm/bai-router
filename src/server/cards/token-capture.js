@@ -82,6 +82,13 @@ window.BAI_CARDS["token-capture"] = {
           if (s && s.gotAccessToken) {
             sc.$('[data-role="ptitle"]').textContent = "已捕获到访问令牌，正在写入配置…";
             sc.$('[data-role="pdesc"]').textContent = "刷新令牌只在令牌到期续期时才会出现；没有它也能正常使用，到期后重新获取即可。";
+          } else if (s && s.needRestart) {
+            /* v1.0.65：客户端在钩子注入前就已启动，内存里是旧入口脚本——
+               改磁盘对它无效，光发消息是抓不到的。必须明说，否则用户会一直试。
+               这里**不**再拼「已等待 N 秒」——等再久也没用，要等的是用户重启客户端。 */
+            sc.$('[data-role="ptitle"]').textContent = "需要先完全退出并重启客户端";
+            sc.$('[data-role="pdesc"]').textContent = s.phaseText
+              + "（关窗口不算，托盘图标也要退出；重开后发一条消息即可）";
           } else if (s && s.active && s.phaseText) {
             const secs = Math.round((s.elapsedMs || 0) / 1000);
             sc.$('[data-role="pdesc"]').textContent = s.phaseText + `（已等待 ${secs} 秒，最长 150 秒）`;
@@ -164,7 +171,15 @@ window.BAI_CARDS["token-capture"] = {
         btn.textContent = "获取中…";
         showProgress(sc, true);
         try {
-          const r = await ctx.api("/api/wb/capture", { method: "POST" });
+          /* provider 必带（契约 v18 里程碑 1b）：wb 与 wbai 是两条渠道、令牌不通用，
+             后端据此决定写进 cfg.wb 还是 cfg.wbai。不带会默认落到 wb —— 那是**写错渠道**，
+             症状是接上去以后一律 401，且极难自查。
+             ctx.api 是 fetch 的薄封装（不自动序列化），故 body 要自己 JSON.stringify。 */
+          const r = await ctx.api("/api/wb/capture", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ provider: sc.key }),
+          });
           if (r && r.ok) {
             let msg = "✔ 令牌获取成功（" + (r.masked || "") + "），已自动填入并保存。";
             if (r.hasRefresh === false) {

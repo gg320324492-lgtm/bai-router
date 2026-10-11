@@ -317,8 +317,9 @@ const REQUIRED_FIELDS = [
 const CRED_KINDS = ["apiKey", "jwt", "jobToken", "keys3", "none"];
 const BADGE_KINDS = ["free", "paid", "cn", "intl", "neutral"];
 
-/* 规范路径（七个 URL 全部保留，见契约第一节的产品决策 1）。 */
-const EXPECTED_PATHS = { bai: "/bai", sn: "/sn", wb: "/wb", zen: "/zen", qd: "/qd", or: "/or" };
+/* 规范路径（八个 URL 全部保留，见契约第一节的产品决策 1）。
+   wbai = WorkBuddy 国际版（契约 v18 里程碑 1b 新增渠道）。 */
+const EXPECTED_PATHS = { bai: "/bai", sn: "/sn", wb: "/wb", wbai: "/wbai", zen: "/zen", qd: "/qd", or: "/or" };
 const ROOT_PATH = "/";
 
 /* ============================================================================
@@ -939,7 +940,7 @@ setCheck("C10");
   const aliased = aliasMap ? [...aliasMap[1].matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]) : [];
   const normP = (p) => (p || "/").replace(/\/+$/, "") || "/";
   const manifestPaths = new Set(keys.map((k) => normP(manifest[k].path)));
-  const canonical = new Set(["/", "/sn", "/wb", "/zen", "/qd", "/or"]);
+  const canonical = new Set(["/", "/sn", "/wb", "/wbai", "/zen", "/qd", "/or"]);
 
   for (const pth of served) {
     if (canonical.has(normP(pth))) ok(`template route "${pth}" -> manifest path ${pth}`);

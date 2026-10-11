@@ -169,7 +169,11 @@ function spawnServer() {
   // 版别/配置组合下都逐字符相等，否则又是 NO_PROXY 漂移（见本函数顶部注释）。
   addNoProxyHost("https://www.workbuddy.ai", cfg.wb?.useProxy);
   addNoProxyHost("https://www.workbuddy.cn", cfg.wb?.useProxy);
-  addNoProxyHost(cfg.wb?.upstream || "https://www.workbuddy.ai", cfg.wb?.useProxy);
+  addNoProxyHost(cfg.wb?.upstream || "https://www.workbuddy.cn", cfg.wb?.useProxy);
+  // WorkBuddy 国际版（v1.0.65 新增渠道 wbai）：独立 upstream / 独立 useProxy，
+  // 与 server.mjs computeNoProxy 里那一行 add **逐字同步**（位置也一样：wb 之后、sn 之前）。
+  // 漏加的后果同上——NO_PROXY 漂移 → 自检重启 → 看门狗计成崩溃 → 无限重启。
+  addNoProxyHost(cfg.wbai?.upstream || "https://www.workbuddy.ai", cfg.wbai?.useProxy);
   addNoProxyHost(cfg.sn?.upstream || "https://token.sensenova.cn", cfg.sn?.useProxy);
   addNoProxyHost(cfg.zen?.upstream || "https://opencode.ai/zen/v1", cfg.zen?.useProxy);
   addNoProxyHost(cfg.qd?.upstream || "https://api2-v2.qoder.sh/model/v1", cfg.qd?.useProxy);

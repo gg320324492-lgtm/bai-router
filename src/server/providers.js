@@ -211,8 +211,10 @@ window.BAI_PROVIDERS = {
     settingsLabels: { relayPort: "OpenCode Zen 中转端口" },
   },
 
-  /* ================= WorkBuddy（/wb）—— 转移链第 5 位 =================
-   * 凭据是从本机客户端抓的登录令牌（JWT，只存内存），上游只讲 OpenAI 协议，需要协议桥。 */
+  /* ================= WorkBuddy 国内版（/wb）—— 转移链第 5 位 =================
+   * 凭据是从本机客户端抓的登录令牌（JWT，只存内存），上游只讲 OpenAI 协议，需要协议桥。
+   * 本格**钉死国内版**：上游恒为 www.workbuddy.cn，凭据取 workbuddy-desktop.info。
+   * 国际版是下一条 wbai，两版各自独立的中转端口与独立的令牌，不要互相自愈。 */
   wb: {
     key: "wb",
     path: "/wb",
@@ -223,7 +225,7 @@ window.BAI_PROVIDERS = {
 
     letter: "WB",
     name: "WorkBuddy",
-    tagline: "腾讯 · 三款 0 积分模型",
+    tagline: "腾讯 · 国内版 · 三款 0 积分模型",
     badge: { text: "0 积分", kind: "cn" },
     chainable: true,
     credential: {
@@ -243,9 +245,52 @@ window.BAI_PROVIDERS = {
     },
 
     conclusion: "捕获到 JWT 且未过期就算就绪；本渠道不比对 key（令牌由客户端带、中转只转发）。",
-    remedy: "点「一键获取令牌」重取。没有刷新令牌，到期需重新捕获；国内版与国际版按登录域名自动判定。",
+    remedy: "点「一键获取令牌」重取。没有刷新令牌，到期需重新捕获；国际版请到「WorkBuddy AI」格单独捕获，两个版本的令牌互不相同。",
 
     settingsLabels: { relayPort: "WorkBuddy 中转端口" },
+  },
+
+  /* ================= WorkBuddy 国际版（/wbai）—— 转移链第 6 位 =================
+   * 与 wb 是**两套东西**（实测 2026-10-11，见契约 v18 §1.5）：模型目录、定价、凭据文件
+   * 全部独立。上游恒为 www.workbuddy.ai，凭据取 workbuddy-desktop-ai.info，中转端口也另起一个。
+   * models 只是出厂兜底清单——面板「刷新模型列表」会按上游 /v3/config 覆盖它，
+   * **不要把这里的三个 id 当成真实目录**。 */
+  wbai: {
+    key: "wbai",
+    path: "/wbai",
+    tab: "WorkBuddy AI",
+    h1: "WorkBuddy AI 路由",
+    title: "WorkBuddy AI 路由 · B.AI 路由台",
+    shortName: "WorkBuddy AI",
+
+    letter: "WAI",
+    name: "WorkBuddy AI",
+    tagline: "腾讯 · 国际版 · 出海",
+    badge: { text: "0 积分 · 海外", kind: "intl" },
+    chainable: true,
+    credential: {
+      kind: "jwt",
+      label: "访问令牌",
+      hint: "从本机 WorkBuddy AI（国际版）客户端一键捕获，只存内存",
+    },
+
+    models: ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"],
+    brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
+    defaultModels: ["deepseek-v4.1-flash", "hy4-preview-f", "hy3"],
+    mappingDefaults: {
+      "claude-fable-5": "DeepSeek-V4.1-Flash",
+      "claude-sonnet-5": "Hy4-Preview-F",
+      "claude-opus-5": "HY3",
+      "claude-haiku-4-5": "DeepSeek-V4.1-Flash",
+    },
+
+    conclusion: "捕获到国际版 JWT 且未过期就算就绪；本渠道不比对 key（令牌由客户端带、中转只转发）。已知限制：国际版上游对 system prompt 做内容风控，Claude Code 那种长 system（含工具定义与本机环境信息）会被判为非官方客户端并返回 400「Illegal API invocation from an unapproved channel」；模型目录、倍率、切换都不受影响，受影响的只有真实对话。",
+    // caveat：卡片上直接显示的限制提示（短句版）。完整解释在 conclusion/remedy 里。
+    // 闸门 C1/C12 只校验必填字段的**存在**，不禁止额外字段，所以加这个是安全的。
+    caveat: "国际版上游对 Claude Code 的长 system 做了内容风控：目录/倍率/切换正常，真实对话可能被拒（400）",
+    remedy: "先启动**国际版**客户端（国内版那个不行，两者令牌文件不同）再点「一键获取令牌」。没有刷新令牌，到期需重新捕获。模型清单以面板「刷新模型列表」从上游拉到的为准，本格出厂的三项只是兜底。真实对话若报上面那个 400，是上游风控而非本机配置问题——国内版 WorkBuddy（/wb）没有此限制，可用。",
+
+    settingsLabels: { relayPort: "WorkBuddy AI 中转端口" },
   },
 
   /* ================= OpenRouter（/or）—— 转移链第 6 位（兜底） =================
