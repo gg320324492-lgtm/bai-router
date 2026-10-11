@@ -108,6 +108,23 @@ try {
         def[k] = { ...def[k], availableModels: CUR[k].availableModels };
       }
     }
+    /* 档位映射（tier → 目标模型 / 显示名）与默认模型，同样以仓库为准。
+     *
+     * 与 availableModels 同一类理由：它是**这台机器的用户偏好**，不是出厂默认。
+     * 随包快照发给的是每一个新装用户，把发布者挑的模型烘进去，等于替所有用户做了
+     * 这个选择。实测：v1.0.68 发布时本机的 `or` 档位是 nvidia/nemotron-3.5-lightning:free，
+     * 仓库里写的是 openrouter/free——发布脚本把前者写回了随包默认。
+     * （C8 闸门放行了它：那个模型确实在仓库的 or.availableModels 里，所以不算错，
+     *   但「不算错」和「该由谁决定」是两件事。）
+     *
+     * 要改出厂默认就改仓库里这份，两边一起改——和 availableModels 同一套做法。 */
+    for (const k of ["sn", "wb", "wbai", "zen", "or", "qd"]) {
+      if (!def[k]) continue;
+      const cur = CUR[k] || {};
+      if (cur.mapping && typeof cur.mapping === "object") def[k].mapping = cur.mapping;
+      if (typeof cur.defaultModel === "string" && cur.defaultModel) def[k].defaultModel = cur.defaultModel;
+    }
+    if (typeof CUR.defaultModel === "string" && CUR.defaultModel) def.defaultModel = CUR.defaultModel;
     console.log(`» 本机状态字段取自仓库 defaults: proxy=${def.proxy || "(空=直连)"}`
       + ` failover.enabled=${def.failover ? def.failover.enabled : "(无)"}`
       + ` wb.upstream=${(def.wb && def.wb.upstream) || "(无)"}`);
