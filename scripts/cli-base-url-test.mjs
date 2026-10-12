@@ -120,17 +120,24 @@ function assertNoDoubleV1(env, label) {
 
 /* ------------------------------------------------------------------ *
  * 三份 server 树
- *   before = git HEAD 的 src/server   （改动的逐字基线）
+ *   before = **钉死的提交 37baa43** 的 src/server（改动的逐字基线）
  *   after  = 工作区的 src/server     （本次改动）
  *   mutant = 工作区去掉「去尾部 /v1」那一步（⑥ 的反向对照）
+ *
+ * ⚠ 基线**不能**用 HEAD。原实现取 `git HEAD`，于是本改动一提交，基线里就已经有那一步，
+ *   测试的自检（"基线里应当仍带 /v1"）当场失败，实测报错：
+ *   「HEAD 基线里已经有这一步 —— 那它就不是这次改动引入的，反向对照失去意义」。
+ *   **依赖 git 状态的测试，一提交就废。** 故钉到具体提交。
  * ------------------------------------------------------------------ */
+
+const BASELINE_REF = process.env.BAI_CLI_BASE_BASELINE || "37baa43";
 
 const TREES = {};
 function snapshotHead(dir) {
-  const files = execFileSync("git", ["-C", REPO, "ls-tree", "-r", "HEAD", "--name-only", "--", "src/server"], { encoding: "utf8" })
+  const files = execFileSync("git", ["-C", REPO, "ls-tree", "-r", BASELINE_REF, "--name-only", "--", "src/server"], { encoding: "utf8" })
     .split("\n").filter(Boolean);
   for (const f of files) {
-    const out = execFileSync("git", ["-C", REPO, "show", `HEAD:${f}`], { maxBuffer: 64 << 20 });   // Buffer，别转字符串
+    const out = execFileSync("git", ["-C", REPO, "show", `${BASELINE_REF}:${f}`], { maxBuffer: 64 << 20 });   // Buffer，别转字符串
     const dst = path.join(dir, f.slice("src/server/".length));
     mkdirSync(path.dirname(dst), { recursive: true });
     writeFileSync(dst, out);
@@ -268,7 +275,7 @@ function normalize(env, P) {
 /* ================================================================== *
  * ①②③④⑤：真 server.mjs，接线前后逐字对拍
  * ================================================================== */
-describe("CLI 接线：BASE_URL 与传输开关（真 server.mjs × 2：HEAD 基线 vs 工作区）", () => {
+describe("CLI 接线：BASE_URL 与传输开关（真 server.mjs × 2：钉死基线 37baa43 vs 工作区）", () => {
   let base, work;
   before(async () => {
     base = await bootServer(TREES.before, "before");

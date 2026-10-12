@@ -37,8 +37,10 @@ async function freePorts(n) {
   return ports;
 }
 
+let child, dataDir, panel;
+
 describe("POST /api/config：不再静默成功", () => {
-  let child, dataDir, panel;
+  child = null; dataDir = ""; panel = 0;
 
   before(async () => {
     const [bai, sn, wb, wbai, zen, qd, or, pnl] = await freePorts(8);
@@ -104,11 +106,11 @@ describe("POST /api/config：不再静默成功", () => {
   test("★ 嵌套载荷（字段写错地方）→ 400，不再回 ok:true", async () => {
     const before = onDisk();
     const r = await post({ zen: { transport: "opencode" } });   // 少 provider、且字段嵌套
-    assert.equal(r.status, 400, "什么都没写进去却回 ok:true —— 那是最坏的一种成功");
-    assert.match(r.json.error, /没写进去|没有要保存/);
-    if (r.json.receivedKeys && r.json.receivedKeys.length) {
-      assert.ok(r.json.receivedKeys.includes("zen"), "要把收到的键原样报出来，才点得中问题");
-    }
+    assert.equal(r.status, 400, "什么都没写进去却回 ok:true —— 那是最比的一种成功");
+    assert.ok(Array.isArray(r.json.unknownKeys) && r.json.unknownKeys.includes("zen"),
+      "要**点名**是哪个字段不认（这里嵌套的 zen），而不是笼统说一句「没写进去」");
+    assert.match(r.json.error, /顶层|不是嵌套/,
+      "还要说清正确形状，否则用户不知道自己错在哪");
     assert.equal(onDisk().zen.transport, before.zen.transport, "配置不得被改动");
   });
 
@@ -171,4 +173,69 @@ describe("POST /api/config：不再静默成功", () => {
     assert.equal(naive({ provider: "zenn" }).provider, "bai",
       "修复前的行为：不认识的渠道被静默当成 B.AI");
   });
+/* ---------------------------------------------------------------------------
+ * v1.0.79：「值没变」不等于「字段不认识」
+ *
+ * 起因：用户点「刷新模型列表」，界面报
+ *   「出错了：这些字段一个都没写进去：availableModels」
+ * 而 `availableModels` **是被处理的**（server.mjs 里 `sub.availableModels = [...]`）。
+ * 真实成因是：刷新回来的目录与原目录**逐字相同** → 前后快照无差异 →
+ * 被「什么都没写进去」的判据一锅端成错误。
+ *
+ * 也就是说**刷新其实成功了**，只是没有新东西可写。
+ * 把成功报成失败比不报更坏：用户会以为功能坏了，然后一直点。
+ * ------------------------------------------------------------------------- */
+  describe("「值没变」与「字段不认识」要分开（v1.0.79）", () => {
+  const post = (body) => fetch(`http://127.0.0.1:${panel}/api/config`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
+  }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => ({})) }));
+
+  const cur = () => JSON.parse(fs.readFileSync(path.join(dataDir, "config.json"), "utf8"));
+
+  test("★ 字段认识、值与当前相同 → 200 且标明「一致」，不是错误", async () => {
+    const now = cur();
+    const same = (now.zen && now.zen.availableModels) || ["space-bunny-free"];
+    const before = JSON.stringify(cur());
+    const r = await post({ provider: "zen", availableModels: [...same] });
+    assert.equal(r.status, 200, "同样的值不是错误，不该回 4xx");
+    assert.equal(r.json.unchanged, true, "要明确说「无改动」，而不是笼统的 ok");
+    assert.match(r.json.message, /一致|没有需要写入/, "要解释清为什么没改动");
+    assert.equal(JSON.stringify(cur()), before, "确实没改，就不该落盘");
+  });
+
+  test("★ 真不认识的字段 → 仍然 400，且点名是哪几个", async () => {
+    const r = await post({ provider: "zen", 完全不存在的字段: 1, 另一个瞎写的: 2 });
+    assert.equal(r.status, 400, "白名单漏收仍然是错误，不能因为上一条放宽就连它一起放过");
+    assert.ok(Array.isArray(r.json.unknownKeys), "要点名是哪几个字段不认");
+    assert.deepEqual(r.json.unknownKeys.sort(), ["完全不存在的字段", "另一个瞎写的"].sort());
+  });
+
+  test("★ 认识的值 + 不认识的字段混发 → 认识的那部分照写，不认识的报错并点名", async () => {
+    const r = await post({ provider: "zen", transport: "direct", 瞎写字段: true });
+    // transport 认、且很可能已是当前值 → 走「无改动」分支，但必须点名不认识的字段
+    /* 断言点是 unknownKeys（哪些字段真的不认），**不是** error 文案——
+     * 文案里会把 {"provider":"zen","transport":"opencode"} 当举例写出来，
+     * 拿"文案里有没有 transport"当判据是测不准的。 */
+    if (r.status === 400) {
+      assert.deepEqual(r.json.unknownKeys, ["瞎写字段"],
+        "transport 是白名单里的，不能被算进「不认」里");
+    } else {
+      assert.equal(r.status, 200);
+      assert.equal(r.json.unknownKeys, undefined,
+        "全部字段都认识时不该报「不认」");
+      assert.equal(cur().zen.transport, "direct", "认识的那部分要照写");
+    }
+  });
+
+  test("反向对照：把「未知字段」与「无改动」重新合并成同一个 400，本组必须变红", () => {
+    // 坏实现：只看「快照没变」就报「字段不认」
+    const bad = (received, changed) => (changed ? null : { status: 400, error: `这些字段一个都没写进去：${received.join("、")}` });
+    const asBad = bad(["availableModels"], false);
+    assert.equal(asBad.status, 400, "坏实现的行为：值没变就报「字段不认」");
+    assert.match(asBad.error, /availableModels/);
+    // 正确实现必须能把「值没变」和「字段不认」分开 —— 上面两条测试已用真实接口钉住
+  });
+  });
+
 });

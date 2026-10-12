@@ -6362,6 +6362,18 @@ const panel = http.createServer(async (req, res) => {
     // v1.0.28: 配置编辑按提供方分流。body.provider="sn"/"wb" 时读写 cfg.sn / cfg.wb 子对象，
     // 否则维持 B.AI 顶层字段（apiKey/mapping/upstream/relayPort/panelPort…），互不影响。
     // v1.0.31: WorkBuddy 无 sk- 密钥，改收 JWT 令牌四件套（accessToken/refreshToken/deviceToken/userId）。
+    /* POST /api/config 认识的字段全集（v1.0.79）。
+     * 「字段不认识」与「字段认识但值没变」必须分开报——前者是白名单漏收（真错误），
+     * 后者是刷新后无新内容（**成功**）。把后者报成错误，用户会以为功能坏了而反复点。
+     *
+     * ⚠️ 这张表与下面 handler 实际处理的字段是**两份**，加字段时两边都要改。
+     *   漏进表 → 明明是白名单里的字段被当成「不认」，白报一次错；
+     *   漏出表 → 真不认识的字段被当成「认识」，退回静默成功（要根治的那种）。 */
+    const CONFIG_ACCEPTED_KEYS = new Set([
+      "provider", "apiKey", "token", "upstream", "relayPort", "panelPort",
+      "useProxy", "proxy", "mapping", "availableModels", "defaultModel",
+      "transport", "failover", "accounts", "poolMode", "all", "cli", "desktop",
+    ]);
     if (req.method === "POST" && u.pathname === "/api/config") {
       const b = await readBody(req);
       const cfg = loadCfg();
@@ -6589,23 +6601,48 @@ async function unknownMappingTargets(p, mapping, cfg) {
        * 后者是调用方把字段写错了地方——实测踩过：该扁平的
        * {"provider":"zen","transport":"opencode"} 写成了嵌套的 {"zen":{...}}，
        * transport 根本不在白名单里被丢掉，接口却回 ok:true。 */
+      /* 「没写进去」有两种截然不同的成因，处理方式相反（v1.0.79）：
+       *
+       * ① **字段不认识**（真的被白名单丢掉了）→ 400，并说清字段要放顶层。
+       *    这才是「静默成功」要根治的那一种。
+       *
+       * ② **字段认识、但值与当前完全相同** → **成功**，不是错误。
+       *    实测踩到：面板「刷新模型列表」在目录没变化时，`availableModels`
+       *    去重后与现值逐字相同 → 被 ① 的判据一锅端成「出错了」。
+       *    而它其实**刷新成功了**，只是没有新东西可写——
+       *    **把成功报成失败，比什么都不报更坏**：用户会以为刷新坏了，然后一直点。
+       *
+       * 所以要把「收到的键」按**认不认识**分开，再决定报什么。 */
       if (JSON.stringify(sub) === before) {
         const others = Object.keys(b).filter((k) => k !== "provider");
-        return json(res, 400, others.length
-          ? {
-            error: `这些字段一个都没写进去：${others.slice(0, 20).join("、")}`
+        const unknown = others.filter((k) => !CONFIG_ACCEPTED_KEYS.has(k));
+        if (unknown.length) {
+          return json(res, 400, {
+            error: `这些字段本接口不认：${unknown.slice(0, 20).join("、")}`
               + "——本接口是白名单式的，不认识的字段会被静默丢掉。"
               + "字段要放在**顶层**（形如 {\"provider\":\"zen\",\"transport\":\"opencode\"}），"
               + "不是嵌套在 provider 下面。",
             provider: P,
             receivedKeys: others.slice(0, 20),
-          }
-          : {
+            unknownKeys: unknown.slice(0, 20),
+          });
+        }
+        /* 一个字段都没带 → 调用方大概率漏发了内容，那是要报的 */
+        if (!others.length) {
+          return json(res, 400, {
             error: "没有要保存的内容——请求里除了 provider 之外没有任何字段。"
               + "如果本来只想改点东西，请确认表单填了内容再保存。",
-            provider: P,
-            receivedKeys: [],
+            provider: P, receivedKeys: [],
           });
+        }
+        /* 全部认识、只是值没变：如实说「已一致」，别报成功也别报失败 */
+        return json(res, 200, {
+          ok: true, unchanged: true, provider: P,
+          message: `收到 ${others.length} 个字段，但内容与当前配置**完全一致**，没有需要写入的改动。`
+            + "（例如「刷新模型列表」拿到的新目录与原目录相同——这是刷新成功，不是失败。）",
+          receivedKeys: others.slice(0, 20),
+          hints: [],
+        });
       }
       saveCfg(cfg);
       // 端上已接到该提供方的话，立即同步新映射
