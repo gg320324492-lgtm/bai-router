@@ -2802,6 +2802,188 @@ async function dropBody(r) {
   try { if (!r || !r.body) return; if (typeof r.body.cancel === "function") await r.body.cancel(); else r.body.destroy(); } catch { }
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// 「200 + 空流」具名归因（v1.0.74）
+//
+// 教训出处：OW Bridge（.research/ow-bridge/docs/validation.md:86-92，只读参考）
+//   它只从**两个**来源读模型的工具调用信封，漏了 StructuredOutput 工具调用，
+//   把一次完全正确的回答报成了「Invalid model response envelope」。
+//   根因是它用「我期望读到的来源都没读到 → 判失败」推失败，**而没读到的来源
+//   本身就是判据的一部分**。判空枚举漏一项，正常响应就被误判成故障。
+//
+// 这里是同一病的另一面（本文件原来的 2971 行：`idx < 0 && !usage` 就 bail 502）。
+// 那个判据只数「我们自己开出来的内容块」，**完全不看上游到底发了什么形状**，
+// 于是「上游用了一种我们还没支持的形状」也被一律归成「后端不可用」。
+//
+// 两条铁律，下面每行实现都受它约束：
+//   ① **判据必须与 wbPipe 的真实解析路径逐项对齐**——wbFrameResidue 判的是
+//      「wbPipe 的消费代码**没消费掉**的东西」，不是另抄一份字段白名单
+//      （另抄一份必然会随解析代码演进而漂移，漂移的方向就是误杀正常响应）。
+//   ② **兜底取反**——拿不准一律判成功。误杀一个正常响应的代价（用户看不到回复、
+//      故障转移还会再转一遍）远大于放过一个异常响应（顶多一句空回复）。
+
+// 顶层元字段：wbPipe 的消费代码会读 error/code/message/usage/choices，其余一律当"没消费"。
+const WB_STREAM_META_KEYS = new Set([
+  "id", "object", "created", "model", "system_fingerprint", "provider",
+  "system", "usage", "choices", "error", "code", "message",
+]);
+// frame 级 type 的已知取值（Anthropic 原生事件名 + Responses API 事件名）。
+// **不在表里的 type 一律当"没消费"**——这正是新增的、也是最要紧的一条。
+const WB_KNOWN_FRAME_TYPES = new Set([
+  "message_start", "message_delta", "message_stop", "content_block_start",
+  "content_block_delta", "content_block_stop", "ping", "error",
+  "response.created", "response.in_progress", "response.output_item.added",
+  "response.output_item.done", "response.output_text.delta",
+  "response.output_text.done", "response.reasoning_summary_text.delta",
+  "response.completed", "response.failed", "response.incomplete",
+]);
+// 一条 residue 的 raw 上限。透传给客户端的原文与记进日志的**键名/类型**都受它约束：
+// 日志侧只写键名和形状，**绝不写值**（上游可能把凭据回显在未知字段里）。
+const WB_RESIDUE_RAW_MAX = 600;
+const WB_PASSTHROUGH_MAX = 1800;
+
+/** 只描述**形状**（类型 + 空/非空 + 对象的前几个键名），绝不回显值。红线：不写凭据。 */
+function wbShapeOf(v) {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return v.length ? `array(${typeof v[0]},${v.length})` : "array(0)";
+  const t = typeof v;
+  if (t === "object") return `object(${Object.keys(v).slice(0, 6).join(",")})`;
+  if (t === "string") return v.trim() ? "string(非空)" : "string(空串)";
+  return t;
+}
+/** 这个"没消费掉的值"里到底有没有东西：空串/null/空数组算**空**（上游说了"这里是空的"），
+ *  非空的任何东西（哪怕形状不认识）都算**有**（内容可能就在这儿）。 */
+function wbResidueHasValue(v) {
+  if (v === null || v === undefined) return false;
+  if (typeof v === "string") return !!v.trim();
+  if (Array.isArray(v)) return v.length > 0;
+  if (typeof v === "object") return Object.keys(v).length > 0;
+  return true;
+}
+function wbResidue(where, key, v) {
+  let raw;
+  try { raw = JSON.stringify(v); } catch { raw = String(v); }
+  return { where, key, shape: wbShapeOf(v), hasValue: wbResidueHasValue(v), raw: String(raw).slice(0, WB_RESIDUE_RAW_MAX) };
+}
+
+/**
+ * 扫描一个 `data:` 帧里 **wbPipe 的消费代码没消费掉** 的东西。
+ * 对齐依据就是 wbPipe 主循环的三处消费（见下面各分支注释），
+ * 任何一处"跳过了"的值都会在这里作为 residue 冒出来。
+ */
+function wbFrameResidue(d, sseEvent) {
+  const out = [];
+  // ① 主循环 `let d; try { d = JSON.parse(payload); } catch { continue; }`：
+  //    顶层不是普通对象（裸字符串 / 数组 / 数字 / null）时，后面全部字段访问都是
+  //    undefined，整帧被静默丢掉。这里把它记成一条 residue。
+  if (!d || typeof d !== "object" || Array.isArray(d)) {
+    if (d !== undefined) out.push(wbResidue("frame", "", d));
+    return out;
+  }
+  // ② 顶层：只读 error/code/message/usage/choices + 一组固定元字段。
+  //    type 单独处理——**词表外的 type 就是"我们不认识的帧类型"**（OW Bridge 同源坑）。
+  for (const k of Object.keys(d)) {
+    if (WB_STREAM_META_KEYS.has(k)) continue;
+    if (k === "type") {
+      const tv = String(d[k] || "");
+      if (WB_KNOWN_FRAME_TYPES.has(tv)) continue;
+      // 明显是 OpenAI 形状、只是多带了个自定义 type 的，放行（不制造噪声透传）
+      if (typeof d[k] === "string" && (d.choices || d.usage)) continue;
+    }
+    out.push(wbResidue("top", k, d[k]));
+  }
+  // ③ `const ch = Array.isArray(d.choices) && d.choices[0]; if (!ch) continue;`
+  //    → choices 之外挂在 choice 上的字段（logprobs / text 等非 delta 形状）会被丢掉。
+  const ch = Array.isArray(d.choices) ? d.choices[0] : null;
+  if (!ch || typeof ch !== "object") return out;
+  for (const k of Object.keys(ch)) {
+    if (k === "delta" || k === "finish_reason" || k === "index") continue;
+    out.push(wbResidue("choice", k, ch[k]));
+  }
+  // ④ `const delta = ch.delta || {}` 之后只消费三种键，且**每种都有形状前提**：
+  //    reasoning_content/reasoning 必须是非空字符串（`typeof rc === "string" && rc`）；
+  //    content 必须是非空字符串（`typeof delta.content === "string" && delta.content`）；
+  //    tool_calls 必须是数组（`Array.isArray(delta.tool_calls)`）。
+  //    形状不符时值被 `if` 直接跳过 —— 这就是"上游返回了内容但我们没识别"的入口：
+  //    content 传数组（Qwen 系网关）、StructuredOutput 落在结构化字段、legacy
+  //    function_call、refusal 字符串……全在这一条里冒出来。
+  const dl = ch.delta;
+  if (dl === undefined || dl === null) return out;
+  if (typeof dl !== "object" || Array.isArray(dl)) { out.push(wbResidue("delta", "", dl)); return out; }
+  for (const k of Object.keys(dl)) {
+    if (k === "role" || k === "index") continue;
+    const v = dl[k];
+    if (k === "content" || k === "reasoning_content" || k === "reasoning") {
+      if (typeof v === "string" && v) continue;              // 真被消费了
+      out.push(wbResidue("delta", k, v));                    // 空串/null/数组 → 没被消费
+      continue;
+    }
+    if (k === "tool_calls") {
+      if (Array.isArray(v) && v.length) continue;            // 真被消费了
+      out.push(wbResidue("delta", k, v));
+      continue;
+    }
+    out.push(wbResidue("delta", k, v));                      // 未知 delta 键
+  }
+  return out;
+}
+
+/** 归因表：四种**具名**空流，各自不同的中文说明 + 用户该做什么。 */
+const EMPTY_STREAM_ATTRIBUTIONS = {
+  upstream_nothing: {
+    label: "上游一个字都没返回",
+    zh: "上游连一个数据帧都没发出来（只有心跳，或上来就是结束标记），模型根本没有开始作答。",
+    hint: "这不是你的配置或本程序的问题，多为该模型后端临时不可用。",
+    do: "建议：等 30 秒重试一次；连续两次都这样，换一个模型档位。",
+  },
+  upstream_truncated: {
+    label: "上游中途被掐断",
+    zh: "上游已经把回答的开头发出来了，但还没发完连接就断了（既没收到结束标记，也没有结束原因）。",
+    hint: "多为网关掐断连接或上游崩溃，与本程序的解析无关。",
+    do: "建议：直接重试；反复断流就换一个档位，或把这个现象反馈给上游。",
+  },
+  upstream_blank: {
+    label: "上游只返回了空信封",
+    zh: "上游回了格式正确的回答框架，但内容字段全是空的（空字符串、空数组或 null），模型没有真正作答。",
+    hint: "多为被上游内容过滤，或模型在当前档位上空转。",
+    do: "建议：重试一次；反复出现就是该档位当前不可用，换一个档位。",
+  },
+  unrecognized_shape: {
+    label: "上游用了我们还不认识的回答格式",
+    zh: "上游确实返回了内容，但它不在本程序已知的解析路径里，因此无法翻译成 Anthropic 格式。",
+    hint: "通常是新模型或新网关换了返回格式，需要升级路由台才能正确翻译。",
+    do: "建议：不用管，原始内容已原样附在下面；若内容不可读，请把这段原文反馈给 B.AI 路由台。",
+  },
+};
+
+/**
+ * 把探针判成四种具名归因之一。顺序即优先级。
+ * ⚠ unrecognized_shape 排在最前，但调用方对它**不 bail**（见 wbPipe 的透传分支）：
+ * 它唯一的产出是一条已具名的诊断 + 原样透传，不是失败。这正是"兜底取反"。
+ */
+function classifyEmptyStream(probe) {
+  const p = probe || {};
+  if (Array.isArray(p.unknown) && p.unknown.some((u) => u && u.hasValue)) return "unrecognized_shape";
+  if (!p.dataFrames) return "upstream_nothing";
+  if (p.opened > 0 && !p.sawDone && !p.sawFinish) return "upstream_truncated";
+  return "upstream_blank";
+}
+/** 归因正文（**不含渠道前缀**——bail() 会自己加 [前缀]，重复加会出现 [X] [X]）。 */
+function wbEmptyStreamCore(kind) {
+  const a = EMPTY_STREAM_ATTRIBUTIONS[kind] || EMPTY_STREAM_ATTRIBUTIONS.upstream_nothing;
+  return `${a.label} —— ${a.zh}${a.hint}${a.do}`;
+}
+/** 透传给客户端的原文。原文回传给**发起这次请求的同一个客户端**，不构成新的信息外泄；
+ *  日志侧只写键名/形状（见 wbResidue），两边都受 WB_PASSTHROUGH_MAX / WB_RESIDUE_RAW_MAX 约束。 */
+function wbUnknownPassthroughText(unknown) {
+  const hits = (unknown || []).filter((u) => u && u.hasValue);
+  const names = [...new Set(hits.map((u) => (u.where ? `${u.where}.` : "") + (u.key || "?")))].slice(0, 8);
+  const raw = hits.map((u) => u.raw).join("\n").slice(0, WB_PASSTHROUGH_MAX);
+  const tail = hits.map((u) => u.raw).join("\n").length > WB_PASSTHROUGH_MAX ? "\n…（已截断）" : "";
+  return `【${wbErrPrefix} ${EMPTY_STREAM_ATTRIBUTIONS.unrecognized_shape.label}】${EMPTY_STREAM_ATTRIBUTIONS.unrecognized_shape.do}\n` +
+    `未识别的字段：${names.join("、")}\n上游原文（未改写）：\n${raw}${tail}`;
+}
+
 // OpenAI SSE → Anthropic SSE（clientStream=false 时聚合成单条 Anthropic JSON 响应）
 async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
   const inTok = Math.max(1, Math.ceil(JSON.stringify(inputJson || {}).length / 4));
@@ -2828,6 +3010,8 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
   const toolParts = [];        // {oi, id, name, args} 按出现顺序
   let text = "", thinking = "";
   let finish = null, usage = null, outChars = 0;
+  // 空流探针：只记**形状与计数**，不记上游的值（红线：不把凭据写进任何地方）。
+  const probe = { dataFrames: 0, opened: 0, sawDone: false, sawFinish: false, heartbeats: 0, unknown: [] };
 
   const emit = (event, data) => {
     if (!clientStream || res.writableEnded) return;
@@ -2876,13 +3060,14 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
     for await (const raw of iter) {
       const line = raw.trimEnd();
       if (!line) continue;
-      if (line.startsWith(":")) { emit("ping", { type: "ping" }); continue; } // 心跳
+      if (line.startsWith(":")) { probe.heartbeats++; emit("ping", { type: "ping" }); continue; } // 心跳
       if (line.startsWith("event:")) { sseEvent = line.slice(6).trim(); continue; }
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") break;
+      if (payload === "[DONE]") { probe.sawDone = true; break; }
       let d;
       try { d = JSON.parse(payload); } catch { continue; }
+      probe.dataFrames++;
       // OpenAI 兼容网关常把错误塞进 200 的 SSE 里（实测 Qoder model server 对不支持的
       // 模型就是 `event: error` + {"code":"invalid_model_error"}，HTTP 仍是 200）。
       // 不识别的话下面的 `if (!ch) continue` 会把它当成"没有内容"，静默产出一个空回复——
@@ -2913,7 +3098,8 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
       }
       if (d.usage) usage = d.usage;
       const ch = Array.isArray(d.choices) && d.choices[0];
-      if (!ch) continue;
+      if (ch) probe.opened++;
+      if (!ch) { probe.unknown.push(...wbFrameResidue(d, sseEvent)); continue; }
       const delta = ch.delta || {};
       const rc = delta.reasoning_content || delta.reasoning;
       if (typeof rc === "string" && rc) {
@@ -2948,7 +3134,12 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
           }
         }
       }
-      if (ch.finish_reason) finish = ch.finish_reason;
+      if (ch.finish_reason) { finish = ch.finish_reason; probe.sawFinish = true; }
+      // 消费完之后再扫残余：这才是"wbPipe 到底漏掉了什么"的准确答案。
+      // ⚠ **收集 ≠ 透传**：只有在最终 idx < 0 时才把这些东西交给客户端（见文末分支）。
+      // 正常响应（idx >= 0）里即使混进了未知字段，也绝不会凭空多出一段内容——
+      // 噪声只留在 probe 里供诊断，不会污染回答。
+      probe.unknown.push(...wbFrameResidue(d, sseEvent));
     }
   } catch (e) {
     // 上游流中断：把错误以 Anthropic error 事件/JSON 形式交还客户端。
@@ -2968,8 +3159,25 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
   // 流跑完了却一个内容块都没有（既没有文本/思考/工具调用，也没有报错事件）：
   // 实测 Qoder 后端全挂时就是这种"200 + 空流"。当成上游失败(502)，
   // 让故障转移去下一家，而不是给用户一个空回复。
-  if (idx < 0 && !usage) {
-    if (bail(`${wbErrPrefix} 上游返回了空流（没有任何内容，可能是该模型后端当前不可用）`, "api_error", 502)) return;
+  //
+  // v1.0.74 起这段从"一句通用文案"改成**具名归因**（classifyEmptyStream），
+  // 并且加了两道 OW-Bridge 式的防误杀：
+  //   ① 判据与真实解析路径逐项对齐（wbFrameResidue），不靠另抄的字段白名单；
+  //   ② unrecognized_shape **绝不 bail**——上游发了我们不认识的形状时判成功并
+  //      原样透传。判空枚举漏一项就会误杀正常响应，这正是 OW Bridge 犯过的错。
+  // usage 存在但没有内容块，仍按原样判成功（保守方向不变：顶多一句空回复）。
+  let passthrough = "";    // 未知形状的原文（仅 idx<0 且全是未识别形状时非空）
+  const emptyKind = classifyEmptyStream(probe);
+  if (idx < 0 && emptyKind === "unrecognized_shape") {
+    // 记一条具名诊断给面板（不 bail——这正是"兜底取反"），并把上游原文透传出去。
+    noteRelayError(errChannel(), "unrecognized_shape", wbEmptyStreamCore(emptyKind));
+    passthrough = wbUnknownPassthroughText(probe.unknown);
+    if (clientStream) {
+      openCur("text", { type: "text", text: "" });
+      emit("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: passthrough } });
+    }
+  } else if (idx < 0 && !usage) {
+    if (bail(wbEmptyStreamCore(emptyKind), "api_error", 502)) return;
   }
 
   closeCur();
@@ -2983,6 +3191,7 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
     return;
   }
   const content = [];
+  if (passthrough) content.push({ type: "text", text: passthrough });
   if (thinking) content.push({ type: "thinking", thinking, signature: "" });
   if (text) content.push({ type: "text", text });
   for (const tp of toolParts) {

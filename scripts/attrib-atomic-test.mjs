@@ -106,14 +106,17 @@ describe("T1 流式故障归因（setErrProvider 带渠道）", () => {
       SRC.includes('? "wb" : "wb"'), false,
       'server.mjs 里还有退化三元 `? "wb" : "wb"`'
     );
-    // wbPipe 这段共用桥里，三处 noteRelayError 都必须走 errChannel()，不得写死渠道
+    // wbPipe 这段共用桥里，所有 noteRelayError 都必须走 errChannel()，不得写死渠道。
+    // 4 处：首事件闸门超时 / 上游 SSE 报错(bail) / 流中断 / 空流里的未知形状
+    // （第 4 处是 v1.0.74「200+空流」具名归因加的**诊断**通道——它记 unrecognized_shape，
+    //   注意它不 bail：未知形状判成功并原样透传，槽位只是给面板看的）。
     const pipeSrc = sliceBetween("async function wbPipe(", "const DUMP_MAX_BYTES = ");
     const slots = pipeSrc.match(/noteRelayError\(([^,]+),/g) || [];
-    assert.equal(slots.length, 3, `wbPipe 里应有 3 处 noteRelayError，实际 ${slots.length}`);
+    assert.equal(slots.length, 4, `wbPipe 里应有 4 处 noteRelayError，实际 ${slots.length}`);
     const notChannelled = slots.filter((s) => !s.startsWith("noteRelayError(errChannel()"));
     assert.deepEqual(notChannelled, [], `wbPipe 里还有写死/间接渠道的归因：${notChannelled.join(" | ")}`);
-    // 三种故障类型都要在：首事件闸门超时 / 上游 SSE 报错 / 流中断
-    for (const kind of ["timeout", "upstream_sse_error", "network"]) {
+    // 四种故障类型都要在：首事件闸门超时 / 上游 SSE 报错 / 流中断 / 未知形状（不判失败，只记诊断）
+    for (const kind of ["timeout", "upstream_sse_error", "network", "unrecognized_shape"]) {
       assert.ok(pipeSrc.includes(`"${kind}"`), `wbPipe 里缺 ${kind} 归因`);
     }
   });
