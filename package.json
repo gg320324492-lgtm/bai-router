@@ -8,7 +8,7 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test --test-concurrency=1 scripts/attrib-atomic-test.mjs scripts/zen-go-tier-test.mjs scripts/zen-capability-probe-test.mjs scripts/empty-stream-diag-test.mjs",
+    "test": "node --test --test-concurrency=1 scripts/attrib-atomic-test.mjs scripts/zen-go-tier-test.mjs scripts/zen-capability-probe-test.mjs scripts/empty-stream-diag-test.mjs scripts/oc-runtime-test.mjs scripts/oc-bridge-test.mjs",
     "dist": "electron-builder --win nsis",
     "publish": "node scripts/publish.cjs",
     "postinstall": "node scripts/patch-updater.cjs"
@@ -40,7 +40,9 @@
           "diag.html",
           "config.defaults.json",
           "qoder-patch.mjs",
-          "zen-probe.mjs"
+          "zen-probe.mjs",
+          "oc-runtime.mjs",
+          "oc-bridge.mjs"
         ]
       },
       {
