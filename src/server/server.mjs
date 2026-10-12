@@ -21,6 +21,8 @@ import { qpApply, qpRevert, qpStatus } from "./qoder-patch.mjs";
  * 纯逻辑（判定 / 并发 / 落盘）在 zen-probe.mjs 里，HTTP 由下面的 zenProbeSend 注入。 */
 import {
   zenProbeLoad, zenRunCapabilityProbe, zenCapLabel, zenCapHint, zenProbeClassify,
+  zenExpectedRejection, ZEN_FREE_TIER_DIRECT_KIND,
+  ZEN_PROBE_TOOL_ANTHROPIC,
   ZEN_PROBE_TIMEOUT_MS, ZEN_PROBE_CONCURRENCY, ZEN_PROBE_MAX_TOKENS, ZEN_PROBE_MAX_TOKENS_RETRY,
 } from "./zen-probe.mjs";
 /* OpenCode 传输层（v1.0.75）：zen 渠道的 `transport` 开关打开时，把这一档的请求改走
@@ -1008,11 +1010,82 @@ function normalizeModel(name) {
   // 去掉 [..] 后缀并小写，否则查不到映射会静默落到默认模型
   return String(name).replace(/\s*\[[^\]]*\]\s*$/, "").trim().toLowerCase();
 }
-function resolveModel(name, cfg) {
+/* ---------- 模型回落留痕（v1.0.78 T9） ----------
+ *
+ * resolveModel 的第三条分支是**静默**的：客户端送来一个「映射表里没有、可用清单里也没有」
+ * 的模型名，我们就回落到本渠道的 defaultModel，请求照样 200。此前这条路上**既没有日志、
+ * 也没有面板痕迹**——用户以为在用 A，实际跑的是 B，两边都看不出来。
+ *
+ * 怎么触发的（实测）：客户端若指向了 WorkBuddy 的中转口、却发来 Zen 的模型名
+ * （space-bunny-free），查不到映射 → 直接落到 wb 的出厂 defaultModel
+ * （deepseek-v4.1-flash）。**不需要故障转移**，一次普通的正常请求就够了。
+ *
+ * 这是「以为在用 A 其实在用 B」的唯一防线，所以它必须**两处都留痕**：
+ *   · 一条日志（排查时按模型名 grep 得到）
+ *   · 一份面板状态（用户自己看得到，见 providerStatus().modelFallback）
+ * 光有日志不够——用户不会去翻日志；光有面板也不够——面板只说"不对"，说不出"哪一步不对的"。
+ *
+ * 🔴 只记模型名与渠道，**一个凭据都不进这里**（它会原样进 /api/status）。
+ */
+const modelFallbacks = Object.create(null);   // 渠道 → [{requested, landed, firstAt, lastAt, count}]
+const MODEL_FALLBACK_KEEP = 10;
+const MODEL_FALLBACK_RELOG_MS = 10 * 60 * 1000;
+function noteModelFallback(ch, requested, landed) {
+  const key = String(ch || "?");
+  const now = Date.now();
+  const list = modelFallbacks[key] || (modelFallbacks[key] = []);
+  const hit = list.find((x) => x.requested === requested && x.landed === landed);
+  if (hit) {
+    /* 同一个模型名持续回落时**不逐请求刷日志**（一个会话里每次请求都会走到这里），
+       但计数与最近时刻照常更新；隔够 10 分钟再补一行，让"还在持续回落"也留下痕。 */
+    if (now - hit.lastAt >= MODEL_FALLBACK_RELOG_MS) {
+      try { log(`模型回落（第 ${hit.count + 1} 次）：渠道 ${key} 收到模型名「${requested}」，仍回落到默认模型「${landed}」。`); } catch { }
+    }
+    hit.count += 1; hit.lastAt = now;
+  } else {
+    try {
+      log(`模型回落：渠道 ${key} 收到模型名「${requested}」，映射表与可用清单里都没有它 —— 已回落到默认模型「${landed}」。`
+        + `请求不会失败，但实际服务的模型不是你选的那个（面板「诊断」里能看到）。`);
+    } catch { }
+    list.unshift({ requested, landed, firstAt: now, lastAt: now, count: 1 });
+    if (list.length > MODEL_FALLBACK_KEEP) list.pop();
+  }
+}
+/** 面板状态用的一份快照：只报 30 分钟内的（与 activeTier 同一个新鲜度窗口），
+ *  且字段名与 store 里的不一样（这里是 ISO 串，panel 直接 new Date）。 */
+function modelFallbackFields(p) {
+  const now = Date.now();
+  return (modelFallbacks[p] || [])
+    .filter((x) => now - x.lastAt < 30 * 60000)
+    .map((x) => ({
+      requested: x.requested, landed: x.landed, count: x.count,
+      firstAt: new Date(x.firstAt).toISOString(), lastAt: new Date(x.lastAt).toISOString(),
+    }));
+}
+/** 档位名 → 真正的模型名。**三条分支与 resolveModel 逐字相同，唯一区别是第三条不留痕**。
+ *
+ *  它存在的理由是 providerStatus 要**事后重算**「那次请求本来打算路由到哪」：
+ * 重算不是一次新的解析，不该再记一次回落（否则面板每刷新一次就多一条回落记录）。
+ * ⚠ 两条分支不许各写各的：它们必须永远一致，否则"重算出来的意图"与"实际执行的解析"
+ * 会慢慢分叉，那比回落本身更难查。scripts/model-truth-test.mjs 有一条断言把这两个
+ * 函数的前四行**逐字**比对，改了一边忘了另一边，测试当场红。 */
+function resolveModelQuiet(name, cfg) {
   const base = normalizeModel(name);
   const m = cfg.mapping?.[base];
   if (m && m.target) return m.target;
   if ((cfg.availableModels || []).includes(base)) return base;
+  return cfg.defaultModel;
+}
+/**
+ * 档位名 → 真正的模型名。`ch` 是渠道键，只用于回落留痕（不传就记成 "?"）。
+ * 前两条分支是**照旧**的：不改解析结果、不改顺序、不改任何返回值。
+ */
+function resolveModel(name, cfg, ch) {
+  const base = normalizeModel(name);
+  const m = cfg.mapping?.[base];
+  if (m && m.target) return m.target;
+  if ((cfg.availableModels || []).includes(base)) return base;
+  noteModelFallback(ch, base, cfg.defaultModel);
   return cfg.defaultModel;
 }
 
@@ -1221,17 +1294,22 @@ async function readProbeJson(response) {
   const raw = await response.text();
   let j = null;
   try { j = JSON.parse(raw); } catch { j = null; }
+  /* 归因需要**上游原文**：本机中转会把它转译成中文（"上游拒绝请求（HTTP 403）：…"），
+   * FreeTierError 这类关键词就丢了，事后没法再按原文分类。所以每条抛出的错误都挂上
+   * `.upstreamRaw` 与 `.upstreamStatus`。**纯附加**：现有三个调用点只读 `e.message`，
+   * 行为一字不变。 */
+  const withRaw = (err) => { try { err.upstreamRaw = raw; err.upstreamStatus = response.status; } catch { } return err; };
   // 失败优先归因。三个调用点（/api/models 的 sn 与默认分支、/api/test 的档位探测）
   // 拿到 JSON 后都只会读 error.message，"Forbidden" 这类裸字符串错误就整条丢了。
   if (response.status >= 400) {
-    if (j === null) throw probeBodyError(response, raw);
+    if (j === null) throw withRaw(probeBodyError(response, raw));
     const said = upstreamErrorText(j);
-    if (!said) throw new Error(`上游返回 HTTP ${response.status}，但没带错误说明${PROBE_HINTS[response.status] || ""}`);
+    if (!said) throw withRaw(new Error(`上游返回 HTTP ${response.status}，但没带错误说明${PROBE_HINTS[response.status] || ""}`));
     // 上游已经把状态码和原因说全了（多半是本机中转转译过的 429/502），别再复述一遍
-    if (said.includes(`HTTP ${response.status}`)) throw new Error(`上游错误：${said}`);
-    throw new Error(`上游拒绝请求（HTTP ${response.status}${PROBE_HINTS[response.status] || ""}）：${said}`);
+    if (said.includes(`HTTP ${response.status}`)) throw withRaw(new Error(`上游错误：${said}`));
+    throw withRaw(new Error(`上游拒绝请求（HTTP ${response.status}${PROBE_HINTS[response.status] || ""}）：${said}`));
   }
-  if (j === null) throw probeBodyError(response, raw);
+  if (j === null) throw withRaw(probeBodyError(response, raw));
   return j;
 }
 
@@ -4182,7 +4260,7 @@ try {
   process.on("exit", () => { try { ocGateway.dispose(); } catch { } });
 } catch { /* 极老的环境没有 process.on("exit") */ }
 
-async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
+async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs }) {
   const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : p === "or" ? "OpenRouter" : wkZh(p);
   setErrProvider(NAME, p);   // 渠道 key 一起传下去：wbPipe 里的 noteRelayError 要按真实渠道归因
   /* ---- OpenCode 传输：**在取令牌之前**提前分流（v1.0.75）----
@@ -4198,7 +4276,7 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
      * 两个方向的 opts.model 都用这一个解析结果。 */
     return ocGateway.exchange({
       cfg, S, j, isProbe, res,
-      mapModel: (name) => resolveModel(name, S),
+      mapModel: (name) => resolveModel(name, S, p),
     });
   }
   let token;
@@ -4439,6 +4517,14 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
       if (steps.length) {
         const recovered = r.status === 200;
         noteWbRotation(p, ob.model, steps, recovered);
+        /* ★ v1.0.78 T9：换模之后**真实服务的模型**已经不是 resolveModel 给的那个了。
+         * 不更新这条观察，面板就会拿换模之前的名字说「实际服务的是它」——
+         * 那正好是本任务要消灭的那种"看着像真相的假话"。换成功了才改：
+         * 换到最后一个还 429 的情况下，实际服务的就是原始模型。 */
+        if (recovered && obs) {
+          obs.swappedFrom = obs.served;
+          obs.served = steps[steps.length - 1].model;
+        }
         if (!recovered) {
           noteRelayError(p, "rate_limit_quota",
             `${ob.model} 触发频率限制，连换 ${steps.length} 个模型仍未成功。`);
@@ -4575,7 +4661,12 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
           + "本程序当前是**直连**中转，请求里不带工具（执行权在 Claude Code 那边），所以这一档走直连必然被拒。"
           + "换模型无效；解法是把传输方式切成「OpenCode 客户端中转」——那样模型手上就有工具，本机需先装 OpenCode（npm i -g opencode-ai）。"
           + "另一条路是把上游地址改成 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，https://opencode.ai/auth）。";
-        noteRelayError(p, "upstream_403", `${NAME} 免费档走直连被拒（上游要求请求带工具）`);
+        /* kind 用**产品级标签** `free_tier_direct` 而不是笼统的 `upstream_403`（v1.0.78）：
+         * 这一条**不是渠道故障**，是「免费档 + 直连」这一组合的产品级预期拒绝。
+         * 面板据此显示「预期内被拒」而不是红灯，文案直接把两条下一步指出来
+         * （①改走 OpenCode 客户端中转 ②切 Go 档），用户不用再猜。 */
+        noteRelayError(p, ZEN_FREE_TIER_DIRECT_KIND,
+          `${NAME} 免费档走直连被拒（预期内，非故障）：改用「OpenCode 客户端中转」，或把上游地址改成 Go 档 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go`);
       } else if (r.status === 402 || /insufficient account funds/i.test(txt)) {
         why = " —— API Key 余额为 0，付费模型需要先充值；Go 档的付费额度同样走这把 Key 的余额。";
         noteRelayError(p, "upstream_402", `${NAME} 余额不足`);
@@ -4693,7 +4784,7 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     if (!tier0 || !rewritten) return { body, rewritten };
     const m = resolveModel(tier0, {
       mapping: target.S.mapping, availableModels: target.S.availableModels, defaultModel: target.S.defaultModel,
-    });
+    }, target.S.p || target.provider);
     return { body: Buffer.from(JSON.stringify({ ...rewritten, model: m })), rewritten: { ...rewritten, model: m } };
   };
   for (const provider of chain) {
@@ -4748,9 +4839,18 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     // 避免捡到上一条请求的陈旧 kind；quota 分支优先级不变（failover_quota 语义不动）。
     const prevKind = (relayErrors[provider] && relayErrors[provider].kind) || "";
     const prevAt = relayErrors[provider] && relayErrors[provider].at ? new Date(relayErrors[provider].at).getTime() : 0;
-    const keepKind = !quotaNow && /^upstream_\d+$/.test(prevKind) && Date.now() - prevAt < 60000;
-    noteRelayError(provider, quotaNow ? "failover_quota" : (keepKind ? prevKind : "failover"),
-      `转移走（HTTP ${status}${quotaNow ? "，额度用尽" : ""}）：${String(lastErr).slice(0, 120)}`);
+    /* 「免费档 + 直连」的预期拒绝要连**消息**一起保留（v1.0.78）。
+     * 改动前它被笼统的「转移走（HTTP 403）：<上游 JSON 原文>」覆盖掉，面板只剩一条
+     * 红字，用户只能猜——那正是本次要修的现象。归因标签本身已经说清了发生了什么，
+     * 所以这里把转移信息降级成一个短前缀，把处置指引留在最显眼的位置。 */
+    if (!quotaNow && prevKind === ZEN_FREE_TIER_DIRECT_KIND && Date.now() - prevAt < 60000) {
+      noteRelayError(provider, ZEN_FREE_TIER_DIRECT_KIND,
+        `已转移走（HTTP ${status}）· ${relayErrors[provider].message}`);
+    } else {
+      const keepKind = !quotaNow && /^upstream_\d+$/.test(prevKind) && Date.now() - prevAt < 60000;
+      noteRelayError(provider, quotaNow ? "failover_quota" : (keepKind ? prevKind : "failover"),
+        `转移走（HTTP ${status}${quotaNow ? "，额度用尽" : ""}）：${String(lastErr).slice(0, 120)}`);
+    }
   }
   noteFailoverEvent(fo.provider, tries);
   return wbAnthroError(res, 502,
@@ -4881,6 +4981,11 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
       let body = Buffer.concat(chunks);
       let rewritten = null; // 模型解析后的请求 JSON（OpenAI 桥用）
       let tier0 = null;      // 原始档位（故障转移时要按目标渠道的映射重新解析成模型名）
+      /* 本次请求写进 store 的那一条观察（可能为 null：小请求不进观察表）。
+       * 把它带下去，是为了让**换模**（WorkBuddy 429 后同渠道换模型）能把"真实服务的模型"
+       * 更新回这条观察——否则 served 停在换模之前那个名字，面板就会拿一个假的名字
+       * 去说「实际服务的是它」。留着它是为了让 served 仍然是*served*，而不是 intent。 */
+      let obs = null;
       const ct = (req.headers["content-type"] || "").toLowerCase();
       if (body.length && ct.includes("json")) {
         try {
@@ -4889,12 +4994,12 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
           if (typeof j.model === "string") {
             const tier = normalizeModel(j.model);
             tier0 = tier; // 记下原始档位，转移时按新渠道的映射重解析
-            j.model = resolveModel(j.model, sliceCfg);
+            j.model = resolveModel(j.model, sliceCfg, p);
             // 只观察"真实会话"流量：max_tokens≥512 的对话请求。
             // 桌面版后台小请求(健康探测/起标题/摘要, max_tokens 通常 ≤128)不算"用户正在用的档位"
             if (req.method === "POST" && req.url.startsWith("/v1/messages") && typeof j.max_tokens === "number" && j.max_tokens >= 512) {
-              if (store[0] && store[0].tier === tier && Date.now() - store[0].at < 2000) store[0].at = Date.now();
-              else { store.unshift({ tier, served: j.model, at: Date.now() }); if (store.length > 30) store.pop(); }
+              if (store[0] && store[0].tier === tier && Date.now() - store[0].at < 2000) { store[0].at = Date.now(); obs = store[0]; }
+              else { obs = { tier, served: j.model, at: Date.now() }; store.unshift(obs); if (store.length > 30) store.pop(); }
             }
           }
           rewritten = j;
@@ -4914,7 +5019,7 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
       // 探活级小请求（max_tokens≤8）：更短超时
       const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();
       try {
-        await attemptWithFailover({ provider: p, S, useProxy, opts }, req, res, cfg, body, rewritten, isProbe, tier0);
+        await attemptWithFailover({ provider: p, S, useProxy, opts, obs }, req, res, cfg, body, rewritten, isProbe, tier0);
       } catch (e) {
         try { log('FODEBUG STACK: ' + String(e && e.stack)); } catch {}
         if (!res.headersSent) wbAnthroError(res, 502, String((e && e.message) || e));
@@ -4948,7 +5053,7 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
             return wbAnthroError(res, 400, `请求体无法解析为 Anthropic messages JSON：${why}｜Content-Type=${ctv}｜长度=${len} 字节｜前 80 字节=${raw}`);
           }
           try {
-            await openaiExchange(fo.provider, { cfg, S: fo.S, j: rewritten, isProbe, res, useProxy: fo.useProxy(cfg) });
+            await openaiExchange(fo.provider, { cfg, S: fo.S, j: rewritten, isProbe, res, useProxy: fo.useProxy(cfg), obs: fo.obs });
           } catch (e) {
             noteRelayError(fo.provider, "network", String((e && e.message) || e));
             if (!res.headersSent) wbAnthroError(res, 502, (e && e.message) || e);
@@ -5059,6 +5164,11 @@ function sliceOf(cfg, p) {
       relayPort: z.relayPort || DEFAULTS.zen.relayPort, defaultModel: z.defaultModel || DEFAULTS.zen.defaultModel,
       availableModels: z.availableModels || [...DEFAULTS.zen.availableModels], mapping: z.mapping || { ...DEFAULTS.zen.mapping },
       useProxy: z.useProxy === true,
+      /* ★ v1.0.78：传输开关带进切片。applyToCli 据此决定 CLI 的 BASE_URL 是写中转端口
+         （transport=opencode）还是写上游本体（direct）——判据与中转内部 openaiExchange
+         的分流用**同一个** zenTransportOf，认不出来的值同样兜底成 direct。
+         `upstream` 字段保持原样（仍带 /v1），那是中转自己拼 /chat/completions 要用的。 */
+      transport: zenTransportOf({ zen: z }),
     };
   }
   if (p === "qd") {
@@ -5210,8 +5320,37 @@ function channelCredentials(c) {
 /* CLI/桌面版里"走本地协议桥"的渠道。applyToCli 用同一个判据决定
    ANTHROPIC_BASE_URL 写 127.0.0.1 还是上游本体——**必须是同一个函数**，
    否则会出现"直连上游却写占位符"（上游收不到真凭据，整个渠道 401）。
-   zen 有意不在其中：它的 CLI 直连上游本体，与 qd/wb/wbai/or 不同。 */
+   这个名单是**静态的**：zen 不在其中，它默认直连上游本体，与 qd/wb/wbai/or 不同；
+   zen 什么时候才进桥，见 cliViaRelay。 */
 const isBridgeChannel = (p) => p === "wb" || p === "wbai" || p === "qd" || p === "or";
+
+/* ★ v1.0.78：CLI 侧"走本地协议桥"的**完整**名单（静态名单 + zen 的动态那一种）。
+ *
+ * 此前 zen 有意不在名单里，于是 `cfg.zen.transport="opencode"`（v1.0.75 加的传输方式）
+ * 在命令行里是**死的**：中转内部 openaiExchange 会把这一档分流进 ocGateway，
+ * 但 CLI 根本不经过中转、一直在直连上游，那个开关只在桌面版有效。
+ * （当时的验证漏洞：只验了"直接打中转端口能通"，没验"CLI 接线后能不能走到中转"。）
+ *
+ * 判据用**严格等于** ZEN_TRANSPORT_OPENCODE —— 认不出来的/缺失的值一律落到 direct，
+ * 与中转内部 zenTransportOf 的兜底（同样是"认不出来 → direct"）逐字一致，两边不会走岔。
+ * 入参是 sliceOf 的返回值形状 `{p, transport}`；cliMode 那边现读 cfg 拼一个同形状的对象。 */
+const cliViaRelay = (S) => isBridgeChannel(S.p) || (S.p === "zen" && S.transport === ZEN_TRANSPORT_OPENCODE);
+
+/* 写给 Claude Code 的 ANTHROPIC_BASE_URL（**只有这一份**）。
+ *
+ * ★ 去掉尾部 `/v1`：Claude Code 自己在 BASE_URL 后面拼 `/v1/messages`，而 zen 的默认
+ *   上游**自带 /v1**（https://opencode.ai/zen/v1）。原样写出去就成了
+ *   https://opencode.ai/zen/v1/v1/messages —— 实测那条 URL 返回的是 404 的 SPA 兜底
+ *   **HTML**（压根不是 API 响应），去掉 /v1 之后才是正确的 FreeTierError JSON。
+ *   bai/sn 的上游本就不带版本号（api.b.ai / token.sensenova.cn），这一句对它们是恒等变换。
+ *
+ * ⚠ 只改**写给客户端的这一份**：`S.upstream`（= `cfg.zen.upstream`）一个字都不动——
+ *   中转内部还要拿它拼 `base + "/chat/completions"`（本文件 openaiExchange），
+ *   那里 `/v1` 是**必需**的。改错地方会把中转自己的调用也一起改坏。 */
+const cliBaseUrlFor = (S) => {
+  if (cliViaRelay(S)) return `http://127.0.0.1:${S.relayPort}`;
+  return String(S.upstream || "").replace(/\/+$/, "").replace(/\/v1$/i, "");
+};
 
 function cliMode(cfg, creds) {
   try {
@@ -5235,7 +5374,7 @@ function cliMode(cfg, creds) {
          桥渠道误报「凭据不一致，需重开对应端」。所以把占位符视为一致：桥不校验入站
          token，本就无从比对；面板该看的是「接的是不是这一家」（下面的 mode），那才有效。
          桌面版侧（applyToDesktop 仍写真 key）因此不受影响——这里判的是 settings.json。 */
-      const bridged = isBridgeChannel(ch);
+      const bridged = cliViaRelay({ p: ch, transport: c?.zen?.transport });
       r["keyMatch" + ch.charAt(0).toUpperCase() + ch.slice(1)] =
         (bridged && key === PROXY_MANAGED_TOKEN) ? true : key === v;
     }
@@ -5431,8 +5570,8 @@ async function applyToCli(S) {
    * 判据与 BASE_URL 完全同源（下面下一行用同一个表达式），两者不会走岔。
    * 与桌面版既有做法一致（applyToDesktop 之外的 FALLBACK_CC 里就写着 PROXY_MANAGED）。
    */
-  const viaLocalRelay = isBridgeChannel(S.p);
-  e.ANTHROPIC_BASE_URL = viaLocalRelay ? `http://127.0.0.1:${S.relayPort}` : S.upstream;
+  const viaLocalRelay = cliViaRelay(S);
+  e.ANTHROPIC_BASE_URL = cliBaseUrlFor(S);
   e.ANTHROPIC_AUTH_TOKEN = viaLocalRelay ? PROXY_MANAGED_TOKEN : (S.key || "wb-local");
   e.ANTHROPIC_MODEL = S.mapping["claude-haiku-4-5"]?.target || S.defaultModel;
   /* 显示名：只写用户手填的 label，不掺倍率（v1.0.65 撤掉）。
@@ -5611,13 +5750,38 @@ function providerStatus(cfg, p, store) {
       host: S.upstream,
       tested: lastTest[p]?.ok, ok: lastTest[p]?.ok, model: lastTest[p]?.model || null,
       ms: lastTest[p]?.ms || null, error: lastTest[p]?.error || null, at: lastTest[p]?.at || null,
+      /* 「预期内被拒」（v1.0.78）：面板据此把这一格从红的「上游不可用」改成中性的
+       * 「预期内被拒 + 两条下一步」。带上 why 是为了**不用点开**就知道该做什么。 */
+      expected: lastTest[p]?.expected === true,
+      expectedKind: lastTest[p]?.expectedKind || null,
+      expectedWhy: lastTest[p]?.expectedWhy || null,
+      expectedTiers: lastTest[p]?.expectedTiers || [],
     },
     recent: (() => {
       if (!t) return { tier: null };
       const m = S.mapping?.[t] || {};
       const obs = store.find((x) => x.tier === t);
-      return { tier: t, label: m.label || t, target: m.target || S.defaultModel, observedAt: obs ? obs.at : null };
+      /* served = **真实服务的那个模型**（store 里存的就是 resolveModel 的结果，也就是
+       *   我们真的发出去的那个名字）。此前它**存了但全仓库没有一个读取点**（面板拿
+       *   target 顶替），于是展示层与真实身份之间隔着一层假话。
+       * target = 「我们打算路由到哪」，由 resolveModelQuiet **重算**——不能写成
+       *   `S.mapping[t]?.target || S.defaultModel`：store.tier 存的是**客户端发来的名字**
+       *   （Claude Code 发的是 settings.json 里写着的那个 target，不是档位 key），拿它当
+       *   档位 key 查表永远查不到，于是 target 恒等于 defaultModel —— 正常流量里
+       *   served=space-bunny-free 而 target=出厂默认档，就会被误报成「以为在用 A 其实在用 B」。
+       *   那种天天误报的告警比静默回落更坏：用户会学会无视它。
+       * 两者不一致时**两个都报**：「以为在用 A 其实在用 B」正是这条差异本身，报一个等于没报。 */
+      const target = resolveModelQuiet(t, S);
+      const served = (obs && obs.served) || null;
+      return {
+        tier: t, label: m.label || t, target, served,
+        observedAt: obs ? obs.at : null,
+        mismatch: !!(served && served !== target),
+      };
     })(),
+    /* 模型回落留痕（P0）。空数组 = 这家渠道近 30 分钟没有回落过。
+     * 与 recent 分开报：recent 是"此刻在用哪个档"，这里是"有过名字查不到、被换掉了"。 */
+    modelFallback: modelFallbackFields(p),
   };
 }
 
@@ -5697,9 +5861,10 @@ async function statusPayload() {
     desktop: desktopMode(cfg),
     // B.AI 灯/接线沿用旧字段名，SenseNova 灯挂 sn 下，WorkBuddy 灯挂 wb 下
     relay: bai.relay, relayLast: bai.relayLast, upstream: bai.upstream, recent: bai.recent,
-    sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, useProxy: cfg.sn?.useProxy === true },
+    modelFallback: bai.modelFallback,
+    sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, modelFallback: sn.modelFallback, useProxy: cfg.sn?.useProxy === true },
     zen: {
-      relay: zen.relay, relayLast: zen.relayLast, upstream: zen.upstream, recent: zen.recent,
+      relay: zen.relay, relayLast: zen.relayLast, upstream: zen.upstream, recent: zen.recent, modelFallback: zen.modelFallback,
       useProxy: cfg.zen?.useProxy === true, keyConfigured: !!cfg.zen?.apiKey,
       // 档位（v1.0.74 T4）：面板必须显著显示当前在哪一档——两档可用性完全不同。
       // id/label/hint 由服务端一处算出（zenTierInfo），面板只负责显示，
@@ -5725,7 +5890,7 @@ async function statusPayload() {
       transportProbe: zenTransportNow.transportProbe,
     },
     qd: {
-      relay: qd.relay, relayLast: qd.relayLast, upstream: qd.upstream, recent: qd.recent,
+      relay: qd.relay, relayLast: qd.relayLast, upstream: qd.upstream, recent: qd.recent, modelFallback: qd.modelFallback,
       useProxy: cfg.qd?.useProxy === true,
       // 令牌是轮换的 jobToken，只有"当前有没有读到"这一态有意义（无到期时间可报）
       token: { configured: !!qdTok, tokenFile: cfg.qd?.tokenFile || DEFAULTS.qd.tokenFile },
@@ -5734,7 +5899,7 @@ async function statusPayload() {
       patch: qdPatchInfo(),
     },
     wb: {
-      relay: wb.relay, relayLast: wb.relayLast, upstream: wb.upstream, recent: wb.recent,
+      relay: wb.relay, relayLast: wb.relayLast, upstream: wb.upstream, recent: wb.recent, modelFallback: wb.modelFallback,
       useProxy: cfg.wb?.useProxy === true,
       // 版别（v1.0.59）："cn"=国内版 / "intl"=国际版 / null=读不到登录文件；
       // authDomain 为登录文件里的 auth.domain 原文（配合上游 host 即能看出是否已自动拨对）
@@ -5760,6 +5925,7 @@ async function statusPayload() {
     // （workbuddy-desktop-ai.info）与自己的令牌——两版同时装时两边都能各自报出就绪状态。
     wbai: {
       relay: wbaiStatus.relay, relayLast: wbaiStatus.relayLast, upstream: wbaiStatus.upstream, recent: wbaiStatus.recent,
+      modelFallback: wbaiStatus.modelFallback,
       useProxy: cfg.wbai?.useProxy === true,
       edition: wbaiAuthNow.edition,
       authDomain: wbaiAuthNow.domain,
@@ -5775,7 +5941,7 @@ async function statusPayload() {
     },
     // OpenRouter（第 6 家）：三盏灯 + 两层轮换状态 + 额度真相（「免费流水区」卡读这里）
     or: {
-      relay: orm.relay, relayLast: orm.relayLast, upstream: orm.upstream, recent: orm.recent,
+      relay: orm.relay, relayLast: orm.relayLast, upstream: orm.upstream, recent: orm.recent, modelFallback: orm.modelFallback,
       useProxy: cfg.or?.useProxy === true,
       // 只回显指纹（keyFp），明文永不进 /api/status
       token: {
@@ -6310,8 +6476,11 @@ const panel = http.createServer(async (req, res) => {
       /* 这个 handler 是**白名单**收字段的：不在表里的 key 会被静默丢掉，还回一个
        * ok:true 的「成功」——那是最坏的一种成功。所以要让它可配，就必须在表里显式加一行。
        *
-       * 认不出来的值退回 direct 并**照收**（与 zenTransportOf 的兜底一致）：
-       * 存下来的坏值等于「没打开开关」，也就是改动前的行为。 */
+       * 认不出来的值**直接 400 拒收**（不是"退回 direct 并照收"——那句是 v1.0.75 写下时
+       * 的设计意图，实现后来改成了拒绝，两边没对上）。理由：切换传输方式是一次
+       * 明确的用户动作，把它静默当成"没切换"比报错更坏——用户会以为已经在 OpenCode
+       * 中转上，实际还在直连。与 zenTransportOf 的**运行期**兜底（读配置时认不出就当
+       * direct）不冲突：那是读脏配置的容错，这里是不接受脏输入。 */
       if (P === "zen" && b.transport !== undefined) {
         const t = String(b.transport || "").trim();
         if (!ZEN_TRANSPORTS.includes(t)) {
@@ -6466,7 +6635,13 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const cfg = loadCfg();
       const S = sliceOf(cfg, P);
       const name = PROVIDERS[P];
-      if (!S.key) {
+      /* zen 走「OpenCode 客户端中转」时**根本不需要 API Key**——
+       * 凭据由 OpenCode 自己带，我们只是转发（`providerConfigured` 早就认了这一点）。
+       * 但这里原先硬性要 Key，于是面板「一键接入」被 400「请先填写 API Key」挡住：
+       * 一个**压根不需要 Key** 的档位，逼着用户去填一个用不上的 Key。
+       * 判据与 cliViaRelay 同源，别各写一份。 */
+      const needsKey = !(P === "zen" && S.transport === ZEN_TRANSPORT_OPENCODE);
+      if (needsKey && !S.key) {
         return json(res, 400, {
           error: P === "wb" || P === "wbai"
             ? `请先在「${name}」页粘贴访问令牌（JWT）——捕获方法见该页说明`
@@ -6536,25 +6711,63 @@ async function unknownMappingTargets(p, mapping, cfg) {
         const m = S.mapping[key] || {};
         return { label: m.label || key, target: m.target || S.defaultModel };
       };
+      /* 探测请求体（v1.0.78）：**只有 Zen 会带 tools**，其余渠道逐字不变。
+       *
+       * 为什么：Zen 免费档的围栏判据是「发给模型的请求里必须带工具」，不带工具的探测
+       * 会被同一个 FreeTierError 403 拒掉——**真实对话完全正常，面板却显示成红色故障**。
+       * 那是探测方式造成的假阳性，不是渠道坏了。Claude Code 的真实流量本来就带工具，
+       * 所以带工具的探测才代表真实可用性。
+       *
+       * 三条纪律（改动这行前先读完）：
+       *   · `max_tokens` **必须仍是 8** —— 它是入口 `isProbe`（max_tokens<=8）的判据，
+       *     改成别的数会连带禁掉短超时（10s）与 429 重试，探测反而更容易假失败。
+       *   · **不带 `tool_choice`** —— 我们只想问「请求形状上游收不收」，不想逼模型真的
+       *     去调工具（那会白花一份配额）。它回文本就够了：能返回就是通。
+       *   · 只给 zen 加 —— 别的上游对 `tools` 的接受度各不相同，凭空给它们加字段等于
+       *     拿一条本来正常的渠道去冒险。 */
+      const probeBody = (tier) => (P === "zen"
+        ? { model: tier + "[1M]", max_tokens: 8, messages: [{ role: "user", content: "ok" }], tools: [ZEN_PROBE_TOOL_ANTHROPIC] }
+        : { model: tier + "[1M]", max_tokens: 8, messages: [{ role: "user", content: "ok" }] });
       const probe = async (tier) => {
         const info = tierInfo(tier);
         let lastErr = null;
+        let expected = null;   // 「这一档预期内被拒」的判定（null = 没判定，按故障报）
         for (let attempt = 0; attempt < 3; attempt++) { // 上游偶发截断/挂起，测活流量重试两次
           const t0 = Date.now();
           try {
             const r = await fetch(`http://127.0.0.1:${S.relayPort}/v1/messages`, {
               method: "POST",
               headers: { authorization: `Bearer ${S.key}`, "content-type": "application/json", "anthropic-version": "2023-06-01" },
-              body: JSON.stringify({ model: tier + "[1M]", max_tokens: 8, messages: [{ role: "user", content: "ok" }] }),
+              body: JSON.stringify(probeBody(tier)),
               signal: AbortSignal.timeout(45000),
             });
             const j = await readProbeJson(r);
             const ms = Date.now() - t0;
             if (!r.ok) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
             return { tier, label: info.label, target: info.target, served: j.model, ok: true, ms, error: null };
-          } catch (e) { lastErr = String(e?.message || e).slice(0, 100); }
+          } catch (e) {
+            lastErr = String(e?.message || e).slice(0, 100);
+            /* 归因按**上游原文**判，不看本机中转转译过的中文文案（后者丢掉了 FreeTierError
+             * 字样，拿它判永远判不出「预期内」）。原文与状态码由 readProbeJson 挂在错误上。
+             * 拿不到原文时一律按故障报——宁可漏判，也绝不能把别的 403 错认成「预期内」。
+             * 传输方式取 **S.transport**（sliceOf 已经带了，用同一个 zenTransportOf 算的），
+             * 不在这里再调一次：多一处调用就多一个与 openaiExchange 的分流判据漂移的机会。 */
+            const exp = zenExpectedRejection(e?.upstreamStatus || 0, e?.upstreamRaw || "", {
+              provider: P,
+              isGo: zenTierOf(S.upstream) === ZEN_TIER_GO,
+              transport: S.transport || "direct",
+            });
+            if (exp.expected) expected = exp;
+          }
         }
-        return { tier, label: info.label, target: info.target, served: null, ok: false, ms: null, error: lastErr || "unknown" };
+        /* `expected` 非空 = 这是**产品级的预期拒绝**（「免费档 + 直连」本来就会被拒），
+         * 不是渠道故障。照样如实标 ok:false（这一档确实发不出消息），但**不**报故障：
+         * 面板改成中性的「预期内被拒」并给出两条可执行的下一步。 */
+        return {
+          tier, label: info.label, target: info.target, served: null, ok: false, ms: null,
+          error: lastErr || "unknown",
+          ...(expected ? { expected: true, expectedKind: expected.kind, expectedWhy: expected.why } : {}),
+        };
       };
       // 免费渠道对短时间并发探测很敏感。串行并留出间隔，避免四个档位
       // 同时命中 429；这不会影响真实对话的吞吐。
@@ -6564,14 +6777,28 @@ async function unknownMappingTargets(p, mapping, cfg) {
         if (i < targets.length - 1) await new Promise((res) => setTimeout(res, 1500));
       }
       const pass = tiers.filter((x) => x.ok).length;
+      /* 「预期内被拒」单独算一类（v1.0.78）。它**既不是通过也不是故障**：
+       * 这一档确实发不出消息（ok 仍是 false，如实说），但原因已知且是产品设计的围栏，
+       * 所以另起一个 expected 计数，让面板显示中性的「预期内被拒 + 两条下一步」，
+       * 而不是亮红灯让用户去查一个根本没坏的渠道。
+       * 只有**全部**失败档位都属这一类时才置 expected —— 混着别的真故障就不能洗白。 */
+      const badTiers = tiers.filter((x) => !x.ok);
+      const expTiers = badTiers.filter((x) => x.expected);
+      const expectedOnly = badTiers.length > 0 && expTiers.length === badTiers.length;
       Object.assign(lastTest[P], {
         ok: pass === tiers.length,
         model: tiers[0]?.label || null,
         ms: tiers[0]?.ms || null,
         error: summarizeTierErrors(tiers),
         at: new Date().toISOString(),
+        ...(expectedOnly ? {
+          expected: true,
+          expectedKind: expTiers[0].expectedKind,
+          expectedWhy: expTiers[0].expectedWhy,
+          expectedTiers: expTiers.map((x) => x.label),
+        } : { expected: false, expectedKind: null, expectedWhy: null, expectedTiers: [] }),
       });
-      return json(res, 200, { ok: pass === tiers.length, provider: P, tiers, pass, total: tiers.length, active });
+      return json(res, 200, { ok: pass === tiers.length, provider: P, tiers, pass, total: tiers.length, active, expected: expectedOnly });
     }
 
     // ---------- 备用自升级 API ----------

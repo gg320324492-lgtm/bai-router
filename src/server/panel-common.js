@@ -618,6 +618,18 @@
     const wired = wiredTo(key);
     if (!relayUp) return { s: "err", txt: "中转未起", detail: cred.detail };
     if (cred.s === "idle") return { s: "idle", txt: "凭据未配", detail: cred.detail };
+    /* 「预期内被拒」优先于红色的「上游不可用」（v1.0.78）。
+     * 这一档确实发不出消息，但对「免费档 + 直连」这个组合来说**上游本来就会拒**——
+     * 报成故障会让用户去查一个根本没坏的东西（本次要修的现象：真实对话完全正常，
+     * 面板却显示成红色故障）。所以走 warn 而不是 err，账上不计进「故障」那一栏。
+     * 副行给的是**可执行的下一步**，不是「换个模型试试」这种猜谜式提示。 */
+    if (up.expected === true) {
+      const names = (up.expectedTiers || []).join("、");
+      return {
+        s: "warn", txt: "预期内被拒",
+        detail: (names ? `（${names} 档）` : "") + (up.expectedWhy || ""),
+      };
+    }
     if (up.tested === false) return { s: "err", txt: "上游不可用", detail: up.error || "" };
     if (cred.s === "warn") return { s: "warn", txt: cred.txt, detail: cred.detail };
     if (up.tested === true) return { s: "ok", txt: wired ? "已接入" : "就绪", detail: up.model ? `${up.model} ${up.ms}ms` : "" };
@@ -650,8 +662,11 @@
     $("txtRelay").textContent = up ? "运行中" : "已停止";
     const rl = (selected ? stOf(selected).relayLast : null) || {};
     const fresh = rl.at && Date.now() - new Date(rl.at).getTime() < 30 * 60000;
+    /* 「预期内被拒」换个前缀（v1.0.78）：这一类不是故障，写成「最近错误」会与它旁边
+     * 真正需要处理的错误混成一类，用户分不出哪条该动手。措辞与归因标签保持一致。 */
+    const rlPrefix = rl.kind === "free_tier_direct" ? "已知限制" : "最近错误";
     $("subRelay").textContent = fresh
-      ? `最近错误·${rl.kind}: ${rl.message}`
+      ? `${rlPrefix}·${rl.kind}: ${rl.message}`
       : `中转 :${selPort || "—"} / 面板 :${(s.panel || {}).port || "—"}`;
     $("subRelay").title = fresh ? `${rl.at}\n${rl.message}` : "";
 
@@ -871,9 +886,12 @@
         } else {
           const C = cfgOf(key);
           const map = C.mapping || {};
+          /* 正在用的那一档旁边补「实际服务的模型」（v1.0.78 T9）。servedNote 只在
+             served 与 target 不一致时吐字——正常路径与改动前**逐字一致**。 */
+          const R = (stOf(key).recent) || null;
           cm.innerHTML = TIERS.map((t) => {
             const m = map[t.key] || {};
-            return `<span class="mrow"><i class="t">${esc(t.short)}</i><i class="v">${esc(m.label || m.target || "未设")}</i></span>`;
+            return `<span class="mrow"><i class="t">${esc(t.short)}</i><i class="v">${esc(m.label || m.target || "未设")}</i>${R && R.tier === t.key ? servedNote(R) : ""}</span>`;
           }).join("");
         }
       }
@@ -1234,6 +1252,69 @@
   }
 
   /* ======================================================================
+   * 9b. 「以为在用 A 其实在用 B」的两处呈现（v1.0.78 T9）
+   *
+   * 抽成两个纯函数是有原因的：这件事**必须能被测**，而 buildDiag / paintMatrix
+   * 那一坨闭包依赖（cfg / status / DOM）没法在 vm 里求值。这里只吃 /api/status
+   * 给的那一份，输出字符串或 items 数组，渲染层只负责把它放上去。
+   *
+   * 两条信号来自同一件事的上下游，对用户是同一句话：
+   *   · modelFallback[] —— 客户端送来的模型名查不到，被**静默回落到默认模型**
+   *     （解析这一步就错了：发的 A，出去的是 B）
+   *   · recent.mismatch —— 真实服务的模型（served）与我们打算路由到的（target）不是同一个
+   *     （解析对了，但上游服务的不是它）
+   * 处置不同，所以分开列；两条都以「你选的是 A、实际跑的是 B」这句人话开头。
+   *
+   * 渲染层不认识任何渠道名（C11）：渠道显示名由调用方用 nameOf 传进来；
+   * 也不认识任何模型名——全是 /api/status 给的原文，本函数只做转义与排版。
+   */
+  function modelIdentityItems(S, name) {
+    const items = [];
+    const R = (S && S.recent) || null;
+    const fb = (S && Array.isArray(S.modelFallback)) ? S.modelFallback : [];
+    const when = (x) => (x ? new Date(x).toLocaleString("zh-CN", { hour12: false }) : "（时间未知）");
+    /* 最多列三条：同一个错配反复回落也只占三行，面板不会被刷屏淹没。 */
+    for (const f of fb.slice(0, 3)) {
+      const tail = Number(f.count) > 1 ? `（累计 ${f.count} 次，最近一次 ${when(f.lastAt)}）` : `（${when(f.lastAt)}）`;
+      items.push({
+        s: "err",
+        t: `${name}：你发的模型名「${f.requested}」查不到，已被回落到「${f.landed}」${tail}`,
+        m: "模型名在本渠道的映射表和可用清单里都查不到时，本路由台会**静默**改用它的默认模型——"
+          + "请求照样成功，所以从结果上看不出任何异常，而这正是「以为在用 A 其实在用 B」。\n"
+          + "常见两种成因：① 客户端指向了别家的中转口，却发着别家的模型名；"
+          + "② 这一档在本渠道没配目标模型。\n"
+          + "怎么办：到该渠道卡的「档位映射」里把这一档的目标模型选对，"
+          + "或者把客户端指回它自己该用的中转口。",
+      });
+    }
+    /* 两个判据都要满足才报警：服务端标了 mismatch，**且**两个名字确实不同。
+     * 只信 mismatch 的话，一旦那份状态自相矛盾（mismatch=true 但两个名字一样），
+     * 面板就会打印「你以为在用 x，实际服务的是 x」——那正是本节要消灭的那类假话。 */
+    if (R && R.tier && R.served && R.served !== R.target && R.mismatch === true) {
+      const who = R.label && R.label !== R.tier ? `（界面显示名 ${R.label}）` : "";
+      items.push({
+        s: "err",
+        t: `${name}：你以为在用「${R.target}」，实际服务的是「${R.served}」`,
+        m: `正在用的档位是 ${R.tier}${who}。我们打算路由到「${R.target}」（档位映射里配的那个），`
+          + `但真实服务的是「${R.served}」——两个都摆出来，是因为这正是要看见的那件事。\n`
+          + `最后一次这样的请求：${when(R.observedAt)}。`,
+      });
+    }
+    return items;
+  }
+
+  /** 矩阵格「档位映射」里，正在用的那一档旁边补一句**真实服务的模型**。
+   *  只在 served 与 target 不一致时出现——正常路径一个字都不加（与改动前逐字一致）。 */
+  function servedNote(R) {
+    /* 判据与 modelIdentityItems 里那一条**完全相同**：服务端标了 mismatch，
+       且两个名字确实不同。只信前者的话，一份自相矛盾的状态会让矩阵格显示
+       「实际服务 x」而它旁边就是同一个 x。 */
+    if (!R || !R.tier || R.mismatch !== true || !R.served || R.served === R.target) return "";
+    return `<i class="serveddiff" title="我们打算路由到：${esc(R.target)}（档位映射里配的那个）；`
+      + `实际服务的是：${esc(R.served)}。两者不一致，所以两个都摆出来。">实际服务 ${esc(R.served)}</i>`;
+  }
+
+  /* ======================================================================
    * 10. 诊断抽屉：只呈现本机当前已知问题，绝不编造历史错误 / 错误数 / 时间线
    * ==================================================================== */
   function buildDiag() {
@@ -1320,6 +1401,16 @@
       } else {
         items.push({ s: "ok", t: `${nameOf(key)} 凭据就绪、上游未测过`, m: `未探测过只算「未验」，不算故障。${P.remedy || ""}`.trim() });
       }
+    }
+
+    /* ③b 模型身份（v1.0.78 T9）：「你以为在用 A，实际跑的是 B」。
+     *
+     * 单独一轮而不是塞进 ③ 的优先级链：③ 那一串 continue 是"每家只报最要紧的那一条"，
+     * 而模型身份错配与凭据错配是**两件独立的事**，都成立时都得看得见。
+     * 判定本身在 modelIdentityItems 里（纯函数，可测）。 */
+    for (const key of chainOf().length ? chainOf() : CHAIN_KEYS) {
+      const items2 = modelIdentityItems(stOf(key), nameOf(key));
+      for (const it of items2) items.push(it);
     }
 
     /* ④ 交还区：分「只是它在跑」和「它已经把配置换掉了」两档。

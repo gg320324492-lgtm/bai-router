@@ -388,6 +388,13 @@ body.no-frame .winCtrls { display: none; }
 .mrow { display: flex; align-items: center; gap: 9px; font-size: 11.5px; padding: 1.5px 0; }
 .mrow .t { color: var(--dim); width: 46px; flex: none; font-size: 10.5px; letter-spacing: .2px; font-style: normal; }
 .mrow .v { font-family: var(--mono); font-size: 11px; color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+/* 「实际服务的模型」（v1.0.78 T9）：只有 served 与 target 不一致时才出现，
+   所以用红色——出现即意味着「你以为在用 A，实际跑的是 B」，那是错配不是装饰。 */
+.mrow .serveddiff {
+  font-family: var(--mono); font-size: 10.5px; font-style: normal; flex: none;
+  color: var(--err); border: 1px solid currentColor; border-radius: 4px;
+  padding: 0 4px; cursor: help;
+}
 
 .crelay { display: flex; align-items: center; gap: 8px; padding: 8px 14px 0; margin-top: auto; }
 .rl { font-family: var(--mono); font-size: 10.5px; color: var(--dim); }

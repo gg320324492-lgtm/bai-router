@@ -132,6 +132,33 @@ export const ZEN_PROBE_TOOL = Object.freeze({
   }),
 });
 
+/**
+ * 同一个合成工具的 **Anthropic Messages 形状**（`/v1/messages` 用），语义与上面逐字一致。
+ *
+ * ⚠ 为什么要两种形状：`ZEN_PROBE_TOOL` 是 OpenAI 形状（`type/function/parameters`），
+ *   能力探测走的是 openaiExchange → 上游 `/chat/completions`；而 `/api/test` 的连通性
+ *   探测打的是本机中转的 `/v1/messages`，那边按 Anthropic 形状收（`name/input_schema`），
+ *   再由 wbToOpenAI 转成 OpenAI 形状发给上游。**同一个字段名不能两用**——
+ *   发错形状上游直接 400，于是「带工具」这个修复会自己把自己变成一次新的假阳性。
+ *
+ * 为什么 `/api/test` 也要带工具（v1.0.78）：Zen 免费档的围栏判据是
+ * **「发给模型的请求里必须带工具」**。不带工具的探测请求会被同一个 FreeTierError 403 拒掉，
+ * 于是**真实对话完全正常，面板却显示成红色故障**——探测方式造成的假阳性，不是渠道坏了。
+ * Claude Code 的真实流量本来就带工具，所以带工具的探测才代表真实可用性。
+ *
+ * 刻意**不带** `tool_choice`：我们只想问「这个请求形状上游收不收」，**不想让模型真的去调工具**
+ * （`required` 会逼出一段 tool_call，白花配额）。它回文本就够了——能返回就是通。
+ */
+export const ZEN_PROBE_TOOL_ANTHROPIC = Object.freeze({
+  name: "probe_ping",
+  description: "Report a value. Never has any side effect.",
+  input_schema: Object.freeze({
+    type: "object",
+    properties: { value: { type: "string", description: "The value to report." } },
+    required: ["value"],
+  }),
+});
+
 /** 落盘文件名（DATA_DIR 下）。带时间戳的是**内容里的 at 字段**，不是文件名——
  *  固定文件名才能让「上次检测时间」有地方读。 */
 export const ZEN_PROBE_FILE = "zen-capability.json";
@@ -216,6 +243,58 @@ export function zenProbeClassify(status, txt) {
 /** 网络层失败（超时 / 连不上）：探不通，但要说清是网络而不是模型。 */
 export function zenProbeNetwork(reason) {
   return { cls: "network", reachable: true, why: `连不上上游（${String(reason || "网络错误").slice(0, 120)}）——不是模型的问题。` };
+}
+
+/* ---------- 预期内的产品级拒绝 ≠ 故障（v1.0.78） ---------- */
+
+/** 「免费档 + 直连」这一组合的 kind 标签。面板据此**不**把它算成故障。 */
+export const ZEN_FREE_TIER_DIRECT_KIND = "free_tier_direct";
+
+/**
+ * 判断一次失败是不是**产品级的预期拒绝**——即「这一档在这个传输方式下本来就会被拒」，
+ * 而不是渠道坏了。
+ *
+ * ⚠ 分类**不另造一套**：`cls` 直接取自 `zenProbeClassify`，本函数只回答一个**新的**问题——
+ *   「这个已经归好类的结果，要不要**升级成故障**？」
+ *   归因（是什么错）与归责（算不算故障）是两件事，混在一起就会出现本次要修的那个现象：
+ *   一条**已知且预期内**的拒绝被当成渠道故障，面板亮红灯，用户去查一个根本没坏的东西。
+ *
+ * 判据刻意很窄，**四个条件同时成立**才认：
+ *   ① provider 必须是 zen —— **别的渠道的 403 照旧按故障报**（如 WorkBuddy 的令牌失效、
+ *      模型未授权，那是真的坏了）。放宽这一条就会把真实故障洗成「预期内」，比原 bug 更危险。
+ *   ② **状态码必须是 403** —— 上游只有这一条拒绝会带 FreeTierError。少了这道闸，一个碰巧
+ *      复述了同样措辞的 401/429/500 也会被判成「预期内」，把真故障洗白。
+ *   ③ 必须是免费档（isGo 为假）—— Go 档的 403 是「需要订阅」，另一条产品级限制，
+ *      由 go_subscription_required 单独归因，不在这里吞掉。
+ *   ④ 上游原文命中 FreeTierError / only be used from within —— 只认**文案**不认状态码，
+ *      与本文件其余判据一致（两个端点的同一拒绝状态码并不统一）。
+ *   ⑤ 直连传输 —— 走 OpenCode 客户端中转时模型手上就有工具，本来就不该被拒；
+ *      那条路还报这个错就说明是真故障，绝不能被洗白。
+ *
+ * 返回 `{ expected, kind, cls, why }`。`expected` 为假时 `kind`/`why` 为空串——
+ * 调用方据此走原来的故障分支，一行都不用改。
+ */
+export function zenExpectedRejection(status, txt, {
+  provider = "zen", isGo = false, transport = "direct",
+} = {}) {
+  const base = { expected: false, kind: "", cls: "", why: "" };
+  if (provider !== "zen") return base;
+  if (Number(status) !== 403) return base;
+  if (isGo) return base;
+  if (transport !== "direct") return base;
+  const t = String(txt || "");
+  if (!/FreeTierError|only be used from within/i.test(t)) return base;
+  return {
+    expected: true,
+    kind: ZEN_FREE_TIER_DIRECT_KIND,
+    // cls 复用同一套分类，不重写：这里如实记成 auth（Key 没问题，是这一档在直连下被围栏拒）。
+    cls: zenProbeClassify(status, t).cls || "auth",
+    why: "这一档在直连下本来就会被拒，不是渠道故障。"
+      + "OpenCode Zen 免费档要求「发给模型的请求里必须带工具」；"
+      + "本程序直连中转时执行权在 Claude Code 那边，请求不带工具，于是被同一个 FreeTierError 403 拒掉。"
+      + "下一步二选一：①把传输方式切成「OpenCode 客户端中转」（需本机已装 OpenCode，npm i -g opencode-ai）；"
+      + "②把上游地址改成 Go 档 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，https://opencode.ai/auth），再点「刷新模型列表」。",
+  };
 }
 
 /* ---------- 工具维度：calls:0 只算观测（纪律①） ---------- */

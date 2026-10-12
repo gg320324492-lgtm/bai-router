@@ -30,6 +30,10 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+/* sliceOf 里有一行 `transport: zenTransportOf({ zen: z })`（v1.0.78 CLI 接线用），而本文件的
+   沙箱是「抠真源码 + new Function」——抠出来的真 sliceOf 会在沙箱里执行，需要这个依赖。
+ * 传**真函数**进去（不是自己重写一份）：同一个 zenTransportOf，认不出来的值兜底成 direct。 */
+import { zenTransportOf } from "../src/server/oc-wiring.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..");
@@ -109,14 +113,14 @@ function loadZenCore({ fetchImpl, defaults } = {}) {
     },
   };
   const factory = new Function(
-    "createHash", "sliceOf", "fetch", "DEFAULTS",
+    "createHash", "sliceOf", "fetch", "DEFAULTS", "zenTransportOf",
     `${ZEN_CORE}
 return { zenTierOf, zenTierZh, zenCatalogEndpointLabel, zenSessionId, zenReadCatalog, zenTierInfo, zenGoState, ZEN_TIER_GO, ZEN_TIER_FREE, ZEN_PROBE_SESSION, ZEN_EXTERNAL_OK, zenCatCache };`
   );
   const api = factory(createHash, (cfg, p) => ({
     p, zh: "OpenCode Zen", key: cfg.zen.apiKey || "",
     upstream: cfg.zen.upstream || DEFAULTS.zen.upstream,
-  }), fetchSpy, DEFAULTS);
+  }), fetchSpy, DEFAULTS, zenTransportOf);
   return { ...api, calls, fetchSpy };
 }
 

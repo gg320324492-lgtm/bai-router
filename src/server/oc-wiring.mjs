@@ -227,6 +227,10 @@ export function writeAnthropicMessage(res, message, clientStream, { inputTokens 
  * `rate_limit` / `timeout` / `network` / `auth`），不另造一套——面板与
  * attemptWithFailover 的 kind 归因都只认那套，新造一个等于多一份要维护的方言。
  *
+ * ⚠ 唯一的例外是 `free_tier_direct`（v1.0.78）：那是**产品级的预期拒绝**，不是故障，
+ *   面板要拿它显示「预期内被拒 + 两条下一步」而不是红灯，所以它**故意不在**上面那套
+ *   故障词表里。
+ *
  * `status` 的选法只有一条判据：**该不该让故障转移接手**（见 failover.mjs 的
  * `shouldFailover`）——400 类不转移（换渠道也一样错），401/403/429/5xx/网络错转移。
  */
