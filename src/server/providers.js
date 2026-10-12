@@ -285,6 +285,13 @@ window.BAI_PROVIDERS = {
     tagline: "腾讯 · 国内版 · 三款 0 积分模型",
     badge: { text: "0 积分", kind: "cn" },
     chainable: true,
+    /* 账号池卡（v1.0.77）：这一格可以挂多个账号，按「同一段对话粘一个号、
+       那个号真用不了才换」的规矩自动轮换。老配置只有一个令牌时池子合成为
+       单条目，行为与池化之前逐字一致（面板会如实说「当前是单账号」）。
+       这里只声明「这一格要画这张卡」；每个账号的状态、处置指引、「本次被跳过」
+       全部由 /api/status 的 pool 字段给出——渲染层因此既不需要认识渠道名，
+       也不需要认识 reason 码（C11）。 */
+    accountPool: true,
     credential: {
       kind: "jwt",
       label: "访问令牌",
@@ -326,6 +333,9 @@ window.BAI_PROVIDERS = {
     tagline: "腾讯 · 国际版 · 出海",
     badge: { text: "0 积分 · 海外", kind: "intl" },
     chainable: true,
+    /* 账号池卡（v1.0.77）：见 wb.accountPool。与 wb **分池不混** ——
+       两版令牌互不通用，装进同一个池子必然有一半是死的。 */
+    accountPool: true,
     credential: {
       kind: "jwt",
       label: "访问令牌",
@@ -453,7 +463,7 @@ window.BAI_PROVIDERS = {
  * ========================================================================== */
 window.BAI_VIEWS = [
   { id: "console", nav: "控制台", dom: "viewConsole", hint: "渠道矩阵 · 映射编辑 · 诊断抽屉", cards: ["model-sync", "oc-transport"] },
-  { id: "cred", nav: "凭据", dom: "viewCred", hint: "每家渠道各自要的东西", cards: ["token-capture", "model-catalog", "or-rotation"] },
+  { id: "cred", nav: "凭据", dom: "viewCred", hint: "每家渠道各自要的东西", cards: ["token-capture", "model-catalog", "or-rotation", "wb-pool"] },
   { id: "fo", nav: "故障转移", dom: "viewFo", hint: "开关 · 顺序 · 冷却", cards: ["failover"] },
   { id: "settings", nav: "设置", dom: "viewSettings", hint: "代理 · 端口 · 更新 · 数据目录", cards: [] },
 ];

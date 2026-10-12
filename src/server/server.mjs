@@ -34,6 +34,13 @@ import { ocTransportFields } from "./oc-transport-info.mjs";
  * 免得 PID 被系统回收后误杀无关程序。判定是纯函数，实测启动时间靠 PowerShell CIM
  * （写的一侧零成本，见 SERVICE_START_MS）。 */
 import { selfStartTimeMs, verifyPidRecord, pidIdentityMessage, VERDICT_SAME } from "./proc-identity.cjs";
+/* WorkBuddy 账号池的**接线层**（v1.0.77）：读配置 → 建池 → 选号 → 回灌 → 给面板。
+ * 纯逻辑、零 IO、零网络（时间源/哈希/刷新动作都由这里注入），内核在 wb-pool.mjs。
+ * 失败原因一律问池子，绝不从响应文案反推账号好坏——见该文件顶部三条规矩。 */
+import {
+  wbPoolOf, wbPickAccount, wbNoteFailure, wbNoteRefreshFailure, wbPoolStatus,
+  wbPaidSameName, wbMappingRows, wbUnusableStatus, redact as redactWiring,
+} from "./wb-pool-wiring.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -421,6 +428,24 @@ function wbTokenOwnership(p, cfg) {
   if (!w.accessToken) return { state: "no-token", ...base };
   if (!sub || !uid) return { state: "unknown", ...base };
   return { state: sub === uid ? "match" : "mismatch", ...base };
+}
+
+/* ---------- 账号池的只读事实（/api/status，v1.0.77）----------
+ *
+ * 面板那一格要显示什么**全在这里算完**：可用 / 冷却中 / 判死 / 已停用 / 本次被跳过，
+ * 外加「池里有几个」。渲染层因此既不需要认识渠道名，也不需要认识 reason 码（C11）。
+ *
+ * 凭据一律走 keyFp 指纹（首 7 位 + 尾 2 位 + 长度），**明文永不进 /api/status**。
+ */
+function wbPoolFields(cfg, p, now) {
+  const st = wbPoolStatus(cfg, p, now, { fingerprint: (a) => keyFp(a.accessToken) });
+  return st || { version: p, total: 0, counts: { total: 0 }, accounts: [], synthetic: false, hint: "" };
+}
+/** 最近一次 429 时算出的「同名付费行」指向（可能为 null）。 */
+function wbPaidHintFields(p) {
+  const h = wbLastPaidHint.get(p);
+  if (!h) return null;
+  return { label: h.label, rows: h.rows, text: h.text, at: h.at || null };
 }
 
 // 自愈覆盖（供 loadCfg 的两条返回路径共用）：**仅当当前 upstream 恰好等于另一版的默认值**
@@ -1302,17 +1327,25 @@ const wbRefreshLocks = new Map();
 // 令牌续期：POST /v2/plugin/auth/token/refresh（刷新令牌放 X-Refresh-Token 头，与 WorkBuddy 客户端一致）
 // 成功后就地写回 config.json（访问/刷新令牌成对滚动，有效期约一年，正常一年才需要续一次）
 // p 决定用哪一份配置：wb → cfg.wb，wbai → cfg.wbai（里程碑 1b，两版令牌互不通用）。
-function wbRefreshToken(cfg, p) {
+//
+// ★ account 给的是**本次真正在用的那个池条目**（可能不是 cfg.wb 里那一把）。
+//   续期成功要把新令牌写回**条目**与**渠道配置**两处：条目是池的真相，渠道配置是
+//   面板「凭据」页与 /v3/config 目录抓取的真相，两处都写才不会出现「池里是新令牌、
+//   面板显示的还是旧的」。老配置（合成池）两者本就是同一枚，写两遍是幂等的。
+function wbRefreshToken(cfg, p, account) {
   const isAi = p === "wbai";
   const zh = isAi ? "WorkBuddy AI" : "WorkBuddy";
   const w = isAi ? cfg.wbai : cfg.wb;
-  if (!w || !w.refreshToken) throw new Error(`${zh} 刷新令牌为空，无法续期——请重新捕获令牌`);
+  const refreshToken = (account && account.refreshToken) || (w && w.refreshToken);
+  if (!w || !refreshToken) throw new Error(`${zh} 刷新令牌为空，无法续期——请重新捕获令牌`);
   const base = (w.upstream || (isAi ? DEFAULTS.wbai.upstream : DEFAULTS.wb.upstream)).replace(/\/+$/, "");
   const headers = {
     "content-type": "application/json",
     "x-requested-with": "XMLHttpRequest",
-    "x-refresh-token": w.refreshToken,
-    authorization: `Bearer ${w.accessToken || ""}`,
+    "x-refresh-token": refreshToken,
+    // ⚠ 授权头也用**这一枚账号的**访问令牌，不是渠道配置里那一把——
+    // 多账号之后两者不再必然是同一枚，用错会拿 A 的令牌去续 B 的会话。
+    authorization: `Bearer ${(account && account.accessToken) || w.accessToken || ""}`,
     "x-auth-refresh-source": "plugin",
     "x-domain": hostOf(base) || (isAi ? "www.workbuddy.ai" : "www.workbuddy.cn"),
     "user-agent": `B.AI-Router/${APP_VERSION}`,
@@ -1323,7 +1356,17 @@ function wbRefreshToken(cfg, p) {
       ? await fetch(base + "/v2/plugin/auth/token/refresh", { method: "POST", headers, body: "{}", signal: AbortSignal.timeout(15000) })
       : await directHttp(base + "/v2/plugin/auth/token/refresh", { method: "POST", headers, body: "{}", timeoutMs: 15000 });
     const txt = await readAllBody(r);
-    if (r.status !== 200) throw new Error(`${zh} 令牌续期失败 HTTP ${r.status}: ${String(txt).slice(0, 160)}`);
+    if (r.status !== 200) {
+      /* ★★★ 续期失败要**带着原始状态码/正文/响应头**往上抛。
+       * 刷新接口的失效信号是 **HTTP 400**（不是 401），不带状态码抛出去的话，
+       * 接线层无从按 `context:"refresh"` 判死，死号就会永远留在池子里烧重试。
+       * 正文一律先过 redact：上游偶尔把请求里的东西原样回显，而这条文案会进日志与面板。 */
+      const e = new Error(`${zh} 令牌续期失败 HTTP ${r.status}: ${redactWiring(String(txt), 160)}`);
+      e.status = r.status;
+      e.text = String(txt);
+      e.headers = r.headers;
+      throw e;
+    }
     let j = {};
     try { j = JSON.parse(txt); } catch { }
     const box = j.data && typeof j.data === "object" ? j.data : j;
@@ -1332,27 +1375,65 @@ function wbRefreshToken(cfg, p) {
     if (typeof na !== "string" || na.length < 20) throw new Error("令牌续期响应里没有新的访问令牌");
     w.accessToken = na;
     if (typeof nr === "string" && nr.length > 20) w.refreshToken = nr;
+    if (account) {
+      account.accessToken = na;
+      if (typeof nr === "string" && nr.length > 20) account.refreshToken = nr;
+      account.credential = { ...(account.credential || {}), lastRefreshTime: Date.now() };
+    }
     saveCfg(cfg);
     const exp = wbTokenExp(na);
     log(`${zh} 令牌已自动续期${exp ? "（新有效期至 " + new Date(exp * 1000).toLocaleDateString("zh-CN") + "）" : ""}`);
     return w.accessToken;
   })();
 }
-async function wbEnsureToken(cfg, p) {
-  const isAi = p === "wbai";
-  const zh = isAi ? "WorkBuddy AI" : "WorkBuddy";
-  const w = isAi ? cfg.wbai : cfg.wb;
-  if (!w || !w.accessToken) throw new Error(`${zh} 访问令牌未配置——到面板「${zh}」页粘贴令牌`);
-  const exp = wbTokenExp(w.accessToken);
-  if (exp && exp * 1000 - Date.now() > 120000) return w.accessToken;
-  if (!w.refreshToken) {
-    if (exp && exp * 1000 > Date.now()) return w.accessToken;
-    throw new Error(`${zh} 访问令牌已过期且没有刷新令牌，请重新捕获`);
+
+/**
+ * 池化之后的令牌入口：按渠道选一个可用账号，必要时先续期。
+ *
+ * @param {object} cfg
+ * @param {"wb"|"wbai"} p
+ * @param {object} [o] {model, sessionKey, now}
+ *   ⚠ **sessionKey 只在真的算得出会话锚点时才传**（探测/健康检查不传）——
+ *   传一个常量进去等于把所有探针粘到同一个号上，白白占住一条绑定。
+ * @returns {Promise<{ok:boolean, token?:string, accountId?:string, reason?:string, remedy?:string}>}
+ */
+async function wbEnsureTokenPooled(cfg, p, o = {}) {
+  const sel = await wbPickAccount(cfg, p, {
+    model: o.model == null ? null : o.model,
+    sessionKey: o.sessionKey == null ? null : o.sessionKey,
+    now: Number(o.now) || Date.now(),
+    tokenExpOf: wbTokenExp,
+    refresh: (pp, acct) => wbRefreshOnce(cfg, pp, acct),
+  });
+  if (!sel.ok) {
+    /* 把 pool 给的结构化原因原样带出去（**不做任何加工**，也就没有反推的余地），
+       并带上选出来的 HTTP 状态码：没配令牌 / 已过期仍是 401（与池化之前一字不差），
+       「在冷却 / 额度用尽」是 429，「判死 / 停用 / 空池」是 503 —— 绝不再冒充 401。 */
+    const zh = p === "wbai" ? "WorkBuddy AI" : "WorkBuddy";
+    const e = new Error(sel.reason === "no_token" && !sel.refreshError
+      ? `${zh} 访问令牌未配置——到面板「${zh}」页粘贴令牌`
+      : sel.reason === "expired"
+        ? `${zh} 访问令牌已过期且没有刷新令牌，请重新捕获`
+        : `${zh} 账号池暂无可用账号（${sel.reason}）：${sel.remedy || ""}`);
+    e.poolReason = sel.reason;
+    e.poolRemedy = sel.remedy || null;
+    e.status = sel.status || wbUnusableStatus(sel.reason);
+    throw e;
   }
-  if (!wbRefreshLocks.has(p)) {
-    wbRefreshLocks.set(p, wbRefreshToken(cfg, p).finally(() => { wbRefreshLocks.delete(p); }));
+  return sel;
+}
+/**
+ * 并发续期去重。**键从「渠道」变成「渠道+账号」**（v1.0.77）：
+ * 池化之后一次请求要选的是**某一枚**账号的令牌，两条并发请求很可能落在不同账号上；
+ * 按渠道去重会让第二个账号的续期被第一个账号的 in-flight 请求「顺带」跳过，
+ * 拿着**旧令牌**继续发请求 —— 症状是莫名其妙的连续 401。
+ */
+async function wbRefreshOnce(cfg, p, account) {
+  const key = `${p}#${(account && account.id) || "solo"}`;
+  if (!wbRefreshLocks.has(key)) {
+    wbRefreshLocks.set(key, wbRefreshToken(cfg, p, account).finally(() => { wbRefreshLocks.delete(key); }));
   }
-  return wbRefreshLocks.get(p);
+  return wbRefreshLocks.get(key);
 }
 
 // ---------- OpenCode Zen 模型目录（v1.0.42）----------
@@ -1654,7 +1735,10 @@ async function wbFetchConfig(cfg, uaKind, p) {
   let host = "www.workbuddy.ai";
   try { host = new URL(base).hostname; } catch { /* 非法地址则用默认 host 拼头 */ }
   let tok;
-  try { tok = await wbEnsureToken(cfg, p); }
+  /* 池化之后目录抓取也走池子：用的是「当前真的能用」的那枚令牌，而不是渠道配置里
+     那一把（两者在多账号下不再必然相同）。无 sessionKey —— 目录抓取是健康检查，
+     不该占住一条粘性绑定。 */
+  try { ({ token: tok } = await wbEnsureTokenPooled(cfg, p)); }
   catch (e) { return { ok: false, error: String((e && e.message) || e).slice(0, 160) }; }
   const url = base.replace(/\/+$/, "") + WB_CONFIG_PATH;
   const headers = {
@@ -2970,8 +3054,23 @@ function wbFrameResidue(d, sseEvent) {
   return out;
 }
 
-/** 归因表：四种**具名**空流，各自不同的中文说明 + 用户该做什么。 */
+/** 归因表：五种**具名**空流/拒答，各自不同的中文说明 + 用户该做什么。 */
 const EMPTY_STREAM_ATTRIBUTIONS = {
+  /* ★★ 新增（v1.0.78）：**非 2xx 不是「空流」，是「上游拒绝了」**。
+   *
+   * 这一条是被一次「诊断与事实相反」的现场逼出来的：上游明明回了一个 429 错误体
+   * （它确实说话了，只是说的是「不」），而判空枚举只看「有没有数据帧」，于是把它
+   * 归成 upstream_nothing = **「上游一个字都没返回」**。诊断和事实正好相反，
+   * 用户照着这句话的指引去「等 30 秒重试 / 换档位」，方向就整个错了。
+   *
+   * 所以判空枚举的第一件事必须是**先看 HTTP 状态码**（见 classifyEmptyStream）。
+   * 归因表里给它单开一条，是为了即使顺序被打乱也不会再退回那句错话。 */
+  upstream_rejected: {
+    label: "上游拒绝了这次请求",
+    zh: "上游**回了**一个错误响应（不是没有回答）——限制、内容策略、鉴权或服务端故障都长这样。",
+    hint: "这句话说的是上游的态度，不是本程序没读懂回答。",
+    do: "建议：按上面括号里的 HTTP 状态码对号入座（429=限流、401/403=账号或权限、5xx=上游自身故障）；具体处置见本条后面的归因文字。",
+  },
   upstream_nothing: {
     label: "上游一个字都没返回",
     zh: "上游连一个数据帧都没发出来（只有心跳，或上来就是结束标记），模型根本没有开始作答。",
@@ -2999,12 +3098,19 @@ const EMPTY_STREAM_ATTRIBUTIONS = {
 };
 
 /**
- * 把探针判成四种具名归因之一。顺序即优先级。
- * ⚠ unrecognized_shape 排在最前，但调用方对它**不 bail**（见 wbPipe 的透传分支）：
+ * 把探针判成五种具名归因之一。顺序即优先级。
+ *
+ * ⚠ 第一条是 `upstream_rejected`，且它**只看 HTTP 状态码、不看任何帧**：
+ * 非 2xx 的响应根本不该进「空流」枚举——那是「上游拒绝了」，不是「上游没说话」。
+ * 少了这一条，一次 429 会被说成「上游一个字都没返回」，诊断与事实相反。
+ * 判据从 `probe.httpStatus` 取；探针里没有这个字段时（历史形态）行为逐字不变。
+ * ⚠ unrecognized_shape 排在它后面，但调用方对它**不 bail**（见 wbPipe 的透传分支）：
  * 它唯一的产出是一条已具名的诊断 + 原样透传，不是失败。这正是"兜底取反"。
  */
 function classifyEmptyStream(probe) {
   const p = probe || {};
+  const httpStatus = Number(p.httpStatus);
+  if (Number.isFinite(httpStatus) && (httpStatus < 200 || httpStatus >= 300)) return "upstream_rejected";
   if (Array.isArray(p.unknown) && p.unknown.some((u) => u && u.hasValue)) return "unrecognized_shape";
   if (!p.dataFrames) return "upstream_nothing";
   if (p.opened > 0 && !p.sawDone && !p.sawFinish) return "upstream_truncated";
@@ -3030,6 +3136,34 @@ function wbUnknownPassthroughText(unknown) {
 async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
   const inTok = Math.max(1, Math.ceil(JSON.stringify(inputJson || {}).length / 4));
   const msgId = "msg_wb_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  /* ── ★ v1.0.78：非 2xx **不进 SSE 解析器** ──
+   *
+   * openaiExchange 在调进来之前已经按 `r.status !== 200` 返回过一次，所以活体路径
+   * 今天走不到这里——**这正是它容易被删掉、又删不掉的原因**。但「判空枚举说什么」
+   * 是一次改动就能踩到的事实：一旦上游的拒绝响应被当成流送进来，classifyEmptyStream
+   * 会说「上游一个字都没返回」，而上游明明回了一个 429 错误体。
+   *
+   * 所以这里再挡一道：状态码非 2xx 就**在读第一帧之前**返回，诊断固定是
+   * 「上游拒绝了这次请求」，绝不进入空流枚举。位置刻意放在 res.writeHead 之前，
+   * 这样 bail() 仍然能把这次失败交给 attemptWithFailover 的影子 res 判要不要转移。 */
+  const httpStatus = Number(r && r.status);
+  if (Number.isFinite(httpStatus) && (httpStatus < 200 || httpStatus >= 300)) {
+    const bodyText = await readAllBody(r).catch(() => "");
+    /* ⚠ 这里**故意不写 noteRelayError**：wbPipe 里的 4 个归因槽位是契约锁死的
+     * （见 attrib-atomic-test.mjs 的 T1）。更要紧的是，能走到这里的调用方几乎都是
+     * openaiExchange，而它**早就已经**把这次失败按精确的 kind（rate_limit /
+     * upstream_429 / auth…）连同池子的归因一起记过了——这里再补一条笼统的
+     * `upstream_429`，会把那条更准的槽位**覆盖掉**。
+     * 那正是「诊断跑偏」本身：只不过不是诊断说错，而是把对的诊断擦成了粗的。
+     * 所以这一段只负责**给客户端一句不说反话的话**，不碰面板槽位。 */
+    const tail = wbEmptyStreamCore("upstream_rejected")
+      .replace(/。$/, "") + `（本次 HTTP ${httpStatus}）`;
+    if (res.headersSent) return wbAnthroError(res, 502, tail);
+    res.writeHead(httpStatus >= 400 && httpStatus < 600 ? httpStatus : 502,
+      { "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: `[${wbErrPrefix}] ${tail}｜上游原文：${upstreamBodyText(bodyText, 200)}` } }));
+    return;
+  }
   const lines = sseLines(r.body)[Symbol.asyncIterator]();
   let firstVal = null;
   // ---- 首事件闸门（v1.0.56）----
@@ -3053,7 +3187,7 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
   let text = "", thinking = "";
   let finish = null, usage = null, outChars = 0;
   // 空流探针：只记**形状与计数**，不记上游的值（红线：不把凭据写进任何地方）。
-  const probe = { dataFrames: 0, opened: 0, sawDone: false, sawFinish: false, heartbeats: 0, unknown: [] };
+  const probe = { httpStatus, dataFrames: 0, opened: 0, sawDone: false, sawFinish: false, heartbeats: 0, unknown: [] };
 
   const emit = (event, data) => {
     if (!clientStream || res.writableEnded) return;
@@ -3421,6 +3555,10 @@ function wbAdvanceModel(p, failedModel, limit, skip) {
  * 所以单独记一份有界的环形历史。 */
 const WB_ROTATION_HISTORY_MAX = 20;
 const wbRotations = [];
+/* ④ 最近一次「同名付费行」的指向（v1.0.77）：429 时算出来的那句话留一份给面板，
+ * 免得用户在错误弹窗里读完之后还得自己回想「刚才说的是哪一行」。
+ * 键是渠道、值是 wbPaidSameName 的返回（label / rows / text），**不含任何凭据**。 */
+const wbLastPaidHint = new Map();
 function noteWbRotation(provider, fromModel, steps, recovered) {
   const last = steps[steps.length - 1] || null;
   wbRotations.unshift({
@@ -3851,6 +3989,12 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     });
   }
   let token;
+  /* 本次真正在用的账号 id。失败回灌与「本次被跳过」都以它为准 —— 不用它就等于
+     把一次失败记在一个「不知道是谁」的号上，那正是判死错账号的起点。 */
+  let wbActiveAccountId = null;
+  /* 翻译后的请求体。**提前算**：池化选号要拿 ob.model 去问「(账号,模型) 那一格
+     冷不冷」，而 ob 跟令牌无关 —— 算两次既浪费又是一个能漂移的地方。 */
+  const ob = wbToOpenAI(j);
   if (p === "zen") {
     token = (cfg.zen && cfg.zen.apiKey) || "";
     if (!token) { noteRelayError(p, "auth", "未配置 OpenCode Zen API Key"); return wbAnthroError(res, 401, "未配置 OpenCode Zen API Key——请到「OpenCode Zen」页填写"); }
@@ -3862,11 +4006,28 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     try { token = qdEnsureToken(cfg); }
     catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
   } else {
-    try { token = await wbEnsureToken(cfg, p); }
-    catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
+    /* WorkBuddy 家族：★ 池化选号取代单令牌（v1.0.77）。
+     *
+     * 会话 key **直接复用 zenSessionId**（同一份「首条 user 消息的 sha256」实现），
+     * 不另写第二套 —— 两处各写一遍的话，某天改了一处忘了另一处，粘性就成了
+     * 「同一段对话有时粘有时不粘」，而症状是 prompt cache 时不时被击穿，极难归因。
+     *
+     * 探针**不传** sessionKey：zenSessionId 对探针返回的是一个固定常量，
+     * 拿它当 key 等于把所有探针粘到同一个号上，白占一条绑定还制造假命中。 */
+    const mk0 = isProbe ? null : zenSessionId(j, false);
+    try {
+      const sel = await wbEnsureTokenPooled(cfg, p, { model: ob && ob.model, sessionKey: mk0 });
+      token = sel.token;
+      wbActiveAccountId = sel.accountId;
+    } catch (e) {
+      /* 池子说不可用 —— **原样报池子给的原因**，一个字都不反推。
+       * 旧代码这里只会说「访问令牌未配置」，那正是 dsh-xdpool 1.7.7 事故的形态：
+       * 一次限流被说成密钥无效，用户跑去重新登录一个根本没坏的号。 */
+      noteRelayError(p, e.poolReason === "no_token" ? "auth" : "failover", e.message);
+      return wbAnthroError(res, e.status || 401, e.message);
+    }
   }
 
-  const ob = wbToOpenAI(j);
   const base = (S.upstream || (p === "zen" ? DEFAULTS.zen.upstream : p === "qd" ? DEFAULTS.qd.upstream : p === "or" ? DEFAULTS.or.upstream : DEFAULTS[p].upstream)).replace(/\/+$/, "");
   // 契约 v18 里程碑 5：发往国内版前删掉 body 里的 reasoning_effort:"off"（插件实测国内版拒该值）。
   // 注意：wbToOpenAI 是**白名单**构造，当前根本不产出 reasoning_effort —— 这条是防御性兜底，
@@ -3987,10 +4148,32 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     }
     // 令牌失效（401/403）→ WorkBuddy 侧可续期并重试一次；Zen 侧 key 失效直接报错；
     // Qoder 侧强制绕过 mtime 缓存重读令牌文件再试一次（Qoder 可能刚轮换过令牌）
-    if ((r.status === 401 || r.status === 403) && isWk(p) && (p === "wbai" ? cfg.wbai : cfg.wb)?.refreshToken) {
-      await readAllBody(r).catch(() => "");
-      try { token = await wbRefreshToken(cfg, p); r = await doCall(token); }
-      catch (e) { noteRelayError(p, "auth", e.message); return wbAnthroError(res, 401, e.message); }
+    if ((r.status === 401 || r.status === 403) && isWk(p) && wbActiveAccountId) {
+      /* 先把**这次模型请求**的失败喂回池子（路径 = model，所以只认 401/403，
+         判死也只认那两条明确文案 —— 一次网络抖动打出来的 401 不会冤杀好账号）。
+         正文必须在这里读走，下面那次续期才有干净的 r 可用。 */
+      const authTxt = await readAllBody(r).catch(() => "");
+      const poolNow = wbPoolOf(cfg, p);
+      const acct = poolNow ? poolNow.accounts.find((a) => a.id === wbActiveAccountId) : null;
+      wbNoteFailure(cfg, p, {
+        accountId: wbActiveAccountId, model: ob.model, status: r.status,
+        text: authTxt, headers: r.headers, now: Date.now(),
+      });
+      const wslice = p === "wbai" ? cfg.wbai : cfg.wb;
+      if (wslice?.refreshToken || acct?.refreshToken) {
+        try { token = await wbRefreshOnce(cfg, p, acct); acct && (acct.accessToken = token); r = await doCall(token); }
+        catch (e) {
+          /* ★★★ 续期失败必须走 wbNoteRefreshFailure：刷新接口的失效信号是
+           * **HTTP 400 而不是 401**，不按刷新路径回灌就会被当成「请求本身有问题」
+           * （content 类），死号永远留在池子里烧重试，而面板上看不出来。
+           * 这是全仓库唯一传 context:"refresh" 的地方（见 wb-pool-wiring.mjs）。 */
+          const fed = wbNoteRefreshFailure(cfg, p, e, { accountId: wbActiveAccountId, now: Date.now() });
+          const reason = fed && fed.failure && fed.failure.dead ? "账号被判死" : "续期失败";
+          const msg = `${e.message}${fed && fed.failure ? " —— " + fed.failure.why : ""}`;
+          noteRelayError(p, "auth", msg);
+          return wbAnthroError(res, fed && fed.failure && fed.failure.dead ? 503 : 401, `${NAME} 令牌${reason}：${msg}`);
+        }
+      }
     }
     if ((r.status === 401 || r.status === 403) && p === "qd") {
       await readAllBody(r).catch(() => "");
@@ -4090,6 +4273,17 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
 
   if (r.status !== 200) {
     const txt = (await readAllBody(r).catch(() => "")) || consumed400 || consumedBodyHint;
+    /* ---- ③ 失败回灌（v1.0.77）----
+     * 放在**归因之前**、且喂的是内核自己的分类结果。归因文案一律用池子给的
+     * reason/remedy，绝不从 txt 反推「这个号是不是坏了」——
+     * 那正是 dsh-xdpool 1.7.7 把限流误报成「API 密钥无效」的根因。 */
+    let wbFed = null;
+    if (isWk(p) && wbActiveAccountId) {
+      wbFed = wbNoteFailure(cfg, p, {
+        accountId: wbActiveAccountId, model: ob.model, status: r.status,
+        text: txt, headers: r.headers, now: Date.now(),
+      });
+    }
     // 只把翻译后的这句话给用户；下面的 Zen 归因仍按原始 txt 匹配，不受影响
     const msg = upstreamBodyText(txt, 200);
 
@@ -4189,8 +4383,36 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
       } else {
         noteRelayError(p, `upstream_${r.status}`, `${NAME} 上游 HTTP ${r.status}`);
       }
-    } else {
-      noteRelayError(p, r.status === 429 ? "rate_limit" : `upstream_${r.status}`, `${NAME} 上游 HTTP ${r.status}`);
+    } else if (isWk(p)) {
+      /* WorkBuddy 家族（wb / wbai）：★ 全部文案**取自池子**（v1.0.77）。
+       *
+       * 改动前这里只有一句笼统的 noteRelayError；改动后多了一段，而这一段是
+       * 「同一个 HTTP 状态码，不同的账号状态，要给用户不同的处置指引」：
+       *   · 判死   → 必须重新登录（等不到回来）
+       *   · 额度用尽 → 要充值（等多久都不会好）
+       *   · 限流   → 等一会儿就好（**绝不能说成重新登录**）
+       * 把它们混成一句，就是 1.7.7 事故。 */
+      const kind = wbFed && wbFed.failure ? wbFed.failure.kind : null;
+      const whyText = wbFed && wbFed.failure ? wbFed.failure.why : "";
+      if (kind === "auth_dead") {
+        why = ` —— ${whyText}`;
+      } else if (kind === "quota") {
+        why = ` —— ${whyText}（本渠道的其它账号会自动顶上，面板「WorkBuddy 账号池」页看得出是哪一个）`;
+      } else if (kind === "rate_limit") {
+        why = ` —— ${whyText}这一档的免费额度被限流，**等一会就会自己好**，不用重新登录。`;
+        /* ⑥ 同名付费行：用户认的是**显示名**，不是 id 前缀。按显示名在映射表里找
+           同名的付费行，直接告诉他「换哪一行」—— 这是他能执行的最短路径。 */
+        const paid = wbPaidSameName({
+          limitedModel: ob.model,
+          rows: wbMappingRows(p === "wbai" ? cfg.wbai : cfg.wb),
+          catalog: (wbCatCaches[p] && wbCatCaches[p].val && wbCatCaches[p].val.models) || [],
+        });
+        if (paid) { why += " " + paid.text; wbLastPaidHint.set(p, { ...paid, at: new Date().toISOString() }); }
+      } else if (wbFed && wbFed.failure && wbFed.failure.why) {
+        why = ` —— ${whyText}`;
+      }
+      noteRelayError(p, r.status === 429 ? "rate_limit" : `upstream_${r.status}`,
+        `${NAME} 上游 HTTP ${r.status}${kind ? "（账号池判为 " + kind + "）" : ""}`);
     }
     // 关键上下文（4xx/5xx 共用）：Qoder 的 500 只看 system 首行根本不够——必须带上
     // model / max_tokens / stream / messages 条数，下次一眼能看出是不是翻译层写错了参数。
@@ -4979,7 +5201,7 @@ async function applyToCli(S) {
    * 等于在用户主目录留了一份明文副本。
    *
    * 之所以能改成占位符：中转**不信任**客户端送来的这个 token。协议桥
-   * （fo.opts.openai：wb/wbai/qd/or/zen）自己用 wbEnsureToken()/qdEnsureToken()/orPick()
+   * （fo.opts.openai：wb/wbai/qd/or/zen）自己用 wbEnsureTokenPooled()/qdEnsureToken()/orPick()
    * 从配置取真实凭据并自己拼 mkHeaders；PASS_HEADERS 虽收集了 authorization，
    * 但那条路径只对**非协议桥**渠道生效。
    *
@@ -5306,6 +5528,11 @@ async function statusPayload() {
         // 而这种错配其它信号全都指错方向（见 wbTokenOwnership 的注释）。
         ownership: wbTokenOwnership('wb', cfg),
       },
+      // ★ 账号池状态（v1.0.77）。`total` 与 `accounts.length` 由同一个数组算出，
+      // 面板显示几个就等于遍历到几个 —— 「磁盘 4 个、界面 2 个」那种落差用户说不清。
+      // 凭据一律走 keyFp 指纹，明文永不进 /api/status。
+      pool: wbPoolFields(cfg, "wb", Date.now()),
+      paidHint: wbPaidHintFields("wb"),
     },
     // WorkBuddy 国际版（wbai，里程碑 1b 新增）：与 wb 结构完全对称，但读**自己的**登录文件
     // （workbuddy-desktop-ai.info）与自己的令牌——两版同时装时两边都能各自报出就绪状态。
@@ -5321,6 +5548,8 @@ async function statusPayload() {
         hasRefresh: !!cfg.wbai?.refreshToken,
         ownership: wbTokenOwnership('wbai', cfg),
       },
+      pool: wbPoolFields(cfg, "wbai", Date.now()),
+      paidHint: wbPaidHintFields("wbai"),
     },
     // OpenRouter（第 6 家）：三盏灯 + 两层轮换状态 + 额度真相（「免费流水区」卡读这里）
     or: {
@@ -5814,6 +6043,34 @@ const panel = http.createServer(async (req, res) => {
         }
         if (cfg[P].accessToken && cfg[P].accessToken.split(".").length !== 3) {
           return json(res, 400, { error: "访问令牌应是 JWT（三段以 . 分隔）——请从捕获结果完整粘贴" });
+        }
+        /* —— 账号池（v1.0.77）——
+         * 收一个数组进去，每个条目必须有**非空 id**（池内一切按 id 认：粘性绑定、
+         * 冷却、判死全都挂在 id 上，id 缺失会让这些状态挂到 undefined 上）。
+         * 收不收 accounts 与顶层 accessToken **互不排斥**：accounts 非空时池子用
+         * 账号池，accessToken 仍作为该渠道的「当前令牌」留着（面板凭据页与 /v3/config
+         * 目录抓取读它），这也是老配置平滑升级到多账号的落点。
+         * ⚠ 冷却/判死**不落盘**（那是内存态，见 wb-pool-wiring.mjs）：往 config.json
+         *   里高频写状态会和用户正在改的配置互相覆盖，而重启后重新计冷却也并无损失。 */
+        if (Array.isArray(b.accounts)) {
+          if (b.accounts.length > 32) {
+            return json(res, 400, { error: "一个渠道最多 32 个账号（再多也只是把上游的限流窗口挨个撞一遍）" });
+          }
+          const bad = b.accounts.findIndex((a) => !a || typeof a !== "object"
+            || typeof a.id !== "string" || !a.id.trim());
+          if (bad >= 0) {
+            return json(res, 400, { error: `第 ${bad + 1} 个账号缺 id：池子里的一切（粘性、冷却、判死）都按 id 认，没有它就挂不上去` });
+          }
+          const ids = new Set();
+          const dup = b.accounts.find((a) => { const k = a.id.trim(); if (ids.has(k)) return true; ids.add(k); return false; });
+          if (dup) return json(res, 400, { error: `账号 id 重复：「${dup.id}」——id 必须唯一，否则两个号会被当成同一个` });
+          cfg[P].accounts = b.accounts.map((a, i) => ({
+            ...a,
+            id: a.id.trim(),
+            label: a.label == null ? a.id.trim() : String(a.label),
+            order: Number.isFinite(a.order) ? a.order : i,
+          }));
+          if (typeof b.poolMode === "string" && b.poolMode.trim()) cfg[P].poolMode = b.poolMode.trim();
         }
       }
       let needRestart = false;

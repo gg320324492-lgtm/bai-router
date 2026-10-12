@@ -95,12 +95,22 @@ assert.ok(RESIDUE.includes('if (typeof v === "string" && v) continue;'),
   "residue 段抠错位置：缺 delta.content 非空字符串的那道消费判据");
 assert.ok(ATTRS.includes("upstream_truncated") && ATTRS.includes("unrecognized_shape"),
   "归因表抠错位置：缺具名归因条目");
-assert.equal((ATTRS.match(/^\s{2}[a-z_]+: \{$/gm) || []).length, 4,
-  `归因表应当正好 4 条具名归因，实际抠到 ${(ATTRS.match(/^\s{2}[a-z_]+: \{$/gm) || []).length} 条`);
+/* v1.0.78 起是 **5** 条：多了 upstream_rejected（非 2xx 是「上游拒绝了」，
+   不是「空流」）。它必须排在分类判据最前面——少了它，一次 429 会被说成
+   「上游一个字都没返回」，诊断与事实相反。 */
+assert.equal((ATTRS.match(/^\s{2}[a-z_]+: \{$/gm) || []).length, 5,
+  `归因表应当正好 5 条具名归因，实际抠到 ${(ATTRS.match(/^\s{2}[a-z_]+: \{$/gm) || []).length} 条`);
+assert.ok(ATTRS.includes("upstream_rejected"), "归因表抠错位置：缺 upstream_rejected（v1.0.78 新增）");
 
 const CLASSIFY = sliceBetween("function classifyEmptyStream(probe) {", "// OpenAI SSE → Anthropic SSE");
 assert.ok(CLASSIFY.includes("unrecognized_shape") && CLASSIFY.includes("wbUnknownPassthroughText"),
   "判据段抠错位置：缺 unrecognized_shape 早退或透传文本生成");
+/* v1.0.78：状态码判据必须**排在 unrecognized_shape 之前**——
+   顺序反了的话，一个「429 + 顺带一个未知字段」的响应会先去走透传分支。 */
+const iRejected = CLASSIFY.indexOf("upstream_rejected");
+const iShape = CLASSIFY.indexOf("unrecognized_shape");
+assert.ok(iRejected > 0, "判据段抠错位置：缺非 2xx 的状态码早退");
+assert.ok(iRejected < iShape, "状态码判据必须排在 unrecognized_shape 之前");
 
 /** 把抠出来的真函数组装成一个可注入 wbErrPrefix 的沙箱。 */
 function loadDiag(errPrefix = "WorkBuddy") {
@@ -113,14 +123,14 @@ return { wbFrameResidue, classifyEmptyStream, wbEmptyStreamCore, wbUnknownPassth
 const api = loadDiag();
 const { wbFrameResidue, classifyEmptyStream, wbEmptyStreamCore, wbUnknownPassthroughText, EMPTY_STREAM_ATTRIBUTIONS } = api;
 
-const KINDS = ["upstream_nothing", "unrecognized_shape", "upstream_truncated", "upstream_blank"];
+const KINDS = ["upstream_rejected", "upstream_nothing", "unrecognized_shape", "upstream_truncated", "upstream_blank"];
 
 /* ================================================================== *
  * A. 源码求值（真函数）
  * ================================================================== */
 
 describe("A. 归因表：每一种具名归因都有不同文案与处置建议", () => {
-  test("四种归因齐全，且文案两两不同、都不再用改前那句通用文案", () => {
+  test("五种归因齐全，且文案两两不同、都不再用改前那句通用文案", () => {
     const texts = KINDS.map((k) => wbEmptyStreamCore(k));
     for (let i = 0; i < texts.length; i++) {
       for (let j = i + 1; j < texts.length; j++) {
@@ -144,6 +154,12 @@ describe("A. 归因表：每一种具名归因都有不同文案与处置建议"
     assert.match(EMPTY_STREAM_ATTRIBUTIONS.unrecognized_shape.do, /不用管/,
       "未知形状属性能被正常翻译，用户不该被要求做任何事");
     assert.match(EMPTY_STREAM_ATTRIBUTIONS.upstream_nothing.do, /重试|换/);
+    // ★ v1.0.78：upstream_rejected 的正文**不许**出现「上游一个字都没返回」——
+    // 非 2xx 的上游是「说了不」，不是「没说话」。这条断言就是那个 bug 的形状。
+    for (const field of ["label", "zh", "hint", "do"]) {
+      assert.ok(!String(EMPTY_STREAM_ATTRIBUTIONS.upstream_rejected[field]).includes(EMPTY_STREAM_ATTRIBUTIONS.upstream_nothing.label),
+        `upstream_rejected.${field} 里混进了「${EMPTY_STREAM_ATTRIBUTIONS.upstream_nothing.label}」`);
+    }
     assert.match(EMPTY_STREAM_ATTRIBUTIONS.upstream_truncated.do, /重试|反馈|换/);
     assert.match(EMPTY_STREAM_ATTRIBUTIONS.upstream_blank.do, /重试|换/);
   });
