@@ -2849,6 +2849,36 @@ async function wbCaptureRestore() {
  * 多留几分钟的风险远小于"用户被 2 分半的时限赶走"。
  * 真要更强的保障，是下面的 restarted 探测——让用户不必猜自己该在什么时候发消息。 */
 const WB_CAPTURE_TIMEOUT_MS = 10 * 60 * 1000;
+
+/* 本次捕获的**终局**要留存多久。
+ *
+ * 为什么必须留存：POST /api/wb/capture 是一次最长 10 分钟的阻塞请求，而面板 api() 的默认
+ * 读超时只有 12 秒（panel-common.js）—— 12 秒时前端**已经放弃并报「读取超时」**，服务端却
+ * 还挂着钩子正常在等。于是真正能把结果告诉用户的只剩它每 2 秒一次的 status 轮询，而轮询和
+ * 「捕获结束」之间天然有最多 2 秒的错位，另有刷新页面、连接重连这些滞后。结果不留存，
+ * 界面就永远停在「还在等待」，用户据此以为没抓到 —— 这正是实测复现出来的症状。
+ *
+ * 为什么只留 2 分钟：够覆盖上面那些滞后就够了（约是轮询错位的 60 倍余量），再久没有第二个
+ * 用途；而 masked 是**真实令牌的一段指纹**（前 7 字符 + 后 2 字符 + 长度），过期就该消失，
+ * 不该在状态接口里挂上几小时。过期的结果一律按「没有结果」返回。 */
+const WB_CAPTURE_RESULT_TTL_MS = 2 * 60 * 1000;
+
+/* 记下**本次**捕获的终局（成功 / 失败 / 超时）。
+ * startedAt 跟着记一份：前端要靠它把这一次的 done 和「上一次留下的 done」区分开，
+ * 否则刚点下按钮的头两秒轮询就会把上一轮的结局当成这一轮的报出去。 */
+function wbRecordCaptureResult(r) {
+  wbCapState.result = {
+    done: true,
+    ok: r.ok === true,
+    /* 失败时**不留任何令牌指纹** —— 没抓到东西，就没有可脱敏的东西 */
+    masked: r.ok ? (r.masked || null) : null,
+    hasRefresh: r.ok ? !!r.hasRefresh : null,
+    error: r.ok ? null : String(r.error || "未知原因"),
+    startedAt: wbCapState.startedAt || null,
+    finishedAt: Date.now(),
+  };
+}
+
 async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
   const zh = p === "wbai" ? "WorkBuddy AI" : "WorkBuddy";
   if (wbCapState.active) {
@@ -2879,6 +2909,9 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
     active: true, startedAt: Date.now(), error: null, script, backup, wrote: false, got: "",
     phase: "injecting", phaseText: "正在注入临时钩子…", kick: null, p,
     restarted: false,          // 客户端是否已在本次注入之后重启过（钩子是否已生效）
+    /* 新一轮开始就清掉上一轮的结果：否则前端刚点下按钮的头两秒轮询就会读到上一次
+       留下的 done，把它当成这一次的结局报出去。 */
+    result: null,
   };
   await fsPromises.writeFile(script, patched, "utf8");
   wbCapState.wrote = true;
@@ -2965,13 +2998,17 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
             // 抓到即还原：不等超时，立刻让 WorkBuddy 的脚本恢复原状
             await wbCaptureRestore();
             log(`${zh} 令牌捕获：成功（已写入 cfg.${p}，钩子已立即还原）${hasRefresh ? "" : "，未含刷新令牌（将沿用配置里已有的，若无则到期需重新获取）"}`);
-            return {
+            const r = {
               ok: true,
               masked: keyFp(obj.accessToken),
               hasRefresh,
               expiresAt: exp || null,
               hints: hasRefresh ? [] : ["本次请求未携带刷新令牌（它只在令牌续期时才随请求发出）。访问令牌有效期约一年，到期后需重新点「一键获取令牌」。"],
             };
+            /* 留存终局：POST 要阻塞到这一刻才返回，而前端早就会 12 秒读超时放弃 ——
+               真正能把「成功」说出口的是它的 status 轮询。 */
+            wbRecordCaptureResult(r);
+            return r;
           }
         }
       } catch { /* 文件还没生成/还没写完整，继续等 */ }
@@ -2998,6 +3035,11 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
       hint = "请确认 WorkBuddy 客户端已打开并已登录，然后在里面随便发一条消息或新建一个对话（客户端会拉起内部 CLI 并带上 Authorization 头），再点一次「一键获取令牌」。";
     }
     throw new Error(`等待超时（${secs} 秒）：未捕获到任何令牌。${hint}若仍失败，可展开下方「手动填写令牌」作为备用方式。`);
+  } catch (e) {
+    /* 失败（含等待超时）同样要留存终局 —— 否则前端轮询永远看不到「结束了」，
+       界面就一直转圈；而 POST 那边早把这次捕获报成「读取超时」了。 */
+    wbRecordCaptureResult({ ok: false, error: String((e && e.message) || e) });
+    throw e;
   } finally {
     await wbCaptureRestore();
     await fsPromises.rm(outFile, { force: true }).catch(() => { });
@@ -3011,6 +3053,62 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
     } catch { }
     wbCapState.active = false;
     wbCapState.got = "";
+  }
+}
+
+/* /api/wb/capture/status 的响应体。
+ *
+ * 除了原有的实时进度（phase / phaseText / kick…），这里带上**本次捕获的终局**：
+ * 成功 / 失败 / 超时各是什么，都写在 wbCapState.result 里（保留期见 WB_CAPTURE_RESULT_TTL_MS）。
+ * 没有它，前端即使一直在轮询也**无从判断捕获已经结束** —— 只能一直转圈，
+ * 而 POST 早已 12 秒读超时放弃，用户看到的就是「明明抓到了却报失败」。
+ *
+ * 对账：新一轮开始时 wbCapState 被整体替换（startedAt 随之换成新的），所以顶层 startedAt
+ * 永远是「当前或最近一次」捕获的开始时刻；下面 result.* 那几个字段描述的也正是这一轮。
+ * 前端发起前先记下旧 startedAt，轮询时对不上就说明读到的是别人的结果，不能当成自己的。 */
+function wbCaptureStatusPayload() {
+  const r = wbCapState.result || null;
+  /* 过了保留期一律按「没有结果」：绝不让前端读到上一轮、乃至几小时前的旧结局 */
+  const fresh = !!(r && r.done && Date.now() - (r.finishedAt || 0) <= WB_CAPTURE_RESULT_TTL_MS);
+  return {
+    active: wbCapState.active,
+    provider: wbCapState.p || "wb",   // 本次捕获写往哪个渠道（里程碑 1b）
+    // v1.0.65：客户端在注入前就已启动 ⇒ 内存里是旧入口脚本，必须完全退出重启
+    needRestart: wbCapState.needRestart === true,
+    // v1.0.70：客户端是否已在注入之后重启过 —— 为真表示钩子此刻已经生效，
+    // 前端据此把提示从「必须完全退出重启」翻成「发一条消息即可」，并显示剩余时间。
+    restarted: wbCapState.restarted === true,
+    timeoutMs: WB_CAPTURE_TIMEOUT_MS,
+    startedAt: wbCapState.startedAt,
+    elapsedMs: wbCapState.active ? Date.now() - wbCapState.startedAt : 0,
+    remainMs: wbCapState.active ? Math.max(0, WB_CAPTURE_TIMEOUT_MS - (Date.now() - wbCapState.startedAt)) : 0,
+    gotAccessToken: !!(wbCapState.active && wbCapState.got),
+    phase: wbCapState.phase || null,
+    phaseText: wbCapState.phaseText || null,
+    kick: wbCapState.kick || null,
+    /* ↓ 本次捕获的终局。masked 是**脱敏后**的令牌（真实明文永不出这个接口），
+         失败时为 null —— 没抓到东西就没有可脱敏的东西。 */
+    done: fresh,
+    ok: fresh ? !!r.ok : false,
+    masked: fresh ? (r.masked || null) : null,
+    hasRefresh: fresh ? (r.hasRefresh === true) : null,
+    error: fresh ? (r.error || null) : null,
+    finishedAt: fresh ? r.finishedAt : null,
+  };
+}
+
+/* POST /api/wb/capture 的处理体。抠成独立函数（而不是内联在请求分发里）有两个用处：
+ * 一是路由本身更短，二是端到端测试能直接复用**真逻辑**而不是抄一份重写。
+ * 返回值即响应体：{ ok:true, ...r } 或 { ok:false, error }。 */
+async function wbCaptureBody(body) {
+  // provider 决定抓到的令牌写进哪一份配置（里程碑 1b：wb / wbai，两版令牌不通用）。
+  // 缺省 wb —— 旧调用方行为不变。
+  const p = (body && body.provider) === "wbai" ? "wbai" : "wb";
+  try {
+    const r = await wbCaptureToken(WB_CAPTURE_TIMEOUT_MS, p);
+    return { ok: true, ...r, provider: p, message: "令牌已自动填入并保存" };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
   }
 }
 
@@ -6063,37 +6161,16 @@ const panel = http.createServer(async (req, res) => {
 
     // v1.0.33: 一键捕获 WorkBuddy 令牌（临时注入客户端 CLI 脚本 → 抓取 → 立即还原）
     if (req.method === "POST" && u.pathname === "/api/wb/capture") {
-      try {
-        // provider 决定抓到的令牌写进哪一份配置（里程碑 1b：wb / wbai，两版令牌不通用）。
-        // 缺省 wb —— 旧调用方行为不变。
-        const body = await readBody(req).catch(() => ({}));
-        const p = (body && body.provider) === "wbai" ? "wbai" : "wb";
-        const r = await wbCaptureToken(WB_CAPTURE_TIMEOUT_MS, p);
-        return json(res, 200, { ok: true, ...r, provider: p, message: "令牌已自动填入并保存" });
-      } catch (e) {
-        return json(res, 200, { ok: false, error: String((e && e.message) || e) });
-      }
+      const body = await readBody(req).catch(() => ({}));
+      return json(res, 200, await wbCaptureBody(body));
     }
     if (req.method === "GET" && u.pathname === "/api/wb/capture/status") {
       // v1.0.58：附带实时进度（phase/phaseText/kick）——前端如实显示「钩子注入了没、
       // 踢侧车结果、还差什么」，超时文案也由后端按卡点分类生成，不再一律转圈。
-      return json(res, 200, {
-        active: wbCapState.active,
-        provider: wbCapState.p || "wb",   // 本次捕获写往哪个渠道（里程碑 1b）
-        // v1.0.65：客户端在注入前就已启动 ⇒ 内存里是旧入口脚本，必须完全退出重启
-        needRestart: wbCapState.needRestart === true,
-        // v1.0.70：客户端是否已在注入之后重启过 —— 为真表示钩子此刻已经生效，
-        // 前端据此把提示从「必须完全退出重启」翻成「发一条消息即可」，并显示剩余时间。
-        restarted: wbCapState.restarted === true,
-        timeoutMs: WB_CAPTURE_TIMEOUT_MS,
-        startedAt: wbCapState.startedAt,
-        elapsedMs: wbCapState.active ? Date.now() - wbCapState.startedAt : 0,
-        remainMs: wbCapState.active ? Math.max(0, WB_CAPTURE_TIMEOUT_MS - (Date.now() - wbCapState.startedAt)) : 0,
-        gotAccessToken: !!(wbCapState.active && wbCapState.got),
-        phase: wbCapState.phase || null,
-        phaseText: wbCapState.phaseText || null,
-        kick: wbCapState.kick || null,
-      });
+      // v1.0.80：再附带**本次捕获的终局**（done/ok/masked/hasRefresh/error/finishedAt）。
+      // POST 会阻塞到捕获结束，而面板的读超时只有 12 秒 —— 报结果的活儿只能落在轮询上；
+      // 没有这几个字段，界面就只能一直转圈，用户会以为没抓到令牌。
+      return json(res, 200, wbCaptureStatusPayload());
     }
 
     // v1.0.57: Qoder worker 补丁——一键装/还原/查状（Node 内置实现，不需要用户装 Python）。

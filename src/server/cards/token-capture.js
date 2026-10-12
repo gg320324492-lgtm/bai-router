@@ -62,12 +62,74 @@ window.BAI_CARDS["token-capture"] = {
       "仍在等待中…（最长 2 分 30 秒，可随时关闭页面重试）",
     ];
     const timers = new Map();
-    function showProgress(sc, on) {
+    /* 停掉某个作用域的等待面板。**两个定时器都要清**：只清轮询那个的话，
+       12 秒一次的文案推进会变成野定时器，页面关掉后仍在跑。 */
+    function stopTimers(sc) {
+      const cur = timers.get(sc);
+      if (!cur) return false;
+      clearInterval(cur.tick);
+      clearInterval(cur.poll);
+      timers.delete(sc);
+      return true;
+    }
+
+    /* POST /api/wb/capture 要阻塞到捕获结束（后端最长等 10 分钟），而 ctx.api() 的默认
+       读超时只有 12 秒 —— 用默认值发过去，一次**成功**的捕获也会被掐成「读取超时」，
+       服务端却还在后台正常等着钩子，于是用户以为没抓到（实测复现的就是这个）。
+       所以发之前先问后端这次要等多久，再按它给足。问不到就用兜底窗口，宁可等久也不误报。 */
+    const CAP_WINDOW_FALLBACK_MS = 10 * 60 * 1000;
+    const CAP_POST_MARGIN_MS = 60 * 1000;
+    const capTimeoutMs = typeof ctx.capTimeoutMs === "function"
+      ? ctx.capTimeoutMs
+      : (backendMs) => (Number(backendMs) || CAP_WINDOW_FALLBACK_MS) + CAP_POST_MARGIN_MS;
+
+    /* 报结果前先占位：两条路径（POST 的返回 / 轮询看到 done）都会走到这里，
+       谁先到谁报。run.reported 兼作「已收摊」信号 —— 不置位的话另一条还会再报一次，
+       而轮询比 POST 早到是常态。 */
+    function claimReport(run) {
+      if (!run || run.reported) return false;
+      run.reported = true;
+      return true;
+    }
+    async function settle(sc, run) {
+      if (!run || run.settled) return;
+      run.settled = true;
+      stopTimers(sc);
+      if (run.btn) { run.btn.disabled = false; run.btn.textContent = run.old; }
+      await ctx.refreshConfig().catch(() => { });
+      ctx.poll();
+    }
+    function okMsg(masked, hasRefresh) {
+      let msg = "✔ 令牌获取成功（" + (masked || "") + "），已自动填入并保存。";
+      if (hasRefresh === false) {
+        msg += "\n注意：本次未捕获到刷新令牌（它只在令牌续期时才随请求发出）。";
+        msg += "访问令牌到期后重新点一次即可。";
+      }
+      return msg;
+    }
+    const failMsg = (err) =>
+      "✘ 获取失败：" + (err || "未知原因") + "\n可改用「手动填写」作为备用方式。";
+
+    /* 轮询看到「本次捕获结束了」：停轮询、如实报成功或失败。 */
+    function finishFromPoll(sc, run, s) {
+      if (!claimReport(run)) return;
+      stopTimers(sc);
+      const box = sc.$('[data-role="prog"]');
+      if (box) box.style.display = "none";
+      if (s.ok) {
+        ctx.showResult(sc.$('[data-role="res"]'), okMsg(s.masked, s.hasRefresh), true);
+      } else {
+        /* 超时也是**有结论的失败**——如实说出来，不让界面一直转圈。 */
+        ctx.showResult(sc.$('[data-role="res"]'), failMsg(s.error), false);
+      }
+      settle(sc, run);
+    }
+
+    function showProgress(sc, on, run) {
       const box = sc.$('[data-role="prog"]');
       if (!box) return;
       box.style.display = on ? "flex" : "none";
-      const cur = timers.get(sc);
-      if (cur) { clearInterval(cur.tick); clearInterval(cur.poll); timers.delete(sc); }
+      stopTimers(sc);
       if (!on) return;
       let n = 0;
       sc.$('[data-role="ptitle"]').textContent = CAP_TIPS[0];
@@ -79,6 +141,14 @@ window.BAI_CARDS["token-capture"] = {
       const poll = setInterval(async () => {
         try {
           const s = await ctx.api("/api/wb/capture/status");
+          /* 「结束了」这条要**第一个**判：它一旦成立，本次的结论就是定论，
+             后面的进度文案都不该再改写了。
+             ⚠ startedAt 必须和发起这次捕获前记下的对上号 —— 上一轮留下的 done
+             不属于这次，据此报出去就是拿旧结局骗用户。 */
+          if (s && s.done && s.startedAt != null && s.startedAt !== run.prevStartedAt) {
+            finishFromPoll(sc, run, s);
+            return;
+          }
           if (s && s.gotAccessToken) {
             sc.$('[data-role="ptitle"]').textContent = "已捕获到访问令牌，正在写入配置…";
             sc.$('[data-role="pdesc"]').textContent = "刷新令牌只在令牌到期续期时才会出现；没有它也能正常使用，到期后重新获取即可。";
@@ -182,8 +252,19 @@ window.BAI_CARDS["token-capture"] = {
         btn.disabled = true;
         const old = btn.textContent;
         btn.textContent = "获取中…";
-        showProgress(sc, true);
+        /* 一次捕获的运行态。prevStartedAt 是发起**之前**后端已有的那一轮的开始时刻：
+           轮询回来时靠它把「本次的结果」和「上一次留下的结果」分开。 */
+        const run = { prevStartedAt: null, reported: false, settled: false, btn, old };
+        showProgress(sc, true, run);
         try {
+          /* 先问后端这次要等多久：POST 会一直阻塞到捕获结束，拿面板 api() 的
+             12 秒默认值去发，一次**成功**的捕获也会被掐成「读取超时」，而服务端
+             还挂着钩子正常在等 —— 用户看到的就是「明明抓到了却报失败」。 */
+          try {
+            const s0 = await ctx.api("/api/wb/capture/status");
+            run.prevStartedAt = (s0 && s0.startedAt != null) ? s0.startedAt : null;
+            run.windowMs = Number(s0 && s0.timeoutMs) || 0;
+          } catch { /* 问不到就按兜底窗口给；宁可等久，绝不误报失败 */ }
           /* provider 必带（契约 v18 里程碑 1b）：wb 与 wbai 是两条渠道、令牌不通用，
              后端据此决定写进 cfg.wb 还是 cfg.wbai。不带会默认落到 wb —— 那是**写错渠道**，
              症状是接上去以后一律 401，且极难自查。
@@ -192,26 +273,34 @@ window.BAI_CARDS["token-capture"] = {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ provider: sc.key }),
+            timeoutMs: capTimeoutMs(run.windowMs),
           });
-          if (r && r.ok) {
-            let msg = "✔ 令牌获取成功（" + (r.masked || "") + "），已自动填入并保存。";
-            if (r.hasRefresh === false) {
-              msg += "\n注意：本次未捕获到刷新令牌（它只在令牌续期时才随请求发出）。";
-              msg += "访问令牌到期后重新点一次即可。";
-            }
-            ctx.showResult(sc.$('[data-role="res"]'), msg, true);
-          } else {
-            ctx.showResult(sc.$('[data-role="res"]'),
-              "✘ 获取失败：" + ((r && r.error) || "未知原因") + "\n可改用「手动填写」作为备用方式。", false);
+          if (claimReport(run)) {
+            if (r && r.ok) ctx.showResult(sc.$('[data-role="res"]'), okMsg(r.masked, r.hasRefresh), true);
+            else ctx.showResult(sc.$('[data-role="res"]'), failMsg((r && r.error) || "未知原因"), false);
           }
         } catch (err) {
-          ctx.showResult(sc.$('[data-role="res"]'), "✘ 获取失败：" + err.message, false);
+          if (!run.reported && err && err.timedOut) {
+            /* 读超时**不等于失败**：捕获是在服务端后台进行的，这里放弃的只是这一次
+               HTTP 读。所以先自己再问一次状态 —— 捕获窗口早就走完了，这一轮其实
+               早就有结论了。问得到就据实报，问不到就交给还在跑的轮询。 */
+            let s = null;
+            try { s = await ctx.api("/api/wb/capture/status"); } catch { }
+            if (s && s.done && s.startedAt != null && s.startedAt !== run.prevStartedAt) {
+              finishFromPoll(sc, run, s);
+            } else {
+              run.keepPolling = true;
+              ctx.showResult(sc.$('[data-role="res"]'),
+                "⏳ 等待已超过显示上限，但**捕获仍在后台继续**（服务端还在等钩子）。\n"
+                + "请到客户端里发一条消息触发；上方的进度会在捕获结束时给出结论。", true);
+            }
+          } else if (claimReport(run)) {
+            ctx.showResult(sc.$('[data-role="res"]'), "✘ 获取失败：" + err.message, false);
+          }
         } finally {
-          showProgress(sc, false);
-          btn.disabled = false;
-          btn.textContent = old;
-          await ctx.refreshConfig().catch(() => { });
-          ctx.poll();
+          /* keepPolling 时不收摊：进度面板与按钮都留给轮询，由它在捕获真正结束时
+             报出结论并复原（finishFromPoll → settle）。 */
+          if (!run.keepPolling) await settle(sc, run);
         }
       });
     }

@@ -53,9 +53,20 @@
       throw err;
     }
   }
-  const postJSON = (path, body) => api(path, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  const postJSON = (path, body, opts) => api(path, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), ...(opts || {}),
   });
+
+  /* 令牌捕获的 POST 会**一直阻塞到捕获结束**（后端最长等 10 分钟），而 api() 的默认
+     读超时只有 12 秒 —— 拿默认值去发，一次**成功**的捕获也会被掐成「读取超时」，
+     而服务端还挂着钩子正常在等。用户看到的就是「明明抓到了，却报获取失败」，
+     于是反复重开客户端、反复重来（实测复现的就是这个）。
+     所以凡是发 /api/wb/capture 的地方，都必须显式给 timeoutMs：先问后端这次要等多久
+     （/api/wb/capture/status 的 timeoutMs），再加上余量；问不到就用兜底窗口，
+     宁可等久，也不误报失败。 */
+  const CAP_WINDOW_FALLBACK_MS = 10 * 60 * 1000;
+  const CAP_TIMEOUT_MARGIN_MS = 60 * 1000;
+  const capTimeoutMs = (backendMs) => (Number(backendMs) || CAP_WINDOW_FALLBACK_MS) + CAP_TIMEOUT_MARGIN_MS;
 
   /* 状态语义色只有四态 + 一色品牌。led/badge/cell 一律走这里，CSS 侧同名。 */
   const STATE = {
@@ -1146,6 +1157,39 @@
   const captureHandlers = {};
   const registerCapture = (key, fn) => { captureHandlers[key] = fn; };
 
+  /* 「一键获取令牌」的**兜底**路径：没被卡片接管的那一行走这里。
+     抠成独立函数（而不是内联在 credAction 的分支里），端到端测试才能直接复用真逻辑。
+     它和卡片那条路踩的是同一个坑 —— POST 会阻塞到捕获结束（后端最长 10 分钟），
+     而面板 api() 的默认读超时只有 12 秒：一次**成功**的捕获也会被掐成「读取超时」，
+     服务端却还在后台正常等着钩子，用户据此以为没抓到。所以必须显式给足 timeoutMs。 */
+  async function captureFallback(key, btn) {
+    const slot = $("applyResult");
+    let outcome = null;
+    await withBusy(btn, async () => {
+      /* 先问后端这次要等多久（/api/wb/capture/status 的 timeoutMs），再加余量 */
+      let capMs = 0;
+      try { const st = await api("/api/wb/capture/status"); capMs = Number(st && st.timeoutMs) || 0; } catch { }
+      let r;
+      try {
+        r = await postJSON("/api/wb/capture", {}, { timeoutMs: capTimeoutMs(capMs) });
+      } catch (e) {
+        /* 读超时**不等于失败**：捕获在服务端后台进行，这里放弃的只是这一次 HTTP 读。
+           如实说「仍在继续」，绝不说「获取失败」—— 说错会让用户白重开一遍客户端。 */
+        if (e && e.timedOut) { outcome = { pending: true }; return; }
+        throw e;
+      }
+      if (!r.ok) throw new Error(r.error || "未捕获到令牌");
+      outcome = { ok: true };
+    }, slot);
+    await refreshConfig(); poll();
+    if (outcome && outcome.pending) {
+      showResult(slot, "⏳ 仍在后台等待客户端触发令牌 —— 这**不代表失败**，捕获还在继续。"
+        + "请在客户端里发一条消息，稍后刷新本页查看结果。", true);
+    } else if (outcome && outcome.ok) {
+      showResult(slot, `✔ ${nameOf(key)} 令牌已捕获并写入配置。到期后点「一键获取令牌」重取。`, true);
+    }
+  }
+
   async function credAction(key, btn) {
     const act = btn.dataset.act;                 // 动作名（字符串）
     const row = q(`.credrow[data-k="${CSS.escape(key)}"]`);
@@ -1170,12 +1214,7 @@
       } else if (act === "capture") {
         const h = captureHandlers[key];
         if (typeof h === "function") { await h(btn); return; }   // 卡片接管（token-capture）
-        await withBusy(btn, async () => {
-          const r = await postJSON("/api/wb/capture", {});
-          if (!r.ok) throw new Error(r.error || "未捕获到令牌");
-        }, $("applyResult"));
-        await refreshConfig(); poll();
-        showResult($("applyResult"), `✔ ${nameOf(key)} 令牌已捕获并写入配置。到期后点「一键获取令牌」重取。`, true);
+        await captureFallback(key, btn);
       } else if (act === "patch" || act === "revert") {
         let o = null;   // 只在**真的成功**之后才赋值；保持 null 就是给 withBusy 报错的信号
         await withBusy(btn, async () => {
@@ -2178,6 +2217,9 @@
     get view() { return currentView; },
     channels: ALL_KEYS,
     nameOf, cfgOf, stOf, sliceOf, channelState, credState, chainOf, rowsOfKind, TIERS, TIER_ZH, MODE_TXT, esc, cap,
+    /* 发 /api/wb/capture 必用的读超时（后端捕获窗口 + 余量）。卡片自己也有兜底实现，
+       这里给出来是为了**只有一处定义**这个数字，两条路径不会各算各的。 */
+    capTimeoutMs,
     $, q, qa, api, postJSON, showInfo, showResult, setLed, withBusy, poll, refreshConfig,
     renderRoute, selectChannel, setView, fp, registerCapture,
   };
