@@ -781,7 +781,7 @@ const SABOTAGE = [
     where: "acquire 的 ① 粘性优先",
     from: "      const bound = eligible.find((a) => a.id === boundId);\n      if (bound) return { ok: true, account: bound, bound: true, eligible: eligible.length, how: \"sticky\" };",
     to: "      const bound = undefined;\n      if (bound) return { ok: true, account: bound, bound: true, eligible: eligible.length, how: \"sticky\" };",
-    reds: "★⑤ 同一 sessionKey 两次拿同一个号 + 判死后自动重绑 + 粘性优先于手动",
+    reds: "★⑤ 同一 sessionKey 两次 acquire 拿同一个号 + 判死后自动重绑",
   },
   {
     name: "no-rebind-after-death",
