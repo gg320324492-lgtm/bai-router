@@ -26,6 +26,18 @@ if (hasNotesFile) {
   notes = process.argv[2] || `v${v}`;
 }
 
+/* 按 ref 的键顺序重建 obj（只含 obj 里真有的键；ref 没有的追加在后面）。
+ * 用途：publish 会往配置对象里补/改字段（见下方 zen.transport），若只是赋值，
+ * 新键会落到对象末尾，于是 config.defaults.json 每次发布都「顺序变了」而变脏——
+ * 而「发布后 git status 应为空」是本脚本自带的自检，顺序漂移会让它永远报警。 */
+function reorderLike(ref, obj) {
+  if (!ref || typeof ref !== "object") return obj;
+  const out = {};
+  for (const k of Object.keys(ref)) if (k in obj) out[k] = obj[k];
+  for (const k of Object.keys(obj)) if (!(k in out)) out[k] = obj[k];
+  return out;
+}
+
 const run = (cmd) => { console.log("»", cmd); execSync(cmd, { cwd: ROOT, stdio: "inherit", env: { ...process.env, ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/" } }); };
 
 // 发布前置：用发布机当前配置刷新随包默认快照（脱敏 apiKey）→ 新电脑开箱即得同款模型列表/映射
@@ -100,8 +112,15 @@ try {
       delete def.failover;   // 仓库里没写这个块，就别把发布机的带进随包快照
     }
     def.proxy = CUR.proxy == null ? "" : CUR.proxy;
-    /* zen.transport 同样只认仓库的（本机选择不进出厂默认，见上面那段说明） */
-    if (def.zen) def.zen.transport = (CUR.zen && CUR.zen.transport) || "direct";
+    /* zen.transport 同样只认仓库的（本机选择不进出厂默认，见上面那段说明）。
+     *
+     * 键顺序也要跟仓库一致：上面那句赋值是**追加**，会把 transport 挪到 zen 对象的末尾，
+     * 于是每次发布 config.defaults.json 都变脏——而「发布后看 git status」正是我刚
+     * 加的自检，顺序一变它就永远报警，等于废掉。 */
+    if (def.zen) {
+      def.zen.transport = (CUR.zen && CUR.zen.transport) || "direct";
+      def.zen = reorderLike(CUR.zen, def.zen);
+    }
     if (def.wb && CUR.wb && CUR.wb.upstream) def.wb.upstream = CUR.wb.upstream;
     /* availableModels 也取仓库的，不取发布机的。
      *
