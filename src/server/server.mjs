@@ -5710,12 +5710,42 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "POST" && u.pathname === "/api/config") {
       const b = await readBody(req);
       const cfg = loadCfg();
-      const P = resolveChannelKey(b.provider);
+      /* provider 给了但不认识 → **拒**，不要静默落到 bai。
+       *
+       * resolveChannelKey 对 /api/models、/api/test 这类只读查询来说，"认不出就当 bai"
+       * 是便利。但这是**写入**接口：静默改错渠道的后果是「界面上说保存成功、
+       * 配置却写到了别家去」，而用户完全看不出发生了什么。
+       * 实测踩过：把载荷写成嵌套的 {"zen":{...}}（正确形状是扁平的 {provider:"zen",...}），
+       * 接口回 ok:true、provider:"bai"，实际什么都没改。
+       *
+       * 注意**不能**改成「provider 缺失也拒」：cards/failover.js 写的就是
+       * {failover:{...}}——不带 provider 是它合法的用法（故障转移是 bai 的顶层设置）。
+       * 所以这里只管「给了但不认识」。 */
+      const rawP = b.provider;
+      if (rawP != null && rawP !== "" && !CHANNELS.includes(String(rawP))) {
+        return json(res, 400, {
+          error: `未知的提供方 ${JSON.stringify(String(rawP).slice(0, 40))}`
+            + `——合法值是 ${CHANNELS.join(" / ")}`
+            + "（给错渠道名会让配置写到别家去，所以这里必须拒而不是默默当成 B.AI）",
+          acceptedProviders: CHANNELS,
+        });
+      }
+      const P = resolveChannelKey(rawP);
       // 落点：bai 是扁平的（字段直接摊在 cfg 顶层），其余各家各有自己的子对象。
       // P 已经是 resolveChannelKey 收敛过的合法渠道键，故按 CHANNELS 成员关系取子对象即可，
       // 不必再写一串三元链（加渠道时漏改一处 = 静默把配置写到别家去）。
       const sub = P === "bai" ? cfg
         : (P === "or" ? (cfg.or || (cfg.or = { ...DEFAULTS.or })) : (cfg[P] || (cfg[P] = { ...DEFAULTS[P] })));
+      /* 「什么都没写进去」也要说出来。
+       *
+       * 上面那一长串全是**白名单收字段**：不在表里的 key 会被静默丢掉，然后照样回
+       * 一个 ok:true。实测踩过——载荷形状写错（该扁平的写成了嵌套的），接口回 ok:true，
+       * 用户以为保存成功，其实配置一个字没动。这是最坏的一种成功：看起来生效了，其实没有。
+       *
+       * 判据用「快照前后比字符串」而不是给十来个写入点各加一个计数器：
+       * 漏加一个计数器 = 那个分支的写入又会被算成「什么都没写」。快照不会有那种漏。
+       * 快照放在 sub 建好**之后**取——sub 的补建是初始化，不是用户改的东西。 */
+      const before = JSON.stringify(sub);
       // —— API Key（仅 B.AI / SenseNova）——
       if (typeof b.apiKey === "string" && b.apiKey.trim()) {
         const k = b.apiKey.trim();
@@ -5865,6 +5895,31 @@ async function unknownMappingTargets(p, mapping, cfg) {
       }
       if (typeof b.defaultModel === "string" && b.defaultModel.trim()) {
         sub.defaultModel = b.defaultModel.trim().toLowerCase();
+      }
+      /* 一个字段都没写进去 → 报错，并**不要** saveCfg（省掉一次无谓的整文件落盘）。
+       *
+       * 「没提交任何内容」与「提交了但字段不认识」是两回事，错误信息得分开：
+       * 前者是用户点了保存却什么都没填（面板 saveSys 在两个输入框都空时就是这种）；
+       * 后者是调用方把字段写错了地方——实测踩过：该扁平的
+       * {"provider":"zen","transport":"opencode"} 写成了嵌套的 {"zen":{...}}，
+       * transport 根本不在白名单里被丢掉，接口却回 ok:true。 */
+      if (JSON.stringify(sub) === before) {
+        const others = Object.keys(b).filter((k) => k !== "provider");
+        return json(res, 400, others.length
+          ? {
+            error: `这些字段一个都没写进去：${others.slice(0, 20).join("、")}`
+              + "——本接口是白名单式的，不认识的字段会被静默丢掉。"
+              + "字段要放在**顶层**（形如 {\"provider\":\"zen\",\"transport\":\"opencode\"}），"
+              + "不是嵌套在 provider 下面。",
+            provider: P,
+            receivedKeys: others.slice(0, 20),
+          }
+          : {
+            error: "没有要保存的内容——请求里除了 provider 之外没有任何字段。"
+              + "如果本来只想改点东西，请确认表单填了内容再保存。",
+            provider: P,
+            receivedKeys: [],
+          });
       }
       saveCfg(cfg);
       // 端上已接到该提供方的话，立即同步新映射
