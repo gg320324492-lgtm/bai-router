@@ -143,6 +143,7 @@
         "label": "Space-Bunny-Free"
       }
     },
+    "transport": "direct",
     "useProxy": false
   },
   "failover": {

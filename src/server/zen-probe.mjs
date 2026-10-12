@@ -129,7 +129,18 @@ export function zenProbeClassify(status, txt) {
   if (/An active OpenCode Go subscription is required/i.test(t))
     return { cls: "auth", reachable: true, why: "需要 OpenCode Go 订阅（上游原文 An active OpenCode Go subscription is required to use Go models.）。Key 已被上游正常解析，缺的是订阅本身。" };
   if (/FreeTierError|only be used from within/i.test(t))
-    return { cls: "auth", reachable: true, why: "免费档被官方封死在 OpenCode 客户端内（上游 FreeTierError），外部中转一律被拒，且换模型无效。" };
+    /* ⚠ 文案更正（v1.0.75，2026-10-12）：这里原先写「免费档被官方封死在 OpenCode 客户端内、
+     * 换模型无效」——**那个说法是错的**，而且是我自己一次配错的实验造成的（探针会话用了全 deny
+     * 权限）。实测证明判据是「发给模型的请求里必须带工具」：deny 会把工具从模型可见列表里
+     * 整个摘掉，于是请求退化成「无工具推理」而被拒。`ask` 保留工具则一切正常。
+     * 而本程序直连中转时请求里没有工具（执行权在 Claude Code 那边），所以走直连必然被拒。
+     * 换模型确实无效，但「被封死」的说法会让人以为无解——它有解，见下。 */
+    return {
+      cls: "auth", reachable: true,
+      why: "上游要求「发给模型的请求里必须带工具」（FreeTierError）。本程序直连中转时请求不带工具"
+        + "——执行权在 Claude Code 那边，工具由它执行——所以走直连这一档必然被拒。"
+        + "换模型无效；解法是改走 OpenCode 客户端中转（这样模型手上就有工具），或切到 Go 档。",
+    };
   if (/Model access is disabled/i.test(t))
     return { cls: "auth", reachable: true, why: "该模型未对这把 Key 开放（上游 Model access is disabled）。" };
   if (s === 401 || s === 403)

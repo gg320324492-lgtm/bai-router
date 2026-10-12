@@ -243,7 +243,18 @@ export function sessionKeyOf(firstUserContent) {
 /** 归一成数组：`which` 可以回字符串、数组或 null。 */
 function toList(v) {
   if (v == null) return [];
-  return (Array.isArray(v) ? v : [v]).map((s) => String(s).trim()).filter(Boolean);
+  /* 字符串还要按行拆：Windows 上 `where opencode` 返回的是**多行**（PATH 里有好几处安装）。
+   * 只 trim 整个字符串的话，那坨 "a\nb" 会被当成一个路径去 spawn，必然 ENOENT，
+   * 而且 existsSync 对它也返回 false —— 症状是「明明装了却说没装」。
+   * defaultWhich 已经拆过并返回数组，但任何调用方传原始多行字符串进来都得照样能用。 */
+  const out = [];
+  for (const item of (Array.isArray(v) ? v : [v])) {
+    for (const line of String(item).split(/\r?\n/)) {
+      const s = line.trim();
+      if (s) out.push(s);
+    }
+  }
+  return out;
 }
 
 /** 默认的 `where opencode`（Windows）。抽出来是为了让测试能整段替换掉。 */
@@ -257,8 +268,9 @@ function defaultWhich(cmd) {
   }
 }
 
-function found(p, source) {
-  return { ok: true, path: p, source, spawnNeedsShell: needsShell(p) };
+function found(p, source, tried = []) {
+  // tried 一并带出：命中时也留着被跳过的候选与原因，诊断页不必再猜「为什么不是另一个路径」
+  return { ok: true, path: p, source, spawnNeedsShell: needsShell(p), tried };
 }
 
 /**
@@ -294,32 +306,74 @@ export function findOpenCodeBinary(opts = {}) {
   const tried = [];
   const seen = (p) => exists(p);
 
+  /* Windows 上「文件存在」不等于「这是个好选择」。v1.0.75 实测踩到两件事：
+   *
+   *   ① `where opencode` 的第一条是**无扩展名的 shell shim**
+   *      （%APPDATA%\npm\opencode，给 cmd 用的脚本）。它 existsSync 为真，
+   *      于是被选中——但它**既不能被 Node 直接 spawn，也没有 cmd.exe 的执行关联**，
+   *      连 shell:true 都救不了。表现是「干等也不就绪」，极难指向真正的原因。
+   *
+   *   ② 退到 `opencode.cmd` 虽然能跑（模块 spawn 时带 shell:true），但**不能优先选它**：
+   *      经 shell 起进程时 child 就是 `cmd.exe`，不是 opencode 本身——
+   *      于是 `child.pid` 不是目标进程，进程名对不上，退出回收会杀不干净。
+   *      v1.0.75 实测：优先 .cmd 时端到端直接超时（211s），优先 .exe 时 14.8s 通过。
+   *
+   * 所以顺序是「先找真正的 .exe，.cmd 只当兜底，无扩展名的直接排除」。
+   * 非 Windows 上 opencode 本来就是无扩展名可执行文件，照旧只判存在。 */
+  const win = String((env && env.OS) || process.platform).toLowerCase().includes("win");
+  const spawnable = (p) => {
+    if (!seen(p)) return false;
+    if (!win) return true;
+    // 无扩展名的 shim：Node 直接 spawn 是 ENOENT，cmd.exe 也没有执行关联 → 排除。
+    // 其余（.exe / .com / .cmd / .bat）可用：.exe 直接跑，.cmd 走既有 shell 通路。
+    return !!(String(p).match(/\.[a-z0-9]+$/i));
+  };
+  const skipReason = (p) => (!seen(p) ? "missing" : (win ? "no-executable-extension" : null));
+
+  /* 候选**全部收集完再择优**，不是逐个来源取第一个。
+   *
+   * 逐源取第一个会踩这个坑（v1.0.75 实测）：`where opencode` 同时返回无扩展名 shim 与
+   * `opencode.cmd`，后者过了「可 spawn」过滤就当场返回了——可 npm 包目录里躺着一个
+   * 真正的 `opencode.exe` 根本没被看见。经 shell 起进程时 child 是 cmd.exe 而非
+   * opencode 本身，`child.pid` 不是目标进程、退出回收杀不干净，端到端直接超时
+   * （实测 211s，而优先 .exe 时 14.8s 通过）。所以必须全局比一次。 */
+  const rank = (p) => {
+    if (!spawnable(p)) return -1;
+    // 0 = 能直接 spawn（.exe/.com）；1 = 必须经 shell（.cmd/.bat）；非 Windows 一律 0
+    if (!win) return 0;
+    return /\.(exe|com)$/i.test(String(p)) ? 0 : 1;
+  };
+  const pool = [];
+  const offer = (p, how) => {
+    const rk = rank(p);
+    tried.push({ how, path: p, skipped: rk < 0 ? skipReason(p) : null, rank: rk < 0 ? null : rk });
+    if (rk >= 0) pool.push({ p, how, rk, order: pool.length });
+  };
+
   // ① where
   let w = null;
   try { w = which("opencode"); } catch { w = null; }
-  for (const cand of toList(w)) {
-    tried.push({ how: "where", path: cand });
-    if (seen(cand)) return found(cand, "where");
-  }
+  for (const cand of toList(w)) offer(cand, "where");
 
-  // ②③ npm 全局装的两处
+  // ②③ npm 全局装的两处（顺序只影响同 rank 时的取舍）
   const appdata = env && env.APPDATA;
   if (appdata) {
-    const shim = join(appdata, "npm", "opencode.cmd");
-    tried.push({ how: "appdata-npm-shim", path: shim });
-    if (seen(shim)) return found(shim, "npm-shim");
-
-    const exe = join(appdata, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe");
-    tried.push({ how: "appdata-npm-package", path: exe });
-    if (seen(exe)) return found(exe, "npm-package");
+    offer(join(appdata, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"), "appdata-npm-package");
+    offer(join(appdata, "npm", "opencode.cmd"), "appdata-npm-shim");
   }
 
   // ④ 官方安装脚本
-  const userExe = join(homedir, ".opencode", "bin", "opencode.exe");
-  tried.push({ how: "user-install", path: userExe });
-  if (seen(userExe)) return found(userExe, "user-install");
+  offer(join(homedir, ".opencode", "bin", "opencode.exe"), "user-install");
 
-  return { ok: false, reason: "opencode-not-found", tried, hint: OPENCODE_MISSING_HINT };
+  // ⑤ 其他平台包（darwin/linux 走 npm 全局；Windows ARM64 也在这）
+  if (env && env.npm_config_prefix) {
+    offer(join(env.npm_config_prefix, "lib", "node_modules", "opencode-ai", "bin", "opencode"), "npm-prefix");
+  }
+
+  if (!pool.length) return { ok: false, reason: "opencode-not-found", tried, hint: OPENCODE_MISSING_HINT };
+  // rank 小者优先；同 rank 时按收集顺序（来源优先级）
+  pool.sort((a, b) => (a.rk - b.rk) || (a.order - b.order));
+  return found(pool[0].p, pool[0].how, tried);
 }
 
 /* ========================================================================== *

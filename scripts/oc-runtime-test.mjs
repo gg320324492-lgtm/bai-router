@@ -196,17 +196,24 @@ describe("③ findOpenCodeBinary", () => {
     assert.equal(r.spawnNeedsShell, false);
   });
 
-  test("优先级：where 未命中 → npm shim 优先于 npm-package 与用户路径", () => {
+  test("优先级：.exe 压过 .cmd shim（v1.0.75 实测：优先 .cmd 时端到端超时 211s）", () => {
     const r = findOpenCodeBinary(D(new Set([SHIM, PKG, USER])));
-    assert.equal(r.source, "npm-shim");
-    assert.equal(r.path, SHIM);
-    assert.equal(r.spawnNeedsShell, true, ".cmd 必须经 shell 才能 spawn");
+    assert.equal(r.source, "appdata-npm-package");
+    assert.equal(r.path, PKG, "经 shell 起进程时 child 是 cmd.exe，PID 不是目标进程、回收杀不干净");
+    assert.equal(r.spawnNeedsShell, false);
   });
 
-  test("优先级：shim 缺失 → 落到 npm-package", () => {
+  test("优先级：.cmd 缺失 → 仍落到 npm-package", () => {
     const r = findOpenCodeBinary(D(new Set([PKG, USER])));
-    assert.equal(r.source, "npm-package");
+    assert.equal(r.source, "appdata-npm-package");
     assert.equal(r.path, PKG);
+  });
+
+  test("优先级：只有 .cmd（.exe 真的不在）→ .cmd 兜底，且标明需要 shell", () => {
+    const r = findOpenCodeBinary(D(new Set([SHIM])));
+    assert.equal(r.source, "appdata-npm-shim");
+    assert.equal(r.path, SHIM);
+    assert.equal(r.spawnNeedsShell, true);
   });
 
   test("优先级：npm 两处都缺 → 落到 ~/.opencode/bin", () => {
@@ -256,9 +263,11 @@ describe("③ findOpenCodeBinary", () => {
     assert.match(r.hint, /npm|安装/i, "必须给可执行的安装指引");
     // tried 覆盖三种路径来源，且按发现顺序排
     assert.deepEqual(r.tried.map((x) => x.how),
-      ["appdata-npm-shim", "appdata-npm-package", "user-install"],
+      ["appdata-npm-package", "appdata-npm-shim", "user-install"],
       "where 没产出时，tried 应记三条候选路径（没有路径可记就不记）");
-    assert.deepEqual(r.tried.map((x) => x.path), [SHIM, PKG, USER]);
+    assert.deepEqual(r.tried.map((x) => x.path), [PKG, SHIM, USER]);
+    // 找不到时每条候选都要写明「不存在」，而不是悄悄不记
+    assert.ok(r.tried.every((x) => x.skipped === "missing"), "全都找不到 → 每条都该标 missing");
     // 指引里不能有任何真实凭据
     assert.doesNotMatch(r.hint, /sk-|key|token/i);
   });
@@ -274,7 +283,7 @@ describe("③ findOpenCodeBinary", () => {
     assert.equal(r.ok, false);
     assert.equal(r.tried[0].how, "where", "where 试过了就必须留痕，哪怕没命中");
     assert.deepEqual(r.tried.slice(1).map((x) => x.how),
-      ["appdata-npm-shim", "appdata-npm-package", "user-install"]);
+      ["appdata-npm-package", "appdata-npm-shim", "user-install"]);
   });
 });
 
@@ -492,5 +501,122 @@ describe("⑥ 只终止自己 spawn 的 PID", () => {
     assert.equal(typeof DEFAULT_PORT, "number");
     assert.ok(DEFAULT_PORT >= 1024 && DEFAULT_PORT <= 65535);
     assert.deepEqual(parseServeArgs(DEFAULT_PORT)[parseServeArgs(DEFAULT_PORT).length - 1], String(DEFAULT_PORT));
+  });
+});
+/* ---------------------------------------------------------------------------
+ * v1.0.75：Windows 上「存在」不等于「Node 能直接 spawn」
+ *
+ * v1.0.75 实测踩到：`where opencode` 的第一条候选是**无扩展名的 shell shim**
+ * （%APPDATA%\npm\opencode，给 cmd 用的脚本）。它 existsSync 为真，于是被选中——
+ * 而 Node spawn 它必然 ENOENT，表现为「干等 60 秒也不就绪」，极难指向真正的原因。
+ * `opencode.cmd` 同理：Node 修过 CVE-2024-27980 后，Windows 上 spawn .cmd/.bat
+ * 必须带 shell:true，而我们刻意不拼 shell 命令行。
+ *
+ * 所以判据必须是「存在且能直接执行」，不是「存在」。
+ * ------------------------------------------------------------------------- */
+describe("Windows 可执行性判据（v1.0.75）", () => {
+  const SHIM = "C:/APPDATA/npm/opencode";                    // 无扩展名，给 cmd 用的脚本
+  const CMD = "C:/APPDATA/npm/opencode.cmd";                  // Node 不能直接 spawn，但模块带 shell:true
+  const EXE = "C:/APPDATA/npm/node_modules/opencode-ai/bin/opencode.exe";
+  const winEnv = { APPDATA: "C:/APPDATA", OS: "Windows_NT" };
+
+  test("where 同时给出 shim 与 .cmd 时 → 仍选包目录里的 .exe（.cmd 要经 shell，PID 不对）", () => {
+    const r = findOpenCodeBinary({
+      env: winEnv, homedir: "C:/Users/u", join: (...p) => p.join("/"),
+      exists: (p) => [SHIM, CMD, EXE].includes(String(p)),
+      which: () => `${SHIM}\n${CMD}`,
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.path, EXE, "必须选 .exe：经 shell 起进程时 child 是 cmd.exe，PID 不是目标进程");
+    assert.equal(r.source, "appdata-npm-package");
+    assert.equal(r.spawnNeedsShell, false);
+  });
+
+  test("★ 排序是全局的，不是逐源取第一个（.cmd 存在也压不过 .exe）", () => {
+    const r = findOpenCodeBinary({
+      env: winEnv, homedir: "C:/Users/u", join: (...p) => p.join("/"),
+      exists: (p) => [SHIM, CMD, EXE].includes(String(p)),
+      which: () => SHIM,                       // where 只给那个跑不起来的
+    });
+    assert.equal(r.path, EXE, "where 没命中可用项时要继续往后找，不能就此认定");
+    const ranks = (r.tried || []).map((t) => t.rank);
+    assert.ok(ranks.includes(0) && ranks.includes(1), "候选要按 rank 排过，不是按来源顺序取第一个");
+  });
+
+  test("只有 .cmd（真 .exe 不在）→ .cmd 兜底可用，且标明需要 shell", () => {
+    const r = findOpenCodeBinary({
+      env: winEnv, homedir: "C:/Users/u", join: (...p) => p.join("/"),
+      exists: (p) => String(p) === CMD,
+      which: () => CMD,
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.path, CMD);
+    assert.equal(r.spawnNeedsShell, true, ".cmd 必须经 shell（模块 spawn 处带了 shell:true）");
+  });
+
+  test("无扩展名 shim 是唯一候选 → 不选它，退到包目录里的 .exe", () => {
+    const r = findOpenCodeBinary({
+      env: winEnv, homedir: "C:/Users/u", join: (...p) => p.join("/"),
+      exists: (p) => [SHIM, EXE].includes(String(p)),
+      which: () => SHIM,
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.path, EXE, "必须退到能直接 spawn 的 .exe");
+    assert.equal(r.source, "appdata-npm-package");
+    assert.equal(r.spawnNeedsShell, false, ".exe 直接 spawn，不需要 shell");
+  });
+
+  test("机器上只有无扩展名 shim（既无 .cmd 也无 .exe）→ 判 not-found", () => {
+    const r = findOpenCodeBinary({
+      env: winEnv, homedir: "C:/Users/u", join: (...p) => p.join("/"),
+      exists: (p) => String(p) === SHIM,
+      which: () => SHIM,
+    });
+    assert.equal(r.ok, false, "宁可不认，也不能挑一个 spawn 不起来的路径");
+    assert.equal(r.reason, "opencode-not-found");
+  });
+
+  test("候选要全部留痕并带 rank / 跳过原因，别悄悄消失", () => {
+    const r = findOpenCodeBinary({
+      env: winEnv, homedir: "C:/Users/u", join: (...p) => p.join("/"),
+      exists: (p) => [SHIM, CMD, EXE].includes(String(p)),
+      which: () => `${SHIM}\n${CMD}`,
+    });
+    const shimRow = (r.tried || []).find((t) => String(t.path) === SHIM);
+    assert.ok(shimRow, "无扩展名 shim 必须留痕");
+    assert.equal(shimRow.skipped, "no-executable-extension",
+      "要写明为什么跳过（是「无扩展名跑不起来」，不是「不存在」——两者处置完全不同）");
+    assert.ok((r.tried || []).some((t) => String(t.path) === CMD && t.rank === 1),
+      ".cmd 要被记录为 rank 1（可用但不如 .exe）");
+  });
+
+  test("非 Windows 上不套用扩展名判据（opencode 就是无扩展名可执行文件）", () => {
+    const posix = "/usr/local/bin/opencode";
+    const r = findOpenCodeBinary({
+      env: { OS: "Linux", PATH: "" }, homedir: "/home/u", join: (...p) => p.join("/"),
+      exists: (p) => String(p) === posix,
+      which: () => posix,
+    });
+    assert.equal(r.ok, true, "Linux/macOS 上无扩展名的可执行文件必须照认");
+    assert.equal(r.path, posix);
+  });
+
+  test("反向对照：判据确实在改变选择（去掉它就会挑中 shim）", () => {
+    const exists = (p) => [SHIM, CMD, EXE].includes(String(p));
+    const cands = `${SHIM}\n${CMD}`.split("\n");
+    const withPredicate = (() => {
+      for (const c of cands) {
+        if (!exists(c)) continue;
+        if (!/\.[a-z0-9]+$/i.test(c)) continue;      // ← 本次新增的判据
+        return c;
+      }
+      return EXE;
+    })();
+    const withoutPredicate = (() => {
+      for (const c of cands) if (exists(c)) return c;
+      return EXE;
+    })();
+    assert.equal(withoutPredicate, SHIM, "去掉判据就会挑中那个跑不起来的 shim");
+    assert.notEqual(withPredicate, withoutPredicate, "判据确实在改变选择 → 上面几条不是恒真断言");
   });
 });

@@ -23,6 +23,10 @@ import {
   zenProbeLoad, zenRunCapabilityProbe, zenCapLabel, zenCapHint, zenProbeClassify,
   ZEN_PROBE_TIMEOUT_MS, ZEN_PROBE_CONCURRENCY, ZEN_PROBE_MAX_TOKENS, ZEN_PROBE_MAX_TOKENS_RETRY,
 } from "./zen-probe.mjs";
+/* OpenCode 传输层（v1.0.75）：zen 渠道的 `transport` 开关打开时，把这一档的请求改走
+ * 一个真 `opencode serve`。默认 `direct` —— 直连路径一行都不变。翻译与进程管理分别在
+ * oc-bridge.mjs / oc-runtime.mjs，接线本身在 oc-wiring.mjs。 */
+import { createOcGateway, zenTransportOf, ZEN_TRANSPORT_OPENCODE, ZEN_TRANSPORTS } from "./oc-wiring.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -3766,9 +3770,48 @@ function orQuotaSnapshot(cfg) {
 // 避免下面每处都写一遍 `p === "wb" || p === "wbai"`（漏一处就是国际版走错上游）。
 const isWk = (p) => p === "wb" || p === "wbai";
 const wkZh = (p) => (p === "wbai" ? "WorkBuddy AI" : "WorkBuddy");
+
+/* OpenCode 传输（v1.0.75）。**惰性**：只有 zen + transport=opencode 的请求才会用到它，
+ * 所以模块级只造一个壳，不起进程、不探测二进制、不发任何请求。 */
+const OC_WORK_DIR = path.join(DATA_DIR, "opencode");
+try { mkdirSync(OC_WORK_DIR, { recursive: true }); } catch { /* 目录建不出来时oc-runtime 会回落到临时目录 */ }
+const ocGateway = createOcGateway({
+  /* opencode 的 cwd 固定落在本产品自己的数据目录下，而不是系统临时目录：
+   * 临时目录是全局共享的（两台机器上跑两个实例会互相踩状态），而且系统清理临时目录时
+   * 会把它连同里面的会话记录一起删掉。 */
+  workDir: OC_WORK_DIR,
+  log: (m) => log(m),
+  noteRelayError: (chan, kind, message) => noteRelayError(chan, kind, message),
+  anthroError: (res, status, msg) => wbAnthroError(res, status, msg),
+});
+/* 关停钩子：进程退出时收掉**我们自己 spawn 的**那个 opencode 进程。
+ * 只按 oc-runtime 记下的 PID 收（它自己的纪律：不按名字/镜像名批量杀——
+ * 用户很可能自己开着 OpenCode 在用）。不挂钩的后果是每次中转重启都留下一具
+ * 常驻的 opencode.exe，占着 180MB 内存与那个端口。
+ * `exit` 里只允许同步操作，`child.kill()` 正是同步的。 */
+try {
+  process.on("exit", () => { try { ocGateway.dispose(); } catch { } });
+} catch { /* 极老的环境没有 process.on("exit") */ }
+
 async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : p === "or" ? "OpenRouter" : wkZh(p);
   setErrProvider(NAME, p);   // 渠道 key 一起传下去：wbPipe 里的 noteRelayError 要按真实渠道归因
+  /* ---- OpenCode 传输：**在取令牌之前**提前分流（v1.0.75）----
+   *
+   * 位置是判据不是随手放的：这一档用 OpenCode 自己的认证，**根本不需要 cfg.zen.apiKey**
+   * （Zen 的 Key 是给直连那条路用的）。放在取令牌之后分流，等于「没配 Key 就永远到不了
+   * OpenCode」，等于这个开关打不开。
+   *
+   * 默认值是 `direct`，`zenTransportOf` 对任何认不出来的值也回 `direct`——
+   * 所以条件不成立时**下面的直连逻辑一个字都不受影响**，它现在怎么失败还怎么失败。 */
+  if (p === "zen" && zenTransportOf(cfg) === ZEN_TRANSPORT_OPENCODE) {
+    /* 模型映射在这一层做（桥刻意不猜：发错的模型名会让模型静默地什么都不回），
+     * 两个方向的 opts.model 都用这一个解析结果。 */
+    return ocGateway.exchange({
+      cfg, S, j, isProbe, res,
+      mapModel: (name) => resolveModel(name, S),
+    });
+  }
   let token;
   if (p === "zen") {
     token = (cfg.zen && cfg.zen.apiKey) || "";
@@ -4069,13 +4112,18 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
           noteRelayError(p, "rate_limit", `${NAME} 触发上游限流`);
         }
       } else if (r.status === 403 && /FreeTierError|only be used from within/i.test(txt)) {
-        /* 免费档围栏。实测（v1.0.74 复核）连 space-bunny-free 也是同一个 403，
-         * 且**带不带 Key、带真 Key 还是垃圾 Key 都逐字相同**——它是产品级封锁，
-         * 换模型绕不过去。所以文案不能再劝「换 space-bunny-free」（实测无效）。 */
-        why = " —— 这是 Zen 的免费档，官方限定只能在 OpenCode 客户端内使用（服务端返回 FreeTierError），"
-          + "外部中转一律被拒，且**换模型无效**（实测 space-bunny-free 与付费模型返回逐字相同的 403）。"
-          + "要用这一渠道，请把上游地址改成 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，https://opencode.ai/auth）。";
-        noteRelayError(p, "upstream_403", `${NAME} 免费档限客户端内使用`);
+        /* 免费档围栏。⚠ 文案更正（v1.0.75，2026-10-12）：这里原写「官方限定只能在
+         * OpenCode 客户端内使用 / 换模型无效」——**那个说法不完整，且会让人以为无解**。
+         * 实测证明判据是「**发给模型的请求里必须带工具**」：把工具从模型可见列表里摘掉
+         * （deny 权限就会这样）后，请求退化成「无工具推理」而被同一个 FreeTierError 拒掉；
+         * 保留工具（ask）则一切正常。而本程序直连中转时请求不带工具（执行权在 Claude Code
+         * 那边），所以**走直连这一档必然被拒**。换模型确实无效，但有解：改走 OpenCode
+         * 客户端中转（模型手上就有工具）。 */
+        why = " —— Zen 的免费档要求**发给模型的请求里必须带工具**（服务端返回 FreeTierError）。"
+          + "本程序当前是**直连**中转，请求里不带工具（执行权在 Claude Code 那边），所以这一档走直连必然被拒。"
+          + "换模型无效；解法是把传输方式切成「OpenCode 客户端中转」——那样模型手上就有工具，本机需先装 OpenCode（npm i -g opencode-ai）。"
+          + "另一条路是把上游地址改成 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，https://opencode.ai/auth）。";
+        noteRelayError(p, "upstream_403", `${NAME} 免费档走直连被拒（上游要求请求带工具）`);
       } else if (r.status === 402 || /insufficient account funds/i.test(txt)) {
         why = " —— API Key 余额为 0，付费模型需要先充值；Go 档的付费额度同样走这把 Key 的余额。";
         noteRelayError(p, "upstream_402", `${NAME} 余额不足`);
@@ -4262,7 +4310,13 @@ function providerConfigured(provider, cfg) {
   if (provider === "sn") return !!cfg.sn?.apiKey;
   if (provider === "wb") return !!cfg.wb?.accessToken;
   if (provider === "wbai") return !!cfg.wbai?.accessToken;
-  if (provider === "zen") return !!cfg.zen?.apiKey;
+  if (provider === "zen") {
+    /* 直连要 Zen 的 API Key；经 OpenCode 那条路用 OpenCode 自己的认证，不读这把 Key
+     * （spec：这一通道根本不需要它）。所以 transport=opencode 时不配 Key 也算「已配置」——
+     * 否则 attemptWithFailover 会把入口渠道自己跳过，用户选了 zen 却拿到「所有渠道都失败了」。
+     * transport 仍是默认的 direct，那条路的判据一个字没变。 */
+    return !!cfg.zen?.apiKey || zenTransportOf(cfg) === ZEN_TRANSPORT_OPENCODE;
+  }
   if (provider === "or") return orKeys(cfg).length > 0;   // 轮换区：至少 1 把 key 就算配置好
   if (provider === "qd") { try { qdEnsureToken(cfg); return true; } catch { return false; } }
   return false;
@@ -5692,6 +5746,19 @@ const panel = http.createServer(async (req, res) => {
         sub.useProxy = b.useProxy;
         needRestart = true; // 直连/走代理由启动期 NO_PROXY 决定（Node 缓存 env 代理配置），改开关需重启
       }
+      // —— Zen 的传输开关（v1.0.75）——
+      /* 这个 handler 是**白名单**收字段的：不在表里的 key 会被静默丢掉，还回一个
+       * ok:true 的「成功」——那是最坏的一种成功。所以要让它可配，就必须在表里显式加一行。
+       *
+       * 认不出来的值退回 direct 并**照收**（与 zenTransportOf 的兜底一致）：
+       * 存下来的坏值等于「没打开开关」，也就是改动前的行为。 */
+      if (P === "zen" && b.transport !== undefined) {
+        const t = String(b.transport || "").trim();
+        if (!ZEN_TRANSPORTS.includes(t)) {
+          return json(res, 400, { error: `传输方式只能是 ${ZEN_TRANSPORTS.join(" 或 ")}（收到 ${JSON.stringify(String(b.transport).slice(0, 40))}）` });
+        }
+        if (sub.transport !== t) sub.transport = t;   // 每次请求实时读 cfg，改完立即生效，不用重启
+      }
       // —— 映射表 ——
       if (b.mapping && typeof b.mapping === "object") {
         const dst = sub.mapping;
@@ -5843,7 +5910,11 @@ async function unknownMappingTargets(p, mapping, cfg) {
       if (P === "sn") warns.push("SenseNova 有 TPM/RPM 限流，探测到 429 属正常，稍候即恢复；图像模型不参与对话路由");
       if (P === "wb") warns.push("WorkBuddy 国内版：0 积分模型由 WorkBuddy 客户端账号提供；令牌过期会自动用刷新令牌续期，无需重新接线。国际版请到「WorkBuddy AI」格单独接线");
       if (P === "wbai") warns.push("WorkBuddy AI 国际版：需要国际版客户端的令牌（与国内版不通用）；模型目录与倍率来自上游 /v3/config，未取到时用出厂兜底清单");
-      if (P === "zen") warns.push("OpenCode Zen 分两档且可用性完全不同：免费档被官方封死在 OpenCode 客户端内（外部中转一律 403，换模型无效）；Go 档（上游含 /zen/go/）能用，但要账号已订阅 OpenCode Go（$10/月，https://opencode.ai/auth）。改档位请改上游地址，然后点「刷新模型列表」换成该档自己的目录");
+      if (P === "zen") warns.push("OpenCode Zen 有两档、还有两种传输方式，可用性完全不同："
+        + "①「直连 + 免费档」会被拒（FreeTierError）——上游要求发给模型的请求里必须带工具，而直连的请求不带（执行权在 Claude Code 那边）；"
+        + "②「直连 + Go 档」（上游含 /zen/go/）能用，但要账号已订阅 OpenCode Go（$10/月，https://opencode.ai/auth）；"
+        + "③「OpenCode 客户端中转 + 免费档」能用，需本机已装 OpenCode（npm i -g opencode-ai），免费模型不需要订阅。"
+        + "改传输方式请在 Zen 页切换；改档位请改上游地址，然后点「刷新模型列表」换成该档自己的目录");
       if (P === "qd") warns.push("Qoder 走账号的 Free 套餐额度；令牌每次 Qoder 启动会轮换，中转会自动跟随——但 Qoder 客户端必须保持运行，否则中转读不到令牌");
       if (P === "or") warns.push("OpenRouter 免费区：免费模型 50 次/天/把 key，用尽自动换模型、再换 key（最多 3 把）；重置时间看 X-RateLimit-Reset，面板显示倒计时与剩余次数");
       log(`一键切到 ${name}: cli=${doCli} desktop=${doDesk}`);
