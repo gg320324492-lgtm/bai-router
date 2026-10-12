@@ -1194,6 +1194,85 @@ setCheck("C14");
 }
 
 /* ============================================================================
+ * C15（附加）被 import 的本地模块必须在打包白名单里
+ *   extraResources 用的是**显式 filter 白名单**（不是整目录拷贝）。所以在 src/server/
+ *   里新写一个模块、并从 server.mjs 里 import 它，源码里跑得通、测试全绿，
+ *   但**装出来的版本启动即崩**：import 目标不在包内。
+ *
+ *   v1.0.74 实测踩中：zen-probe.mjs（能力探测的纯逻辑模块）被 server.mjs import，
+ *   但没进 package.json 的 filter。scripts/publish.cjs 里那道守卫能在**构建那一刻**
+ *   发现文件缺失，可它只让构建失败、不能让包变对；而构建之前没有任何信号。
+ *
+ *   本闸门把这件事提前到提交前：扫所有会被打进包的 .mjs/.js 的相对 import，
+ *   逐个对照 filter 白名单。cards/ 子目录是整目录拷贝（filter 不含它），单独放行。
+ *
+ *   两条腿：
+ *     ① 反向——import 的目标不在 filter 里 → 报错（真样本：zen-probe.mjs）
+ *     ② 正向——filter 里的条目在 src/server/ 下不存在 → 警告（白名单写错/文件被删）
+ * ==========================================================================*/
+setCheck("C15");
+{
+  const pkgPath = path.join(ROOT, "package.json");
+  let filter = null;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    const er = (pkg.build && pkg.build.extraResources) || [];
+    const srvEntry = er.find((e) => e && e.from === "src/server");
+    filter = (srvEntry && srvEntry.filter) || null;
+    if (!Array.isArray(filter)) {
+      err("package.json 的 build.extraResources 里找不到 src/server 的 filter 数组——"
+        + "本闸门无从校验，请确认打包配置没被改过形状");
+    }
+  } catch (e) {
+    err(`package.json 读不到或不是合法 JSON：${e.message}`);
+  }
+
+  if (Array.isArray(filter)) {
+    // 只扫「本身会被打包」的源文件：filter 里的 .mjs/.js（排除 .json/.html/.css）
+    const SRC_EXT = /\.(mjs|js)$/;
+    const IMPORT_RX = /(?:^|[^\w$])(?:import|export)\s[^;]*?from\s*["'](\.[^"']+)["']|import\s*\(\s*["'](\.[^"']+)["']\s*\)/g;
+    const missing = [];
+    let scanned = 0;
+    for (const rel of filter) {
+      if (!SRC_EXT.test(rel)) continue;
+      const abs = path.join(SRV, rel);
+      let src;
+      try { src = fs.readFileSync(abs, "utf8"); } catch { continue; }  // 文件不在 → 交给②腿报
+      scanned++;
+      for (;;) {
+        const m = IMPORT_RX.exec(src);
+        if (!m) break;
+        const spec = m[1] || m[2];
+        // 只认同目录的兄弟文件（./x.mjs）。带 ../ 的、以及目录导入都不在本闸门范围。
+        if (!/^\.\/[^/]+$/.test(spec)) continue;
+        const target = spec.slice(2);
+        if (!filter.includes(target)) {
+          missing.push(`${rel} → ${spec}`);
+        }
+      }
+    }
+    if (!scanned) err("filter 里一个 .mjs/.js 源文件都没扫到，本闸门实际没跑");
+    if (missing.length) {
+      for (const x of missing) {
+        err(`${x.split(" → ")[0]} import 了一个不在 extraResources filter 里的模块「${x.split(" → ")[1].slice(2)}」`
+          + ` —— 源码跑得通但**装出来的版本启动即崩**（filter 是显式白名单，不是整目录拷贝）。`
+          + `请把该文件加进 package.json 的 build.extraResources[src/server].filter`);
+      }
+    } else {
+      ok(`scanned ${scanned} packaged module(s); every relative sibling import is in the filter`);
+    }
+
+    // ② 正向：filter 里的条目在源目录里不存在（多半是文件被删/改名，白名单没跟上）
+    for (const rel of filter) {
+      if (rel.includes("*") || rel.endsWith("/")) continue;
+      if (!fs.existsSync(path.join(SRV, rel))) {
+        warn(`filter 列了「${rel}」但 src/server/ 下没有这个文件——白名单与源码不一致`);
+      }
+    }
+  }
+}
+
+/* ============================================================================
  * 打印
  * ==========================================================================*/
 
@@ -1212,8 +1291,9 @@ const CHECK_TITLES = {
   C12: "renderer-critical channel fields present for every channel",
   C13: "seed config must not carry machine-specific paths/usernames",
   C14: "seed config must not carry credentials or non-empty identity fields",
+  C15: "relative module imports must be listed in the extraResources filter",
 };
-const ORDER = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14"];
+const ORDER = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C15"];
 
 console.log("check-manifest -- provider panel manifest/template consistency gate");
 console.log("root: " + ROOT);

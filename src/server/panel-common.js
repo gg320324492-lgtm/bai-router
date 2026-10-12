@@ -504,6 +504,9 @@
   let polling = false;      // 轮询重入保护（不是 busy：busy 是"有动作在飞"）
   let selected = null;      // 当前选中的渠道 key；null = 还没定（等第一次 status）
   let fromPath = false;     // 选中是否由 URL 路径直接决定（决定要不要滚动+高亮）
+  /* 逐模型能力标记（v1.0.74 T3+T6）：id → { capLabel, capHint }，**全部来自服务端探测结果**。
+   * 空表 = 这一家没有能力探测（大多数渠道），下拉框外观与加这项之前逐字相同。 */
+  let capByModel = Object.create(null);
 
   const normPath = (p) => (p || "/").replace(/\/+$/, "") || "/";
   function keyFromPath(p) {
@@ -789,6 +792,7 @@
       </div>
       <div class="cname">${esc(nameOf(key))}${P.path ? `<span class="cpath">${esc(P.path)}</span>` : ""}</div>
       <div class="ctag">${esc(P.tagline || "")}</div>
+      ${P.tierBadge === true ? '<div class="ctier"></div>' : ""}
       ${P.caveat ? `<div class="ccaveat" title="${esc(P.caveat)}">⚠ ${esc(P.caveat)}</div>` : ""}
       <div class="cmap"></div>
       <div class="crelay"></div>
@@ -842,6 +846,24 @@
       el.dataset.state = st.s;
       clsx(el, key === selected, "sel");
       const P = MANIFEST[key] || {};
+      /* 档位徽章（v1.0.74 T4）：只有清单声明 tierBadge 的渠道才画这一格，
+       * 档位本身由 /api/status 的 tier* 字段给出——渲染层不认识任何渠道名（C11）。
+       * 两档可用性完全不同（免费档封死在客户端内 / Go 档需订阅），
+       * 不显著标出来用户就不知道自己用的是哪一档。 */
+      const cti = q(".ctier", el);
+      if (cti) {
+        const S2 = stOf(key);
+        const label = S2.tierLabel || "";
+        const needSub = S2.goSubRequired === true;
+        if (!label) {
+          cti.innerHTML = "";
+        } else {
+          const cls = needSub ? "err" : (S2.tier === "go" ? "ok" : "warn");
+          cti.innerHTML = `<span class="tb ${cls}" title="${esc(S2.tierHint || "")}">`
+            + `${needSub ? "需订阅 Go" : esc(label)}</span>`
+            + (needSub ? '<span class="dim tb-note">上游已确认缺订阅</span>' : "");
+        }
+      }
       const cm = q(".cmap", el);
       if (cm) {
         if (P.chainable !== true) {
@@ -930,11 +952,15 @@
       if (sub) sub.textContent = P.tagline || "";
       showEl($("btnSave"), false); showEl($("btnTest"), false);
       showEl($("btnModels"), false); showEl($("btnResetModels"), false);
+      showEl($("btnProbe"), false);
       return;
     }
     showEl($("btnSave"), true); showEl($("btnTest"), true);
     showEl($("btnModels"), (P.models || []).length > 0);
     showEl($("btnResetModels"), (P.defaultModels || []).length > 0);
+    /* 能力探测按钮（v1.0.74 T3+T6）：**只有清单声明 capabilityProbe 的渠道才画**。
+     * 端点与判定全在服务端，渲染层既不拼 URL 也不认识渠道名（C11）。 */
+    showEl($("btnProbe"), P.capabilityProbe === true);
 
     if (badge) badge.textContent = P.letter || "";
     if (title) title.textContent = `${nameOf(selected)} · 模型映射`;
@@ -956,7 +982,14 @@
       for (const o of [...list, "__custom__"]) {
         const op = document.createElement("option");
         if (o === "__custom__") { op.value = "__custom__"; op.textContent = "自定义…"; }
-        else { op.value = o; op.textContent = optText(o); op.title = o; }
+        else {
+          op.value = o;
+          /* 能力标记挂在选项文字后面（v1.0.74）：「space-bunny-free · 探不通」比让用户
+           * 点了才发现要好。标签与说明都来自服务端探测结果，这里不自己判定。 */
+          const cp = capByModel[o];
+          op.textContent = optText(o) + (cp && cp.capLabel ? " · " + cp.capLabel : "");
+          op.title = o + (cp && cp.capHint ? "\n\n" + cp.capHint : "");
+        }
         sel.appendChild(op);
       }
       sel.value = isCustom ? "__custom__" : (m.target || "");
@@ -1232,6 +1265,25 @@
 
       if (st.s === "idle") {
         items.push({ s: "idle", t: `${nameOf(key)}：${P.conclusion || ""}`.trim(), m: P.remedy || "" });
+        continue;
+      }
+      /* 档位不可用（v1.0.74 T4）：**优先于**「上游连不上」与「最近一次失败」——
+       * 那些信号此刻全都在指错方向。用户点一次发送看到一句 FreeTierError，
+       * 面板其余部分却一片正常（凭据就绪、上游可达），下次他多半会以为是网络抖动。
+       * 真正的原因是「这一档用不了」，且它是账号级的、持续到用户去订阅为止，
+       * 所以必须常驻在这里，而不是绑在 30 分钟新鲜的 relayLast 上。 */
+      if (S.goSubRequired === true) {
+        items.push({ s: "err", t: `${nameOf(key)} 当前是 ${S.tierLabel || "Go 档"}，但账号还没订阅`, m: S.tierHint || "" });
+        continue;
+      }
+      if (P.tierBadge === true && S.tierLabel) {
+        /* 两档可用性完全不同：即便此刻通着，也得让用户知道自己站在哪一档上——
+         * 免费档随时可能被上游改规则封死，Go 档随时可能因为没订阅而失效。
+         * 已确认「需订阅」的情形走上面那条 err 项，不在这里重复报。 */
+        items.push({
+          s: "warn", t: `${nameOf(key)} 当前档位：${S.tierLabel}`,
+          m: (S.tierHint || "") + (P.remedy ? "\n\n" + P.remedy : ""),
+        });
         continue;
       }
       /* 令牌归属不符：**最高优先级**，排在"上游连不上"之前。
@@ -1611,8 +1663,22 @@
   function paintCatalogSource(r) {
     const el = $("catSource");
     if (!el) return;
+    /* 档位前缀（v1.0.74 T4）：两档的目录是两回事（免费档 83 个 / Go 档 38 个），
+     * 而免费档列出的模型**一个都调不通**（上游 403 FreeTierError）。所以这份目录
+     * 属于哪一档，比它有多少个模型重要得多——必须写在最前面。 */
+    const tierLabel = r && r.tierLabel ? String(r.tierLabel) : "";
+    const tierHtml = tierLabel
+      ? `<b class="${r.goSubRequired ? "warn" : ""}">${esc(tierLabel)}</b>`
+        + (r.goSubRequired ? '<b class="warn"> · 需订阅</b>' : "") + `<span class="dim"> · </span>`
+      : "";
     const s = (r && r.source) || null;
     const meta = s ? (CATALOG_SOURCE[s] || { txt: s, hint: "来源未知" }) : null;
+    /* 能力检测出处（v1.0.74 T3+T6）：**上次检测时间必须常驻**。
+     * 结论会过期——上游随时可能加围栏或恢复额度，用户看到「可用 · 支持工具」
+     * 时有权知道那是几分钟前测的、还是三天前的。文案由服务端算好，这里不拼。 */
+    const capHtml = r && r.capAtLabel
+      ? `<span class="dim"> · 上次检测 ${esc(r.capAtLabel)}${r.capStale ? "（上游已改，这份作废）" : ""}</span>`
+      : (r && r.capHint ? `<span class="dim"> · ${esc(r.capHint)}</span>` : "");
     if (!meta) {
       /* 分两种「没有 source」：这家渠道压根不报出处（sn/qd/or 的目录来自各自
        * 的接口，没有「实时/快照/兜底」这一说），还是确实没拉过。
@@ -1620,25 +1686,31 @@
       const n = r && Array.isArray(r.models) ? r.models.length : null;
       if (n == null) {
         el.className = "catsrc dim";
-        el.innerHTML = "模型目录：未拉取过，点「刷新模型列表」获取";
+        el.innerHTML = tierHtml + "模型目录：未拉取过，点「刷新模型列表」获取";
         el.title = "";
       } else {
         el.className = "catsrc";
-        el.innerHTML = `模型目录：<b class="ok">已加载</b><span class="dim">（${n} 个 · 该渠道的目录每次都直接取，不分实时与快照）</span>`;
+        el.innerHTML = `模型目录：${tierHtml}<b class="ok">已加载</b><span class="dim">（${n} 个 · 该渠道的目录每次都直接取，不分实时与快照）</span>${capHtml}`;
         el.title = (r && r.note) || "";
       }
       return;
     }
     // disk / builtin 都不是上游当下的样子，标成需留意，别让它看起来和实时目录一样可信
-    el.innerHTML = `模型目录：<b class="${s === "live" ? "ok" : "warn"}">${meta.txt}</b>`
-      + `<span class="dim">（${r.count || 0} 个${r.catalogAt ? " · 拉取于 " + new Date(r.catalogAt).toLocaleString("zh-CN", { hour12: false }) : ""}）</span>`;
-    el.title = meta.hint + (r.note ? "\n\n" + r.note : "");
+    el.innerHTML = `模型目录：${tierHtml}<b class="${s === "live" ? "ok" : "warn"}">${meta.txt}</b>`
+      + `<span class="dim">（${r.count || 0} 个${r.catalogAt ? " · 拉取于 " + new Date(r.catalogAt).toLocaleString("zh-CN", { hour12: false }) : ""}）</span>${capHtml}`;
+    el.title = (r && r.tierHint ? r.tierHint + "\n\n" : "") + meta.hint
+      + (r && r.capHint ? "\n\n" + r.capHint : "") + (r && r.note ? "\n\n" + r.note : "");
     el.className = "catsrc";
   }
 
   async function refreshModels() {
     const P = MANIFEST[selected] || {};
     const r = await api("/api/models?p=" + selected);
+    /* 逐模型能力标记（v1.0.74 T3+T6）：**文案全部来自服务端**，渲染层只按 id 取来显示，
+     * 因此不需要认识任何渠道名（C11）。没有 capLabel 的渠道（非探测类）这张表就是空的，
+     * 下拉框外观与改动前逐字相同。 */
+    capByModel = Object.create(null);
+    for (const m of (Array.isArray(r.all) ? r.all : [])) if (m && m.key && m.capLabel) capByModel[m.key] = m;
     const C = cfgOf(selected);
     const curTargets = TIERS
       .map((t) => String(((C.mapping || {})[t.key] || {}).target || "").toLowerCase())
@@ -1669,6 +1741,31 @@
     await postJSON("/api/config", { provider: selected, availableModels: defs });
     await refreshConfig();
     showResult($("sysResult"), `✔ ${nameOf(selected)} 已恢复默认模型：${defs.join("、")}`, true);
+  }
+
+  /* 能力探测（v1.0.74 T3+T6）：对免费模型逐个发真实请求，取代那份已被实测推翻的
+   * 出厂白名单。文案与判定**全部来自服务端**——这里只负责显示，
+   * 不复制判定逻辑，也因此不认识任何渠道名（C11）。
+   *
+   * 超时给足：并发 2、每个 10 秒、免费模型最多十来个，最坏一轮要一分多钟。
+   * api() 默认 12 秒会中途掐断，那会让用户以为探测失败——其实是前端自己放弃了。 */
+  async function runCapabilityProbe() {
+    const slot = $("testResult");
+    showResult(slot, "正在逐个探测免费模型（只探免费模型、并发 2、每个最多 10 秒）…", true);
+    const r = await api("/api/models/probe-zen", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+      timeoutMs: 300000,
+    });
+    const lines = [`✔ ${r.summary || "探测完成"}`, `检出时间：${r.atLabel || ""}`];
+    const models = r.models || {};
+    for (const id of Object.keys(models).sort()) {
+      const rec = models[id];
+      lines.push(`· ${id} — ${rec.label}` + (rec.why ? `（${rec.why}）` : ""));
+    }
+    showResult(slot, lines.join("\n"), true);
+    // 重拉一次目录，让下拉框与出处徽章立刻带上新的能力标记
+    await refreshModels();
+    showResult(slot, lines.join("\n"), true);
   }
 
   async function saveSys() {
@@ -2027,6 +2124,7 @@
     onClick("btnTest", () => withBusy($("btnTest"), testTiers, $("testResult")));
     onClick("btnModels", () => withBusy($("btnModels"), refreshModels, $("testResult")));
     onClick("btnResetModels", () => withBusy($("btnResetModels"), resetModels, $("sysResult")));
+    onClick("btnProbe", () => withBusy($("btnProbe"), runCapabilityProbe, $("testResult")));
     onClick("btnSaveSys", () => withBusy($("btnSaveSys"), saveSys, $("sysResult")));
     onClick("btnDeploy", () => withBusy($("btnDeploy"), deployLocal, $("sysResult")));
 

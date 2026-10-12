@@ -17,6 +17,12 @@ import {
   shouldFailover, FAILOVER_COOLDOWN_MS,
 } from "./failover.mjs";
 import { qpApply, qpRevert, qpStatus } from "./qoder-patch.mjs";
+/* 逐模型能力探测（v1.0.74 · T3+T6）：只探免费模型、只在用户显式点「检测可用性」时跑。
+ * 纯逻辑（判定 / 并发 / 落盘）在 zen-probe.mjs 里，HTTP 由下面的 zenProbeSend 注入。 */
+import {
+  zenProbeLoad, zenRunCapabilityProbe, zenCapLabel, zenCapHint, zenProbeClassify,
+  ZEN_PROBE_TIMEOUT_MS, ZEN_PROBE_CONCURRENCY, ZEN_PROBE_MAX_TOKENS, ZEN_PROBE_MAX_TOKENS_RETRY,
+} from "./zen-probe.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -515,10 +521,44 @@ function loadCfg() {
 function saveCfg(cfg) {
   writeAtomic(CONFIG_FILE, JSON.stringify(cfg, null, 2) + "\n");
 }
-function writeAtomic(file, data) {
+/* Windows 上 rename 覆盖一个「正被别的句柄占住」的目标文件会抛 EPERM / EACCES / EBUSY。
+ * 杀毒实时扫描、同步客户端、编辑器打开着、甚至映射中的可执行文件，都会**短暂**触发。
+ * 9 个调用点里有 settings.json（Claude Code 自己的配置，见 applyCcSettings 附近）这种
+ * 最容易被别人占住的文件，直接往上抛 = 用户看到「保存失败」而实际只是几百毫秒的锁。
+ *
+ * 做法照抄 OW Bridge 的同类实现（.research/ow-bridge/src/atomic.js，只读参考）：
+ * 只对 EPERM/EACCES/EBUSY 退避重试，**其它错误码立即抛出**——磁盘写满（ENOSPC）、
+ * 目录不存在（ENOENT）、只读盘（EROFS）这类重试只是把失败推迟，还白等一秒半。
+ *
+ * · 重试**重跑整个 writeFileSync + renameSync**，不是只重试 rename：tmp 本身
+ *   也可能被扫描器占住，只重试 rename 会在 tmp 已残缺的情况下替换出坏文件。
+ * · **保持同步**：9 个调用点全是同步调用，转 async 会波及一大片。
+ *   同步睡眠用 Atomics.wait（Atomics.waitAsync 本版 Node 未普及）。
+ * · **总阻塞上限 = ATOMIC_DELAYS 之和 = 50+100+200+400+600 = 1350ms**（约 1.3 秒，
+ *   刻意压在 1.5 秒以内）。这是最坏情况的**同步阻塞**时间，落在 Electron 主进程上，
+ *   再长会拖住 UI 帧；1350ms 之后仍然失败就说明不是瞬时锁，该报错。
+ * · opts.rename / opts.delays 仅供测试注入真实行为，生产路径不传。
+ */
+const ATOMIC_TRANSIENT = new Set(["EPERM", "EACCES", "EBUSY"]);
+const ATOMIC_DELAYS = [50, 100, 200, 400, 600];
+/* Atomics.wait 要求一个 Int32Array 视图；建一次复用即可（全局一次，别每次调用重建）。 */
+const ATOMIC_SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+function sleepSyncMs(ms) { if (ms > 0) Atomics.wait(ATOMIC_SLEEP_BUF, 0, 0, ms); }
+
+function writeAtomic(file, data, opts) {
+  const rename = (opts && opts.rename) || renameSync;
+  const delays = (opts && opts.delays) || ATOMIC_DELAYS;
   const tmp = file + ".tmp";
-  writeFileSync(tmp, data);
-  renameSync(tmp, file);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      writeFileSync(tmp, data);
+      rename(tmp, file);
+      return;
+    } catch (e) {
+      if (!ATOMIC_TRANSIENT.has(e && e.code) || attempt >= delays.length) throw e;
+      sleepSyncMs(delays[attempt]);
+    }
+  }
 }
 
 // ---------- 备用自升级通道（v1.0.24）：完全不依赖 electron-updater ----------
@@ -1302,23 +1342,212 @@ async function wbEnsureToken(cfg, p) {
 // 公开接口，无需鉴权也不需要任何补丁——这点与 Qoder 正好相反（Qoder 的目录要靠 worker
 // 钩子导出明文）。但公开目录只给 id，没有价格/免费标记，可用性只能按实测结论标注。
 //
-// 实测（2026-10，用户 Free key）：84 个模型里 11 个标 -free，其中只有 space-bunny-free
-// 能外部调用；其余 -free 一律返回 FreeTierError「only be used from within OpenCode」——
-// 这是产品级封锁，没有服务端别名可绕，不像 Qoder 的 lite 恰好落在免费档上。
-// 付费模型则需 key 有余额（当前为 0，一律 402 Insufficient account funds）。
+// ⚠⚠ **这行白名单曾经是唯一依据，而它今天一条都不成立。**
+// 注释原本写着「实测（2026-10，用户 Free key）：只有 space-bunny-free 能从外部调用」。
+// 2026-10-12 用**同一把真 key** 复核（.research/reports/T5-probe-result.md）：
+// `space-bunny-free` 打 /zen/v1/messages 与 /zen/v1/chat/completions **都是 403
+// FreeTierError**，连付费模型都逐字相同。所以旧注释已经**作废**，它记录的是一次
+// 已经不再成立的观测——「实测过」不等于「现在还成立」，上游改一次就全废。
+//
+// **它现在的角色降级为「探测结果缺失时的占位」，不再当既成事实用**：
+// 真实判据是 `zenExternalOk(id, cfg)` —— 有探测结果就用探测结果，没有才回落到这里。
+// 换句话说，用户点一次「检测可用性」，这个常量就彻底让位给实测值。
 const ZEN_EXTERNAL_OK = new Set(["space-bunny-free"]);
-let zenCatCache = { at: 0, list: [] };
-async function zenReadCatalog() {
-  if (Date.now() - zenCatCache.at < 30 * 60 * 1000 && zenCatCache.list.length) return zenCatCache.list;
+
+/* ---------- Zen 档位判定（v1.0.74 · T4） ----------
+ * **判据只有 cfg.zen.upstream 的 URL**：出现 `/zen/go/` 即 Go 档，否则免费档。
+ * 不新增配置字段——config.defaults.json 的出厂值一个字节不动，用户在面板把上游地址
+ * 改成 https://opencode.ai/zen/go/v1 就是切档。
+ *
+ * 为什么必须集中成一处：目录端点、请求头、错误归因、面板徽标**四处**都要判档，
+ * 各写一遍正则早晚会漏一处。而漏在「目录」那一处后果最严重：
+ * Go 档会去拉免费档的清单（38 个 vs 83 个），把 9 个 Go 档根本没有的免费模型
+ * 摆进用户下拉框，点一个就报错。 */
+const ZEN_TIER_GO = "go";
+const ZEN_TIER_FREE = "free";
+function zenTierOf(upstream) {
+  return /\/zen\/go(?:\/|$)/i.test(String(upstream || "")) ? ZEN_TIER_GO : ZEN_TIER_FREE;
+}
+function zenTierZh(tier) { return tier === ZEN_TIER_GO ? "Go 档" : "免费档"; }
+/** 目录端点的**路径**（不是完整 URL——upstream 可以是用户自填的私有地址，
+ * 完整 URL 会被原样写进面板文案与日志；路径足够说明"拉的是哪一档的清单"）。
+ * 这里返回的是 upstream + /models 的**末尾片段**，且只用于人类可读的说明文字。 */
+function zenCatalogEndpointLabel(cfg) {
+  const base = String((cfg && cfg.zen && cfg.zen.upstream) || DEFAULTS.zen.upstream).replace(/\/+$/, "");
+  const m = base.match(/(\/zen\/(?:go\/)?v1)\/models$/);
+  return m ? m[1] + "/models" : "/models（自定义上游）";
+}
+
+/* Go 档的会话 id（实测：**缺这个头 → 400 MissingSessionID**；任意非空值都能通过，
+ * 短串 / UUID / 300 字符全试过）。官方要的是「stable session ID for each conversation」，
+ * 所以锚点取请求里**第一条 role==="user" 的消息内容**：同一会话的每一轮请求
+ * 带的都是那同一条首条 user 消息，id 因此在整段对话里恒定；不同会话自然不同。
+ * 哈希后取前 16 位 hex、加 "bai-" 前缀——不含任何可还原的原文。
+ *
+ * 探针与「没有 user 消息」的请求一律用**固定** id：每次探测都造一个新会话等于
+ * 凭空给上游灌会话记录，那正是官方点名监控滥用的东西。 */
+const ZEN_PROBE_SESSION = "bai-probe";
+function zenSessionId(j, isProbe) {
+  if (isProbe) return ZEN_PROBE_SESSION;
+  const msgs = Array.isArray(j && j.messages) ? j.messages : [];
+  const first = msgs.find((m) => m && m.role === "user");
+  const anchor = first == null ? "" : (typeof first.content === "string" ? first.content : JSON.stringify(first.content == null ? "" : first.content));
+  if (!anchor) return ZEN_PROBE_SESSION;
+  return "bai-" + createHash("sha256").update(anchor).digest("hex").slice(0, 16);
+}
+
+/* 「需订阅 Go」是**账号级、持续性**的：实测同一把 key 打 Go 档，回的是
+ * "An active OpenCode Go subscription is required to use Go models."——key 已被上游
+ * 正常解析（付费档才有的错误就是证据），缺的是订阅。所以它必须挂住给面板看，
+ * 而不是随着单次错误的提示条闪一下就没了：用户不该每次点发送才知道一次。 */
+const zenGoState = { required: false, at: null };
+function noteZenGoRequired(required) {
+  const want = !!required;
+  if (zenGoState.required === want) return;      // 只在状态翻转时记一次，避免刷日志
+  zenGoState.required = want;
+  zenGoState.at = want ? new Date().toISOString() : null;
+  if (want) log("OpenCode Zen：上游要求 Go 订阅，面板已标出「需订阅 Go」（订阅入口 https://opencode.ai/auth）");
+}
+/** 档位快照：/api/status 与 /api/models 共用同一份，面板两处显示的档位因此不会打架。 */
+function zenTierInfo(cfg) {
+  const id = zenTierOf((cfg && cfg.zen && cfg.zen.upstream) || DEFAULTS.zen.upstream);
+  const go = id === ZEN_TIER_GO;
+  const subRequired = go && zenGoState.required;
+  return {
+    id, label: zenTierZh(id),
+    subRequired, subAt: subRequired ? zenGoState.at : null,
+    // 面板把 hint 原样显示出来（含订阅链接与档位差异），渲染层因此不必认识任何渠道名。
+    hint: subRequired
+      ? "Go 档需要账号已订阅 OpenCode Go 才能用（上游原文 An active OpenCode Go subscription is required to use Go models.）。"
+        + "这不是 Key 配错、也不是模型不可用——Key 已被上游正常解析，缺的是订阅。"
+        + "订阅入口 https://opencode.ai/auth ，$10/月，其中 LongCat 2.5 Preview Free 与 Step 5 Preview Free 标 Unlimited。接通后此标记会自动撤掉。"
+      : go
+        ? "当前是 Go 档（上游含 /zen/go/）：这一档没有免费档那道 FreeTierError 围栏，"
+          + "但需要账号已订阅 OpenCode Go（$10/月，https://opencode.ai/auth）。两个免费模型标 Unlimited。"
+        : "当前是免费档（上游不含 /zen/go/）：官方把免费档限定在 OpenCode 客户端内使用，"
+          + "外部中转一律 FreeTierError。要用请把上游地址改成 https://opencode.ai/zen/go/v1 并订阅 Go。",
+  };
+}
+
+// 目录缓存**按 URL 分桶**：两档的目录是两回事（免费档 83 个 / Go 档 38 个），
+// 共用一个缓存槽会让用户切档后还看到上一档的清单 —— Go 档下那 9 个不存在的模型
+// 会被摆进下拉框，用户点一个就报错。
+const zenCatCache = new Map();   // url -> { at, list }
+async function zenReadCatalog(cfg) {
+  const S = sliceOf(cfg, "zen");
+  const url = S.upstream.replace(/\/+$/, "") + "/models";
+  const hit = zenCatCache.get(url);
+  if (hit && Date.now() - hit.at < 30 * 60 * 1000 && hit.list.length) return hit.list;
+  /* **带了 Key 就带 Key 抓**（实测：同一个 /zen/v1/models，不带 Key 返回 83 个模型、
+   * 带 Key 返回 43 个，且 43 是 83 的**严格子集**——差集全是 claude-* / gemini-* /
+   * deepseek-* 等付费模型）。不带头抓 = 把 40 个该账号根本调不通的模型摆到用户
+   * 下拉框里。没配 Key 才退回免鉴权抓（目录本来就公开，不会因此报错）。
+   * Key 只从 cfg.zen.apiKey 取，**绝不进日志 / 错误消息 / 任何落盘文件**——
+   * 这里既不 log 也不抛，抓不到一律静默返回过期缓存。 */
+  const headers = S.key ? { authorization: `Bearer ${S.key}` } : {};
   try {
-    const fr = await fetch("https://opencode.ai/zen/v1/models", { signal: AbortSignal.timeout(15000) });
+    const fr = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
     const jj = await fr.json();
     const list = (jj.data || []).map((m) => String(m.id || "").trim()).filter(Boolean);
-    if (list.length) zenCatCache = { at: Date.now(), list };
-    return zenCatCache.list;
+    if (list.length) zenCatCache.set(url, { at: Date.now(), list });
+    return list.length ? list : (hit ? hit.list : []);
   } catch {
-    return zenCatCache.list;
+    return hit ? hit.list : [];
   }
+}
+
+/* ---------- Zen 能力探测的 HTTP 适配 + 结论落读（v1.0.74 · T3+T6） ----------
+ *
+ * 判定/并发/落盘的**纯逻辑**在 zen-probe.mjs（那里没有一行网络代码，所以能被测试
+ * 直接求值）。这里只做两件事：①把它接到真的上游上；②把落盘结论喂给 /api/models。
+ */
+
+/** Zen 的请求头。**openaiExchange 与能力探针共用这一份**——
+ * 两处各写一遍的话，某天改了 UA 而漏改探针，探测结论就跟真实流量对不上了。
+ * 判据仍是「只在 Go 档加 x-opencode-session」，免费档一个字都不加（实测该头
+ * 对免费档的围栏毫无作用，加了只是凭空多一个可能被上游记账的会话标识）。 */
+function zenUpstreamHeaders(tok, base, j, isProbe) {
+  const h = {
+    "content-type": "application/json",
+    authorization: `Bearer ${tok}`,
+    "user-agent": `B.AI-Router/${APP_VERSION}`,
+  };
+  if (zenTierOf(base) === ZEN_TIER_GO) h["x-opencode-session"] = zenSessionId(j, isProbe);
+  return h;
+}
+
+/**
+ * 发一次探测请求。**`isProbe` 由调用方显式传入**，绝不从 `body.max_tokens` 反推——
+ * zen-probe.mjs 里 max_tokens 会为绕开上游下限从 8 抬到 16，一旦改成反推，
+ * 抬完的那一刻探测就静默变成了真实对话：短超时没了、重试没了，一次网络抖动
+ * 就会把一个好模型误判成「探不通」。
+ *
+ * 键**只**从内存里的 cfg 取，绝不进 URL、查询串、日志或任何落盘文件。
+ */
+async function zenProbeSend(cfg, body, { isProbe }) {
+  const z = (cfg && cfg.zen) || {};
+  const base = String(z.upstream || DEFAULTS.zen.upstream).replace(/\/+$/, "");
+  const url = base + "/chat/completions";
+  const headers = zenUpstreamHeaders(z.apiKey || "", base, body, isProbe === true);
+  const bodyStr = JSON.stringify(body);
+  const useProxy = z.useProxy === true;
+  const out = { status: 0, text: "", probe: isProbe === true };
+  try {
+    const r = useProxy
+      ? await fetch(url, { method: "POST", headers, body: bodyStr, signal: AbortSignal.timeout(ZEN_PROBE_TIMEOUT_MS) })
+      : await directHttp(url, { method: "POST", headers, body: bodyStr, timeoutMs: ZEN_PROBE_TIMEOUT_MS });
+    out.status = r.status;
+    out.text = await readAllBody(r).catch(() => "");
+  } catch (e) {
+    // 网络层失败也走归因：让「连不上上游」和「上游说调不通」在结果里分得开
+    out.status = 0;
+    out.text = String((e && e.message) || e).slice(0, 160);
+  }
+  return out;
+}
+
+/** 读落盘结论（没探过就是空，**不影响**任何东西）。 */
+function zenProbeSnapshot(cfg) {
+  const tier = zenTierInfo(cfg);
+  const upstream = String((cfg && cfg.zen && cfg.zen.upstream) || DEFAULTS.zen.upstream).replace(/\/+$/, "");
+  return zenProbeLoad(DATA_DIR, upstream, tier.id);
+}
+
+/**
+ * **模型能不能外部调用**的唯一判据（v1.0.74 起接管 ZEN_EXTERNAL_OK）：
+ *   有探测结果 → 用探测结果；没有 → 回落到那个常量（并如实标「未检测」）。
+ *
+ * 回落而不是直接判 false，是因为用户没点过「检测可用性」时全盘清空会让下拉框
+ * 变空、映射失去目标——那是把"没测过"当成"不能用"，和当初那个过期常量是同一种错误。
+ */
+function zenExternalOk(id, cfg) {
+  const snap = zenProbeSnapshot(cfg);
+  const rec = (snap.models || {})[id];
+  if (rec && typeof rec.ok === "boolean") {
+    return { external: rec.ok, probed: true, rec, snap };
+  }
+  if (rec) {
+    // ok === null：撞上内容性错误，纪律②要求**不改判定**——沿用原结论。
+    return { external: ZEN_EXTERNAL_OK.has(id), probed: false, unknown: true, rec, snap };
+  }
+  return { external: ZEN_EXTERNAL_OK.has(id), probed: false, rec: null, snap };
+}
+
+/** 面板直接显示的一组字段（文案全在服务端算，渲染层不认识任何渠道名）。 */
+function zenCapFields(cfg) {
+  const snap = zenProbeSnapshot(cfg);
+  const n = Object.keys(snap.models || {}).length;
+  return {
+    at: snap.at || null,
+    stale: snap.stale === true,
+    count: n,
+    /* 「上次检测时间」必须显示：结论会过期，用户有权知道手上这份是几小时前的。 */
+    atLabel: snap.at ? new Date(snap.at).toLocaleString("zh-CN", { hour12: false }) : null,
+    hint: snap.at
+      ? `上次检测：${new Date(snap.at).toLocaleString("zh-CN", { hour12: false })}（${n} 个免费模型）。`
+        + "结论会过期——上游随时可能改围栏或恢复额度，点「检测可用性」重跑一次即可。"
+      : "尚未检测：可用性目前按出厂白名单标注，那份白名单已在 2026-10-12 实测复核为不成立。点「检测可用性」用真实请求逐个探测。",
+  };
 }
 
 // ---------- WorkBuddy 模型目录（v1.0.65，契约 v18 里程碑 2/3）----------
@@ -2504,10 +2733,33 @@ function wbToOpenAI(j) {
 }
 
 // Anthropic 风格错误（Claude Code 按 type 分类重试/提示）
-// 这段桥被 wb / zen / qd 三个提供方共用（makeRelay 的 openai:true），前缀不能写死
-// WorkBuddy——否则 Zen/Qoder 的报错会顶着 "[WorkBuddy]" 出现在用户面前。
+// 这段桥被 **五个**提供方共用（makeRelay 的 openai:true —— 见 relaySpec 里的
+// wb / wbai / zen / qd / or，v1.0.73 的国际版补全把 3 个加到了 5 个），
+// 前缀不能写死 WorkBuddy——否则 Zen/Qoder 的报错会顶着 "[WorkBuddy]" 出现在用户面前。
 let wbErrPrefix = "WorkBuddy";
-function setErrProvider(name) { wbErrPrefix = name; }
+// 同一段桥里的 noteRelayError 也必须按**真实渠道**归因（面板每渠道只有一个槽位）。
+// 以前三处全写死 "wb"，其中 bail() 那处还是个三元的**两个分支都等于 "wb"** 的退化写法——
+// 意图是按渠道归因、从未填完。后果：Zen / Qoder / OpenRouter 的流式超时与断流
+// 在面板的归因里**完全看不见**，全被记到 WorkBuddy 名下。
+let wbErrChannel = "wb";
+function setErrProvider(name, channel) {
+  wbErrPrefix = name;
+  // 向后兼容：不传 channel 的调用（老调用点 / 未来新增的提供方）一律回 "wb"，
+  // 绝不让 undefined 流进 relayErrors 去造一个空白槽位。
+  wbErrChannel = typeof channel === "string" && channel ? channel : "wb";
+}
+// 读取侧再兜一层：万一有路径绕过 setErrProvider 直接写 wbErrChannel，
+// 也不会把 undefined 当成槽位名写进去（noteRelayError 会 fallback 到 bai，更糟）。
+function errChannel() { return wbErrChannel || "wb"; }
+// ⚠️ 残留并发风险（**本轮有意没动**，别当成已解决）：wbErrPrefix / wbErrChannel 都是
+// **模块级全局**，而三个中转端口的请求是并发的。仍可能串的正是下面三处读它们的行：
+//   · setErrProvider 调用点（openaiExchange / makeRelay / 影子 res 分支）设值
+//   · 首事件闸门超时    → noteRelayError(errChannel(), "timeout", …)
+//   · bail() 上游 SSE 报错 → noteRelayError(errChannel(), "upstream_sse_error", …)
+//   · 迭代器抛异常断流   → noteRelayError(errChannel(), "network", …)
+// 期间若另一个请求抢先 setErrProvider 了别的渠道，本请求的归因与前缀都会串过去。
+// 根治要把这份上下文挂到请求/连接上（makeRelay 的 req 或 wbPipe 的入参），
+// 属于另一次重构；本轮只把「写死的 wb」修成「真实渠道」，**没碰并发语义**。
 // 提供方 → 展示名（中转端口自己答错时用：全局 wbErrPrefix 是别的请求留下的，
 // 不重设会把 [Qoder] 的错误挂上 [WorkBuddy] 之类的前缀）
 const RELAY_LABELS = CHANNEL_LABELS;   // 与 PROVIDERS 同一张表，见文件头 CHANNELS 处
@@ -2565,7 +2817,7 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
   // 才知道是正常流还是伪装成 200 的错误，头也就还没发出去，仍可整段丢弃换渠道。
   const first = timeoutMs > 0 ? await withDeadline(lines.next(), timeoutMs) : await lines.next();
   if (first.timedOut) {
-    noteRelayError("wb", "timeout", `${wbErrPrefix} 上游 ${Math.round(timeoutMs / 1000)}s 内未发出首个响应块`);
+    noteRelayError(errChannel(), "timeout", `${wbErrPrefix} 上游 ${Math.round(timeoutMs / 1000)}s 内未发出首个响应块`);
     await dropBody(r);
     return wbAnthroError(res, 504, `${wbErrPrefix} 上游 ${Math.round(timeoutMs / 1000)} 秒内没有返回任何内容，已中断本次请求`);
   }
@@ -2603,7 +2855,7 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
   // （Qoder 后端全挂）能被故障转移兜住的关键。头一旦发出（流式已 message_start），
   // 就只剩把错误事件交给客户端这一条路（和之前一样）。
   const bail = (msg, kind, status) => {
-    noteRelayError(wbErrPrefix === "WorkBuddy" ? "wb" : "wb", "upstream_sse_error", msg.slice(0, 180));
+    noteRelayError(errChannel(), "upstream_sse_error", msg.slice(0, 180));
     if (!res.headersSent) {
       // 影子 res：只记状态码与正文，由 attemptWithFailover 决定转移还是落盘
       res.writeHead(status || 502, { "content-type": "application/json; charset=utf-8" });
@@ -2699,10 +2951,13 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
       if (ch.finish_reason) finish = ch.finish_reason;
     }
   } catch (e) {
-    // 上游流中断：把错误以 Anthropic error 事件/JSON 形式交还客户端
-    noteRelayError("wb", "network", `WorkBuddy 流中断: ${String(e && e.message || e).slice(0, 160)}`);
+    // 上游流中断：把错误以 Anthropic error 事件/JSON 形式交还客户端。
+    // 前缀用 wbErrPrefix（渠道展示名）而不是写死的 "WorkBuddy"——槽位归因修好之后，
+    // 这行是最后还会把 [WorkBuddy] 挂到 Zen/Qoder/OpenRouter 头上的地方。
+    const brk = String(e && e.message || e).slice(0, 200);
+    noteRelayError(errChannel(), "network", `${wbErrPrefix} 流中断: ${brk.slice(0, 160)}`);
     if (clientStream) {
-      emit("error", { type: "error", error: { type: "api_error", message: `[WorkBuddy] 上游流中断: ${String(e && e.message || e).slice(0, 200)}` } });
+      emit("error", { type: "error", error: { type: "api_error", message: `[${wbErrPrefix}] 上游流中断: ${brk}` } });
       try { res.end(); } catch { }
       return;
     }
@@ -3127,23 +3382,62 @@ async function fetchCatalogFor(p, cfg) {
   }
 
   if (p === "zen") {
-    // Zen 提供公开模型目录（无需鉴权），但只给 id、没有价格与免费标记。
-    // 全部列出来并按实测结论标注可用性——让用户看得见"上游有什么、为什么用不了"，
-    // 而不是下拉框里只有孤零零一个模型。不可用的**不进下拉**，免得选了必然报错。
-    const cat = await zenReadCatalog();
-    const all = cat.map((id) => ({
-      key: id, name: id, free: id.includes("free"), external: ZEN_EXTERNAL_OK.has(id),
-    }));
+    /* Zen 提供公开模型目录，但**端点跟着 upstream 走**（v1.0.74 T4）：
+     * 此前这里硬编码 https://opencode.ai/zen/v1/models，于是 Go 档会去拉免费档的
+     * 清单（38 个 vs 83 个），把 9 个 Go 档根本没有的免费模型摆进下拉框，
+     * 用户点一个就报错——这是 T4 里最容易漏、后果最严重的一处。
+     * 目录只给 id、没有价格与免费标记；可用性按实测结论标注，
+     * 让用户看得见"上游有什么、为什么用不了"，而不是下拉框里只有孤零零一个模型。
+     * 不可用的**不进下拉**，免得选了必然报错。 */
+    const cat = await zenReadCatalog(cfg);
+    const tier = zenTierInfo(cfg);
+    const cap = zenCapFields(cfg);
+    /* v1.0.74 T3/T6：`external` **改读探测结果**（zenExternalOk），不再是那个
+     * 已于 2026-10-12 被实测推翻的出厂常量。没探过的模型回落常量并如实标
+     * 「未检测」——把"没测过"当成"不能用"和当初那个过期常量是同一种错误。 */
+    const all = cat.map((id) => {
+      const v = zenExternalOk(id, cfg);
+      const rec = v.rec || null;
+      return {
+        key: id, name: id, free: id.includes("free"),
+        external: v.external,
+        probed: v.probed,
+        capLabel: rec ? zenCapLabel(rec) : (v.external ? "可用 · 未检测" : "未检测"),
+        capHint: rec ? zenCapHint(rec) : (v.probed === false && !v.unknown
+          ? "尚未检测：这份清单来自出厂白名单，而该白名单已在 2026-10-12 实测复核为不成立。点「检测可用性」用真实请求逐个探测。"
+          : ""),
+      };
+    });
     const freeN = all.filter((m) => m.free).length;
     const okN = all.filter((m) => m.external).length;
+    const probedN = all.filter((m) => m.probed).length;
+    const toolN = all.filter((m) => m.capLabel === "可用 · 支持工具").length;
     return {
       ok: true, count: all.length,
+      tier: tier.id, tierLabel: tier.label, tierHint: tier.hint,
+      goSubRequired: tier.subRequired,
+      /* 能力检测（v1.0.74）：面板据此显示「上次检测时间」与逐模型标记。
+       * capAtLabel 是服务端算好的文案，渲染层不必也不该自己拼。 */
+      capAt: cap.at, capAtLabel: cap.atLabel, capHint: cap.hint, capStale: cap.stale,
+      capProbed: probedN, capTools: toolN,
       models: all.filter((m) => m.external).map((m) => m.key),
       all, freeCount: freeN,
-      note: cat.length
-        ? `Zen 公开目录共 ${all.length} 个模型，其中 ${freeN} 个标 free；实测只有 ${okN} 个能从中转调用。`
-          + `其余 -free 会被服务端拒为 FreeTierError（"can only be used from within OpenCode"，产品级限制，非本机可绕），付费模型则需 API Key 有余额。`
-        : "未读到 Zen 公开目录（网络或上游暂时不可达），当前显示内置列表",
+      note: (cat.length
+        ? `${tier.label}目录（${zenCatalogEndpointLabel(cfg)}）共 ${all.length} 个模型，其中 ${freeN} 个标 free；`
+          + (tier.subRequired
+            ? "⚠ 上游已明确回「需要 Go 订阅」——这一档现在一个模型都调不通，请先到 https://opencode.ai/auth 订阅。"
+            : cap.at
+              /* 有实测就只讲实测，不再复述那句已经过期的「其余 -free 会被 FreeTierError 拒」——
+               * 那句话现在既无出处也无日期，正是它当初让白名单活到了今天。 */
+              ? `实测 ${probedN} 个免费模型：${toolN} 个支持工具调用；${cap.atLabel} 检出，可能已过期，点「检测可用性」可重跑。`
+              : `出厂白名单标注 ${okN} 个可外部调用，但该白名单已于 2026-10-12 实测复核为不成立——点「检测可用性」用真实请求逐个探测。`)
+          + "付费模型不在检测范围内（探了要花钱），需 API Key 有余额。"
+        /* 目录没拉到时**照样要说订阅**：这一条与目录读没读到无关，
+         * 而它恰恰是最要紧的一句——只报「没读到目录」会把用户引去查网络。 */
+        : `未读到 Zen ${tier.label}目录（网络或上游暂时不可达），当前显示内置列表`
+          + (tier.subRequired
+            ? "；⚠ 但上游已明确回「需要 Go 订阅」——请先到 https://opencode.ai/auth 订阅，这一档现在一个模型都调不通。"
+            : "")),
     };
   }
 
@@ -3265,7 +3559,7 @@ const isWk = (p) => p === "wb" || p === "wbai";
 const wkZh = (p) => (p === "wbai" ? "WorkBuddy AI" : "WorkBuddy");
 async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : p === "or" ? "OpenRouter" : wkZh(p);
-  setErrProvider(NAME);
+  setErrProvider(NAME, p);   // 渠道 key 一起传下去：wbPipe 里的 noteRelayError 要按真实渠道归因
   let token;
   if (p === "zen") {
     token = (cfg.zen && cfg.zen.apiKey) || "";
@@ -3295,11 +3589,10 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   const url = isWk(p) ? base + "/v2/chat/completions" : base + "/chat/completions";
   const mkHeaders = (tok) => {
     if (p === "zen") {
-      return {
-        "content-type": "application/json",
-        authorization: `Bearer ${tok}`,
-        "user-agent": `B.AI-Router/${APP_VERSION}`,
-      };
+      /* Zen 的请求头与能力探针共用 zenUpstreamHeaders 一份（v1.0.74）。
+       * 该头只在 Go 档加 x-opencode-session；免费档一个字都不加——实测该头对免费档的
+       * 围栏毫无作用，加了只是凭空多一个可能被上游记账的会话标识。 */
+      return zenUpstreamHeaders(tok, base, j, isProbe === true);
     }
     if (p === "or") {
       // OpenRouter：标准 Bearer + SSE。HTTP-Referer/X-Title 只是统计用，可省。
@@ -3353,9 +3646,11 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     return h;
   };
   let bodyStr = JSON.stringify(ob);   // OpenRouter 轮换会改写 model，故为 let
+  /* 探测档的 10 秒短超时来自 zen-probe.mjs 的 ZEN_PROBE_TIMEOUT_MS —— 能力探测与
+     真实对话共用同一个常量，否则「探针用的是哪档超时」就只剩口头约定。 */
   const doCall = (tok) => useProxy
-    ? fetch(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, signal: AbortSignal.timeout(isProbe ? 10000 : 30000) })
-    : directHttp(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, timeoutMs: isProbe ? 10000 : 30000 });
+    ? fetch(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, signal: AbortSignal.timeout(isProbe ? ZEN_PROBE_TIMEOUT_MS : 30000) })
+    : directHttp(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, timeoutMs: isProbe ? ZEN_PROBE_TIMEOUT_MS : 30000 });
 
   let r;
   // 声明必须在 try 之外：下面 try/catch 之后（r.status !== 200 分支）还要用它们，
@@ -3511,9 +3806,39 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     // 归因：Zen 的几种典型拒绝各有明确含义，直接翻译成人话，别让用户对着裸错误码猜。
     let why = "";
     if (p === "zen") {
-      // v1.0.58-T0：500 拆出**独立分支**（原先 500 和 429 挤在同一个外层 if，
-      // 上游自己 500 会落到 429 的「限流、等 30 秒」文案上，误导用户白等）。
-      if (r.status === 500) {
+      /* —— Go 档专属分支：**只看文案、不看状态码** ——
+       *
+       * 为什么不能沿用下面那套 `r.status === N && /.../.test(txt)`：
+       * Go 档两个端点的错误形状实测不同，而**形状决定了我们能不能稳定拿到文案**：
+       *   /zen/go/v1/chat/completions → {"error":{...}}          ← **没有顶层 type 包裹**
+       *   /zen/go/v1/messages         → {"type":"error","error":{...}} ← Anthropic 形状
+       * 且同一条拒绝在两个端点上的 HTTP 状态码并不一致（实测「需要订阅」在
+       * /messages 上是 403，在 /chat/completions 上未实测）。所以这里只认文案。
+       *
+       * 「需订阅 Go」另外要落到 zenGoState 上：它是账号级的持续状态，
+       * 面板要能常驻显示「需订阅 Go」，而不是等用户每次点发送才知道一次。 */
+      const isGo = zenTierOf(base) === ZEN_TIER_GO;
+      if (/An active OpenCode Go subscription is required/i.test(txt)) {
+        why = " —— 当前是 Go 档，需要账号已订阅 OpenCode Go 才能用（上游原文 An active OpenCode Go subscription is required to use Go models.）。"
+          + "这不是 API Key 配错、也不是模型不可用——Key 已被上游正常解析，缺的是订阅本身。"
+          + "订阅入口 https://opencode.ai/auth ，$10/月，其中 LongCat 2.5 Preview Free 与 Step 5 Preview Free 标 Unlimited。";
+        noteRelayError(p, "go_subscription_required", `${NAME} Go 档需要订阅（面板已标出「需订阅 Go」）`);
+        noteZenGoRequired(true);
+      } else if (/MissingSessionID/i.test(txt)) {
+        // 内部 bug 的自证信号：我们明明在 Go 档加了 x-opencode-session 仍被拒。
+        why = " —— 上游要求 x-opencode-session 请求头（MissingSessionID）而本次请求没带上。"
+          + "这是本机的缺陷（Go 档应当自动注入该头），请把这次现象报给开发者；"
+          + "临时可切回免费档上游，但免费档对外部中转是封死的，实际并不能用。";
+        noteRelayError(p, "go_missing_session", `${NAME} Go 档缺少 x-opencode-session（本机缺陷）`);
+      } else if (/Model is unavailable/i.test(txt)) {
+        // 文案要分清两层：免费档是「没对免费档开放」，Go 档是「不在这一档的清单里」。
+        why = isGo
+          ? " —— 该模型不在当前档位的清单里：Go 档与免费档是两套独立的模型目录"
+            + "（免费档 83 个 / Go 档 38 个，互不通用）。请点「刷新模型列表」按当前上游重新拉取目录，"
+            + "或在上游地址里切到你真正想用的那一档。"
+          : " —— 该模型后端当前不可用（Zen 侧临时下线或未对免费档开放）。";
+        noteRelayError(p, "upstream_400", `${NAME} ${isGo ? "模型不在 Go 档清单里" : "模型不可用"}`);
+      } else if (r.status === 500) {
         why = " —— OpenCode Zen 上游自身故障（HTTP 500，典型响应体 internal server error）：不是你的配置问题，也不是限流，等 30 秒再试通常没有用。故障转移会自动改走其他渠道；持续出现时稍后再试或查看 Zen 服务状态。";
         noteRelayError(p, "upstream_500", `${NAME} 上游自身故障（HTTP 500 internal server error）`);
         // 冷却策略：500 是上游**瞬时**故障，走 attemptWithFailover 默认的 90 秒短冷却、
@@ -3535,14 +3860,16 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
           noteRelayError(p, "rate_limit", `${NAME} 触发上游限流`);
         }
       } else if (r.status === 403 && /FreeTierError|only be used from within/i.test(txt)) {
-        why = " —— 这是 Zen 的免费档，官方限定只能在 OpenCode 客户端内用（服务端返回 FreeTierError），外部无法调用。换 space-bunny-free，或用付费额度。";
+        /* 免费档围栏。实测（v1.0.74 复核）连 space-bunny-free 也是同一个 403，
+         * 且**带不带 Key、带真 Key 还是垃圾 Key 都逐字相同**——它是产品级封锁，
+         * 换模型绕不过去。所以文案不能再劝「换 space-bunny-free」（实测无效）。 */
+        why = " —— 这是 Zen 的免费档，官方限定只能在 OpenCode 客户端内使用（服务端返回 FreeTierError），"
+          + "外部中转一律被拒，且**换模型无效**（实测 space-bunny-free 与付费模型返回逐字相同的 403）。"
+          + "要用这一渠道，请把上游地址改成 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，https://opencode.ai/auth）。";
         noteRelayError(p, "upstream_403", `${NAME} 免费档限客户端内使用`);
       } else if (r.status === 402 || /insufficient account funds/i.test(txt)) {
-        why = " —— API Key 余额为 0，付费模型需要先充值；免费档里只有 space-bunny-free 能外部调用。";
+        why = " —— API Key 余额为 0，付费模型需要先充值；Go 档的付费额度同样走这把 Key 的余额。";
         noteRelayError(p, "upstream_402", `${NAME} 余额不足`);
-      } else if (r.status === 400 && /Model is unavailable/i.test(txt)) {
-        why = " —— 该模型后端当前不可用（Zen 侧临时下线或未对免费档开放）。";
-        noteRelayError(p, "upstream_400", `${NAME} 模型不可用`);
       } else if (r.status === 403 && /Model access is disabled/i.test(txt)) {
         why = " —— 该模型未对你的 Key 开放。";
         noteRelayError(p, "upstream_403", `${NAME} 模型未授权`);
@@ -3587,6 +3914,9 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
     }
     return wbAnthroError(res, r.status, String(msg).slice(0, 300) + why);
   }
+  // 走到这里就是 200 了：上游接受了请求。Go 档一旦真的通了，之前记下的
+  // 「需订阅 Go」就该撤掉——否则用户订完订阅，面板上那个红字永远不消失。
+  if (p === "zen") noteZenGoRequired(false);
   const ct = r.headers.get("content-type") || "";
   if (!ct.includes("text/event-stream")) {
     const txt = await readAllBody(r).catch(() => "");
@@ -3597,7 +3927,7 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   // 但必须有上限——否则「上游连上了却一直不吐字」会永远挂着，转移也等不到。
   await wbPipe(r, res, {
     model: j.model, clientStream: j.stream === true, inputJson: j,
-    timeoutMs: Math.max(60000, (isProbe ? 10000 : 30000) * 3),
+    timeoutMs: Math.max(60000, (isProbe ? ZEN_PROBE_TIMEOUT_MS : 30000) * 3),
   }); // Anthropic 默认非流式
 }
 
@@ -3759,7 +4089,7 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
       if (opts.openai) {
         // 端点匹配用：容忍结尾多余的 "/"（路径归一化只影响识别，判 404 的文案仍用原样 urlPath）
         const epPath = urlPath.length > 1 ? urlPath.replace(/\/+$/, "") : urlPath;
-        setErrProvider(relayLabel(p));
+        setErrProvider(relayLabel(p), p);
         // —— 桌面版探测端点 ①：token 计数。本机按字符数估算应答，绝不为此调用上游 ——
         if (epPath === "/v1/messages/count_tokens") {
           if (req.method !== "POST") {
@@ -3855,7 +4185,7 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
         const headers = {};
         for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
         // isProbe 由入口算好后传入（同时决定中转观察与超时档位），这里不再重算
-        const headerTimeoutMs = isProbe ? 10000 : 30000;
+        const headerTimeoutMs = isProbe ? ZEN_PROBE_TIMEOUT_MS : 30000;
         // WorkBuddy（fo.opts.openai）：上游只讲 OpenAI 且仅流式——独立协议桥处理，
         // 请求（Anthropic→OpenAI）与响应（OpenAI SSE→Anthropic SSE）都在桥内翻译。
         if (fo.opts.openai) {
@@ -3869,7 +4199,7 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
             const why = !len ? "请求体为空"
               : !ctv.toLowerCase().includes("json") ? "Content-Type 不是 JSON"
               : "body 不是合法 JSON";
-            setErrProvider(relayLabel(fo.provider));
+            setErrProvider(relayLabel(fo.provider), fo.provider);
             return wbAnthroError(res, 400, `请求体无法解析为 Anthropic messages JSON：${why}｜Content-Type=${ctv}｜长度=${len} 字节｜前 80 字节=${raw}`);
           }
           try {
@@ -4569,6 +4899,12 @@ async function statusPayload() {
   // OpenRouter 的额度真相（/auth/key）：面板轮询走 60 秒缓存，不打上游
   const orQuota = orQuotaSnapshot(cfg);
   const orKeysNow = orKeys(cfg);
+  // Zen 档位快照（v1.0.74 T4）：一次算出，下面的 zen 块与面板两处显示共用同一份，
+  // 免得「状态带说 Go 档、目录出处说免费档」这种自相矛盾。
+  const zenTierNow = zenTierInfo(cfg);
+  // Zen 能力探测快照（v1.0.74）：同一个函数供 /api/status 与 /api/models 共用，
+  // 面板两处显示的「上次检测时间」因此不会打架。
+  const zenCapNow = zenCapFields(cfg);
   return {
     now: new Date().toISOString(),
     /* 自报身份：版本 + 实际跑的是哪个文件。
@@ -4612,7 +4948,24 @@ async function statusPayload() {
     // B.AI 灯/接线沿用旧字段名，SenseNova 灯挂 sn 下，WorkBuddy 灯挂 wb 下
     relay: bai.relay, relayLast: bai.relayLast, upstream: bai.upstream, recent: bai.recent,
     sn: { relay: sn.relay, relayLast: sn.relayLast, upstream: sn.upstream, recent: sn.recent, useProxy: cfg.sn?.useProxy === true },
-    zen: { relay: zen.relay, relayLast: zen.relayLast, upstream: zen.upstream, recent: zen.recent, useProxy: cfg.zen?.useProxy === true, keyConfigured: !!cfg.zen?.apiKey },
+    zen: {
+      relay: zen.relay, relayLast: zen.relayLast, upstream: zen.upstream, recent: zen.recent,
+      useProxy: cfg.zen?.useProxy === true, keyConfigured: !!cfg.zen?.apiKey,
+      // 档位（v1.0.74 T4）：面板必须显著显示当前在哪一档——两档可用性完全不同。
+      // id/label/hint 由服务端一处算出（zenTierInfo），面板只负责显示，
+      // 不在渲染层复制判定逻辑（C11：渲染层不许认识渠道名）。
+      tier: zenTierNow.id,
+      tierLabel: zenTierNow.label,
+      tierHint: zenTierNow.hint,
+      goSubRequired: zenTierNow.subRequired,
+      // 能力探测快照（v1.0.74 T3/T6）：面板要显示「上次检测时间」，
+      // 否则用户无从判断手上那份「可用 · 支持工具」是刚才测的还是三天前的。
+      capAt: zenCapNow.at,
+      capAtLabel: zenCapNow.atLabel,
+      capHint: zenCapNow.hint,
+      capStale: zenCapNow.stale,
+      capCount: zenCapNow.count,
+    },
     qd: {
       relay: qd.relay, relayLast: qd.relayLast, upstream: qd.upstream, recent: qd.recent,
       useProxy: cfg.qd?.useProxy === true,
@@ -4857,6 +5210,39 @@ const panel = http.createServer(async (req, res) => {
         if (!e || !e.httpStatus) throw e;
         return json(res, e.httpStatus, { error: String((e && e.message) || e).slice(0, 200) });
       }
+    }
+
+    /* POST /api/models/probe-zen —— 逐模型能力探测（v1.0.74 · T3+T6）
+     *
+     * **只在用户点「检测可用性」时被调用**：本文件没有任何定时器、setInterval 或后台
+     * 调度会打这个端点。理由是配额：每轮探测对每个免费模型发 1~2 个真实请求，
+     * 后台跑一次没人看见却照扣额度，比不跑更糟。
+     *
+     * 配额纪律都写死在 zen-probe.mjs 里并被测试锁死：只探 id 含 `-free` 的模型
+     * （付费模型一次请求都不发）、并发上限 2、单探针 10 秒、会话 id 固定 bai-probe。
+     */
+    if (req.method === "POST" && u.pathname === "/api/models/probe-zen") {
+      const cfg = loadCfg();
+      if (!((cfg.zen || {}).apiKey)) return json(res, 400, { error: "尚未填写 OpenCode Zen API Key——没有 Key 探测只会一律拿到 401，白白打上游" });
+      // 目录按当前 upstream 走（两档是两套清单，混了会探到这一档根本没有的模型）
+      const cat = await zenReadCatalog(cfg);
+      const tier = zenTierInfo(cfg);
+      const upstream = String((cfg.zen.upstream || DEFAULTS.zen.upstream)).replace(/\/+$/, "");
+      const send = (body, opts) => zenProbeSend(cfg, body, opts);
+      const out = await zenRunCapabilityProbe({
+        catalog: cat, upstream, tier: tier.id, dataDir: DATA_DIR,
+        send, imageSend: send,
+      });
+      // 结果本身不含任何凭据：只有模型 id、判定、计数与上游错误文案。
+      log(`OpenCode Zen：能力探测完成，实测 ${out.probed} 个免费模型（并发峰值 ${out.peakConcurrency}），跳过付费模型 ${out.skippedPaid.length} 个`);
+      const okN = Object.values(out.models || {}).filter((r) => r.ok === true).length;
+      const toolsN = Object.values(out.models || {}).filter((r) => r.tools === "yes").length;
+      return json(res, 200, {
+        ...out, tier: tier.id, tierLabel: tier.label,
+        atLabel: new Date(out.at).toLocaleString("zh-CN", { hour12: false }),
+        summary: `探测了 ${out.probed} 个免费模型：${okN} 个探得通，其中 ${toolsN} 个支持工具调用。`
+          + `付费模型 ${out.skippedPaid.length} 个按纪律未探（探了要花钱）。并发峰值 ${out.peakConcurrency}。`,
+      });
     }
 
     // v1.0.60：六家提供方的顺序（扫描与批量写入都按这个顺序走，面板展示顺序一致）
@@ -5248,7 +5634,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
       if (P === "sn") warns.push("SenseNova 有 TPM/RPM 限流，探测到 429 属正常，稍候即恢复；图像模型不参与对话路由");
       if (P === "wb") warns.push("WorkBuddy 国内版：0 积分模型由 WorkBuddy 客户端账号提供；令牌过期会自动用刷新令牌续期，无需重新接线。国际版请到「WorkBuddy AI」格单独接线");
       if (P === "wbai") warns.push("WorkBuddy AI 国际版：需要国际版客户端的令牌（与国内版不通用）；模型目录与倍率来自上游 /v3/config，未取到时用出厂兜底清单");
-      if (P === "zen") warns.push("OpenCode Zen 的免费额度多数限客户端内使用，实测仅 space-bunny-free 可外部调用；购买 Go 订阅后可解锁 Go 通道的 30 个模型");
+      if (P === "zen") warns.push("OpenCode Zen 分两档且可用性完全不同：免费档被官方封死在 OpenCode 客户端内（外部中转一律 403，换模型无效）；Go 档（上游含 /zen/go/）能用，但要账号已订阅 OpenCode Go（$10/月，https://opencode.ai/auth）。改档位请改上游地址，然后点「刷新模型列表」换成该档自己的目录");
       if (P === "qd") warns.push("Qoder 走账号的 Free 套餐额度；令牌每次 Qoder 启动会轮换，中转会自动跟随——但 Qoder 客户端必须保持运行，否则中转读不到令牌");
       if (P === "or") warns.push("OpenRouter 免费区：免费模型 50 次/天/把 key，用尽自动换模型、再换 key（最多 3 把）；重置时间看 X-RateLimit-Reset，面板显示倒计时与剩余次数");
       log(`一键切到 ${name}: cli=${doCli} desktop=${doDesk}`);

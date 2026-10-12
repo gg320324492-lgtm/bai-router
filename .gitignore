@@ -1,3 +1,7 @@
+# 临时研究区：克隆的第三方项目源码 + agent 产出的报告。
+# 只是我读代码的地方，绝不进仓库（别 git add -A 把它带进去）。
+.research/
+
 node_modules/
 dist/
 cert/

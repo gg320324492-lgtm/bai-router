@@ -196,6 +196,9 @@
           <button class="btn sm" id="btnSave" type="button">保存映射</button>
           <button class="btn sm ghost" id="btnTest" type="button">测试连通</button>
           <button class="btn sm ghost" id="btnModels" type="button" title="从上游 /v1/models 拉取当前真实模型目录，更新下拉框">刷新模型列表</button>
+          <!-- 能力探测（v1.0.74 T3+T6）：默认隐藏，只有清单里声明了 capabilityProbe
+               的渠道才显示（providers.js 是渠道数据的单一事实源，渲染层不认识渠道名）。 -->
+          <button class="btn sm ghost" id="btnProbe" type="button" title="对免费模型逐个发一次真实请求，实测「能不能调通 / 支不支持工具 / 收不收图片」。只探免费模型、并发 2、每个 10 秒；付费模型一次都不探。">检测可用性</button>
           <button class="btn sm ghost" id="btnResetModels" type="button" title="恢复为发布机默认的模型清单">恢复默认模型</button>
           <label class="checks"><input type="checkbox" id="ckAllTiers">测全部四档</label>
           <span class="spacer"></span>

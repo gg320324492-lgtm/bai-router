@@ -187,6 +187,17 @@ window.BAI_PROVIDERS = {
     name: "OpenCode Zen",
     tagline: "免费模型 · 接入需自备 Key",
     badge: { text: "免费 · 海外", kind: "intl" },
+    /* 档位徽章（v1.0.74 T4）：Zen 有免费档与 Go 档两套完全不同的可用性——
+     * 免费档被官方封死在客户端内（403 FreeTierError），Go 档能用但要 $10/月订阅。
+     * 判据是上游地址里有没有 /zen/go/，**不新增配置字段**：用户直接在设置里改上游即可。
+     * 这里只声明"这一格要显示档位"，档位本身由服务端 /api/status 的 zen.tier* 给出——
+     * 渲染层因此不需要认识任何渠道名（C11）。 */
+    tierBadge: true,
+    /* 能力探测按钮（v1.0.74 T3+T6）：这一家是唯一有「逐模型能力探测」的渠道——
+     * 目录只给 id，可用性只能靠真实请求测出来（出厂白名单已于 2026-10-12 实测复核
+     * 为不成立）。这里只声明"要画这个按钮"，端点、判定与文案全在服务端，
+     * 渲染层因此不需要认识任何渠道名（C11）。 */
+    capabilityProbe: true,
     chainable: true,
     credential: {
       kind: "apiKey",
@@ -196,7 +207,11 @@ window.BAI_PROVIDERS = {
 
     models: ["space-bunny-free"],
     brands: { deepseek: "DeepSeek", hy: "Hy", glm: "GLM", kimi: "Kimi", qwen: "Qwen" },
-    /* 免费档里唯一能外部调用的就是 space-bunny-free，所以四档全部指向它。 */
+    /* 出厂四档仍指向 space-bunny-free：它是**默认档位（免费档）**里唯一的免费模型，
+     * 换掉就得写死一个付费模型，而付费模型按设计一律不进探测、也不该被默认选中。
+     * ⚠️ 但「免费档里它能外部调用」这句话已于 2026-10-12 用真 key 实测推翻
+     * （403 FreeTierError，围栏在鉴权之后、推理之前拦）。所以它出厂时是**未检测**
+     * 状态，不是「已知可用」——点一次「检测可用性」才会拿到真实结论。 */
     defaultModels: ["space-bunny-free"],
     mappingDefaults: {
       "claude-fable-5": "Space-Bunny-Free",
@@ -205,8 +220,18 @@ window.BAI_PROVIDERS = {
       "claude-haiku-4-5": "Space-Bunny-Free",
     },
 
-    conclusion: "填了 oc_sk_ 密钥就算就绪；免费档只有一个模型，四档全部指向它，接通即代表四档都可用。",
-    remedy: "先在上游控制台生成 API Key 再保存。额度用尽会返回 429，由故障转移自动换渠道。",
+    /* 出厂映射仍指向免费档的 space-bunny-free：那是**默认档位**下唯一曾被实测标注可用的。
+     * 切到 Go 档（改上游地址）后请点「刷新模型列表」，下拉会换成 Go 档自己的目录
+     * —— 两档的清单互不通用（免费档 83 个 / Go 档 38 个）。
+     * 更好的做法是点「检测可用性」：它按真实请求逐个探测，并逐模型标出
+     * 「可用 · 支持工具」/「可用 · 仅对话」/「探不通」。 */
+    conclusion: "两档的可用性完全不同，看矩阵卡上的档位徽章："
+      + "「免费档」被官方封死在 OpenCode 客户端内（外部中转一律 403 FreeTierError，换模型无效）；"
+      + "「Go 档」能用，但要账号已订阅 OpenCode Go（$10/月）。判据只有上游地址里有没有 /zen/go/，不新增配置项。",
+    remedy: "要先在上游控制台生成 oc_ 开头的 API Key 再保存。要真正调通，把设置里的上游地址改成 "
+      + "https://opencode.ai/zen/go/v1 并到 https://opencode.ai/auth 订阅 Go，然后点「刷新模型列表」换成 Go 档目录。"
+      + "目录里的可用性标着「未检测」就点「检测可用性」——出厂白名单已于 2026-10-12 实测复核为不成立，"
+      + "只有真实请求说了算。检测只跑免费模型、并发 2、每个 10 秒，付费模型一次都不探（探了要花钱）。",
 
     settingsLabels: { relayPort: "OpenCode Zen 中转端口" },
   },

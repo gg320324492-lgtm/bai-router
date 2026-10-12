@@ -371,6 +371,19 @@ body.no-frame .winCtrls { display: none; }
 .cname .cpath { font-family: var(--mono); font-size: 10.5px; color: var(--dim); font-weight: 400; margin-left: 6px; }
 .ctag { font-size: 11.5px; color: var(--dim); padding: 0 14px 8px; line-height: 1.5; }
 
+/* 档位徽章（v1.0.74 T4）。两档可用性完全不同（免费档被封死在客户端内 /
+   Go 档需订阅），所以它必须**显眼**：实心边框 + 语义色，不是行内小字。 */
+.ctier { padding: 0 14px 2px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ctier:empty { display: none; }
+.ctier .tb {
+  font-size: 10.5px; font-weight: 650; letter-spacing: .2px;
+  padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor;
+}
+.ctier .tb.ok { color: var(--ok); }
+.ctier .tb.warn { color: var(--warn); }
+.ctier .tb.err { color: var(--err); background: var(--err-soft); }
+.ctier .tb-note { font-size: 10.5px; }
+
 .cmap { padding: 7px 14px 0; border-top: 1px dashed var(--line); display: flex; flex-direction: column; }
 .mrow { display: flex; align-items: center; gap: 9px; font-size: 11.5px; padding: 1.5px 0; }
 .mrow .t { color: var(--dim); width: 46px; flex: none; font-size: 10.5px; letter-spacing: .2px; font-style: normal; }

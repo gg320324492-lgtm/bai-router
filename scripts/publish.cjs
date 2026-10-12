@@ -172,7 +172,7 @@ run("npx electron-builder --win nsis");
   const foOk = fs.existsSync(path.join(ROOT, "dist", "win-unpacked", "resources", "server", "failover.mjs"));
   // v1.0.46 五页收敛成一份模板：模板/清单/CSS 任缺其一，五个页面全白屏
   const srv = path.join(ROOT, "dist", "win-unpacked", "resources", "server");
-  const need2 = ["provider.html", "providers.js", "panel-common.css", "failover.mjs"];
+  const need2 = ["provider.html", "providers.js", "panel-common.css", "failover.mjs", "zen-probe.mjs"];
   const miss2 = need2.filter((x) => !fs.existsSync(path.join(srv, x)));
   const cardsDir = path.join(srv, "cards");
   const cardOk = ["failover.js", "model-catalog.js", "token-capture.js"]
