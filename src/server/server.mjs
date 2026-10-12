@@ -27,6 +27,9 @@ import {
  * 一个真 `opencode serve`。默认 `direct` —— 直连路径一行都不变。翻译与进程管理分别在
  * oc-bridge.mjs / oc-runtime.mjs，接线本身在 oc-wiring.mjs。 */
 import { createOcGateway, zenTransportOf, ZEN_TRANSPORT_OPENCODE, ZEN_TRANSPORTS } from "./oc-wiring.mjs";
+/* 传输开关给面板的只读事实（v1.0.75）：当前是哪一档 + 打开它需要的那件前置条件
+ * 在本机满足没有。探测本身（TTL 缓存 / 三态判据）在那个文件里。 */
+import { ocTransportFields } from "./oc-transport-info.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -5168,6 +5171,8 @@ async function statusPayload() {
   // Zen 能力探测快照（v1.0.74）：同一个函数供 /api/status 与 /api/models 共用，
   // 面板两处显示的「上次检测时间」因此不会打架。
   const zenCapNow = zenCapFields(cfg);
+  // 传输开关的只读事实（v1.0.75）：当前档位 + 前置条件在本机满足没有（三态分清）。
+  const zenTransportNow = ocTransportFields(cfg);
   return {
     now: new Date().toISOString(),
     /* 自报身份：版本 + 实际跑的是哪个文件。
@@ -5228,6 +5233,14 @@ async function statusPayload() {
       capHint: zenCapNow.hint,
       capStale: zenCapNow.stale,
       capCount: zenCapNow.count,
+      // 传输方式（v1.0.75）：面板上那个开关的全部事实都在这里。
+      // transport 是中转**真正会走**的那一档（认不出来的值报 direct），
+      // transportProbe.state ∈ found / missing / error ——「检测失败」与「没装」
+      // 必须分开，面板据此给两种处置完全不同的提示。
+      transport: zenTransportNow.transport,
+      transportHint: zenTransportNow.transportHint,
+      transportValues: zenTransportNow.transportValues,
+      transportProbe: zenTransportNow.transportProbe,
     },
     qd: {
       relay: qd.relay, relayLast: qd.relayLast, upstream: qd.upstream, recent: qd.recent,

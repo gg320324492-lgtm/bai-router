@@ -459,6 +459,27 @@ body.no-frame .winCtrls { display: none; }
 .fpline .k { color: var(--dim); flex: none; font-size: 10.5px; }
 .fpline .v { font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 .fpline .v.zh { font-family: inherit; font-size: 11.5px; }
+/* 状态词（已安装 / 未安装 / 检测失败）：不是路径，所以不吃 .v 的等宽与截断。 */
+.fpline .v.ok { font-family: inherit; font-size: 11.5px; color: var(--ok); }
+.fpline .v.err { font-family: inherit; font-size: 11.5px; color: var(--err); }
+.fpline .v.warn { font-family: inherit; font-size: 11.5px; color: var(--warn); }
+
+/* 传输方式开关（v1.0.75 · cards/oc-transport.js）：两个可选项各一行，
+   前置条件逐条写死——「能不能打开」和「打开要什么」必须摆在同一个视野里，
+   否则用户只能等 403 才知道自己缺了条件。 */
+.ocopts { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 10px; }
+.ocopt {
+  display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
+  padding: 9px 11px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel2);
+}
+.ocopt:hover { border-color: var(--brand-line); }
+.ocopt.on { border-color: var(--brand); background: var(--brand-soft); }
+.ocopt .checks { padding-top: 2px; }
+.ocopt .body { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.ocopt .t { font-size: 12px; font-weight: 650; color: var(--ink); }
+.ocopt .d { font-size: 11.5px; color: var(--ink2); line-height: 1.7; }
+.ocopt .n { font-size: 11.5px; color: var(--dim); line-height: 1.7; }
+.ocopt .lvl:empty { display: none; }
 
 .checks { display: flex; gap: 8px; font-size: 11.5px; color: var(--dim); user-select: none; align-items: center; }
 .checks label { display: flex; align-items: center; gap: 6px; cursor: pointer; }

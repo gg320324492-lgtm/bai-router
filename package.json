@@ -1,14 +1,14 @@
 {
   "name": "bai-router",
   "productName": "B.AI Router",
-  "version": "1.0.74",
+  "version": "1.0.75",
   "private": true,
   "description": "B.AI 模型路由台：Claude Code / Claude 桌面版 外接模型的一键切换与中转",
   "author": "pc",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test --test-concurrency=1 scripts/attrib-atomic-test.mjs scripts/zen-go-tier-test.mjs scripts/zen-capability-probe-test.mjs scripts/empty-stream-diag-test.mjs scripts/oc-runtime-test.mjs scripts/oc-bridge-test.mjs scripts/oc-wiring-test.mjs",
+    "test": "node --test --test-concurrency=1 scripts/attrib-atomic-test.mjs scripts/zen-go-tier-test.mjs scripts/zen-capability-probe-test.mjs scripts/empty-stream-diag-test.mjs scripts/oc-runtime-test.mjs scripts/oc-bridge-test.mjs scripts/oc-wiring-test.mjs scripts/oc-ui-test.mjs",
     "dist": "electron-builder --win nsis",
     "publish": "node scripts/publish.cjs",
     "postinstall": "node scripts/patch-updater.cjs",
@@ -44,7 +44,8 @@
           "zen-probe.mjs",
           "oc-runtime.mjs",
           "oc-bridge.mjs",
-          "oc-wiring.mjs"
+          "oc-wiring.mjs",
+          "oc-transport-info.mjs"
         ]
       },
       {

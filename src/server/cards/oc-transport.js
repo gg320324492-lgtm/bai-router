@@ -1,0 +1,209 @@
+/* cards/oc-transport.js —— 「传输方式」开关卡（v1.0.75）。
+ *
+ * 这一档的请求可以走两条完全不同的路：
+ *   · 直连 —— 本程序直接调上游接口（**出厂值**，改动前的路径，一行都没变）
+ *   · 经一个本机的 OpenCode 客户端 —— 用它自己的身份发请求
+ * 两者可配置性、失败方式、前置条件全都不一样，所以必须是**面板上看得见的一档开关**，
+ * 而不是让人手改 config.json。
+ *
+ * ── 这张卡只画「清单声明了 transportSwitch 的渠道」的那一格 ──
+ * 选项、各自的前置条件来自 window.BAI_PROVIDERS 的 transportOptions；
+ * 当前是哪一档、前置条件在本机满足没有，来自 /api/status 的 transport /
+ * transportProbe（探测在服务端 oc-transport-info.mjs，**复用** oc-runtime 的
+ * findOpenCodeBinary，本卡不自己去找可执行文件）。
+ * 渲染层因此不需要认识任何渠道名，也不需要复制任何判定逻辑。
+ *
+ * ── 三种探测状态必须画成三种东西 ──
+ *   found   → 绿 + 路径，可以直接打开这一档
+ *   missing → 红 + 一条**可以自己执行**的安装命令，并明说本产品不会替你下载
+ *   error   → 「检测失败」+ 原因，并明说这**不等于没装**
+ * 最后一条最容易省掉，省掉就是在误导人：把 error 画成 missing，处置会从
+ * 「再试一次」变成「去装一个可能早就装好的东西」。
+ *
+ * 导出 renderTransportPanel / transportPayload / applyTransport 三个纯函数给
+ * scripts/oc-ui-test.mjs 直接调（vm 里只挂一个空 window 就能跑，测试不碰真实 DOM）。
+ */
+window.BAI_CARDS = window.BAI_CARDS || {};
+window.BAI_CARDS["oc-transport"] = {
+  /* ================================================================== *
+   * 纯函数区（无 DOM、无网络，测试直接调这三个）
+   * ================================================================== */
+
+  /**
+   * 画这一格。**纯函数**：只认传进来的数据，不读全局、不碰 DOM。
+   *
+   * @param {object} o
+   * @param {Array<{value,label,desc,need,requiresProbe}>} o.options 清单里声明的选项
+   * @param {string} o.current   当前生效的档位（服务端给的，中转真正会走的那一档）
+   * @param {object|null} o.probe {state,path,source,hint,error,checkedAt}
+   * @param {string} o.hint      「何时生效」说明（服务端给的）
+   * @param {Function} [o.esc]
+   * @returns {string} HTML
+   */
+  renderTransportPanel(o) {
+    const esc = o.esc || ((s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+      (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])));
+    const opts = Array.isArray(o.options) && o.options.length ? o.options : [];
+    const current = String(o.current || "");
+    const probe = o.probe || null;
+    const state = String((probe && probe.state) || "unknown");
+
+    const rows = opts.map((op) => {
+      const on = op.value === current;
+      return `<label class="ocopt${on ? " on" : ""}">
+        <span class="checks"><input type="radio" name="ocTransport" data-role="oc-transport-opt" value="${esc(op.value)}"${on ? " checked" : ""}></span>
+        <span class="body">
+          <span class="t">${esc(op.label || op.value)}</span>
+          <span class="d">${esc(op.desc || "")}</span>
+          <span class="n">${esc(op.need || "")}</span>
+        </span>
+        <span class="lvl ${on ? "ok" : ""}">${on ? "当前" : ""}</span>
+      </label>`;
+    }).join("");
+
+    /* 探测那一段。三种状态各有各的说法，互相之间**不共用任何一句关键判词**。 */
+    let probeLine;
+    if (state === "found") {
+      probeLine = `<div class="fpline"><span class="k">本机检测</span><span class="v ok">已安装</span></div>`
+        + `<div class="fpline"><span class="k">路径</span><span class="v" style="font-family:var(--mono);white-space:normal;word-break:break-all">${esc(probe.path || "")}</span></div>`
+        + (probe.source ? `<div class="fpline"><span class="k">来源</span><span class="v zh">${esc(probe.source)}</span></div>` : "");
+    } else if (state === "missing") {
+      probeLine = `<div class="fpline"><span class="k">本机检测</span><span class="v err">未安装</span></div>`
+        + `<div class="hint" data-role="oc-probe-hint" style="margin-top:6px;white-space:pre-wrap">${esc(probe.hint || "")}</div>`;
+    } else if (state === "error") {
+      /* ★ 与「未安装」严格分开：这里说的是「面板此刻说不出装没装」。 */
+      probeLine = `<div class="fpline"><span class="k">本机检测</span><span class="v warn">检测失败</span></div>`
+        + `<div class="hint" data-role="oc-probe-hint" style="margin-top:6px;white-space:pre-wrap">${esc(probe.hint || "")}</div>`
+        + (probe.error ? `<div class="hint" data-role="oc-probe-error" style="margin-top:4px;color:var(--err)">${esc(probe.error)}</div>` : "");
+    } else {
+      probeLine = `<div class="fpline"><span class="k">本机检测</span><span class="v">尚未读到</span></div>`;
+    }
+
+    return `<div class="fieldset">
+      <div class="ocopts">${rows}</div>
+      <div data-role="oc-probe">${probeLine}</div>
+      <div class="hint" data-role="oc-effect" style="margin-top:9px">${esc(o.hint || "")}</div>
+      <div class="result" data-role="oc-transport-result"></div>
+    </div>`;
+  },
+
+  /** 清单里声明了才画。**只有布尔 true 算数**——渲染层不许自己决定要不要画这一格。 */
+  shouldShow(P) {
+    return !!(P && P.transportSwitch === true);
+  },
+
+  /** 切换请求的载荷。**只有这两个字段**——服务端是白名单收字段，多余的会被静默丢掉还回 ok:true。 */
+  transportPayload(provider, value) {
+    return { provider: provider, transport: String(value == null ? "" : value) };
+  },
+
+  /**
+   * 发切换请求并把结果（成或不成都）如实报出去。
+   * 服务端拒收时（400）异常里带的就是它给的理由，这里**原样转述**并按失败渲染——
+   * 静默地把单选钮拨回去而不说理由，用户只会以为面板坏了。
+   *
+   * @param {{post:Function, onResult:Function, onSettled?:Function}} deps
+   * @param {{provider:string, value:string, label?:string, hint?:string}} args
+   */
+  async applyTransport(deps, args) {
+    const body = this.transportPayload(args.provider, args.value);
+    try {
+      await deps.post("/api/config", body);
+      const said = `已保存为「${args.label || args.value}」。${args.hint || ""}`;
+      if (deps.onResult) deps.onResult(true, said);
+      return { ok: true, body };
+    } catch (e) {
+      /* 服务端拒了 = 没保存。必须说「没保存」+ 它的理由，不能让界面停在拨过去的那一档。 */
+      const msg = `没保存成功：${String((e && e.message) || e)}`;
+      if (deps.onResult) deps.onResult(false, msg);
+      return { ok: false, error: msg, body };
+    } finally {
+      if (deps.onSettled) deps.onSettled();
+    }
+  },
+
+  /* ================================================================== *
+   * 挂载
+   * ================================================================== */
+  mount(ctx) {
+    const $ = ctx.$ || ((id) => document.getElementById(id));
+    const MANIFEST = window.BAI_PROVIDERS || {};
+    const NAME = "oc-transport";
+    const self = this;
+
+    /* 落点：映射编辑卡（#mapPanel）之下、诊断抽屉之上。清单里声明了
+     * transportSwitch 的渠道才显示它；换到别的渠道就收起来（refresh 由
+     * 共享层在 selectChannel 之后调）。 */
+    let panel = $(NAME);
+    if (!panel) {
+      const anchor = $("mapPanel");
+      panel = document.createElement("div");
+      panel.className = "panelbox";
+      panel.id = NAME;
+      panel.style.display = "none";
+      panel.innerHTML = `<div class="pb-head"><h3>传输方式</h3><span class="sub">这一档的请求走哪条路</span></div>`;
+      if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(panel, anchor.nextSibling);
+      else document.body.appendChild(panel);
+    }
+
+    const body = document.createElement("div");
+    panel.appendChild(body);
+
+    const key = () => ctx.channel || "";
+    const declared = () => {
+      const P = MANIFEST[key()] || {};
+      return self.shouldShow(P) ? P : null;
+    };
+    const resultSlot = () => body.querySelector('[data-role="oc-transport-result"]');
+
+    function paint() {
+      const P = declared();
+      if (!P) { panel.style.display = "none"; return; }
+      panel.style.display = "";
+      /* 重画会整块换掉 innerHTML，所以先把「上一条结果」捞出来重贴回去：
+       * 切换成功后紧跟着的那次重画（等轮询回来）会把它抹掉，而那句话正是
+       * 「下一次请求生效」的提示——抹掉就成了静默切换。 */
+      const prev = resultSlot();
+      const prevText = prev ? String(prev.textContent || "") : "";
+      const prevGood = prev ? /(^|\s)good(\s|$)/.test(String(prev.className || "")) : false;
+      const S = ctx.stOf(key()) || {};
+      body.innerHTML = self.renderTransportPanel({
+        options: P.transportOptions || [],
+        current: S.transport || "",
+        probe: S.transportProbe || null,
+        hint: S.transportHint || "",
+        esc: ctx.esc,
+      });
+      if (prevText && ctx.showResult) ctx.showResult(resultSlot(), prevText, prevGood);
+      for (const el of body.querySelectorAll('[data-role="oc-transport-opt"]')) {
+        el.addEventListener("change", () => onPick(el.value, P));
+      }
+    }
+
+    async function onPick(value, P) {
+      const op = (P.transportOptions || []).find((x) => x.value === value);
+      const S = ctx.stOf(key()) || {};
+      await self.applyTransport({
+        post: ctx.postJSON,
+        onResult: (good, text) => ctx.showResult(resultSlot(), text, good),
+        onSettled: () => {
+          /* 成败都按**服务端说的**那一档重画：拨回去 / 拨过去由状态决定，
+           * 不由刚才那个单选钮决定（失败时必须自己弹回去，否则界面停在一个没保存的值上）。
+           * 当前档位的权威是 /api/status，所以等一次轮询回来再重画。 */
+          if (typeof ctx.poll !== "function") { paint(); return; }
+          Promise.resolve(ctx.poll()).then(paint, () => paint());
+        },
+      }, {
+        provider: key(), value,
+        label: (op && op.label) || value,
+        hint: S.transportHint || "",
+      });
+    }
+
+    paint();
+    return {
+      update() { paint(); },
+      refresh() { paint(); },
+    };
+  },
+};

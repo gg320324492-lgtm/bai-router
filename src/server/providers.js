@@ -200,6 +200,32 @@ window.BAI_PROVIDERS = {
      * 为不成立）。这里只声明"要画这个按钮"，端点、判定与文案全在服务端，
      * 渲染层因此不需要认识任何渠道名（C11）。 */
     capabilityProbe: true,
+    /* 传输方式开关（v1.0.75）：这一档的请求可以走两条完全不同的路，**默认直连**
+     * ——出厂值写在 config.defaults.json 的 zen.transport，与接线之前一致；
+     * 缺省值与认不出来的值一律 direct（判据与 oc-wiring 的 zenTransportOf 同一处）。
+     *
+     * 这里只声明「这一格要画传输开关」+ 两个选项各自的**前置条件**；
+     * 当前档位与前置条件在本机满足没有，由 /api/status 的 zen.transport /
+     * zen.transportProbe 给出（探针复用 oc-runtime 的 findOpenCodeBinary，不另造一套）。
+     * 于是渲染层不需要认识任何渠道名，也不需要自己判断「装没装」（C11）。 */
+    transportSwitch: true,
+    transportOptions: [
+      {
+        value: "direct",
+        label: "直连",
+        desc: "本程序直接调 Zen 接口 —— 改动前的路径，一行都不变。",
+        need: "前置条件：免费档会被拒（上游要求发给模型的请求里必须带工具，直连这条路不带）；Go 档要账号已订阅 OpenCode Go（$10/月）。",
+      },
+      {
+        value: "opencode",
+        label: "OpenCode 客户端中转",
+        desc: "经本机的 OpenCode 走，用它自己的身份发请求 —— 模型手上因此有工具。",
+        need: "前置条件：本机必须已装 OpenCode（npm i -g opencode-ai）。免费模型不需要任何订阅。",
+        /* 打开这一档前要先把「本机装没装」摆出来；摆不出来（探测出错）时
+         * 如实说检测失败，**不要**当成「没装」——两者的处置完全不同。 */
+        requiresProbe: "opencode",
+      },
+    ],
     chainable: true,
     credential: {
       kind: "apiKey",
@@ -426,7 +452,7 @@ window.BAI_PROVIDERS = {
  * 以及本表的 id（DOM 容器 id 在 dom 字段）。C9 逐个核对。
  * ========================================================================== */
 window.BAI_VIEWS = [
-  { id: "console", nav: "控制台", dom: "viewConsole", hint: "渠道矩阵 · 映射编辑 · 诊断抽屉", cards: ["model-sync"] },
+  { id: "console", nav: "控制台", dom: "viewConsole", hint: "渠道矩阵 · 映射编辑 · 诊断抽屉", cards: ["model-sync", "oc-transport"] },
   { id: "cred", nav: "凭据", dom: "viewCred", hint: "每家渠道各自要的东西", cards: ["token-capture", "model-catalog", "or-rotation"] },
   { id: "fo", nav: "故障转移", dom: "viewFo", hint: "开关 · 顺序 · 冷却", cards: ["failover"] },
   { id: "settings", nav: "设置", dom: "viewSettings", hint: "代理 · 端口 · 更新 · 数据目录", cards: [] },
