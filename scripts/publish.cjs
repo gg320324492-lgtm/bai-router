@@ -70,9 +70,18 @@ try {
        · wb.upstream  发布机那条是 loadCfg 的 wbHealUpstream 按登录域名**自愈**的结果
                     （v1.0.59 起 .ai/.cn 之间切换），把自愈结果当出厂默认，等于替所有
                     新用户选了版别。自愈本身在运行期还会再跑一次。
+       · zen.transport 「这台机器走直连还是走 OpenCode 客户端中转」是本机选择。
+                    v1.0.75 加这一档时漏在这里：发布机那份 config.json 里不带该字段，
+                    随包快照里也就没有它——出厂默认「靠缺失兜底成 direct」虽然行为正确，
+                    但**更糟的情况是发布者自己切到了 opencode 再发版**，
+                    快照就会把 opencode 当出厂默认发给所有新用户。
+                    与 proxy 完全同类，故按规矩写进这一段。
 
-       三者共同点：运行期 server.mjs 都会按各自机器修正它们，所以留在出厂默认里没有
+       四者共同点：运行期 server.mjs 都会按各自机器修正它们，所以留在出厂默认里没有
        任何好处，只有"看起来配置齐全"的错觉。新增同类字段请写进这一段，别再散着写。
+
+       ⚠ 自检：发布后请看 `git status`。这段改写的是**仓库里的** config.defaults.json，
+       若它变脏了，说明上面某个「本机状态」字段漏在了这一段之外——那就是要修的地方。
        ════════════════════════════════════════════════════════════════════ */
     if (CUR.failover) {
       const fo = { ...CUR.failover };
@@ -91,6 +100,8 @@ try {
       delete def.failover;   // 仓库里没写这个块，就别把发布机的带进随包快照
     }
     def.proxy = CUR.proxy == null ? "" : CUR.proxy;
+    /* zen.transport 同样只认仓库的（本机选择不进出厂默认，见上面那段说明） */
+    if (def.zen) def.zen.transport = (CUR.zen && CUR.zen.transport) || "direct";
     if (def.wb && CUR.wb && CUR.wb.upstream) def.wb.upstream = CUR.wb.upstream;
     /* availableModels 也取仓库的，不取发布机的。
      *
