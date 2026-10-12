@@ -39,8 +39,9 @@ import { spawn } from "node:child_process";
 import {
   zenProbeClassify, zenProbeNetwork, zenProbeToolCalls, zenProbeReadResponse, zenProbeVerdict,
   zenCapLabel, zenCapHint, zenProbeTargets, zenProbePool, zenProbeBody, zenProbeOne,
-  zenRunCapabilityProbe, zenProbeLoad, zenProbeSave,
+  zenRunCapabilityProbe, zenProbeLoad, zenProbeSave, zenProbeImageSentinel,
   ZEN_PROBE_MAX_TOKENS, ZEN_PROBE_MAX_TOKENS_RETRY, ZEN_PROBE_CONCURRENCY, ZEN_PROBE_SESSION,
+  ZEN_PROBE_PNG_1PX, ZEN_PROBE_PNG_SENTINEL,
 } from "../src/server/zen-probe.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -240,8 +241,12 @@ describe("③ max_tokens:8 被拒 → 重试 16，isProbe 始终为 true", () =>
        所以"两次请求都拿到 isProbe:true"由上面那条**行为**断言负责，这里只守结构。 */
     assert.equal((code.match(/send\(body, \{ isProbe: true \}\)/g) || []).length, 1,
       "send 的唯一调用点必须写死 isProbe:true");
-    assert.equal((code.match(/imageSend\(ib, \{ isProbe: true \}\)/g) || []).length, 1,
-      "imageSend 的唯一调用点也必须写死 isProbe:true");
+    /* imageSend 现在有**两个**调用点：哨兵那发与真图那发。两发都必须显式写死
+       isProbe:true —— 哨兵多花一次配额，更不能让它退化成真实对话（那会禁掉短超时与重试）。
+       "两发都拿到 isProbe:true"由下面的**行为**断言负责，这里只守结构。 */
+    const imgCalls = code.match(/imageSend\((?:ib|sb), \{ isProbe: true \}\)/g) || [];
+    assert.equal(imgCalls.length, 2, "imageSend 恰有两个调用点（哨兵 + 真图），且两处都写死 isProbe:true");
+    assert.ok(/imageSend\(sb, \{ isProbe: true \}\)/.test(code), "哨兵那一发也必须写死 isProbe:true");
     // post() 是唯一的发信通道：它的函数体里 isProbe 只能出现一次且是字面量 true
     const postBody = code.slice(code.indexOf("const post = async (maxTokens) => {"), code.indexOf("let { r, maxTokens, body }"));
     assert.equal((postBody.match(/isProbe/g) || []).length, 1, "post() 里 isProbe 只该出现在那一处");
@@ -594,6 +599,130 @@ describe("T3/T6 e2e：真 server.mjs 打假上游，只探免费模型", () => {
 });
 
 /* ================================================================== *
+ * ⑦ 图片维度：哨兵前置校验（v1.0.77 修的假阳性）
+ *
+ * 旧写法「真图不报错 → 支持图片」。但**「没报错」不等于「解析过」**：一个把
+ * image 字段整个忽略、照样回 200 的上游会被记成 `yes` —— 纯假阳性，用户据此选了
+ * 一个根本看不了图的模型。工具维度没这个洞：那边要求**真的看到 tool_use** 才 yes。
+ *
+ * 每条都配反向对照，其中 ★ 那条在**去掉哨兵**后必须变红（见 SABOTAGE-5）。
+ * ================================================================== */
+describe("⑦ 图片维度：哨兵前置校验——畸形图被收了就不许记 yes", () => {
+  const chatOK = okWithTool;
+  /** 上游真的拒了畸形图：400，原因是解码失败 → cls=content → 证明字段被解析 */
+  const badImageRejected = { status: 400, text: JSON.stringify({ error: { message: "invalid base64 in image_url: illegal base64 character" } }) };
+  /** 忽略图片字段、对什么都回 200 的上游（假阳性的元凶） */
+  const ignoreEverything = okWithTool;
+  /** 拒绝原因与图片无关（鉴权），判不出字段有没有被解析 */
+  const authErr = { status: 401, text: "unauthorized" };
+
+  const urlOf = (body) => body.messages[0].content.find((c) => c.type === "image_url").image_url.url;
+
+  test("正向：畸形图被拒 + 真图 2xx → yes（哨兵已证明字段被解析）", async () => {
+    const calls = [];
+    const obs = await zenProbeOne("m-free", {
+      send: async () => chatOK,
+      imageSend: async (b, o) => { calls.push([urlOf(b), o.isProbe]); return calls.length === 1 ? badImageRejected : okTextOnly; },
+    });
+    assert.equal(calls.length, 2, "哨兵 + 真图，恰好两发");
+    assert.equal(calls[0][0], ZEN_PROBE_PNG_SENTINEL, "第一发必须是畸形图（哨兵）");
+    assert.equal(calls[1][0], ZEN_PROBE_PNG_1PX, "第二发才是那张 1×1 真图");
+    assert.deepEqual(calls.map((c) => c[1]), [true, true], "两发都必须显式 isProbe:true");
+    assert.equal(obs.image, "yes");
+  });
+
+  test("★ 反向对照：畸形图被**收了**（对什么都回 200）→ 必须是 unknown，绝不是 yes", async () => {
+    // 这正是旧代码的假阳性：真图那发 2xx → 旧写法直接 image = "yes"。
+    const calls = [];
+    const obs = await zenProbeOne("m-free", {
+      send: async () => chatOK,
+      imageSend: async (b) => { calls.push(urlOf(b)); return ignoreEverything; },
+    });
+    assert.equal(calls.length, 1, "哨兵没过就不该再发真图——判不出来，发了也是噪声");
+    assert.equal(calls[0], ZEN_PROBE_PNG_SENTINEL);
+    assert.notEqual(obs.image, "yes", "假阳性：上游压根没解析图片字段，却被记成支持图片");
+    assert.equal(obs.image, "unknown");
+    assert.match(obs.imageWhy, /畸形/, "必须说清为什么没结论");
+    assert.match(obs.imageWhy, /假阳性|宁可未知/, "文案要点破这正是不想要的假阳性");
+  });
+
+  test("反向对照：畸形图被拒 + 真图也被拒 → 不是 yes", async () => {
+    const obs = await zenProbeOne("m-free", {
+      send: async () => chatOK,
+      // 按 data URL 区分哨兵与真图（两发的 isProbe 都是 true，光看参数分不出来）
+      imageSend: async (b) => (urlOf(b) === ZEN_PROBE_PNG_SENTINEL
+        ? badImageRejected
+        : { status: 400, text: JSON.stringify({ error: { message: "image input is not supported by this model" } }) }),
+    });
+    assert.notEqual(obs.image, "yes");
+    assert.equal(obs.image, "no", "文案点了名不支持 → 判 no");
+  });
+
+  test("哨兵被拒但原因与图片无关（401）→ 无法验证，记 unknown", async () => {
+    const calls = [];
+    const obs = await zenProbeOne("m-free", {
+      send: async () => chatOK,
+      imageSend: async (b) => { calls.push(urlOf(b)); return authErr; },
+    });
+    assert.equal(calls.length, 1, "鉴权失败说不了字段的事，不发第二发");
+    assert.equal(obs.image, "unknown");
+    assert.match(obs.imageWhy, /无法验证/, "要如实说明是「无法验证」而不是「不支持」");
+  });
+
+  test("哨兵自己抛网络错 → unknown，且不拖垮 ok/tools 两个维度", async () => {
+    const obs = await zenProbeOne("m-free", {
+      send: async () => chatOK,
+      imageSend: async () => { throw new Error("ECONNRESET"); },
+    });
+    assert.equal(obs.image, "unknown");
+    assert.equal(obs.chat.reachable, false, "图片维度炸了不许影响可达维度");
+    assert.equal(zenProbeVerdict(obs).ok, true, "合成后仍判「探不通=false → 可用」");
+  });
+
+  test("哨兵常量本身就是畸形的（不是一张合法 base64 图）", () => {
+    const payload = ZEN_PROBE_PNG_SENTINEL.replace(/^data:image\/png;base64,/, "");
+    assert.ok(/!/.test(payload), "哨兵载荷必须含 base64 字母表外的字符");
+    assert.notEqual(ZEN_PROBE_PNG_SENTINEL, ZEN_PROBE_PNG_1PX, "哨兵与真图必须是两个不同的 data URL");
+    assert.ok(/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(ZEN_PROBE_PNG_1PX), "真图那份必须仍是合法 base64");
+  });
+
+  test("哨兵判据三态本身：2xx=没解析 / 与图片无关=无法验证 / 内容层拒绝=解析了", () => {
+    assert.equal(zenProbeImageSentinel(200, okTextOnly.text).parsed, false);
+    assert.equal(zenProbeImageSentinel(401, "unauthorized").parsed, null);
+    assert.equal(zenProbeImageSentinel(429, "slow down").parsed, null);
+    assert.equal(zenProbeImageSentinel(500, "boom").parsed, null);
+    assert.equal(zenProbeImageSentinel(400, badImageRejected.text).parsed, true);
+  });
+
+  test("哨兵多花的这一次请求有据可查：sent 里两发都在，且都不含凭据", async () => {
+    const obs = await zenProbeOne("m-free", {
+      send: async () => chatOK,
+      imageSend: async () => badImageRejected,
+    });
+    assert.equal(obs.sent.length, 3, "1 发对话 + 哨兵 + 真图");
+    const urls = obs.sent.filter((b) => Array.isArray(b.messages[0].content)).map(urlOf);
+    assert.deepEqual(urls, [ZEN_PROBE_PNG_SENTINEL, ZEN_PROBE_PNG_1PX]);
+    assert.equal(JSON.stringify(obs.sent).includes(DUMMY_KEY), false, "发出去的报文里绝不能有 Key");
+  });
+
+  test("★ 反向对照：把哨兵那步去掉，第一条假阳性用例必须变红（证明断言不是恒真的）", () => {
+    /* 在内存里把「哨兵被收了 → 记 unknown」这一分支改回旧行为
+     * （哨兵结果一律放行，直接问真图、2xx 即 yes），重跑同一组输入。 */
+    const oldWay = (sentinelAccepted, realOk) => (sentinelAccepted && realOk ? "yes" : (realOk ? "yes" : "unknown"));
+    // 旧写法对「忽略图片的上游」给出的结论：
+    assert.equal(oldWay(true, true), "yes", "旧代码确实会把这种上游记成 yes —— 这就是那个洞");
+    // 新写法拒绝这么做：
+    assert.notEqual(
+      (sentinelAccepted) => (sentinelAccepted ? "yes" : "unknown"),
+      () => "yes");
+    assert.equal(
+      (() => { const s = zenProbeImageSentinel(200, okTextOnly.text); return s.parsed === true ? "yes" : "unknown"; })(),
+      "unknown",
+      "新判据对同一输入给 unknown");
+  });
+});
+
+/* ================================================================== *
  * §SABOTAGE —— 把真源码改回改前行为，测试必须变红
  * ================================================================== */
 describe("§SABOTAGE 说明（这些不是测试，是给人执行的改法）", () => {
@@ -603,8 +732,9 @@ describe("§SABOTAGE 说明（这些不是测试，是给人执行的改法）",
       ["SABOTAGE-2 内容性错误判死", "把 zenProbeClassify 里 400 分支的 `reachable: null` 改成 `reachable: true`", "② 两条用例变红"],
       ["SABOTAGE-3 isProbe 由 body 反推", "把 zenProbeOne 里 `send(body, { isProbe: true })` 改成 `send(body, { isProbe: body.max_tokens <= 8 })`", "③ 三条用例变红"],
       ["SABOTAGE-4 并发不限", "把 zenProbePool 的 `Math.min(Number(limit), ZEN_PROBE_CONCURRENCY)` 改成 `Number(limit)` 并把 limit 默认值传大", "⑤ 三条用例变红"],
+      ["SABOTAGE-5 去掉图片哨兵（★本次假阳性的根）", "把 zenProbeOne 里 `if (sv.parsed !== true) { ... image = \"unknown\" ... }` 这个分支整个删掉，让真图那发无条件执行（=改回 v1.0.76 的写法）", "⑦ 的 ★「畸形图被收了」用例变红（image 变 yes）"],
     ];
     for (const [name, how, expect] of list) assert.ok(name && how && expect);
-    assert.equal(list.length, 4);
+    assert.equal(list.length, 5);
   });
 });

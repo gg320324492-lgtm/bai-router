@@ -22,7 +22,26 @@
  * |---|---|---|
  * | 外部可调 | 最小对话请求是否 2xx | 文本 + 一个合成工具 |
  * | 工具调用 | 是否回 `tool_calls` | 同上（不额外发请求） |
- * | 图片输入 | 1×1 PNG data URL 是否被接受 | 独立请求（它失败**不得**拖垮前两者） |
+ * | 图片输入 | 1×1 PNG data URL 是否被接受 | **先哨兵后真图**两发（它失败**不得**拖垮前两者） |
+ *
+ * ## 图片维度为什么必须先发哨兵（假阳性洞，v1.0.77 修）
+ *
+ * 原写法是「真图不报错 → 支持图片」。但**「没报错」不等于「解析过」**：一个把
+ * image 字段整个忽略、照样回 200 的上游会被记成 `yes`——纯假阳性，用户据此选了
+ * 一个根本看不了图的模型。对照**工具**维度就知道差距在哪：那边要求**真的看到
+ * tool_use** 才记 `yes`，判据是正面的；图片维度却拿了「没报错」当正面证据。
+ *
+ * 修法（OW Bridge 同源思路，见 `.research/dsh-wb/src/probe.ts:159-199` 的哨兵设计，
+ * 那边叫 `validation: 'validating' | 'non-validating'`）：
+ *
+ *   ① **哨兵**：先发一张**故意畸形**的图（`ZEN_PROBE_PNG_SENTINEL`，base64 根本
+ *      不合法）。**被拒** → 这个字段是真的被解析了 → ② 那一发的 yes/no 才有意义。
+ *   ② **真图**：只在哨兵被拒后才发。
+ *   ③ 哨兵**被接受** → 说明判不出来（对什么都回 200）→ 记 `unknown` 并写明原因，
+ *      **绝不记 yes**。
+ *   ④ 哨兵被拒**不算失败**（它本来就该被拒），也不进 ok/tools 判定。
+ *
+ * ⚠️ 哨兵多花一次请求配额。只在用户显式点按钮、且只对 `-free` 模型时发生。
  *
  * ## 照抄 OW Bridge 的两条纪律（`.research/ow-bridge/src/`）
  *
@@ -86,6 +105,18 @@ export const ZEN_PROBE_CONCURRENCY = 2;
 /** 1×1 透明 PNG（67 字节）。图片维度只问「上游收不收」，不关心内容。 */
 export const ZEN_PROBE_PNG_1PX =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/**
+ * 哨兵：**故意畸形**的图片，base64 载荷根本不是合法 base64（`!` 不在 base64 字母表里）。
+ *
+ * 它唯一的作用就是「让上游拒掉」：一个真的解析 image 字段的上游，在解码这一步
+ * 就必然报错。**能拒它**，才说明这个字段不是摆设，后一发的 yes/no 才可信。
+ *
+ * 反过来，**收了它**（2xx）说明这个上游对什么都回 200——那种情况下真图那发
+ * 无论成功还是失败都只是噪声，所以记 `unknown`，绝不记 `yes`。
+ */
+export const ZEN_PROBE_PNG_SENTINEL =
+  "data:image/png;base64,!!!not-valid-base64!!!";
 
 /** 最简单的合成工具：一个无副作用的单参数函数。 */
 export const ZEN_PROBE_TOOL = Object.freeze({
@@ -212,6 +243,41 @@ export function zenProbeReadResponse(status, txt) {
   return { ...c, json, calls: tc.calls, envelope: tc.envelope };
 }
 
+/* ---------- 图片维度：哨兵前置校验 ---------- */
+
+/**
+ * 哨兵一发的判定：这一次畸形图，**到底证明了什么**。
+ *
+ * 返回 `{ parsed, why }`，三态是刻意的：
+ *   `true`   **解析了**——上游拒了这张不可能存在的图 → 真图那一发的 yes/no 有意义
+ *   `false`  **没解析**——上游 2xx 收了 → 它对什么都回 200，判不出来 → 记 unknown
+ *   `null`   **无法验证**——拒绝原因与图片无关（鉴权/额度/限流/上游故障/网络），
+ *            或根本读不出进程外信息。此时也记 unknown，且**绝不**升级成 yes。
+ *
+ * ⚠️ `false` 那个分支就是原假阳性的堵口：旧写法在这里直接把真图那发的 2xx 记成
+ *    「支持图片」，于是「忽略 image 字段的上游」被误判成支持图。绝不能退化回去。
+ */
+export function zenProbeImageSentinel(status, txt) {
+  const c = zenProbeClassify(status, txt);
+  if (c.reachable === false) {
+    return {
+      parsed: false, cls: c.cls,
+      why: "哨兵校验未通过：上游把一张**故意畸形的图片**也照收不误（HTTP 2xx）——"
+        + "说明它根本没解析 image 字段，对任何内容都回 200。这种上游的探测结果判不出来，"
+        + "本次不记「支持图片」（宁可未知，也不要一个假阳性）。",
+    };
+  }
+  /* 拒绝原因与图片无关 → 说明不了字段有没有被解析 → 无法验证，仍不记 yes。 */
+  if (["auth", "quota", "rate_limit", "upstream", "network"].includes(c.cls)) {
+    return {
+      parsed: null, cls: c.cls,
+      why: `哨兵无法验证：畸形图确实被拒了，但原因与图片无关（${c.cls}）——${c.why}判不出这个上游是否真的解析 image 字段，本次不记「支持图片」。`,
+    };
+  }
+  /* 拒在内容/参数层（content、probe_params 等）= 上游真的去解这张图了。 */
+  return { parsed: true, cls: c.cls, why: `哨兵按预期被拒（${c.cls}）——image 字段确实被解析。` };
+}
+
 /* ---------- 判定合成 ---------- */
 
 /**
@@ -326,11 +392,15 @@ export async function zenProbePool(items, worker, limit = ZEN_PROBE_CONCURRENCY)
 
 /* ---------- 单模型探测（含 max_tokens 抬档） ---------- */
 
-/** 构造请求体。工具维度与可达维度**共用同一个请求**（配额有限，不为一个问题发两次）。 */
-export function zenProbeBody(model, { maxTokens = ZEN_PROBE_MAX_TOKENS, image = false, tools = true } = {}) {
+/** 构造请求体。工具维度与可达维度**共用同一个请求**（配额有限，不为一个问题发两次）。
+ *
+ * `png` 只给图片维度用：默认是那张 1×1 透明图，哨兵那一发传 `ZEN_PROBE_PNG_SENTINEL`
+ * （故意畸形）。**两者的报文形状完全一样**，只有那个 data URL 不同——哨兵要验的就是
+ * 「同样的形状、换张坏图，上游会不会变脸」。 */
+export function zenProbeBody(model, { maxTokens = ZEN_PROBE_MAX_TOKENS, image = false, tools = true, png = ZEN_PROBE_PNG_1PX } = {}) {
   const content = image
     ? [{ type: "text", text: "Reply with the single word: ok." },
-    { type: "image_url", image_url: { url: ZEN_PROBE_PNG_1PX } }]
+    { type: "image_url", image_url: { url: png } }]
     : "Call the probe_ping tool with value \"ok\". Do not answer with plain text.";
   const b = { model, stream: false, max_tokens: maxTokens, messages: [{ role: "user", content }] };
   if (tools) {
@@ -377,18 +447,42 @@ export async function zenProbeOne(model, { send, imageSend } = {}) {
   // 图片维度独立请求，且**失败不得拖垮前两者**（不支持图片的模型照样能对话）
   let image = "unknown";
   let imageWhy = "";
+  /* ⚠️ 哨兵**多花一次请求**（配额纪律：只探 -free、只在用户点按钮时才跑）。
+   *    这一发是图片维度唯一的真阳性保障，别为了省配额把它删掉。 */
+  let sent = [body];
   if (typeof imageSend === "function") {
-    const ib = zenProbeBody(model, { maxTokens, image: true, tools: false });
+    const postImage = (png) => zenProbeBody(model, { maxTokens, image: true, tools: false, png });
+    // ① 哨兵：故意畸形的图。能拒它，才说明这个字段是真的被解析了。
+    let sv;
     try {
-      const ir = await imageSend(ib, { isProbe: true });
-      const ic = zenProbeReadResponse(ir.status, ir.text);
-      if (ic.reachable === false) image = "yes";
-      else if (ic.cls === "content" || ic.cls === "probe_params") { image = "unknown"; imageWhy = ic.why; }
-      else if (/image|vision|multimodal|multi-modal/i.test(ir.text || "")) { image = "no"; imageWhy = ic.why; }
-      else { image = "unknown"; imageWhy = ic.why; }
+      const sb = postImage(ZEN_PROBE_PNG_SENTINEL);
+      sent.push(sb);
+      const sr = await imageSend(sb, { isProbe: true });
+      sv = zenProbeImageSentinel(sr.status, sr.text);
     } catch (e) {
+      sv = { parsed: null, cls: "network", why: zenProbeNetwork((e && e.message) || e).why };
+    }
+
+    if (sv.parsed !== true) {
+      /* 哨兵被收了 / 无法验证 → 判不出来。**绝不记 yes**，也不浪费第二发去问一个
+       * 注定没意义的问题——旧代码的假阳性正是从这一步直接跳到「2xx 即 yes」来的。 */
       image = "unknown";
-      imageWhy = zenProbeNetwork((e && e.message) || e).why;
+      imageWhy = sv.why;
+    } else {
+      // ② 哨兵被拒 → 真图这一发才问「收不收」。哨兵被拒**不是失败**，它本来就该被拒。
+      const ib = postImage(ZEN_PROBE_PNG_1PX);
+      sent.push(ib);
+      try {
+        const ir = await imageSend(ib, { isProbe: true });
+        const ic = zenProbeReadResponse(ir.status, ir.text);
+        if (ic.reachable === false) image = "yes";
+        else if (ic.cls === "content" || ic.cls === "probe_params") { image = "unknown"; imageWhy = ic.why; }
+        else if (/image|vision|multimodal|multi-modal/i.test(ir.text || "")) { image = "no"; imageWhy = ic.why; }
+        else { image = "unknown"; imageWhy = ic.why; }
+      } catch (e) {
+        image = "unknown";
+        imageWhy = zenProbeNetwork((e && e.message) || e).why;
+      }
     }
   }
 
@@ -397,7 +491,7 @@ export async function zenProbeOne(model, { send, imageSend } = {}) {
     tools: { cls: chat.cls, calls: chat.calls, envelope: chat.envelope, reachable: chat.reachable },
     maxTokens, escalated,
     /* 自证用：真实发出去的 body，测试据此断言 max_tokens ∈ {8,16} 且不含凭据 */
-    sent: [body, ...(typeof imageSend === "function" ? [zenProbeBody(model, { maxTokens, image: true, tools: false })] : [])],
+    sent,
   };
 }
 

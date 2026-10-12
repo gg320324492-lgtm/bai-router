@@ -30,6 +30,10 @@ import { createOcGateway, zenTransportOf, ZEN_TRANSPORT_OPENCODE, ZEN_TRANSPORTS
 /* 传输开关给面板的只读事实（v1.0.75）：当前是哪一档 + 打开它需要的那件前置条件
  * 在本机满足没有。探测本身（TTL 缓存 / 三态判据）在那个文件里。 */
 import { ocTransportFields } from "./oc-transport-info.mjs";
+/* 进程身份核对（v1.0.77）：只按 PID 终止之前先确认这个 PID 还是当初那个进程，
+ * 免得 PID 被系统回收后误杀无关程序。判定是纯函数，实测启动时间靠 PowerShell CIM
+ * （写的一侧零成本，见 SERVICE_START_MS）。 */
+import { selfStartTimeMs, verifyPidRecord, pidIdentityMessage, VERDICT_SAME } from "./proc-identity.cjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -90,6 +94,12 @@ const resolveChannelKey = (raw) => (CHANNELS.includes(raw) ? raw : "bai");
 const PASS_HEADERS = ["authorization", "content-type", "anthropic-version", "anthropic-beta", "x-api-key", "accept", "user-agent"];
 
 const BOOT = Date.now();
+
+/** 本进程的启动时刻（epoch ms）。**零成本**：monotonic 的 uptime 减掉当前时钟即可，
+ *  不用外呼 PowerShell。随 /api/status 的 service.startTimeMs 一起报出去——main.js
+ *  拿到对面自报的 PID 时，靠它核对「这个 PID 还是不是对面那个进程」，再决定能不能
+ *  taskkill。老版本服务不报这个字段 → 调用方按「无法验证」处理，不杀。 */
+const SERVICE_START_MS = selfStartTimeMs();
 
 /* 日志去向（v1.0.73 梳理）：
  *   · server-child.log  服务端的**唯一**日志源。子进程 stdout/stderr 直通这个 fd，
@@ -2330,24 +2340,47 @@ function wbSidecarRpc(pipePath, method, params, timeoutMs = 3000) {
 //   no_host      —— 后台在跑但没有常驻会话（下次发消息会自动新建，钩子届时就会加载）
 //   pipe_fail    —— 管道连上了但 RPC 失败（**不杀任何进程**，如实报告）
 //   sidecar_killed —— 管道连不上，兜底只杀 PID 文件里那个 sidecar 进程（绝不碰主进程）
+//   pid_unverified —— PID 文件都在、进程也活着，但**身份核对没通过**（PID 被回收 / 取不到启动时间）。
+//                      **不杀任何进程**，并把核对结论原样说给用户（绝不静默照杀）。
 async function wbKickHostSession() {
-  // 在全部候选 PID 文件里挑第一个「进程确实活着」的——精确路径可能残留过期 PID 文件，
-  // 见到存在就用会把扫描到的真正活侧车挡在后面（多实例/多 env 场景实测过这个坑）。
+  // 在全部候选 PID 文件里挑第一个「进程确实活着**且身份对得上**」的——精确路径可能残留
+  // 过期 PID 文件，见到存在就用会把扫描到的真正活侧车挡在后面（多实例/多 env 场景实测过这个坑）。
   const pidFiles = await wbSidecarPidFiles();
   let info = null, pidPath = null;
+  const unverified = [];
   for (const p of pidFiles) {
     let j = null;
     try { j = JSON.parse(readFileSync(p, "utf8")); } catch { continue; }
     if (!j || !j.pid) continue;
     try {
       process.kill(j.pid, 0);
-      info = j; pidPath = p; break;               // 活着
     } catch (e) {
-      if (e && e.code === "ESRCH") continue;       // 过期残留 → 下一个候选
-      info = j; pidPath = p; break;                // EPERM 等：进程在，只是不归本用户
+      if (e && e.code === "ESRCH") continue;        // 过期残留 → 下一个候选
+      // EPERM 等：进程在，只是不归本用户 —— 仍要继续做身份核对
     }
+    /* ⚠️ 身份核对（v1.0.77）。`process.kill(pid,0)` 只证明「这个 PID 现在有进程」，
+     * 不证明「它还是当初那个」——原进程死了、Windows 把 PID 给了别的程序时，
+     * 两者都为真，兜底那一杀就会打在无关进程上。所以这里再问一次「你什么时候起的」。
+     *
+     * sidecar.pid 是 **WorkBuddy 自己写的**，格式不由我们定，所以没法往里塞我们自己的
+     * 启动时间字段；这里退一步用**文件写入时刻**当上界——写这份记录的进程必然不晚于
+     * 这次写入才启动，于是「进程启动时间 > 文件写入时刻」就等于「PID 已被回收」。
+     * WorkBuddy 若哪天顺手记了 startedAt，就优先用它的精确值。 */
+    const ident = await verifyPidRecord({ pid: j.pid, file: p, record: j });
+    if (ident.verdict !== VERDICT_SAME) {
+      unverified.push(pidIdentityMessage(ident, { pid: j.pid, source: "sidecar PID 文件身份核对" }));
+      continue;                                     // 核对不过 → 跳过这个候选，不碰它
+    }
+    info = j; pidPath = p; break;
   }
   if (!info) {
+    if (unverified.length) {
+      return {
+        action: "pid_unverified",
+        detail: `WorkBuddy 后台（sidecar）PID 文件的进程都还在，但**身份核对没通过，已一律不终止**：${unverified.join("；")}。`
+          + "若确认它就是 WorkBuddy 的后台，请完全退出并重开 WorkBuddy 客户端（下次发消息时它会重建侧车）。",
+      };
+    }
     return {
       action: "no_sidecar",
       detail: pidFiles.length ? "WorkBuddy 后台（sidecar）PID 文件均为过期残留（进程已不在）" : "WorkBuddy 后台（sidecar）未在运行",
@@ -2604,7 +2637,9 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
       hint = "WorkBuddy 客户端似乎没有在运行。钩子已注入：启动 WorkBuddy 并登录后随便发一条消息即可被自动抓取，再重试。";
     } else if (kact === "no_host") {
       hint = "WorkBuddy 后台在运行但还没有常驻会话通道——直接在客户端里发一条消息（会自动新建带钩子的进程）；若已发过消息仍失败，请重试一次。";
-    } else if (kact === "pipe_fail" || kact === "error") {
+    } else if (kact === "pipe_fail" || kact === "error" || kact === "pid_unverified") {
+      /* pid_unverified 一并归到这里：那次**一个进程都没杀**（PID 文件里的 PID 没能证实
+       * 还是当初那个进程，宁可不动也不误杀）。文案用 kick 的原始 detail，把核对结论带出来。 */
       hint = `WorkBuddy 后台重启失败（${(wbCapState.kick && wbCapState.kick.detail) || "未知原因"}），钩子可能尚未被任何进程加载。可关闭并重新打开 WorkBuddy 客户端后重试。`;
     } else {
       hint = "请确认 WorkBuddy 客户端已打开并已登录，然后在里面随便发一条消息或新建一个对话（客户端会拉起内部 CLI 并带上 Authorization 头），再点一次「一键获取令牌」。";
@@ -5186,6 +5221,9 @@ async function statusPayload() {
      * 源码构建是 <仓库>\src\server\server.mjs，一眼可分。version 则说明它落后几版。 */
     service: {
       up: true, uptimeSec: Math.floor((Date.now() - BOOT) / 1000), pid: process.pid,
+      /* 进程启动时刻：调用方（main.js）只按 PID 终止前靠它核对身份。进程存活期间这个值
+       * 不变，PID 一旦被回收、新进程算出来的值必然更晚——两者可判，见 proc-identity.cjs。 */
+      startTimeMs: SERVICE_START_MS,
       version: APP_VERSION,
       script: SERVER_SELF,
       build: /[\\/]resources[\\/]server[\\/]/i.test(SERVER_SELF) ? "installed" : "source",

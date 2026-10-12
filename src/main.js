@@ -33,6 +33,17 @@ try {
   }
 } catch { }
 
+/* 进程身份核对（v1.0.77）：只按 PID 终止之前，先确认这个 PID 还是不是当初那个进程。
+ * 契约要求「taskkill 只按 PID，绝不按进程名杀」——按名字杀会误杀正在跑的正式实例；
+ * 但只按 PID 杀有镜像风险：原进程已死、Windows 把 PID 分配给了别的程序时，
+ * 「PID 还活着」为真，我们却会杀掉一个完全无关的进程。
+ * 这个模块与服务端共用一份（随 extraResources 一起打包，两边 require 同一个文件）。
+ * 判定三态：same 才动手；recycled / unverifiable 一律**不杀**并如实说明。
+ * require 失败（打包漏了这个文件）也归到 unverifiable：宁可一次都不杀，也不裸着 taskkill。 */
+let procIdentity = null;
+try { procIdentity = require(path.join(path.dirname(SERVER_JS), "proc-identity.cjs")); }
+catch (e) { logMain(`进程身份核对模块加载失败（${e.message}）——本次不会按 PID 终止任何进程`); }
+
 let win = null;
 let tray = null;
 let child = null;
@@ -391,6 +402,37 @@ async function reclaimPort(port) {
   return { port, occupant: `${o.name} pid ${o.pid}`, blocked: true };
 }
 
+/**
+ * 终止「对面那个服务进程」——**先核对身份，再 taskkill，只按 PID**。
+ *
+ * 为什么必须多这一步：`st.service.pid` 是从 `/api/status` 读来的。读到的那一刻
+ * 它确实是那个服务，但**读**与**杀**之间隔着一次网络往返；服务若在这中间退出、
+ * Windows 把 PID 回收给别的程序，`taskkill /F /PID` 就会打在一个无关进程上。
+ * 服务自报的 `startTimeMs` 给了判据：同一进程存活期间该值不变，被回收的新进程
+ * 算出来的必然更晚。
+ *
+ * 旧版本服务**不报** `startTimeMs` → 核不到 → `unverifiable` → **不杀**，并把
+ * 「为什么没杀」写进日志。宁可留着这个进程让端口回收那条路径去处理，也不能赌一把。
+ */
+async function killServiceIfOurs(st, why) {
+  const sv = (st && st.service) || {};
+  if (!sv.pid) return false;
+  // 自己永远不杀（restartServer 这条路径原先连这个判断都没有）。
+  if (String(sv.pid) === String(process.pid)) return false;
+  if (!procIdentity) {
+    logMain(`${why}：未终止对面服务——身份核对模块不可用，无法验证 PID ${sv.pid}，按保守起见不杀`);
+    return false;
+  }
+  const ident = await procIdentity.verifyPidRecord({ pid: sv.pid, record: sv, file: null });
+  if (ident.verdict !== procIdentity.VERDICT_SAME) {
+    logMain(`${why}：未终止对面服务——${procIdentity.pidIdentityMessage(ident, { pid: sv.pid, source: "服务进程身份核对" })}`);
+    return false;
+  }
+  await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(sv.pid)], { windowsHide: true }, r));
+  logMain(`${why}：已按 PID ${sv.pid} 终止对面服务（${ident.why}）`);
+  return true;
+}
+
 async function ensureServer() {
   // 预检：抢回被旧残留占用的端口（含 SenseNova 中转 :15732）
   const r1 = await reclaimPort(relayPort);
@@ -403,9 +445,12 @@ async function ensureServer() {
     logMain(lastSpawnError);
   }
   const st = await getStatus();
-  if (st && st.service && st.service.up && st.service.pid && st.service.pid !== process.pid) {
-    try { await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(st.service.pid)], { windowsHide: true }, r)); } catch { }
-    for (let i = 0; i < 20 && (await ping()); i++) await new Promise((r) => setTimeout(r, 300));
+  if (st && st.service && st.service.up) {
+    /* 等它真的下去再拉新的。**只在确实动手了才等**——身份核对没过时我们刻意不杀，
+     * 那时干等 6 秒毫无意义（那个进程根本不是我们能停的），直接往下走。 */
+    if (await killServiceIfOurs(st, "启动前清理上一个服务")) {
+      for (let i = 0; i < 20 && (await ping()); i++) await new Promise((r) => setTimeout(r, 300));
+    }
   }
   spawnServer();
   const ok = await waitReady(25000);
@@ -443,8 +488,8 @@ async function restartServer() {
   const r3 = await reclaimPort(snRelayPort);
   portReport = [r1, r2, r3].filter(Boolean);
   const st = await getStatus();
-  if (st && st.service && st.service.pid) {
-    try { await new Promise((r) => execFile("taskkill", ["/F", "/PID", String(st.service.pid)], { windowsHide: true }, r)); } catch { }
+  if (st && st.service && st.service.up) {
+    await killServiceIfOurs(st, "重启前清理上一个服务");
   }
   for (let i = 0; i < 20 && (await ping()); i++) await new Promise((r) => setTimeout(r, 300));
   spawnServer();
