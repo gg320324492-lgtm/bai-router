@@ -942,6 +942,14 @@ async function detectWorkingProxy() {
 let proxyCheckTimer = null;
 function scheduleProxyCheck(delay = 3000, reason = "周期探测") {
   clearTimeout(proxyCheckTimer);
+  // 自动化闸门：端到端测试 spawn 的是**真** server.mjs，而自动代理探测一旦
+  // 探到与配置里不同的代理，就会 applyProxy() 写配置并 exit(0) 自重启换继任者。
+  // 后果有两条，都只在「被自动化驱动」时才有意义：
+  //   ① 正在飞的 fetch 被进程退出连带 RST → ECONNRESET（scripts/attrib-atomic-test.mjs
+  //      的 T1 e2e 长期偶发红，就是它）；
+  //   ② 继任者是 detached 的，父进程 child.kill() 够不着 → 永久孤儿占着 9 个端口。
+  // 自动探测对测试毫无价值（面板上手动检测不受影响，故只关自动这一路）。
+  if (process.env.BAI_NO_PROXY_AUTODETECT === "1") return;
   proxyCheckTimer = setTimeout(async () => {
     if (!serverActivated) return; // 待命/未激活实例不探测（也就绝不触发写配置与自重启）
     const found = await detectWorkingProxy();
@@ -1670,18 +1678,58 @@ const WB_CONFIG_PATH = "/v3/config";
 // 要两份数据得发两次请求。App 形态的版本号走 wbUa()（运行时读真实客户端版本），
 // 不要在这里写死——写死的那个数一定会过期。
 const WB_UA_CLI = "CLI/2.63.2 CodeBuddy/2.63.2";
-/* 目录缓存与落盘文件都**按渠道各一份**（里程碑 1b）：两版是两套目录、两个上游，
-   共用一份缓存会让 .cn 的结果被当成 .ai 的用（applyToCli 读它显示倍率，错配会显示错的价）。
-   wbCatCache 仍是进程内变量、同步可读——applyToCli 取倍率靠它（契约 v18 里程碑 4）。 */
+/* ---------- v1.0.78 T8：目录与倍率**按账号分桶** ----------
+ *
+ * 为什么必须分桶（这不是洁癖，是会算错账的）：`/v3/config` 是**带着某一枚账号的令牌**
+ * 抓回来的，那份清单和其中的 `credits` 倍率**本身就是账号权限的事实**（用户已实测：
+ * 不同账号的清单确实不同）。而分桶之前缓存只按渠道存，于是**在账号 A 下抓到的目录与倍率
+ * 会被复用到账号 B**，两个后果都直接可见：
+ *   ① wbAdvanceModel 按 `credits` 从低到高挑替补 —— 倍率来自错误账号就挑错档位；
+ *   ② 面板上那个倍率是错的，而倍率正是用户判断「这次请求要花多少」的**唯一依据**。
+ *
+ * 桶的键 = 账号的**不可逆指纹**（{@link wbAccountFp}），只进内存键、磁盘文件名与面板标签。
+ * 渠道维度**不撤**（里程碑 1b 的教训仍在：.cn 的结果不能给 .ai 用），现在是「渠道 × 账号」。
+ */
+const WB_CAT_FP_LEN = 16;
+/**
+ * 账号的不可逆指纹 = `sha256(访问令牌)` 的前 16 位十六进制。
+ *
+ * 🔴 红线：这一串**只**允许出现在内存 Map 的键、磁盘缓存文件名与面板标签里；
+ *   它不是凭据的反面（拿不回令牌），也永远不会随任何返回值回显明文。
+ *
+ * 为什么**不用** keyFp（首 7 + 尾 2 + 长度）：那个是**可逆的**——两段明文加长度足以把
+ *   候选集缩到可枚举，而缓存文件名是会被同步盘/网盘上传、会被别人翻到的东西。
+ *   文件名里只允许出现这一种不可逆形式。
+ *
+ * 为什么**只用令牌、不掺账号 id**：id 是用户自己起的低熵串（"acct-a"、"工作号"），
+ *   单独哈希等于留了一本可以字典反查的账。**代价说在明处**：令牌续期/重新登录之后
+ *   指纹会变，桶也就换了一个——同一账号的落盘目录成为孤儿，被
+ *   {@link wbPruneCatFiles} 删掉，下次重新抓一次。这是「宁可多抓一次，也绝不串号」。
+ */
+function wbAccountFp(token) {
+  const s = String(token || "");
+  if (!s) return null;                 // 没令牌就没有目录（wbPickAccount 也会先报 no_token）
+  return createHash("sha256").update(s).digest("hex").slice(0, WB_CAT_FP_LEN);
+}
+
+/** 目录缓存：渠道 → 账号指纹 → {at, upstream, val}。**没有账号维度的键一律不存在**，
+ *  所以「忘了传账号」在类型上就是拿不到缓存，而不是拿到别人的。 */
 const wbCatCaches = {
-  wb: { at: 0, upstream: "", val: null },
-  wbai: { at: 0, upstream: "", val: null },
+  wb: new Map(),
+  wbai: new Map(),
 };
 const WB_CAT_TTL_MS = 30 * 60 * 1000; // 目录变化慢，30 分钟（与 zenReadCatalog 同策略）
+/** 每渠道**每账号**一份的落盘文件名。**只含渠道名与不可逆指纹，绝不含令牌或账号 id。**
+ *  （`wb-catalog-<16 位指纹>.json`；这个正则就是「认得哪些文件是我写的」的判据。） */
+function wbCatFileFor(p, fp) {
+  return path.join(DATA_DIR, `${p}-catalog-${fp}.json`);
+}
+/** 升级前的旧文件名（每渠道一份）。**只在合成单条目池时读写**——多账号下读它等于
+ *  把「上一个账号的目录」当成当前账号的，正是本任务要消灭的那件事。 */
 const wbCatFiles = {
   wb: path.join(DATA_DIR, "wb-catalog.json"),
   wbai: path.join(DATA_DIR, "wbai-catalog.json"),
-};   // 上次成功目录落盘，供降级用
+};
 
 // 倍率归一化（契约 §1.3）：上游两种写法 "x0.79" 与 "x0.34 credits"（带后缀），
 // 另有 ""（无信息）、null（部分 App 形态的图片/视频模型）。
@@ -1728,18 +1776,19 @@ function wbMapModel(m) {
   };
 }
 // 单次抓取：返回 { ok, models, promotions, error } —— 空目录（含 models:null）算失败。
-// p 决定上游与用哪一份令牌（wb → 国内版配置，wbai → 国际版配置）。
-async function wbFetchConfig(cfg, uaKind, p) {
+// p 决定上游（wb → 国内版配置，wbai → 国际版配置）；
+// ★ v1.0.78 T8：`acct` 决定**用哪枚账号的令牌**，由调用方显式传进来，这里绝不自己去挑。
+async function wbFetchConfig(cfg, uaKind, p, acct) {
   const S = sliceOf(cfg, p);
   const base = S.upstream || DEFAULTS[p].upstream;
   let host = "www.workbuddy.ai";
   try { host = new URL(base).hostname; } catch { /* 非法地址则用默认 host 拼头 */ }
-  let tok;
-  /* 池化之后目录抓取也走池子：用的是「当前真的能用」的那枚令牌，而不是渠道配置里
-     那一把（两者在多账号下不再必然相同）。无 sessionKey —— 目录抓取是健康检查，
-     不该占住一条粘性绑定。 */
-  try { ({ token: tok } = await wbEnsureTokenPooled(cfg, p)); }
-  catch (e) { return { ok: false, error: String((e && e.message) || e).slice(0, 160) }; }
+  /* 为什么必须显式：分桶之后「抓的时候用的是哪个账号」与「结果存进哪个桶」必须
+     **由同一个值**决定。只要这一步还隐式取号，就可能出现「拿 A 的令牌抓、存进 B 的桶」
+     ——那正是本任务要消灭的串号，而它在代码里长得和改动前一模一样，看不出来。
+     抓取入口 {@link wbCatalogAccount} 先选号一次，再把 `{id,fp,token}` 一路传下来。 */
+  const tok = acct && acct.token;
+  if (!tok) return { ok: false, error: "没有可用的账号令牌，跳过目录抓取", empty: true };
   const url = base.replace(/\/+$/, "") + WB_CONFIG_PATH;
   const headers = {
     authorization: `Bearer ${tok}`,
@@ -1815,10 +1864,119 @@ function wbMergeModels(cliModels, appModels) {
   }
   return out;
 }
-// 读上次成功目录（落盘降级用）。按渠道各读各的文件（里程碑 1b）。
-function wbReadCatDisk(p) {
-  try { return JSON.parse(readFileSync(wbCatFiles[p], "utf8")); } catch { return null; }
+/* ---------- v1.0.78 T8：桶的四个动作（取号 / 取桶 / 读盘 / 清理）---------- */
+
+/**
+ * 进程内桶读取。**没有账号指纹就没有桶**——这是刻意的：
+ * 让「忘了传账号」变成拿不到东西（退化成 builtin），而不是拿到**别人的**目录。
+ */
+function wbCatBucket(p, fp) {
+  const m = wbCatCaches[p];
+  return m && fp ? (m.get(fp) || null) : null;
 }
+/** 桶里的模型数组（同步可读：wbAdvanceModel 与 429 点名付费行都靠它取倍率）。 */
+function wbCatModels(p, fp) {
+  const b = wbCatBucket(p, fp);
+  return b && b.val && Array.isArray(b.val.models) ? b.val.models : null;
+}
+
+/** 读这个账号上次成功落盘的目录。`fp` 为空（一个可用账号都没有）时**只在合成池下**
+ *  认旧文件名——那是改动前的逐字行为：老用户令牌失效但磁盘上有快照时仍看得到那份目录。
+ *  多账号下 `fp` 为空就是没有目录可用，宁可退回内置兜底也不端别人的上来。 */
+function wbReadCatDisk(p, fp, synthetic) {
+  if (fp) {
+    try {
+      const v = JSON.parse(readFileSync(wbCatFileFor(p, fp), "utf8"));
+      if (v && typeof v === "object") return v;
+    } catch { /* 没有就往下走 */ }
+  }
+  /* 旧文件名（每渠道一份）**只在合成池下认**：它是池化之前某一个账号抓的，
+     多账号下把它读给另一个账号就是串号——宁可退回 builtin，也不给错的价。 */
+  if (synthetic) {
+    try { return JSON.parse(readFileSync(wbCatFiles[p], "utf8")); } catch { return null; }
+  }
+  return null;
+}
+
+/**
+ * 清掉「已经不属于任何在用账号」的落盘桶（孤儿）。
+ * 孤儿从哪来：令牌续期/重新登录会换指纹（见 {@link wbAccountFp} 的说明），
+ * 同一账号的旧桶就再也算不到了。留着只会占地方，而且**面板/诊断里看到一份
+ * 不属于任何账号的目录，比看不到更糟**。
+ * `keep` = 当前池里全部账号的指纹集合。**只删本渠道、只删本程序写的文件名**。
+ */
+function wbPruneCatFiles(p, keep) {
+  let names;
+  try { names = readdirSync(DATA_DIR); } catch { return; }
+  const re = new RegExp(`^${p}-catalog-([0-9a-f]{${WB_CAT_FP_LEN}})\\.json$`);
+  for (const n of names) {
+    const m = re.exec(n);
+    if (!m) continue;                 // 认不出的名字一律不碰（宁可留垃圾也不误删）
+    if (keep && keep.has(m[1])) continue;
+    try { rmSync(path.join(DATA_DIR, n), { force: true }); } catch { /* 删不掉就算了 */ }
+  }
+}
+
+/**
+ * ★ 账号判死 / 停用 / 移出时，**它那一份目录缓存一并作废**（内存桶 + 落盘文件）。
+ *
+ * 为什么：留着既没用（这个号已经选不中了，目录不会再被读到），
+ * 又**占地方且误导诊断**——面板上写着「实时目录 · 账号A」，而账号A 明明已经判死了，
+ * 用户会去查一个根本不该存在的问题。所以判死即作废，是把「这份目录归谁」这件事
+ * 保持为真。
+ *
+ * 判据直接读池内核写在条目上的状态（dead/disabled/ignored），
+ * **不自己另写一套判断**（那正是「从现象反推状态」的毛病）。
+ */
+function wbPruneDeadCatCaches(cfg, p) {
+  const pool = wbPoolOf(cfg, p);
+  if (!pool) return;
+  const keep = new Set();
+  for (const a of pool.accounts) {
+    const fp = wbAccountFp(a.accessToken);
+    if (fp) keep.add(fp);
+    const gone = a.dead === true || a.disabled === true || a.ignored === true;
+    if (!gone || !fp) continue;
+    wbCatCaches[p].delete(fp);
+    try { rmSync(wbCatFileFor(p, fp), { force: true }); } catch { /* 删不掉就算了 */ }
+  }
+  /* 顺带扫一遍孤儿：判死的那个号刚被删掉，剩下的指纹仍要留着（别把活号的删了）。 */
+  wbPruneCatFiles(p, keep);
+}
+
+/**
+ * ★ 目录抓取的**唯一入口**：先显式选出一个账号，再把 `{id,label,fp,token}` 交给
+ * {@link wbReadCatalog} 一路传下去。
+ *
+ * 「显式」体现在结构上：选号只发生这一次，抓取与缓存都用这一个对象，
+ * 所以「拿谁的令牌抓」与「存进谁的桶」在类型上不可能分叉。
+ * 面板刷新/批量扫描这些**没有会话上下文**的调用方也走这里（无 sessionKey，
+ * 目录抓取是健康检查，不该占住一条粘性绑定）。
+ *
+ * ⚠ **选不出号时返回 fp:null，不抛错**：改动前 wbFetchConfig 抓不到令牌只是
+ * 「本次抓取失败」，降级链照样走完、/api/models 照样回 200 带内置兜底。
+ * 把它改成抛错会让「没配令牌」从一份看得见的目录退化成一句报错——
+ * 那是本任务之外的回归。所以这里保留「失败也是一条结果」的形状。
+ */
+async function wbCatalogAccount(cfg, p) {
+  wbPruneDeadCatCaches(cfg, p);        // 判死的号顺手把它的目录作废（④）
+  const pool = wbPoolOf(cfg, p);
+  const synthetic = !!(pool && pool.synthetic);
+  let sel;
+  try {
+    sel = await wbEnsureTokenPooled(cfg, p);
+  } catch (e) {
+    /* 原样带出池子给的那句中文（规矩①：不反推），由降级链照旧消费。 */
+    return { id: null, label: null, fp: null, token: null, synthetic, error: String((e && e.message) || e).slice(0, 160) };
+  }
+  const fp = wbAccountFp(sel.token);
+  const a = sel.account || null;
+  return {
+    id: sel.accountId, label: a && a.label != null ? String(a.label) : String(sel.accountId),
+    fp, token: sel.token, synthetic,
+  };
+}
+
 // 内置兜底：读不到上游时用配置里的 availableModels，倍率标 null（未知）
 function wbBuiltinCatalog(cfg, p) {
   const S = sliceOf(cfg, p);
@@ -1828,24 +1986,41 @@ function wbBuiltinCatalog(cfg, p) {
 }
 // 目录读取入口：实时 → 上次成功（落盘）→ 内置兜底，全程记录来源（契约 §2 降级链）。
 // 返回 { models:[{id,name,credits,free,…}], promotions, source:"live"|"disk"|"builtin", error? }
-// 缓存/落盘/令牌均按渠道 p 隔离（里程碑 1b）。
-async function wbReadCatalog(cfg, p) {
+//
+// ★ v1.0.78 T8：**缓存、落盘与令牌三者都按「渠道 × 账号」隔离**。
+//   `acct` 由 {@link wbCatalogAccount} 显式给出来——「抓的时候用哪个账号」与
+//   「结果存进哪个桶」由**同一个值**决定，两者在结构上不可能分叉。
+//   里程碑 1b 当年解决的是「.cn 的结果被 .ai 用掉」，今天补的是同一条轴上的下一格：
+//   「A 的倍率被 B 用掉」。两者的症状都是**面板显示错的价**。
+async function wbReadCatalog(cfg, p, acct) {
   const S = sliceOf(cfg, p);
   const upstream = S.upstream || DEFAULTS[p].upstream;
   const now = Date.now();
-  const cache = wbCatCaches[p];
-  if (cache.val && cache.upstream === upstream && now - cache.at < WB_CAT_TTL_MS) {
+  const fp = acct && acct.fp;
+  const synthetic = !!(acct && acct.synthetic);
+  const cache = fp ? wbCatBucket(p, fp) : null;
+  if (cache && cache.val && cache.upstream === upstream && now - cache.at < WB_CAT_TTL_MS) {
     return cache.val;
+  }
+  /* 一个可用账号都没有（没配令牌 / 全判死）：**与改动前逐字一致**——
+     合成单账号池还能读自己那份旧快照，读不到就用内置兜底；两者都只是「降级结果」，
+     不进缓存（下次请求要重试上游）。多账号下没有 fp 就没有任何可读目录，
+     直接走内置兜底——宁可少列几个模型，也不把别的账号的目录端上来。 */
+  if (!fp) {
+    const d0 = wbReadCatDisk(p, null, synthetic);
+    return d0 && Array.isArray(d0.models) && d0.models.length
+      ? { models: d0.models, promotions: d0.promotions || null, source: "disk", at: d0.at || null, error: acct.error }
+      : { models: wbBuiltinCatalog(cfg, p), promotions: null, source: "builtin", error: acct.error };
   }
   // 两次请求：CLI 形态（倍率，作为基线与可信倍率）优先；App 形态补齐 roster 与促销。
   // 合并规则见 wbMergeModels 顶部注释（并集，倍率以 CLI 为准）。
-  const cli = await wbFetchConfig(cfg, "cli", p);
+  const cli = await wbFetchConfig(cfg, "cli", p, acct);
   let val;
   if (cli.ok) {
     let promotions = null;
     let models = cli.models;
     try {
-      const app = await wbFetchConfig(cfg, "app", p);
+      const app = await wbFetchConfig(cfg, "app", p, acct);
       if (app.ok) {
         promotions = app.promotions || null;
         /* roster 合并**只在国际版做**：国内版 App 形态的增量几乎都是代码补全/图像/内部
@@ -1855,19 +2030,35 @@ async function wbReadCatalog(cfg, p) {
         if (p === "wbai") models = wbMergeModels(cli.models, app.models || []);
       }
     } catch { /* App 形态失败无所谓，促销只是附注，roster 退回纯 CLI */ }
-    val = { models, promotions, source: "live", at: new Date().toISOString() };
-    try { writeAtomic(wbCatFiles[p], JSON.stringify(val, null, 2) + "\n"); } catch { /* 落盘失败不影响本次结果 */ }
+    val = { models, promotions, source: "live", at: new Date().toISOString(), accountFp: fp };
+    /* 落盘**每渠道每账号一份**，文件名里只有不可逆指纹。
+       合成单条目池时**另外照旧写一份旧文件名**：老用户目录里那个 wb-catalog.json
+       继续存在（内容与改动前逐字相同），降级装回旧版本也还有快照可用。 */
+    try { writeAtomic(wbCatFileFor(p, fp), JSON.stringify(val, null, 2) + "\n"); } catch { /* 落盘失败不影响本次结果 */ }
+    if (synthetic) {
+      try { writeAtomic(wbCatFiles[p], JSON.stringify({ ...val, accountFp: undefined }, null, 2) + "\n"); } catch { }
+    }
+    /* 顺手扫孤儿：换过令牌的旧桶在这里被清掉，不会越攒越多。 */
+    wbPruneCatFiles(p, new Set(wbCatPoolFingerprints(cfg, p).concat([fp])));
   } else {
-    const disk = wbReadCatDisk(p);
+    const disk = wbReadCatDisk(p, fp, synthetic);
     if (disk && Array.isArray(disk.models) && disk.models.length) {
-      val = { models: disk.models, promotions: disk.promotions || null, source: "disk", at: disk.at || null, error: cli.error };
+      val = { models: disk.models, promotions: disk.promotions || null, source: "disk", at: disk.at || null, error: cli.error, accountFp: fp };
     } else {
-      val = { models: wbBuiltinCatalog(cfg, p), promotions: null, source: "builtin", error: cli.error };
+      val = { models: wbBuiltinCatalog(cfg, p), promotions: null, source: "builtin", error: cli.error, accountFp: fp };
     }
   }
-  // 只有 live 结果进缓存（降级结果下次请求要重试上游）。逐渠道写回，避免动到另一版的缓存。
-  if (val.source === "live") wbCatCaches[p] = { at: now, upstream, val };
+  // 只有 live 结果进缓存（降级结果下次请求要重试上游）。**逐「渠道+账号」写回**，
+  // 绝不动到同渠道另一个账号的桶——那正是改动前那个 bug 的形状。
+  if (val.source === "live") wbCatCaches[p].set(fp, { at: now, upstream, val });
   return val;
+}
+
+/** 当前池里全部账号的不可逆指纹（清理孤儿时的「保留名单」）。 */
+function wbCatPoolFingerprints(cfg, p) {
+  const pool = wbPoolOf(cfg, p);
+  if (!pool) return [];
+  return pool.accounts.map((a) => wbAccountFp(a.accessToken)).filter(Boolean);
 }
 
 // ---------- Qoder 模型目录（v1.0.41）----------
@@ -3509,8 +3700,14 @@ const wbModelCoolLeft = (key, now) => {
  * 不需要任何「用积分」开关）。
  * `skip` = 本次请求已经试过并失败的模型，避免在循环里来回挑同一个。
  * 找不到就返回 { ok:false }，由调用方如实把上游的 429 抛给用户。
+ *
+ * ★★ v1.0.78 T8（本任务的核心价值）：`acctFp` 是**本次请求实际用的那个账号**的指纹。
+ *   下面按倍率从低到高排序这件事，只有在倍率来自**这枚令牌**的清单时才成立——
+ *   拿另一个账号的倍率挑替补，挑到的是「那个账号看得到、这次请求却调不通」的档位，
+ *   而面板上显示的也是那份错的价。所以 `acctFp` 是必填的，取不到桶就一路退到
+ *   「倍率未知」的内置列表，**宁可少排一个档，也绝不按别人的倍率排**。
  */
-function wbAdvanceModel(p, failedModel, limit, skip) {
+function wbAdvanceModel(p, failedModel, limit, skip, acctFp) {
   /* 候选来源按可得性依次退让（冷启动时进程内缓存是空的，这是实测踩到的情况：
      服务刚起 → 目录还没拉过 → 候选池空 → 误判成「没有其它可选模型」，
      明明 hy3/hy4-preview 都在线。v1.0.65 实测日志：
@@ -3518,13 +3715,17 @@ function wbAdvanceModel(p, failedModel, limit, skip) {
      ① 进程内实时目录（有倍率，按倍率从低到高排，优先挑最不容易撞限流的）
      ② 磁盘上的上次成功目录（重启后仍在）
      ③ 都没有 → 如实说没有替代，不要瞎换 */
-  const mem = wbCatCaches[p] && wbCatCaches[p].val && Array.isArray(wbCatCaches[p].val.models);
-  const disk = wbReadCatDisk(p);
+  const cfg = loadCfg();
+  /* ★ 这一桶必须属于本次请求用的账号。没有 acctFp 就**不许**退回按渠道取一份**——
+     那正是改动前那个串号形状：只是把「按渠道复用」换成「按任意账号复用」。 */
+  const mem = wbCatModels(p, acctFp);
+  const pool0 = wbPoolOf(cfg, p);
+  const disk = acctFp ? wbReadCatDisk(p, acctFp, !!(pool0 && pool0.synthetic)) : null;
   /* ③ 再兜一层：配置里的 availableModels（拿不到倍率，但至少知道有哪些模型可换）。
      宁可换成倍率未知的另一个模型，也好过把上游的 429 原样甩给用户 ——
      前者能继续干活，后者什么都干不了。倍率未知只在显示上少个后缀。 */
-  const builtin = wbBuiltinCatalog(loadCfg(), p);
-  const models = (mem && wbCatCaches[p].val.models)
+  const builtin = wbBuiltinCatalog(cfg, p);
+  const models = mem
     || (disk && Array.isArray(disk.models) ? disk.models : null)
     || builtin;
   const now = Date.now();
@@ -3740,7 +3941,10 @@ async function fetchCatalogFor(p, cfg) {
     // WorkBuddy **有**公开的模型目录接口：GET {base}/v3/config（契约 v18 里程碑 2）。
     // 旧结论「没有目录接口、回显配置即可」已被实测推翻（见 wbReadCatalog 顶部）。
     // 降级链：实时 → 上次成功（落盘）→ 内置兜底，来源如实标注。两版各拉各的（里程碑 1b）。
-    const cat = await wbReadCatalog(cfg, p);
+    // ★ v1.0.78 T8：先**显式选一个账号**，再把同一个账号对象一路传下去——
+    //   面板上的倍率因此永远是「这一个账号看得到的那一份」，而不是池子里随便一份。
+    const acct = await wbCatalogAccount(cfg, p);
+    const cat = await wbReadCatalog(cfg, p, acct);
     const models = cat.models;
     const freeN = models.filter((m) => m.free).length;
     const labels = {};
@@ -3751,9 +3955,13 @@ async function fetchCatalogFor(p, cfg) {
     }
     const srcZh = { live: "实时目录", disk: "上次成功目录（落盘降级）", builtin: "内置兜底列表" }[cat.source] || cat.source;
     const who = p === "wbai" ? "WorkBuddy AI" : "WorkBuddy";
+    /* 多账号时倍率的归属必须说清楚：这份清单是**某一个账号**的权限事实，
+       不说清它是谁的，用户看到的就是一份「不知道该信几分」的目录。
+       单账号（synthetic）**一个字都不加**——池化对老用户是纯增量。 */
+    const whoAcct = (acct.synthetic || !acct.fp) ? "" : `（账号「${acct.label}」· 指纹 ${acct.fp}）`;
     const note = cat.source === "live"
-      ? `${who} 目录来自上游 ${WB_CONFIG_PATH}（${srcZh}）：共 ${models.length} 个模型，其中 ${freeN} 个 0 倍率免费。`
-      : `未取到 ${who} 实时目录${cat.error ? `（${cat.error}）` : ""}，当前显示${srcZh}——`
+      ? `${who} 目录来自上游 ${WB_CONFIG_PATH}${whoAcct}（${srcZh}）：共 ${models.length} 个模型，其中 ${freeN} 个 0 倍率免费。`
+      : `未取到 ${who} 实时目录${cat.error ? `（${cat.error}）` : ""}，当前显示${srcZh}${whoAcct}——`
         + `${models.length} 个模型，倍率可能不是最新的；稍后重试可恢复实时目录。`;
     return {
       ok: true,
@@ -3763,6 +3971,11 @@ async function fetchCatalogFor(p, cfg) {
       labels, freeCount: freeN, source: cat.source,
       // 目录的**拉取时刻**：判断 disk 档是否过期就看它（面板出处徽标要用）
       catalogAt: cat.at || null,
+      /* ★ v1.0.78 T8：这份目录**是哪个账号的**（面板出处徽标要用，⑤）。
+         只有不可逆指纹 + 用户自己起的标签，**绝不含令牌或账号 id**；
+         合成单条目池时 synthetic=true —— 面板据此判定「单账号就不用显示这一段」，
+         于是单账号场景的徽标与改动前逐字一致。 */
+      sourceAccount: { fp: acct.fp, label: acct.label, synthetic: acct.synthetic === true },
       // 降级到兜底时才标 static，让 scan-all 不动配置（契约：非可信数据不比差异）；
       // live/disk 都是真实目录，交给 scan-all 正常做 diff。
       ...(cat.source === "builtin" ? { static: true } : {}),
@@ -3992,6 +4205,10 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
   /* 本次真正在用的账号 id。失败回灌与「本次被跳过」都以它为准 —— 不用它就等于
      把一次失败记在一个「不知道是谁」的号上，那正是判死错账号的起点。 */
   let wbActiveAccountId = null;
+  /* ★ v1.0.78 T8：本次请求**真正在用**的那个账号的不可逆指纹。
+     换模挑替补（wbAdvanceModel）与 429 点名付费行都要按它去读目录——
+     「本次请求实际使用的账号」是倍率唯一正确的来源，别处那份都不算。 */
+  let wbActiveFp = null;
   /* 翻译后的请求体。**提前算**：池化选号要拿 ob.model 去问「(账号,模型) 那一格
      冷不冷」，而 ob 跟令牌无关 —— 算两次既浪费又是一个能漂移的地方。 */
   const ob = wbToOpenAI(j);
@@ -4019,6 +4236,7 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
       const sel = await wbEnsureTokenPooled(cfg, p, { model: ob && ob.model, sessionKey: mk0 });
       token = sel.token;
       wbActiveAccountId = sel.accountId;
+      wbActiveFp = wbAccountFp(sel.token);
     } catch (e) {
       /* 池子说不可用 —— **原样报池子给的原因**，一个字都不反推。
        * 旧代码这里只会说「访问令牌未配置」，那正是 dsh-xdpool 1.7.7 事故的形态：
@@ -4202,7 +4420,9 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
         const limit = wbParseLimit(peek);
         // 认不出是限流就不换：瞎换比不换更糟（用户要的模型被换掉他并不知道）
         if (!limit) { consumedBodyHint = peek; break; }
-        const next = wbAdvanceModel(p, ob.model, limit, tried);
+        /* ★ v1.0.78 T8：倍率来自**本次请求实际使用的账号**那一桶，
+           不再是「这个渠道随便哪一份目录」。 */
+        const next = wbAdvanceModel(p, ob.model, limit, tried, wbActiveFp);
         if (!next.ok) { consumedBodyHint = peek; break; }
         tried.add(next.model);
         const from = ob.model;
@@ -4405,7 +4625,9 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy }) {
         const paid = wbPaidSameName({
           limitedModel: ob.model,
           rows: wbMappingRows(p === "wbai" ? cfg.wbai : cfg.wb),
-          catalog: (wbCatCaches[p] && wbCatCaches[p].val && wbCatCaches[p].val.models) || [],
+          /* ★ v1.0.78 T8：点名付费行时读的目录也必须是**本次请求实际用的那个账号**的——
+           「同名付费档用同一枚令牌不受影响」这句话，只有当倍率取自同一枚令牌时才成立。 */
+          catalog: wbCatModels(p, wbActiveFp) || [],
         });
         if (paid) { why += " " + paid.text; wbLastPaidHint.set(p, { ...paid, at: new Date().toISOString() }); }
       } else if (wbFed && wbFed.failure && wbFed.failure.why) {

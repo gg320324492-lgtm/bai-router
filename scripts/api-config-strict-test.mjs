@@ -62,7 +62,7 @@ describe("POST /api/config：不再静默成功", () => {
     child = spawn(process.execPath, [SERVER], {
       env: {
         ...process.env, BAI_DATA_DIR: dataDir,
-        NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1",   // 挡住自重启
+        NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1", BAI_NO_PROXY_AUTODETECT: "1",   // 挡住自重启
       },
       stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
     });

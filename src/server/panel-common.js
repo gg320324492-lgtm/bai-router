@@ -1695,10 +1695,24 @@
       }
       return;
     }
+    /* ★ v1.0.78 T8：**这份目录是哪个账号的**（⑤）。
+     * `/v3/config` 是带着某一枚账号的令牌抓回来的，那份清单和其中的倍率**本身就是
+     * 账号权限的事实**——多账号时不标出账号，用户看到的就是一份「不知道该信几分」的价。
+     * 只显示服务端给的**不可逆指纹 + 用户自己起的标签**，渲染层永远不接触凭据。
+     * 单账号（synthetic）或压根没账号时**一个字都不加**——池化对老用户是纯增量，
+     * 徽标与改动前逐字一致。 */
+    const sa = r && r.sourceAccount && r.sourceAccount.fp && !r.sourceAccount.synthetic
+      ? r.sourceAccount : null;
+    const acctHtml = sa
+      ? `<span class="dim"> · 取自账号 <b>${esc(String(sa.label || ""))}</b>（指纹 ${esc(String(sa.fp))}）</span>`
+      : "";
     // disk / builtin 都不是上游当下的样子，标成需留意，别让它看起来和实时目录一样可信
     el.innerHTML = `模型目录：${tierHtml}<b class="${s === "live" ? "ok" : "warn"}">${meta.txt}</b>`
-      + `<span class="dim">（${r.count || 0} 个${r.catalogAt ? " · 拉取于 " + new Date(r.catalogAt).toLocaleString("zh-CN", { hour12: false }) : ""}）</span>${capHtml}`;
+      + `<span class="dim">（${r.count || 0} 个${r.catalogAt ? " · 拉取于 " + new Date(r.catalogAt).toLocaleString("zh-CN", { hour12: false }) : ""}）</span>${acctHtml}${capHtml}`;
     el.title = (r && r.tierHint ? r.tierHint + "\n\n" : "") + meta.hint
+      + (sa ? "\n\n这份目录与其中的积分倍率属于账号「" + String(sa.label || "") + "」（指纹 " + String(sa.fp) + "）："
+        + "不同账号可见的模型与倍率可能不同，换账号后会重新拉一份。"
+        + "判死/停用的账号，它的目录缓存会被一并作废。" : "")
       + (r && r.capHint ? "\n\n" + r.capHint : "") + (r && r.note ? "\n\n" + r.note : "");
     el.className = "catsrc";
   }

@@ -481,7 +481,7 @@ describe("T4 e2e：Go 档 / 免费档 请求头与错误归因", () => {
     child = spawn(process.execPath, [SERVER], {
       env: {
         ...process.env, BAI_DATA_DIR: dataDir,
-        NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1",   // 挡住自重启，否则 kill 不到重生的那个
+        NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1", BAI_NO_PROXY_AUTODETECT: "1",   // 挡住自重启，否则 kill 不到重生的那个
       },
       stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
     });

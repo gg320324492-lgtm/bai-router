@@ -215,7 +215,7 @@ async function bootServer(cfgOverrides) {
   const out = [];
   /* 代理环境变量一并摘掉（理由见上面 cfg.proxy 那段注释）：server.mjs 会把它传给
    * opencode 子进程，那台代理当前会把 opencode.ai 的转发整个挂住。 */
-  const env = { ...process.env, BAI_DATA_DIR: dataDir, NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1" };
+  const env = { ...process.env, BAI_DATA_DIR: dataDir, NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1", BAI_NO_PROXY_AUTODETECT: "1" };
   for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]) delete env[k];
   env.NO_PROXY = "127.0.0.1,localhost";
   const child = spawn(process.execPath, [SERVER], {

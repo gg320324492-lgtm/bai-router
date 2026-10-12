@@ -507,7 +507,7 @@ describe("T3/T6 e2e：真 server.mjs 打假上游，只探免费模型", () => {
     await new Promise((r) => fake.listen(upstream, "127.0.0.1", r));
 
     child = spawn(process.execPath, [SERVER], {
-      env: { ...process.env, BAI_DATA_DIR: dataDir, NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1" },
+      env: { ...process.env, BAI_DATA_DIR: dataDir, NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1", BAI_NO_PROXY_AUTODETECT: "1" },
       stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
     });
     child.stdout.resume(); child.stderr.resume();

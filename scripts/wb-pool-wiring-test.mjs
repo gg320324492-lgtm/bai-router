@@ -1076,7 +1076,7 @@ async function bootServer() {
   const accountsLen = 1;   // wb 是合成的单条目池
   writeFileSync(path.join(dataDir, "config.json"), JSON.stringify(cfg, null, 2));
 
-  const env = { ...process.env, BAI_DATA_DIR: dataDir, NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1" };
+  const env = { ...process.env, BAI_DATA_DIR: dataDir, NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1", BAI_NO_PROXY_AUTODETECT: "1" };
   for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]) delete env[k];
   env.NO_PROXY = "127.0.0.1,localhost";
   const child = spawn(process.execPath, [SERVER], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });

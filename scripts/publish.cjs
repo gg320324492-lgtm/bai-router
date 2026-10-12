@@ -3,6 +3,7 @@
 const { execSync, execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { decideProxyUse, buildGhEnv, runDirectProbe } = require("./publish-proxy.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
@@ -224,15 +225,63 @@ if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {
    `gh ... --notes "…"` 后，双引号内的反引号会被 bash 当**命令替换**执行——
    实测「含反引号 `echo INJECTED` 的文本」会变成「含反引号 INJECTED 的文本」，
    日志正文被破坏，且等同于把发版脚本变成任意命令执行入口。参数数组不经过 shell。 */
+/* ── 发版这一步的网络路径（v1.0.78）────────────────────────────────────────
+ *
+ * `gh release create` 要上传 111MB 安装包。2026-10-12 实测两次：经本机 Clash 的
+ * HTTP 代理会**卡死**（挂 20+ 分钟，CPU 只用 0.56 秒＝纯等待，不是在传），最后失败；
+ * 去掉代理变量则 90~130 秒完成。本机开着 Clash TUN，所以去代理后直连照样通。
+ *
+ * 但**不能无条件清**：万一某台机器没有 TUN、只能靠 HTTP 代理出网，清掉就根本发不出去。
+ * 所以先探一次「不带代理能不能连通 GitHub」（≤4 秒），通了才清，不通就保留。
+ * 判定逻辑抽在 scripts/publish-proxy.cjs（纯函数 + 注入探测器），
+ * 由 scripts/publish-proxy-test.mjs 覆盖四种情形，不必真上传、不必真联网。
+ *
+ * ⚠ 边界：`run()`（electron-builder）一个代理变量都不动——它可能要靠代理拉
+ *   二进制镜像（ELECTRON_BUILDER_BINARIES_MIRROR）。本模块只造一份**新**的
+ *   env 传给 gh，全程不写 process.env，所以构建阶段的网络设置原封不动。
+ * ⚠ 只打印代理变量的**名**，不打印值：代理 URL 里可能嵌着 user:password。 */
+const proxyDecision = decideProxyUse(process.env, runDirectProbe);
+const ghEnv = buildGhEnv(process.env, proxyDecision);
+console.log(`» 发版网络路径：${proxyDecision.useProxy ? "走代理上传（保留代理变量）" : "直连上传（本次已清掉代理变量）"}`);
+console.log(`  理由：${proxyDecision.reason}`);
+
 const gh = (args) => {
   console.log("» gh", args.map((a) => (a.length > 60 ? a.slice(0, 57) + "…" : a)).join(" "));
-  return execFileSync("gh", args, { cwd: ROOT, stdio: ["ignore", "inherit", "inherit"] });
+  // env 显式给 ghEnv：上面那份是**新建**对象，构建阶段那份（process.env）没被动过。
+  return execFileSync("gh", args, { cwd: ROOT, stdio: ["ignore", "inherit", "inherit"], env: ghEnv });
 };
-gh([
-  "release", "create", `v${v}`, "-R", `${owner}/${repo}`,
-  `dist/${exe}`, `dist/${exe}.blockmap`, "dist/upgrade.ps1", "dist/latest.yml",
-  "--title", `v${v}`, "--notes", notes,
-]);
+/* 上传失败要把三件事说清楚，否则现在这种「静默挂 20 分钟后失败」的形态等于
+   把用户丢在黑箱前（实测还会被 gh 自己清掉刚建的 draft，连补救的落点都没了）：
+ *   ① draft 可能已被清理 —— 给出确认命令；
+ *   ② 卡住时看 CPU —— 几乎不动就是在等网络，不是在传；
+ *   ③ 重试命令 —— 脚本整体重跑，或手工重发（--notes-file 避开引号/反引号地狱）。 */
+const ghRc = (e) => (e && typeof e.status === "number" ? e.status : (e && e.signal ? `信号 ${e.signal}` : "?"));
+try {
+  gh([
+    "release", "create", `v${v}`, "-R", `${owner}/${repo}`,
+    `dist/${exe}`, `dist/${exe}.blockmap`, "dist/upgrade.ps1", "dist/latest.yml",
+    "--title", `v${v}`, "--notes", notes,
+  ]);
+} catch (e) {
+  console.error([
+    ``,
+    `✖ 发版失败：gh release create 退出码 ${ghRc(e)}`,
+    ``,
+    `  ⚠ gh 在上传失败时**可能已经删掉**刚创建的 draft release（这是 gh 自己的清理行为）。`,
+    `    先确认草稿还在不在：  gh release view v${v} -R ${owner}/${repo}`,
+    ``,
+    `  ⚠ 如果这次是「长时间没输出然后失败」：看 CPU。占用几乎不动＝在等网络，不是在传。`,
+    `    经代理传大包会这样（2026-10-12 卡 20+ 分钟）；上面已打印本次走的网络路径。`,
+    ``,
+    `  ↺ 重试（重跑全部闸门后重发）：  node scripts/publish.cjs`,
+    `  ↺ 或手工重发上传：`,
+    `      gh release create v${v} -R ${owner}/${repo} \\`,
+    `        "dist/${exe}" "dist/${exe}.blockmap" dist/upgrade.ps1 dist/latest.yml \\`,
+    `        --title v${v} --notes-file release-notes.md`,
+    ``,
+  ].join("\n"));
+  throw e;
+}
 // 命令行参数没有被当作正文时（文件存在），把它作为「发布说明」追加到 GitHub release
 // 正文——单纯给人看的备注，不影响 latest.yml。失败只警告：客户端更新日志不依赖它。
 if (hasNotesFile && process.argv[2] && process.argv[2] !== notes) {

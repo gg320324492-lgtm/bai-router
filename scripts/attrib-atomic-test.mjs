@@ -247,6 +247,12 @@ describe("T1 端到端：真 server.mjs 跑一次流式故障", () => {
         // 这两个 env 用来**阻止它自重启**：needEnvRestart 要求 NODE_USE_ENV_PROXY !== "1"，
         // 而自重启是 detached+unref 的——不挡住的话 child.kill() 杀不到重生的那个，会留孤儿占端口。
         NODE_USE_ENV_PROXY: "1", BAI_ENV_FIXED: "1",
+        // 第三个闸门：关掉**自动**代理探测。它和上面两个是**不同的**重启路径，必须一起挡：
+        // 自动探测探到与配置不同的代理（本机 Clash 在 127.0.0.1:7897，而这里的 cfg.proxy 是空串
+        // =直连）就会 applyProxy() 写配置、再 exit(0) 自重启换继任者——本进程被杀，正在飞的
+        // fetch 直接 ECONNRESET，本用例的 status 轮询窗口正好压在这个窗口上（实测偶发红）。
+        // 面板上手动检测走的是另一条路，不受此闸门影响，行为照旧。
+        BAI_NO_PROXY_AUTODETECT: "1",
       },
       stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
     });
