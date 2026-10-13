@@ -147,7 +147,11 @@ window.BAI_CARDS["model-sync"] = {
     async function scan() {
       busy = true;
       try {
-        const j = await ctx.postJSON("/api/models/scan-all", {});
+        /* 显式给足读预算（v1.0.81）：六家并行拉，墙钟由最慢的那家封顶——wb 最坏 45 秒
+           （令牌续期 15s + CLI 形态 15s + App 形态 15s，三次串行）。拿 api() 的默认 12 秒
+           去发，服务端算完了差异也会被掐成「这次没能读完六家的目录」——而那句红字
+           会让用户以为目录读不出来，其实数据早就算好了。数字由 panel-common.js 统一给。 */
+        const j = await ctx.postJSON("/api/models/scan-all", {}, { timeoutMs: ctx.SCAN_ALL_TIMEOUT_MS });
         state = norm(j);
         render();
 

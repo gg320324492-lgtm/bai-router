@@ -368,12 +368,39 @@ describe("e2e：/api/test 真跑一遍，工具确实发到了上游", () => {
     try { dataDir && rmSync(dataDir, { recursive: true, force: true }); } catch { }
   });
 
-  const test_ = (provider, extra = {}) => fetch(`http://127.0.0.1:${P.panel}/api/test`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ provider, all: true, ...extra }),
-    signal: AbortSignal.timeout(120000),
-  }).then((r) => r.json());
+  /* v1.0.81：POST /api/test 改成**立刻回包、探测在后台跑**（原先它在 HTTP 请求里
+     同步跑完四档，最坏 ≈545 秒，而面板读超时只有 12 秒 —— 上游一慢就把一次正常的
+     探测报成「读取超时」）。所以这里发完 POST 必须**轮 /api/status 等它跑完**，
+     再把 upstream 那一块还原成过去 POST 的返回形状，下面的断言一句都不用改。
+     ⚠ 判「跑完」不能只看 running===false：POST 返回时探测可能已经跑完（假上游极快），
+       那时 running 压根没被观测到 true —— 那样会立刻读到**上一次**的残留结果。
+       所以还要看 at ≥ 发请求那一刻。 */
+  const test_ = async (provider, extra = {}) => {
+    const t0 = Date.now();
+    const post = await fetch(`http://127.0.0.1:${P.panel}/api/test`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider, all: true, ...extra }),
+      signal: AbortSignal.timeout(120000),
+    }).then((r) => r.json());
+    assert.equal(post.started, true, `POST 应回 started:true，实际 ${JSON.stringify(post)}`);
+    const up = await (async () => {
+      const t1 = Date.now();
+      while (Date.now() - t1 < 100000) {
+        const s = await fetch(`http://127.0.0.1:${P.panel}/api/status`).then((r) => r.json());
+        const u = (s[provider] || s).upstream || {};
+        if (!u.running && u.at && Date.parse(u.at) >= t0 - 1000) return u;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      throw new Error("探测 100 秒没跑完");
+    })();
+    const tiers = up.tiers || [];
+    return {
+      ok: up.ok, provider, tiers,
+      pass: tiers.filter((t) => t.ok).length, total: tiers.length,
+      active: up.active, expected: up.expected,
+    };
+  };
   const status = () => fetch(`http://127.0.0.1:${P.panel}/api/status`).then((r) => r.json());
   const zenUpstreamCalls = () => seen.filter((s) => /\/zen\/v1\/chat\/completions$/.test(s.url));
 

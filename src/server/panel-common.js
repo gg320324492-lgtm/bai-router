@@ -68,6 +68,41 @@
   const CAP_TIMEOUT_MARGIN_MS = 60 * 1000;
   const capTimeoutMs = (backendMs) => (Number(backendMs) || CAP_WINDOW_FALLBACK_MS) + CAP_TIMEOUT_MARGIN_MS;
 
+  /* ======================================================================
+   * 0b. 上游型动作的**显式**读预算（v1.0.81）
+   *
+   * 病根是**预算倒挂**：api() 的默认值 12 秒是给「读本机状态」那种快接口兜底的，
+   * 而后端凡是打上游，一律给自己 15 秒以上的预算（zenReadCatalog 15s、
+   * orFetchFreeModels 15s、wbFetchConfig 15s、探测 45s…）。上游只要用满自己那份，
+   * 前端 100% 先断 —— 然后把一次**成功**报成「✘ 读取超时（超过 12 秒）」。
+   * 这是同一族缺陷的**第三轮**修复（第一轮 v1.0.79 修 /api/config，第二轮 v1.0.80 修
+   * /api/wb/capture，本轮一次修掉六个：/api/test、/api/models 的两个调用点、
+   * /api/models/scan-all、/api/or/refresh）。
+   *
+   * 🔴 **不要动 api() 里的 12000。** 它是共享层的安全网：值没变/接口快时立刻返回，
+   *     接口死了不会让人干等两分钟。改默认值会让所有慢接口一起失去保护。
+   *     正解是**逐个调用点声明自己需要多久** —— 也就是下面这几个常量。
+   *
+   * 处置分两类，别一律「把 timeout 调大」糊过去：
+   *   · 长到没法等、又拿得到进度出口的（测连通 ≤545s）→ 改成**提交 + 轮询**，
+   *     见 testTiers()：每次读都是短的，全程有反馈，真超时也不会说成失败。
+   *   · 几十秒量级、用户要的就是当场结果的（拉目录、扫六家、重查额度）→ 显式给足。
+   *
+   * 三个数字都写清了「后端最坏多久」的**来源**，改动 server.mjs 的上游预算时必须回来
+   * 改这里；scripts/api-timeout-budget-test.mjs 会把两边的数字机械地对账。
+   */
+  /* GET /api/models?p= —— 拉上游实时目录。wb/wbai 最坏 45 秒，且**不是** 15 秒：
+     wbCatalogAccount 可能先触发一次令牌续期（15s），wbReadCatalog 再串行拉
+     CLI 形态（15s）与 App 形态（15s）——三次串行。60s = 45s + 余量。
+     ⚠ 只有缓存过期后的第一次真跑满（wb/zen 目录缓存 TTL 都是 30 分钟），日常不受影响。 */
+  const CATALOG_TIMEOUT_MS = 60000;
+  /* POST /api/models/scan-all —— 六家 allSettled 并行，墙钟 = 最慢的那家，
+     也就是上面那条 wb 的 45 秒。给同一个数字。 */
+  const SCAN_ALL_TIMEOUT_MS = 60000;
+  /* POST /api/or/refresh —— orFetchFreeModels(15s) 串行 orFetchQuota(12s) = 27 秒。
+     45s = 27s + 余量。 */
+  const OR_REFRESH_TIMEOUT_MS = 45000;
+
   /* 状态语义色只有四态 + 一色品牌。led/badge/cell 一律走这里，CSS 侧同名。 */
   const STATE = {
     ok: { cls: "ok", txt: "就绪" },
@@ -1274,7 +1309,10 @@
         await refreshConfig(); poll();
         showResult($("applyResult"), `✔ ${nameOf(key)} 轮换区已更新。`, true);
       } else if (act === "quota") {
-        await withBusy(btn, async () => { await postJSON("/api/or/refresh", {}); }, $("applyResult"));
+        /* 显式给足读预算（v1.0.81）：后端是 orFetchFreeModels(15s) 串行
+           orFetchQuota(12s) = 最坏 27 秒 > api() 的默认 12 秒。拿默认值发，
+           OpenRouter 一慢就会把一次**成功**的重查报成「读取超时」。 */
+        await withBusy(btn, async () => { await postJSON("/api/or/refresh", {}, { timeoutMs: OR_REFRESH_TIMEOUT_MS }); }, $("applyResult"));
         await refreshConfig(); poll();
         showResult($("applyResult"),
           "已按 pricing 全 0 重筛免费模型目录并重查额度。非免费档账号的用量接口读不到——"
@@ -1765,16 +1803,70 @@
     await refreshConfig();
   }
 
+  /* 「测试连通」的轮询节奏与放弃条件（v1.0.81）。 */
+  const TEST_POLL_MS = 2000;
+  /* 12 分钟 > 后端最坏 545 秒（45s×3 重试 ×4 档串行 + 档间 1.5s）。给足一倍余量，
+     免得慢机器上刚要收工就被前端放弃。⚠ 到点了**也不说失败** —— 探测还在服务端跑着，
+     说「失败」正是本次要消灭的那类假报。 */
+  const TEST_WAIT_LIMIT_MS = 12 * 60 * 1000;
+
+  /* 等这一家的探测跑完，返回 /api/status 里那一份 upstream。
+   *
+   * 为什么必须轮询而不是延长 timeout：一次探测最坏 9 分钟。用一个大 timeout 去等它，
+   * 用户全程毫无反馈，而且**真超了还是假失败**——与改之前一模一样。
+   * 轮询的每一次读都只有几毫秒（/api/status 是纯本地组包 + 9 秒内的本机探测），
+   * 12 秒的默认值绰绰有余，于是根本不存在「读被掐断」这件事。
+   */
+  async function waitTestDone(P, slot) {
+    const t0 = Date.now();
+    for (;;) {
+      let s = null;
+      /* 单次读失败（服务重启中/某一轮慢）**不等于探测失败**：下一轮再说。
+         这里若 throw，外层 withBusy 会把一次还在正常跑的探测写成一坨红字。 */
+      try { s = await api("/api/status"); } catch { /* 下一轮 */ }
+      const up = s ? (stOf(P).upstream || {}) : {};
+      const secs = Math.round((Date.now() - t0) / 1000);
+      if (up.running) {
+        showResult(slot, `⏳ 正在逐档探测…（已 ${secs}s）\n`
+          + "上游慢的时候这一下最长可能几分钟（勾了「测全部四档」会更久）。探测在服务端跑着，"
+          + "面板不会掐断它，也不用刷新页面。", true);
+        await new Promise((r) => setTimeout(r, TEST_POLL_MS));
+        continue;
+      }
+      /* 跑完了。⚠ 不能只看 running===false：POST 返回时探测可能已经结束（本地中转很快），
+         那时 running 压根没被观测到 true，那样会读到**上一次**的残留结果。
+         所以还要看 at 不早于本次发起（t0 之前 1 秒内不算旧账）。 */
+      if (up.at && Date.parse(up.at) >= t0 - 1000) return up;
+      if (Date.now() - t0 > TEST_WAIT_LIMIT_MS) return null;
+      showResult(slot, `⏳ 正在排队/发起探测…（已 ${secs}s）`, true);
+      await new Promise((r) => setTimeout(r, TEST_POLL_MS));
+    }
+  }
+
   async function testTiers() {
     const all = has("ckAllTiers") && $("ckAllTiers").checked;
-    const r = await postJSON("/api/test", all ? { provider: selected, all: true } : { provider: selected });
-    const single = !!r.active && !all;
-    const lines = (r.tiers || []).map((t) => {
+    const P = selected;
+    const slot = $("testResult");
+    /* v1.0.81：POST 立刻回包（后端把探测丢后台了），这里轮 /api/status 取结果。
+       这一步超时不会「误报失败」：读的是本机状态，不是上游。 */
+    const r = await postJSON("/api/test", all ? { provider: P, all: true } : { provider: P });
+    if (r.alreadyRunning) showResult(slot, "⏳ 这一家已经在探测了，接着等它跑完…", true);
+    const up = await waitTestDone(P, slot);
+    /* 放弃等待 ≠ 失败：探测仍在服务端跑，结果会由 5 秒轮询的 /api/status 正常显示。
+       如实说「还在跑」，绝不说「失败」——与 v1.0.79/80 同一个纪律。 */
+    if (!up) {
+      showResult(slot, "⏳ 探测仍在服务端继续（已等满 12 分钟），**这不是失败**。\n"
+        + "结果出来后会由状态轮询自动显示，也可以点上面的「刷新」重看。", true);
+      return;
+    }
+    const tiers = up.tiers || [];
+    const single = !!up.active && !all;
+    const lines = tiers.map((t) => {
       const who = single ? "当前使用：" : (TIER_ZH[t.tier] || t.tier) + "：";
       return t.ok ? `✔ ${who}${t.label} · ${t.ms}ms` : `✘ ${who}${t.label} · 失败：${t.error}`;
     });
     const tail = single ? "" : "（最近 30 分钟没观察到真实对话流量，已测全部四档）";
-    showResult($("testResult"), lines.join("\n") + (tail ? "\n" + tail : ""), !!r.ok);
+    showResult(slot, lines.join("\n") + (tail ? "\n" + tail : ""), !!up.ok);
   }
 
   /* 目录来源徽标：**常驻**在映射编辑区上方。
@@ -1849,7 +1941,10 @@
 
   async function refreshModels() {
     const P = MANIFEST[selected] || {};
-    const r = await api("/api/models?p=" + selected);
+    /* ★ v1.0.81：这一步过去吃 api() 的默认 12 秒，而后端拉目录最坏 45 秒（wb）——
+       同一个按钮的**后面**一步（POST /api/config 写 availableModels）v1.0.79 已经修过，
+       **前面**这一步没修，所以那个按钮至今仍可能假报失败。这里显式给 CATALOG_TIMEOUT_MS。 */
+    const r = await api("/api/models?p=" + selected, { timeoutMs: CATALOG_TIMEOUT_MS });
     /* 逐模型能力标记（v1.0.74 T3+T6）：**文案全部来自服务端**，渲染层只按 id 取来显示，
      * 因此不需要认识任何渠道名（C11）。没有 capLabel 的渠道（非探测类）这张表就是空的，
      * 下拉框外观与改动前逐字相同。 */
@@ -2069,7 +2164,10 @@
     const key = selected;
     if (!key) return;
     try {
-      const r = await api("/api/models?p=" + key);
+      /* 同一个上游型接口、同一个预算（v1.0.81）：这里失败只 console.warn、界面停在
+         旧徽标上，所以过去没人注意它也在吃 12 秒。改成显式 60s 是为了**别让冷缓存的
+         首次进入**把徽标悄悄留成上一次的样子 —— 留旧徽标比说「没拉过」轻，但也会骗人。 */
+      const r = await api("/api/models?p=" + key, { timeoutMs: CATALOG_TIMEOUT_MS });
       if (selected !== key) return;   // 期间又切了渠道，丢弃这次结果
       paintCatalogSource(r);
     } catch (e) {
@@ -2220,6 +2318,9 @@
     /* 发 /api/wb/capture 必用的读超时（后端捕获窗口 + 余量）。卡片自己也有兜底实现，
        这里给出来是为了**只有一处定义**这个数字，两条路径不会各算各的。 */
     capTimeoutMs,
+    /* 上游型动作的显式读预算（v1.0.81）。卡片自己调 /api/models/scan-all 也要给足，
+       数字**只在这里定义一次** —— 两边各写各的，改了一边就会重新出现预算倒挂。 */
+    CATALOG_TIMEOUT_MS, SCAN_ALL_TIMEOUT_MS, OR_REFRESH_TIMEOUT_MS,
     $, q, qa, api, postJSON, showInfo, showResult, setLed, withBusy, poll, refreshConfig,
     renderRoute, selectChannel, setView, fp, registerCapture,
   };

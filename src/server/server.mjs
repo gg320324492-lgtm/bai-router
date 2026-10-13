@@ -5854,6 +5854,17 @@ function providerStatus(cfg, p, store) {
       expectedKind: lastTest[p]?.expectedKind || null,
       expectedWhy: lastTest[p]?.expectedWhy || null,
       expectedTiers: lastTest[p]?.expectedTiers || [],
+      /* 「正在探测」（v1.0.81）：测连通改成后台跑之后，/api/status 就是前端唯一的进度出口。
+       * ⚠ **running 与下面那组 lastTest 是两回事**：running 时下面那组仍是**上一次**的
+       *   结果（不是空的、也不是半成品）。前端必须先看 running 决定要不要继续轮询，
+       *   否则会在探测刚开始时把上一次的结论当成这次的报上去。 */
+      running: !!testRun && testRun.p === p,
+      runningAt: (testRun && testRun.p === p) ? new Date(testRun.startedAt).toISOString() : null,
+      /* 本次的逐档结果（v1.0.81）：POST 立刻回包后，结果只存在这里。tiers 只在本家
+       * 测过之后才非空（≤4 个小对象），all/active 供前端复现原有的措辞。 */
+      tiers: lastTest[p]?.tiers || [],
+      all: lastTest[p]?.all === true,
+      active: lastTest[p]?.active || null,
     },
     recent: (() => {
       if (!t) return { tier: null };
@@ -6080,6 +6091,141 @@ const lastTest = {
   or: { ok: null, model: null, ms: null, error: null, at: null },
 };
 
+/* 「**这一家正在探测**」的登记（v1.0.81）。测连通最坏要跑 9 分钟，所以 POST /api/test
+ * 改成立刻回包、把探测丢后台（runTierProbe）—— 那就得有个地方说清「现在到底在不在跑」，
+ * 否则前端无从判断该继续轮询还是可以收工。
+ *
+ * ⚠ 只存**一个**进行中的任务（连点两下不跑两轮）。清空时必须比**对象同一性**
+ *   （testRun === mine）：A 家在探时用户转去点 B 家，两个任务会并发，A 的 finally
+ *   若无条件写 null，就会把 B 的 running 提前抹掉 —— 那一瞬间前端会以为测完了，
+ *   去读一个还根本没写出来的结果。
+ */
+let testRun = null;   // { p, startedAt }
+
+/* 测连通的后台探测体（v1.0.81）—— 从 POST /api/test 的 handler 里**原样搬出来**的。
+ *
+ * 探测逻辑一个字没改（四档串行、每档 3 次重试、结果写进 lastTest[P]），改的只是
+ * **谁来调它**：过去 handler 在 HTTP 请求里同步跑完（最坏 ≈545 秒），
+ * 现在由 POST /api/test 丢进后台并立刻回包，前端轮 /api/status 取结果。
+ *
+ * ⚠ 参数是 (cfg, P, all)：P 由入口 resolveChannelKey 收敛好；cfg 在入口取一次快照传进来，
+ *   免得长跑途中读到换过的配置（那会让一次探测的各档来自两个不同版本）。
+ */
+async function runTierProbe(cfg, P, all) {
+  const S = sliceOf(cfg, P);
+  // 每家一份「最近真实调用」观察表；按渠道键取，不用再写一串三元链
+  // （加渠道时漏改一处 = 测活时用错家的档位历史）。
+  const store = P === "bai" ? recentCallsBai
+    : P === "sn" ? recentCallsSn
+    : P === "wb" ? recentCallsWb
+    : P === "wbai" ? recentCallsWbai
+    : P === "zen" ? recentCallsZen
+    : P === "qd" ? recentCallsQd
+    : recentCallsOr;
+  const active = all ? null : activeTier(store);
+  const targets = active ? [active] : TIERS.map((t) => t.key);
+  const tierInfo = (key) => {
+    const m = S.mapping[key] || {};
+    return { label: m.label || key, target: m.target || S.defaultModel };
+  };
+  /* 探测请求体（v1.0.78）：**只有 Zen 会带 tools**，其余渠道逐字不变。
+   *
+   * 为什么：Zen 免费档的围栏判据是「发给模型的请求里必须带工具」，不带工具的探测
+   * 会被同一个 FreeTierError 403 拒掉——**真实对话完全正常，面板却显示成红色故障**。
+   * 那是探测方式造成的假阳性，不是渠道坏了。Claude Code 的真实流量本来就带工具，
+   * 所以带工具的探测才代表真实可用性。
+   *
+   * 三条纪律（改动这行前先读完）：
+   *   · `max_tokens` **必须仍是 8** —— 它是入口 `isProbe`（max_tokens<=8）的判据，
+   *     改成别的数会连带禁掉短超时（10s）与 429 重试，探测反而更容易假失败。
+   *   · **不带 `tool_choice`** —— 我们只想问「请求形状上游收不收」，不想逼模型真的
+   *     去调工具（那会白花一份配额）。它回文本就够了：能返回就是通。
+   *   · 只给 zen 加 —— 别的上游对 `tools` 的接受度各不相同，凭空给它们加字段等于
+   *     拿一条本来正常的渠道去冒险。 */
+  const probeBody = (tier) => (P === "zen"
+    ? { model: tier + "[1M]", max_tokens: 8, messages: [{ role: "user", content: "ok" }], tools: [ZEN_PROBE_TOOL_ANTHROPIC] }
+    : { model: tier + "[1M]", max_tokens: 8, messages: [{ role: "user", content: "ok" }] });
+  const probe = async (tier) => {
+    const info = tierInfo(tier);
+    let lastErr = null;
+    let expected = null;   // 「这一档预期内被拒」的判定（null = 没判定，按故障报）
+    for (let attempt = 0; attempt < 3; attempt++) { // 上游偶发截断/挂起，测活流量重试两次
+      const t0 = Date.now();
+      try {
+        const r = await fetch(`http://127.0.0.1:${S.relayPort}/v1/messages`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${S.key}`, "content-type": "application/json", "anthropic-version": "2023-06-01" },
+          body: JSON.stringify(probeBody(tier)),
+          signal: AbortSignal.timeout(45000),
+        });
+        const j = await readProbeJson(r);
+        const ms = Date.now() - t0;
+        if (!r.ok) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
+        return { tier, label: info.label, target: info.target, served: j.model, ok: true, ms, error: null };
+      } catch (e) {
+        lastErr = String(e?.message || e).slice(0, 100);
+        /* 归因按**上游原文**判，不看本机中转转译过的中文文案（后者丢掉了 FreeTierError
+         * 字样，拿它判永远判不出「预期内」）。原文与状态码由 readProbeJson 挂在错误上。
+         * 拿不到原文时一律按故障报——宁可漏判，也绝不能把别的 403 错认成「预期内」。
+         * 传输方式取 **S.transport**（sliceOf 已经带了，用同一个 zenTransportOf 算的），
+         * 不在这里再调一次：多一处调用就多一个与 openaiExchange 的分流判据漂移的机会。 */
+        const exp = zenExpectedRejection(e?.upstreamStatus || 0, e?.upstreamRaw || "", {
+          provider: P,
+          isGo: zenTierOf(S.upstream) === ZEN_TIER_GO,
+          transport: S.transport || "direct",
+        });
+        if (exp.expected) expected = exp;
+      }
+    }
+    /* `expected` 非空 = 这是**产品级的预期拒绝**（「免费档 + 直连」本来就会被拒），
+     * 不是渠道故障。照样如实标 ok:false（这一档确实发不出消息），但**不**报故障：
+     * 面板改成中性的「预期内被拒」并给出两条可执行的下一步。 */
+    return {
+      tier, label: info.label, target: info.target, served: null, ok: false, ms: null,
+      error: lastErr || "unknown",
+      ...(expected ? { expected: true, expectedKind: expected.kind, expectedWhy: expected.why } : {}),
+    };
+  };
+  // 免费渠道对短时间并发探测很敏感。串行并留出间隔，避免四个档位
+  // 同时命中 429；这不会影响真实对话的吞吐。
+  const tiers = [];
+  for (let i = 0; i < targets.length; i++) {
+    tiers.push(await probe(targets[i]));
+    if (i < targets.length - 1) await new Promise((res) => setTimeout(res, 1500));
+  }
+  const pass = tiers.filter((x) => x.ok).length;
+  /* 「预期内被拒」单独算一类（v1.0.78）。它**既不是通过也不是故障**：
+   * 这一档确实发不出消息（ok 仍是 false，如实说），但原因已知且是产品设计的围栏，
+   * 所以另起一个 expected 计数，让面板显示中性的「预期内被拒 + 两条下一步」，
+   * 而不是亮红灯让用户去查一个根本没坏的渠道。
+   * 只有**全部**失败档位都属这一类时才置 expected —— 混着别的真故障就不能洗白。 */
+  const badTiers = tiers.filter((x) => !x.ok);
+  const expTiers = badTiers.filter((x) => x.expected);
+  const expectedOnly = badTiers.length > 0 && expTiers.length === badTiers.length;
+  Object.assign(lastTest[P], {
+    ok: pass === tiers.length,
+    model: tiers[0]?.label || null,
+    ms: tiers[0]?.ms || null,
+    error: summarizeTierErrors(tiers),
+    at: new Date().toISOString(),
+    ...(expectedOnly ? {
+      expected: true,
+      expectedKind: expTiers[0].expectedKind,
+      expectedWhy: expTiers[0].expectedWhy,
+      expectedTiers: expTiers.map((x) => x.label),
+    } : { expected: false, expectedKind: null, expectedWhy: null, expectedTiers: [] }),
+  });
+
+  /* 逐档结果也存下来（v1.0.81）：前端改成轮 /api/status 之后，结果是**从这里**读的——
+   * POST /api/test 那一行 json() 早已没有第二个读者。tiers 是最多 4 个小对象，
+   * 且只在本家测过之后才非空，挂进 /api/status 的代价可以忽略。
+   * all/active 一并存：前端要靠 all 决定「当前使用」还是逐档罗列的措辞。 */
+  lastTest[P].tiers = tiers;
+  lastTest[P].all = !!all;
+  lastTest[P].active = active;
+  log(`测连通 ${P}: ${pass}/${tiers.length} 档通过` + (expectedOnly ? "（全部为预期内被拒）" : ""));
+}
+
 const panel = http.createServer(async (req, res) => {
   res.setHeader("access-control-allow-origin", "http://127.0.0.1:" + loadCfg().panelPort);
   const u = new URL(req.url, "http://127.0.0.1");
@@ -6264,7 +6410,13 @@ const panel = http.createServer(async (req, res) => {
      * 基线取 loadCfg() 的**当前内存快照**，而不是拉回来的原始结果——onActivated() 已经把
      * config.defaults.json 并进了每家的 availableModels，拿裸结果比会凭空多出一堆「新增」。
      *
-     * 六家并行拉（allSettled，一家挂了不牵连其余），墙钟时间由最慢的那家（15s 超时）封顶。 */
+     * 六家并行拉（allSettled，一家挂了不牵连其余），墙钟时间由**最慢的那家**封顶。
+     *
+     * ⚠ v1.0.81 修正一句错的：这里原先写的是「最慢的那家（15s 超时）」，对 wb/wbai 不成立。
+     *   它们的目录要走 wbCatalogAccount（可能触发令牌续期 15s）+ wbFetchConfig(cli) 15s
+     *   + wbFetchConfig(app) 15s，**三次串行 = 最坏 45s**。前端因此必须给 ≥60s
+     *   （见 panel-common.js 的 CATALOG_TIMEOUT_MS），写 15s 会让一次成功的扫描
+     *   被掐成「这次没能读完六家的目录」。 */
     if (req.method === "POST" && u.pathname === "/api/models/scan-all") {
       const cfg = loadCfg();
       const settled = await Promise.allSettled(ALL_PKEYS.map((k) => fetchCatalogFor(k, cfg)));
@@ -6805,114 +6957,41 @@ async function unknownMappingTargets(p, mapping, cfg) {
     }
 
     // v1.0.28: 测连通按 provider 分流，各测各的中转端口/映射/密钥
+    /* ★ v1.0.81：**立刻回包**，探测搬到后台（runTierProbe）。
+     *
+     * 改之前这个 handler 把四档串行探完才回包：单档 3 次重试 × 45s，勾上「测全部四档」
+     * 最坏 ≈545 秒。而面板 api() 的默认读超时是 12 秒 —— 上游只要慢一次，前端就
+     * 100% 先断，然后把一次**正在正常进行的探测**报成「✘ 读取超时（超过 12 秒）」。
+     * 服务端还在探，下一轮 5 秒轮询才会把结果送到用户眼前，而那次失败提示已经骗过
+     * 用户一遍了（与 v1.0.79/80 是同一个故事：成功要说成成功）。
+     *
+     * 现在 POST 只做两件事：登记「这一家正在探测」（供 /api/status 暴露 running）、
+     * 把探测丢进后台，立刻回 {started:true}。前端改成轮 /api/status —— 每次读都是短的，
+     * 读多久都不会被掐断，过程中看得见进度，结束时拿到的就是真结果。
+     *
+     * ⚠ 同一渠道已在探测中就**不重起一次**（连点两下不跑两轮），回 alreadyRunning。
+     * ⚠ 清 running 用**对象同一性**判定（testRun === mine）：A 家在探时用户转去点 B 家，
+     *   两个任务并发，A 的 finally 绝不能把 B 的 running 提前抹掉。
+     */
     if (req.method === "POST" && u.pathname === "/api/test") {
-      const cfg = loadCfg();
       const b = await readBody(req).catch(() => ({}));
       const P = resolveChannelKey(b.provider);
-      const S = sliceOf(cfg, P);
-      // 每家一份「最近真实调用」观察表；按渠道键取，不用再写一串三元链
-      // （加渠道时漏改一处 = 测活时用错家的档位历史）。
-      const store = P === "bai" ? recentCallsBai
-        : P === "sn" ? recentCallsSn
-        : P === "wb" ? recentCallsWb
-        : P === "wbai" ? recentCallsWbai
-        : P === "zen" ? recentCallsZen
-        : P === "qd" ? recentCallsQd
-        : recentCallsOr;
-      const active = b.all ? null : activeTier(store);
-      const targets = active ? [active] : TIERS.map((t) => t.key);
-      const tierInfo = (key) => {
-        const m = S.mapping[key] || {};
-        return { label: m.label || key, target: m.target || S.defaultModel };
-      };
-      /* 探测请求体（v1.0.78）：**只有 Zen 会带 tools**，其余渠道逐字不变。
-       *
-       * 为什么：Zen 免费档的围栏判据是「发给模型的请求里必须带工具」，不带工具的探测
-       * 会被同一个 FreeTierError 403 拒掉——**真实对话完全正常，面板却显示成红色故障**。
-       * 那是探测方式造成的假阳性，不是渠道坏了。Claude Code 的真实流量本来就带工具，
-       * 所以带工具的探测才代表真实可用性。
-       *
-       * 三条纪律（改动这行前先读完）：
-       *   · `max_tokens` **必须仍是 8** —— 它是入口 `isProbe`（max_tokens<=8）的判据，
-       *     改成别的数会连带禁掉短超时（10s）与 429 重试，探测反而更容易假失败。
-       *   · **不带 `tool_choice`** —— 我们只想问「请求形状上游收不收」，不想逼模型真的
-       *     去调工具（那会白花一份配额）。它回文本就够了：能返回就是通。
-       *   · 只给 zen 加 —— 别的上游对 `tools` 的接受度各不相同，凭空给它们加字段等于
-       *     拿一条本来正常的渠道去冒险。 */
-      const probeBody = (tier) => (P === "zen"
-        ? { model: tier + "[1M]", max_tokens: 8, messages: [{ role: "user", content: "ok" }], tools: [ZEN_PROBE_TOOL_ANTHROPIC] }
-        : { model: tier + "[1M]", max_tokens: 8, messages: [{ role: "user", content: "ok" }] });
-      const probe = async (tier) => {
-        const info = tierInfo(tier);
-        let lastErr = null;
-        let expected = null;   // 「这一档预期内被拒」的判定（null = 没判定，按故障报）
-        for (let attempt = 0; attempt < 3; attempt++) { // 上游偶发截断/挂起，测活流量重试两次
-          const t0 = Date.now();
-          try {
-            const r = await fetch(`http://127.0.0.1:${S.relayPort}/v1/messages`, {
-              method: "POST",
-              headers: { authorization: `Bearer ${S.key}`, "content-type": "application/json", "anthropic-version": "2023-06-01" },
-              body: JSON.stringify(probeBody(tier)),
-              signal: AbortSignal.timeout(45000),
-            });
-            const j = await readProbeJson(r);
-            const ms = Date.now() - t0;
-            if (!r.ok) throw new Error(upstreamErrorText(j, 120) || `上游返回 HTTP ${r.status}，但没带错误说明`);
-            return { tier, label: info.label, target: info.target, served: j.model, ok: true, ms, error: null };
-          } catch (e) {
-            lastErr = String(e?.message || e).slice(0, 100);
-            /* 归因按**上游原文**判，不看本机中转转译过的中文文案（后者丢掉了 FreeTierError
-             * 字样，拿它判永远判不出「预期内」）。原文与状态码由 readProbeJson 挂在错误上。
-             * 拿不到原文时一律按故障报——宁可漏判，也绝不能把别的 403 错认成「预期内」。
-             * 传输方式取 **S.transport**（sliceOf 已经带了，用同一个 zenTransportOf 算的），
-             * 不在这里再调一次：多一处调用就多一个与 openaiExchange 的分流判据漂移的机会。 */
-            const exp = zenExpectedRejection(e?.upstreamStatus || 0, e?.upstreamRaw || "", {
-              provider: P,
-              isGo: zenTierOf(S.upstream) === ZEN_TIER_GO,
-              transport: S.transport || "direct",
-            });
-            if (exp.expected) expected = exp;
-          }
-        }
-        /* `expected` 非空 = 这是**产品级的预期拒绝**（「免费档 + 直连」本来就会被拒），
-         * 不是渠道故障。照样如实标 ok:false（这一档确实发不出消息），但**不**报故障：
-         * 面板改成中性的「预期内被拒」并给出两条可执行的下一步。 */
-        return {
-          tier, label: info.label, target: info.target, served: null, ok: false, ms: null,
-          error: lastErr || "unknown",
-          ...(expected ? { expected: true, expectedKind: expected.kind, expectedWhy: expected.why } : {}),
-        };
-      };
-      // 免费渠道对短时间并发探测很敏感。串行并留出间隔，避免四个档位
-      // 同时命中 429；这不会影响真实对话的吞吐。
-      const tiers = [];
-      for (let i = 0; i < targets.length; i++) {
-        tiers.push(await probe(targets[i]));
-        if (i < targets.length - 1) await new Promise((res) => setTimeout(res, 1500));
+      if (testRun && testRun.p === P) {
+        return json(res, 200, {
+          ok: true, started: false, alreadyRunning: true, provider: P,
+          startedAt: new Date(testRun.startedAt).toISOString(),
+        });
       }
-      const pass = tiers.filter((x) => x.ok).length;
-      /* 「预期内被拒」单独算一类（v1.0.78）。它**既不是通过也不是故障**：
-       * 这一档确实发不出消息（ok 仍是 false，如实说），但原因已知且是产品设计的围栏，
-       * 所以另起一个 expected 计数，让面板显示中性的「预期内被拒 + 两条下一步」，
-       * 而不是亮红灯让用户去查一个根本没坏的渠道。
-       * 只有**全部**失败档位都属这一类时才置 expected —— 混着别的真故障就不能洗白。 */
-      const badTiers = tiers.filter((x) => !x.ok);
-      const expTiers = badTiers.filter((x) => x.expected);
-      const expectedOnly = badTiers.length > 0 && expTiers.length === badTiers.length;
-      Object.assign(lastTest[P], {
-        ok: pass === tiers.length,
-        model: tiers[0]?.label || null,
-        ms: tiers[0]?.ms || null,
-        error: summarizeTierErrors(tiers),
-        at: new Date().toISOString(),
-        ...(expectedOnly ? {
-          expected: true,
-          expectedKind: expTiers[0].expectedKind,
-          expectedWhy: expTiers[0].expectedWhy,
-          expectedTiers: expTiers.map((x) => x.label),
-        } : { expected: false, expectedKind: null, expectedWhy: null, expectedTiers: [] }),
+      const mine = { p: P, startedAt: Date.now() };
+      testRun = mine;
+      void runTierProbe(loadCfg(), P, !!b.all).catch((e) => {
+        log("测连通后台任务异常:", String((e && e.message) || e).slice(0, 200));
+        Object.assign(lastTest[P], { ok: false, error: String((e && e.message) || e).slice(0, 200), at: new Date().toISOString() });
+      }).finally(() => { if (testRun === mine) testRun = null; });
+      return json(res, 200, {
+        ok: true, started: true, running: true, provider: P,
+        startedAt: new Date(mine.startedAt).toISOString(),
       });
-      return json(res, 200, { ok: pass === tiers.length, provider: P, tiers, pass, total: tiers.length, active, expected: expectedOnly });
     }
 
     // ---------- 备用自升级 API ----------
