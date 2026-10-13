@@ -118,9 +118,11 @@ assert.notEqual(SRV_CAPTURE_PARAM, SRV_CAPTURE, "捕获窗口参数化没打上 
 
 const makeCapture = new Function("D", `
   "use strict";
-  const { fsPromises, existsSync, readFileSync, rmSync, path, WB_BACKUP_FILE, log,
+  const { fsPromises, existsSync, readFileSync, writeFileSync, rmSync, path, WB_BACKUP_FILE, log,
           findWbCliScript, wbMd5, WB_CAPTURE_HOOK, DATA_DIR, wbKickHostSession,
-          wbClientRunningBefore, wbClientRestartedAfter, loadCfg, saveCfg, wbTokenExp } = D;
+          wbClientRunningBefore, wbClientRestartedAfter, wbClientExeFromScript, wbAutoRestartClient,
+          loadCfg, saveCfg, wbTokenExp } = D;
+  const WB_PREWARM_GRACE_MS = 25000;
   let wbCapState = { active: false, startedAt: null, error: null, p: "wb" };
   ${SRV_RESTORE}
   ${SRV_CAPTURE_PARAM}
@@ -341,6 +343,7 @@ async function startCaptureServer(opts = {}) {
     fsPromises: fs.promises,
     existsSync: fs.existsSync,
     readFileSync: fs.readFileSync,
+    writeFileSync: fs.writeFileSync,
     rmSync: fs.rmSync,
     path,
     WB_BACKUP_FILE: path.join(dir, "wb-codebuddy.bak.json"),
@@ -350,6 +353,11 @@ async function startCaptureServer(opts = {}) {
     WB_CAPTURE_HOOK: "\n// === BAI-CAPTURE-HOOK ===\n// === /BAI-CAPTURE-HOOK ===\n",
     DATA_DIR: dataDir,
     wbKickHostSession: async () => ({ action: "no_sidecar", detail: "测试桩：没有 WorkBuddy 后台" }),
+    /* v1.0.82 新增：捕获流程会调它自动重启客户端。本文件只关心「捕获成功/失败怎么报」，
+       自动重启本身由 wb-auto-capture-test.mjs 用假进程表专门验；这里给一个诚实的桩
+       （不假装重启成功，免得掩盖了别的回归）。 */
+    wbAutoRestartClient: async () => ({ action: "not_running", detail: "测试桩：客户端没有在运行", killed: 0 }),
+    wbClientExeFromScript: () => null,
     wbClientRunningBefore: async () => false,
     wbClientRestartedAfter: async () => false,
     loadCfg: () => JSON.parse(JSON.stringify(cfg)),
@@ -483,6 +491,24 @@ function mountCard(base) {
  * 4. 用例
  * ====================================================================== */
 
+test("勾选自动重启时请求显式携带许可，完成后开关恢复可用", async () => {
+  const srv = await startCaptureServer({ windowMs: 3000 });
+  const ui = mountCard(srv.base);
+  try {
+    const box = ui.host.querySelector('[data-role="auto-restart"]');
+    assert.ok(box);
+    box.checked = true;
+    const done = ui.click();
+    assert.equal(box.disabled, true);
+    assert.ok(await srv.waitActive());
+    const request = ui.apiCalls.find((x) => x.path === "/api/wb/capture" && x.opts.method === "POST");
+    assert.equal(JSON.parse(request.opts.body).autoRestart, true);
+    srv.fire({ accessToken: TOK_WITH_REFRESH });
+    await done;
+    assert.equal(box.disabled, false);
+  } finally { await srv.close(); }
+});
+
 /* ---------------------------------------------------------------- *
  * ★ ① 端到端复现：12 秒客户端超时 + 真阻塞捕获。
  *   改前：12 秒准时抛 TimeoutError → 「✘ 获取失败：读取超时（超过 12 秒）」，
@@ -501,6 +527,7 @@ describe("★ ① 端到端：12 秒读超时不再把成功的捕获掐成失�
     /* POST 必须**不是** 12 秒默认值 —— 这是「12 秒必放弃」的直接反证 */
     const post = ui.apiCalls.find((c) => c.path === "/api/wb/capture" && c.opts.method === "POST");
     assert.ok(post, "卡片必须真的发 POST /api/wb/capture");
+    assert.equal(JSON.parse(post.opts.body).autoRestart, false, "未勾选时必须向后端明确禁止自动重启");
     assert.ok(post.opts.timeoutMs > 12000,
       `POST 的读超时必须给足捕获窗口（实得 ${post.opts.timeoutMs}）—— 12 秒默认值会把成功掐成失败`);
 

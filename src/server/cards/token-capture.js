@@ -28,8 +28,10 @@ window.BAI_CARDS["token-capture"] = {
         <div class="cardbody" data-cid="tc-${esc(n)}">
           <div class="tcap">
             <span class="k">怎么拿</span>
-            <span class="v">在本机客户端里发一条带鉴权的请求，中转把令牌抓回来（只存内存，不落配置）</span>
+            <span class="v">开始获取后，客户端发起带鉴权的请求时会自动保存令牌。完成或超时后会还原临时改动。</span>
           </div>
+          <label class="tcap"><input type="checkbox" data-role="auto-restart">允许自动重启客户端（可选）</label>
+          <div class="tcap"><span class="v">勾选后，点击获取会关闭并重新打开对应客户端窗口；未保存内容可能丢失，客户端内的终端会话也可能结束。未勾选时请手动重启，或使用「手动填写」。</span></div>
           <div class="progress" data-role="prog" style="display:none">
             <div class="spin"></div>
             <div>
@@ -56,10 +58,10 @@ window.BAI_CARDS["token-capture"] = {
 
     /* ---------------- 等待面板 ---------------- */
     const CAP_TIPS = [
-      "正在等待客户端触发…",
-      "如果 10 秒内没反应，请在对应客户端里打开一个对话，或随便发一条消息",
-      "钩子已就位，客户端一发起带鉴权的请求就会自动抓到访问令牌",
-      "仍在等待中…（最长 2 分 30 秒，可随时关闭页面重试）",
+      "正在准备获取令牌…",
+      "正在等待客户端发起带鉴权的请求…",
+      "若尚未捕获，请按下方提示重启客户端或发一条消息",
+      "仍在等待中…（最长 10 分钟，超时后自动还原客户端脚本）",
     ];
     const timers = new Map();
     /* 停掉某个作用域的等待面板。**两个定时器都要清**：只清轮询那个的话，
@@ -96,6 +98,7 @@ window.BAI_CARDS["token-capture"] = {
       run.settled = true;
       stopTimers(sc);
       if (run.btn) { run.btn.disabled = false; run.btn.textContent = run.old; }
+      if (run.restartBox) run.restartBox.disabled = false;
       await ctx.refreshConfig().catch(() => { });
       ctx.poll();
     }
@@ -132,9 +135,15 @@ window.BAI_CARDS["token-capture"] = {
       stopTimers(sc);
       if (!on) return;
       let n = 0;
+      /* 轮询分支若接管了标题（自动重启中 / 重启没做成 / 等用户手动重启），
+         这个 12 秒推进器就**必须让位**——否则它会在下一拍把
+         「正在自动重启，窗口会被关掉」覆盖成一句「请发一条消息」，
+       那正是我们要消灭的那种误导。 */
+      let tickBlocked = false;
       sc.$('[data-role="ptitle"]').textContent = CAP_TIPS[0];
       sc.$('[data-role="pdesc"]').textContent = "完成后会自动还原对客户端的临时改动，不影响它正常使用。";
       const tick = setInterval(() => {
+        if (tickBlocked) return;
         n = Math.min(n + 1, CAP_TIPS.length - 1);
         sc.$('[data-role="ptitle"]').textContent = CAP_TIPS[n];
       }, 12000);
@@ -150,26 +159,47 @@ window.BAI_CARDS["token-capture"] = {
             return;
           }
           if (s && s.gotAccessToken) {
+            tickBlocked = false;
             sc.$('[data-role="ptitle"]').textContent = "已捕获到访问令牌，正在写入配置…";
             sc.$('[data-role="pdesc"]').textContent = "刷新令牌只在令牌到期续期时才会出现；没有它也能正常使用，到期后重新获取即可。";
+          } else if (s && s.restarting) {
+            /* v1.0.82：正在由**程序**自动重启客户端。这一句必须显眼：
+               我们要关掉的是用户正在用的窗口，不能默默杀用户的应用 ——
+               「窗口会被关掉并重新打开」+「未保存内容可能丢失」都要说出口。 */
+            tickBlocked = true;
+            sc.$('[data-role="ptitle"]').textContent = "正在自动重启客户端，请勿手动操作";
+            sc.$('[data-role="pdesc"]').textContent = s.phaseText
+              || "正在自动重启 WorkBuddy 客户端：**你的客户端窗口会被关掉并重新打开**，未保存的对话内容可能丢失。稍等几秒，窗口会自动重新出现。";
+          } else if (s && s.restart && !s.restarted && s.restart.action !== "restarted" && s.restart.action !== "not_running") {
+            /* 展示真实重启结局；启动失败时旧窗口已经退出，不能声称没有动任何进程。 */
+            tickBlocked = true;
+            sc.$('[data-role="ptitle"]').textContent = s.restart.action === "disabled"
+              ? "自动重启已关闭，请手动重启客户端"
+              : s.restart.action === "spawn_failed" ? "客户端已退出，但未能重新打开" : "没能完成自动重启客户端";
+            sc.$('[data-role="pdesc"]').textContent = (s.restart.detail || "")
+              + "本轮仍在等待，可手动重开客户端后发消息；本轮结束后需重新获取，或使用「手动填写令牌」。";
           } else if (s && s.needRestart && !s.restarted) {
             /* v1.0.65：客户端在钩子注入前就已启动，内存里是旧入口脚本——
                改磁盘对它无效，光发消息是抓不到的。必须明说，否则用户会一直试。
                这里**不**拼「已等待 N 秒」——等再久也没用，要等的是用户重启客户端。 */
+            tickBlocked = true;
             sc.$('[data-role="ptitle"]').textContent = "需要先完全退出并重启客户端";
             sc.$('[data-role="pdesc"]').textContent = s.phaseText
               + "（关窗口不算，托盘图标也要退出；重开后发一条消息即可）";
           } else if (s && s.restarted) {
             /* v1.0.70：探测到客户端已在注入之后重启 —— 钩子此刻确实生效了。
                不用再让用户自己判断"我这一步做对没有"，界面直接翻成「可以发消息了」。
-               剩下的时间也一并显示，免得再出现"我是不是又错过了时限"的悬念。 */
+               剩下的时间也一并显示，免得再出现"我是不是又错过了时限"的悬念。
+               v1.0.82：自动重启成功时也会走这里 —— 后端重启探测到新进程，且它**可能**
+               空载就抓到（预热请求带鉴权时用户全程零操作）；抓不到时再说「发一条消息」。 */
+            tickBlocked = true;
             const left = Math.max(0, Math.round((s.remainMs || 0) / 1000));
             const mm = Math.floor(left / 60);
             const ss = String(left % 60).padStart(2, "0");
-            sc.$('[data-role="ptitle"]').textContent = "钩子已生效，发一条消息即可";
+            sc.$('[data-role="ptitle"]').textContent = "客户端已重启，正在等待令牌…";
             sc.$('[data-role="pdesc"]').textContent =
-              `已检测到客户端重启，钩子已经加载。现在到 ${s.provider === "wbai" ? "WorkBuddy AI" : "WorkBuddy"} 客户端里发一条消息即可抓到令牌`
-              + `（还剩 ${mm}:${ss}，超时后自动还原客户端脚本）`;
+              (s.phaseText || `${s.provider === "wbai" ? "WorkBuddy AI" : "WorkBuddy"} 客户端已重启，正在等待带鉴权的请求`)
+              + `（还剩 ${mm}:${ss}，超时后自动还原客户端脚本）。若这段时间内没抓到，请在客户端里发一条消息即可。`;
           } else if (s && s.active && s.phaseText) {
             /* 时长由后端给（v1.0.70 之前这里写死「最长 150 秒」，与后端一改就对不上了）。 */
             const secs = Math.round((s.elapsedMs || 0) / 1000);
@@ -254,7 +284,10 @@ window.BAI_CARDS["token-capture"] = {
         btn.textContent = "获取中…";
         /* 一次捕获的运行态。prevStartedAt 是发起**之前**后端已有的那一轮的开始时刻：
            轮询回来时靠它把「本次的结果」和「上一次留下的结果」分开。 */
-        const run = { prevStartedAt: null, reported: false, settled: false, btn, old };
+        const restartBox = sc.$('[data-role="auto-restart"]');
+        const run = { prevStartedAt: null, reported: false, settled: false, btn, old,
+          restartBox, autoRestart: !!(restartBox && restartBox.checked) };
+        if (restartBox) restartBox.disabled = true;
         showProgress(sc, true, run);
         try {
           /* 先问后端这次要等多久：POST 会一直阻塞到捕获结束，拿面板 api() 的
@@ -272,7 +305,7 @@ window.BAI_CARDS["token-capture"] = {
           const r = await ctx.api("/api/wb/capture", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ provider: sc.key }),
+            body: JSON.stringify({ provider: sc.key, autoRestart: run.autoRestart }),
             timeoutMs: capTimeoutMs(run.windowMs),
           });
           if (claimReport(run)) {

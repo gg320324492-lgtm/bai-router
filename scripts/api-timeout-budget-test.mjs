@@ -327,17 +327,19 @@ const ENDPOINTS = {
   },
 };
 
-/* 含上游等待、但**不是面板 HTTP 端点**的函数——每个都要写明理由，
-   否则 §1 的防漏检查会红（这条豁免表就是防漏检查的一部分）。 */
+/* 通用端点表之外的等待：启动、中转及令牌捕获的专用动态预算。
+   每个都要写明理由，令牌捕获另由 wb-capture-report-test 验证前端窗口及终局。 */
 const NOT_A_PANEL_ENDPOINT = {
   openaiExchange: "中转出站（relay server），面板不可达，没有前端读它",
   handleUpstream: "中转出站（同上），最长等待来自请求头预算，不是面板动作",
   downloadLatestInstaller: "备用自升级：POST /api/selfupdate 调它但**不 await**（已在 §1 结构判据里验过）",
   listenWithRetry: "启动期的看门狗 ping 自身面板，与面板动作无关",
   findWbCliScript: "令牌捕获路径里定位客户端安装目录（powershell/where 子进程），" +
-    "由已在 §1 结构判据里验过的非阻塞 POST /api/wb/capture 驱动，不是面板动作",
+    "走 /api/wb/capture 专用长请求预算（后端捕获窗口 + 前端60s余量）",
   wbClientEarliestStartMs: "同上：令牌捕获路径里用 powershell 读客户端进程启动时间（8s），" +
-    "只喂给已非阻塞的 /api/wb/capture",
+    "只喂给 /api/wb/capture 专用动态预算",
+  wbClientProcessTable: "捕获专用的进程查询（12s），在捕获截止时间内执行；前端使用捕获窗口+60s余量",
+  wbTerminatePidOnly: "捕获专用的退出请求（每次10s），正常退出/强制退出等待有上限；位于捕获截止时间内",
 };
 
 /* --- 解析前端的每一个调用点 --- */

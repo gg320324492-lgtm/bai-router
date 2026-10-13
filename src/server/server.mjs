@@ -2692,10 +2692,27 @@ function wbSidecarRpc(pipePath, method, params, timeoutMs = 3000) {
 //   no_sidecar   —— WorkBuddy 后台没在跑（没 PID 文件 / 进程已死）
 //   no_host      —— 后台在跑但没有常驻会话（下次发消息会自动新建，钩子届时就会加载）
 //   pipe_fail    —— 管道连上了但 RPC 失败（**不杀任何进程**，如实报告）
-//   sidecar_killed —— 管道连不上，兜底只杀 PID 文件里那个 sidecar 进程（绝不碰主进程）
+//   pipe_unreachable —— **控制管道根本连不上**（v1.0.82）。这里曾经有一个「兜底把整个
+//                      sidecar 杀掉」的分支，已经删掉：sidecar 管着**用户在客户端里开的
+//                      终端 PTY**（本文件 2624 的注释自己写着），杀它等于把用户的终端会话
+//                      一起陪葬 —— 与代码里三处「用户会话未动」的承诺直接矛盾。现在这条路
+//                      **一个进程都不动**，只如实报告并给出替代路径。
 //   pid_unverified —— PID 文件都在、进程也活着，但**身份核对没通过**（PID 被回收 / 取不到启动时间）。
 //                      **不杀任何进程**，并把核对结论原样说给用户（绝不静默照杀）。
-async function wbKickHostSession() {
+//
+// 管道失败只报告；不保留直接杀 sidecar 的兜底。
+async function wbKickHostSession(opts = {}) {
+  if (!opts.exe) return { action: "pid_unverified", detail: "未指定本次客户端安装目录，已跳过后台会话重启（未终止任何进程）" };
+  let allowedPids = null;
+  if (opts.exe) {
+    const procs = await wbClientProcessTable(opts.provider);
+    const norm = (s) => String(s || "").replace(/\//g, "\\").toLowerCase();
+    const sidecars = (procs || []).filter((x) => norm(x.exe) === norm(opts.exe) && /sidecar-entry/i.test(x.cmd));
+    if (sidecars.length !== 1) {
+      return { action: "pid_unverified", detail: "无法唯一确认本次客户端的 sidecar，已跳过后台会话重启（未终止任何进程）" };
+    }
+    allowedPids = new Set(sidecars.map((x) => x.pid));
+  }
   // 在全部候选 PID 文件里挑第一个「进程确实活着**且身份对得上**」的——精确路径可能残留
   // 过期 PID 文件，见到存在就用会把扫描到的真正活侧车挡在后面（多实例/多 env 场景实测过这个坑）。
   const pidFiles = await wbSidecarPidFiles();
@@ -2705,6 +2722,7 @@ async function wbKickHostSession() {
     let j = null;
     try { j = JSON.parse(readFileSync(p, "utf8")); } catch { continue; }
     if (!j || !j.pid) continue;
+    if (allowedPids && !allowedPids.has(Number(j.pid))) continue;
     try {
       process.kill(j.pid, 0);
     } catch (e) {
@@ -2760,14 +2778,23 @@ async function wbKickHostSession() {
     }
     return { action: "pipe_fail", detail: `常驻会话终止失败：${lastErr || "未知错误"}（未杀任何进程）`, sessions: arr.length };
   } catch (e) {
-    // 管道连不上/超时：兜底只杀 sidecar 进程本身（PID 来自它自己的文件，且只杀这一个 PID）。
-    // 主进程下次用到时会重建 sidecar → 重建常驻会话 → 新进程读到钩子。
-    try {
-      process.kill(info.pid);
-      return { action: "sidecar_killed", detail: `控制管道无响应（${e.message}），已直接终止 sidecar 进程 ${info.pid}（仅此一个 PID；下次发消息时 WorkBuddy 会自动重建）` };
-    } catch (e2) {
-      return { action: "pipe_fail", detail: `无法触达 sidecar：${e.message}；终止也失败：${e2.message}（未杀任何进程）` };
-    }
+    /* 🔴 v1.0.82：管道连不上时**不再**杀 sidecar（原来这里是 process.kill(info.pid)）。
+     *
+     * 为什么必须改：sidecar 管着**用户自己在客户端里开的终端 PTY**（见本文件 2624 的注释）。
+     * 杀 sidecar = 把那些终端会话一起陪葬 —— 这与上面 2759「其余 N 个用户会话未动」、
+     * 2625「用户开的终端 PTY 不动」两处承诺**直接矛盾**，是代码里承诺与行为打架的实锤。
+     * 触发条件也不是理论上的：管道无响应/超时（3s）就会踩到，而客户端正忙时最容易踩。
+     *
+     * 现在这条路径**一个进程都不动**，如实说清楚为什么不动、替代路径是什么。
+     */
+    return {
+      action: "pipe_unreachable",
+      detail: `控制管道连不上（${e.message}），**没有终止任何进程**。`
+        + "sidecar 管着你**在客户端里开的终端会话**，直接杀它会把那些终端一起结束，"
+        + "所以这里没有这么做——「只重启常驻会话」这条温和的路走不通时，宁可不动。"
+        + "替代路径：① 用「手动填写令牌」把令牌填进来（最快，永远可用）；"
+        + "② 或先完全退出并重开客户端再点一次「一键获取令牌」（新进程会加载钩子）。",
+    };
   }
 }
 
@@ -2819,6 +2846,264 @@ function findWbCliScript(p) {
   })();
 }
 
+/* ---------- 自动重启 WorkBuddy 客户端（v1.0.82：把「用户零操作」补上） ----------
+ *
+ * 为什么要做（.research/reports/N-全自动捕获可行性.md 已逐条核实，不再重复调查）：
+ *   · 改磁盘上的入口脚本对**已在运行**的客户端无效 —— Electron 启动时就把脚本读进内存了；
+ *   · 真正承接聊天请求的是 daemon 的 **prewarm 预热池 worker**（`codebuddy --prewarm`），
+ *     而 wbKickHostSession 只筛 `__workbuddy_cli_host__` 常驻会话，**预热池 worker 从来不在
+ *     它的名单里**（所以「踢会话」这条杠杆对真正的干活的进程无效）；
+ *   · 踢完常驻会话之后 daemon **不会补员**：spawn 触发源只有 startup_ready /
+ *     product_snapshot_change / post_acquire，**没有心跳**（实测客户端开着 8 分钟零新进程）。
+ *   ⇒ 唯一能保证「拿到一个加载了钩子的新进程」的杠杆是**重启客户端主进程**：
+ *     它触发 startup_ready → prewarm_triggered → prewarm_spawn_started，新 worker 会加载
+ *     磁盘上的钩子，且**空载时就会主动出网**。这正是「退出 + 重开」这一步无法被「踢会话」
+ *     替代的原因，而「重开」这一步现在由程序自己做 —— 用户零操作。
+ *
+ * 🔴 安全红线（三条，一条都不许破）：
+ *   ① **只按 PID 终止**，且**先核对身份**（proc-identity.cjs 的三态 same / recycled /
+ *      unverifiable）。PID 被系统回收后误杀无关程序不是理论风险；unverifiable 一律不杀，
+ *      宁可不做，也绝不拿用户的别的程序去赌。
+ *   ② **绝不用按镜像名终止的那条 taskkill 参数组合，绝不按进程名批量终止** ——
+ *      那会误杀用户正在用的正式实例（红线：taskkill 只按 PID）。
+ *      按名字**读**进程表只是「发现」手段（和 proc-identity 的用法一致）；动手时永远只有
+ *      一个核对过的 PID。
+ *   ③ **绝不碰 sidecar 管的终端 PTY**：sidecar 是客户端的子进程，重启客户端本就必然连带
+ *      结束它（这是客户端整体退出的固有后果，下面会如实告知用户），但我们**绝不**单独去
+ *      终止 sidecar 或任何用户会话 —— 那正是 wbKickHostSession 兜底分支被删掉的原因。
+ */
+
+/* 终止客户端主进程的两个时限：先给 8 秒正常退出（不用 /F，让它有机会把状态存好），
+ * 等不到才升级为强制终止；强制终止之后再等 30 秒确认它真的没了（没消失就不能拉起，
+ * 否则新实例会被单实例锁挡掉，用户看到的是「点了没反应」）。 */
+const WB_CLIENT_EXIT_GRACE_MS = 8000;
+const WB_CLIENT_EXIT_WAIT_MS = 30000;
+
+/* 重启之后给预热池的宽限时间：超过这个时长还没抓到令牌，就再踢一次常驻会话，
+ * 让用户下一条消息必然落到一个**带着钩子**的新进程上（预热请求本身可能不带鉴权，
+ * 这是「零操作」没能覆盖全时唯一还剩下的那一环）。 */
+const WB_PREWARM_GRACE_MS = 25 * 1000;
+
+/* 从注入用的 CLI 脚本路径反推客户端主程序 exe。
+ * script 形如 <base>\resources\app.asar.unpacked\cli\bin\codebuddy，上溯 5 级到 <base>。
+ * 取不到就返回 null（调用方如实报告，绝不猜一个路径去启动）。 */
+function wbClientExeFromScript(script, p) {
+  if (!script || typeof script !== "string") return null;
+  const base = path.resolve(script, "..", "..", "..", "..", "..");
+  const names = p === "wbai"
+    ? ["WorkBuddyAI.exe", "WorkBuddy AI.exe", "WorkBuddy.exe"]
+    : ["WorkBuddy.exe", "WorkBuddy AI.exe", "WorkBuddyAI.exe"];
+  for (const n of names) {
+    const c = path.join(base, n);
+    try { if (existsSync(c)) return c; } catch { }
+  }
+  return null;
+}
+
+/* 客户端进程表：[{pid, startMs, exe, cmd}]。
+ *
+ * ⚠️ 按**镜像名**筛只是「发现」手段（Windows 上按可执行路径筛进程没有便宜做法），
+ *    动手终止时仍然只按**核对过的 PID** —— 见文件头红线 ②。
+ * 返回 null = **探测失败**（≠ 客户端没在跑）；返回 [] = 确实一个都没有。
+ * 这两者必须分得开：探测失败时我们不知道该怎么办，只能如实说，绝不能当成「没在跑」就
+ * 跳过重启，更不能当成「在跑」就去乱杀。 */
+async function wbClientProcessTable(p) {
+  const ps = "$ErrorActionPreference='Stop';$r=@();"
+    + "foreach($q in Get-CimInstance Win32_Process -Filter \"Name='WorkBuddy.exe' OR Name='WorkBuddyAI.exe' OR Name='WorkBuddy AI.exe'\"){"
+    + "$r+=[pscustomobject]@{pid=$q.ProcessId;st=([DateTimeOffset]$q.CreationDate).ToUnixTimeMilliseconds();"
+    + "exe=$q.ExecutablePath;cmd=$q.CommandLine}}"
+    + "ConvertTo-Json -InputObject @($r) -Compress";
+  try {
+    const out = await new Promise((res) => execFile("powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", ps],
+      { windowsHide: true, timeout: 12000 },
+      (e, so) => res(e ? null : String(so == null ? "" : so).trim())));
+    if (out == null) { log(`WorkBuddy 客户端进程表探测失败（${p}）：PowerShell 查询未返回结果`); return null; }
+    let j;
+    try { j = JSON.parse(out || "null"); }
+    catch (e) { log(`WorkBuddy 客户端进程表探测返回的不是 JSON（${p}）：${out.slice(0, 120)}`); return null; }
+    const arr = Array.isArray(j) ? j : (j == null ? [] : [j]);
+    return arr
+      .filter((x) => x && Number(x.pid) > 0)
+      .map((x) => ({
+        pid: Number(x.pid),
+        startMs: Number(x.st) > 0 ? Number(x.st) : null,
+        exe: String(x.exe == null ? "" : x.exe),
+        cmd: String(x.cmd == null ? "" : x.cmd),
+      }));
+  } catch (e) {
+    log(`WorkBuddy 客户端进程表探测异常（${p}）：${e.message}`.slice(0, 220));
+    return null;
+  }
+}
+
+/* 从进程表里挑「客户端主进程」。
+ *
+ * 判据（两条都要）：① 可执行文件路径与我们正要拉起的那个 exe 完全一致；
+ * ② 命令行里**没有**子进程标记（--type=renderer / --type=gpu / --type=utility /
+ * sidecar-entry.js / daemon-app-server-entry.js / crashpad / sandbox-* / betterleaks）。
+ * ② 是必须的：sidecar、daemon、渲染进程**都跑在同一个 exe 上**，只有靠命令行才分得开。
+ * ⚠️ 它们一律**不在**终止目标里（红线 ③）—— sidecar 后面挂着用户的终端 PTY。
+ * 同一个 exe 下出现多个主进程候选时拒绝选择，避免动到另一用户数据目录。 */
+function wbPickMainClientProcess(procs, exePath) {
+  const arr = Array.isArray(procs) ? procs.filter((x) => x && Number(x.pid) > 0) : [];
+  if (!arr.length) return null;
+  const norm = (s) => String(s == null ? "" : s).replace(/\//g, "\\").toLowerCase();
+  const want = norm(exePath);
+  if (!want) return null;
+  const pool = arr.filter((x) => norm(x.exe) === want);
+  const isChild = (x) => {
+    const cmd = String(x.cmd || "").trim();
+    const match = cmd.match(/^"([^"]+)"(?:\s|$)|^(\S+)(?:\s|$)/);
+    return !match || norm(match[1] || match[2]) !== want
+      || /--type=|sidecar-entry|daemon-app-server-entry|crashpad|sandbox-|betterleaks|codebuddy|--serve\b|--prewarm\b|\.(?:m?js)\b/i.test(cmd);
+  };
+  const mains = pool.filter((x) => !isChild(x));
+  // 无法唯一识别时不猜；多个主进程可能属于不同的用户数据目录。
+  return mains.length === 1 ? mains[0] : null;
+}
+
+/* 这个 PID 现在还在吗？ESRCH = 已经没了。
+ * 刻意不做别的判据：这里只回答「在不在」，「是不是当初那个」由 proc-identity 回答。 */
+function wbPidAlive(pid) {
+  try { process.kill(Number(pid), 0); return true; }
+  catch (e) { return !(e && e.code === "ESRCH"); }
+}
+
+/* **只按 PID** 终止一个进程：先发关闭请求（不带 /F，给客户端机会正常退出、把状态存好），
+ * 等它自己消失；等不到才升级为强制终止。
+ *
+ * 🔴 两个 taskkill 调用**都只带 PID 参数**（见下面两行代码）：按镜像名终止会连用户正在用的
+ *    正式实例一起杀掉，契约明文禁止，这个文件里不许出现。也不带树形终止参数 —— 我们要的
+ *    就是「只结束客户端主进程」，不主动去连带终止它的子进程（见红线 ③）。 */
+async function wbTerminatePidOnly(pid, opts = {}) {
+  const graceMs = Number(opts.graceMs) > 0 ? Number(opts.graceMs) : WB_CLIENT_EXIT_GRACE_MS;
+  const exec = opts.execFile || execFile;
+  const alive = opts.alive || wbPidAlive;
+  const run = (args) => new Promise((res) =>
+    exec("taskkill", args, { windowsHide: true, timeout: 10000 }, (e) => res(e ? String((e && e.message) || e) : "")));
+  const check = async () => typeof opts.verifyIdentity === "function" ? opts.verifyIdentity() : null;
+  const beforeSoft = await check();
+  if (!beforeSoft || beforeSoft.verdict !== VERDICT_SAME) {
+    return { ok: false, forced: false, error: "关闭前无法确认进程身份，已跳过终止" };
+  }
+  const soft = await run(["/PID", String(pid)]);
+  const t0 = Date.now();
+  while (Date.now() - t0 < graceMs) {
+    if (!alive(pid)) return { ok: true, forced: false };
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  if (!alive(pid)) return { ok: true, forced: false };
+  // 宽限期内 PID 可能被回收；绝不能把 /F 发给接替它的无关进程。
+  const beforeHard = await check();
+  if (beforeHard && beforeHard.verdict === "recycled") return { ok: true, forced: false };
+  if (!beforeHard || beforeHard.verdict !== VERDICT_SAME) {
+    return { ok: false, forced: false, error: "强制关闭前无法确认进程身份，已跳过强制终止" };
+  }
+  const hard = await run(["/PID", String(pid), "/F"]);   // 仍只按 PID
+  if (hard) return { ok: false, forced: true, error: hard };
+  const t1 = Date.now();
+  while (Date.now() - t1 < WB_CLIENT_EXIT_WAIT_MS) {
+    if (!alive(pid)) return { ok: true, forced: true };
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return { ok: false, forced: true, error: soft ? `关闭请求失败：${soft}` : "进程在终止后仍然存在" };
+}
+
+/* 重新拉起客户端：spawn(exe, []) —— **必须无参数**。
+ * 带激活参数可能走 msix「共享到」那条激活路径（WorkBuddyShareTarget.msix），
+ * 拉起来的东西未必是我们要的客户端主程序（见调查 R6）。 */
+async function wbSpawnClientExe(exe, opts = {}) {
+  const sp = opts.spawn || spawn;
+  return new Promise((resolve) => {
+    try {
+      const ch = sp(exe, [], { detached: true, stdio: "ignore" });
+      ch.once("error", (e) => resolve({ ok: false, error: String(e.message || e) }));
+      ch.once("spawn", () => {
+        ch.unref();
+        resolve({ ok: true, pid: ch.pid || null });
+      });
+    } catch (e) {
+      resolve({ ok: false, error: String((e && e.message) || e) });
+    }
+  });
+}
+
+/* 完整的「自动重启客户端」：探测 → 挑主进程 → **身份核对** → 只按 PID 终止 → 等它消失 → 无参数拉起。
+ *
+ * 返回 {action, detail, ...}，action 取值：
+ *   restarted      —— 旧主进程已退出、新进程已拉起（成功）
+ *   not_running    —— 客户端本来就没开，**不动任何进程**，提示打开即可
+ *   probe_fail     —— 进程表探测失败（分不清在不在）→ **不动任何进程**
+ *   no_exe/no_main —— 定位不到 exe / 挑不出主进程 → **不动任何进程**
+ *   unverified     —— 身份核对 recycled/unverifiable → **不动任何进程**（红线 ①）
+ *   kill_failed / spawn_failed —— 终止失败 / 拉起失败 → 如实说，附手动路径
+ * spawn_failed 表示旧进程已退出但新进程启动失败；其余失败必须如实报告。 */
+async function wbAutoRestartClient(p, opts = {}) {
+  const zh = opts.zh || (p === "wbai" ? "WorkBuddy AI" : "WorkBuddy");
+  const manual = `替代路径：① 用「手动填写令牌」把令牌填进来（永远可用）；② 或手动完全退出并重开 ${zh} 客户端后重试。`;
+  const exe = opts.exe || wbClientExeFromScript(opts.script, p);
+  const procs = await wbClientProcessTable(p);
+  if (procs === null) {
+    return { action: "probe_fail", killed: 0, detail: `未能查询到 ${zh} 客户端的进程列表（系统查询失败），已跳过自动重启并**没有终止任何进程**。${manual}` };
+  }
+  if (!procs.length) {
+    return {
+      action: "not_running", killed: 0,
+      detail: `${zh} 客户端当前**没有在运行**，所以没有重启它（也不会去启动它）。`
+        + `钩子已注入程序目录：请打开 ${zh} 并登录，然后随便发一条消息即可被自动抓取。`,
+    };
+  }
+  if (!exe) {
+    return { action: "no_exe", killed: 0, detail: `定位不到 ${zh} 客户端的主程序，**没有终止任何进程**。${manual}` };
+  }
+  const main = wbPickMainClientProcess(procs, exe);
+  if (!main) {
+    return { action: "no_main", killed: 0, detail: `认不出 ${zh} 客户端的主进程（探测到 ${procs.length} 个同名进程，主程序特征不匹配），**没有终止任何进程**。${manual}` };
+  }
+  /* 🔴 红线 ①：动手之前先问「这个 PID 还是不是当初那个进程」。
+   * PID 被系统回收后，同一个 PID 会挂在完全无关的程序上，那时 kill 就会误杀。
+   * 核对用的是我们自己刚探到的启动时间当锚（record.startTimeMs），三态里
+   * 只有 same 才继续；recycled / unverifiable 一律到此为止，如实告诉用户为什么。 */
+  const ident = await verifyPidRecord({ pid: main.pid, file: null, record: { startTimeMs: main.startMs } });
+  if (!ident || ident.verdict !== VERDICT_SAME) {
+    return {
+      action: "unverified", killed: 0, pid: main.pid,
+      detail: `${zh} 客户端主进程 ${pidIdentityMessage(ident, { pid: main.pid, source: "客户端主进程身份核对" })}。`
+        + "因此**已放弃自动重启，一个进程都没有终止** —— 宁可不重启，也不冒险杀掉你机器上别的程序。"
+        + manual,
+    };
+  }
+  /* 真的要动手了：先把「窗口会被关掉」这件事说出去（红线 ③ 的文案义务），
+   * 再终止。onBeforeTerminate 之后就有一个不可逆的外部副作用了。 */
+  if (typeof opts.onBeforeTerminate === "function") {
+    try { opts.onBeforeTerminate(main.pid); } catch { }
+  }
+  const term = await wbTerminatePidOnly(main.pid, {
+    ...opts,
+    verifyIdentity: () => verifyPidRecord({ pid: main.pid, file: null, record: { startTimeMs: main.startMs } }),
+  });
+  if (!term.ok) {
+    return {
+      action: "kill_failed", killed: 0, pid: main.pid,
+      detail: `自动重启没能关掉 ${zh} 客户端（PID ${main.pid}）：${term.error || "未知原因"}。${manual}`,
+    };
+  }
+  const s = await wbSpawnClientExe(exe, opts);
+  if (!s.ok) {
+    return {
+      action: "spawn_failed", killed: 1, pid: main.pid, exe,
+      detail: `已退出 ${zh} 客户端（PID ${main.pid}），但**没能自动重新打开**（${s.error}）。`
+        + `请手动双击打开 ${exe}，然后发一条消息即可抓到令牌。`,
+    };
+  }
+  return {
+    action: "restarted", killed: 1, pid: main.pid, exe, forced: term.forced, newPid: s.pid,
+    detail: `已自动重启 ${zh} 客户端（旧主进程 PID ${main.pid} 已退出${term.forced ? "（用了强制终止）" : "（正常退出）"}，新窗口正在打开）。`
+      + "新进程会重新加载刚注入的钩子，通常几秒内就能抓到令牌。",
+  };
+}
+
 // 还原：只要备份在，就把原文件写回去（幂等，可重复调用）
 async function wbCaptureRestore() {
   const st = wbCapState;
@@ -2826,9 +3111,9 @@ async function wbCaptureRestore() {
   try {
     if (st.wrote) {
       const cur = await fsPromises.readFile(st.script, "utf8").catch(() => "");
-      if (cur.includes("BAI-CAPTURE-HOOK")) await fsPromises.writeFile(st.script, st.backup, "utf8");
+      if (st.injectionFailed || cur.includes("BAI-CAPTURE-HOOK")) await fsPromises.writeFile(st.script, st.backup, "utf8");
     }
-  } catch (e) { log("WorkBuddy 令牌捕获：还原失败 " + e.message); }
+  } catch (e) { log("WorkBuddy 令牌捕获：还原失败 " + e.message); return; }
   st.wrote = false;
 }
 
@@ -2879,15 +3164,19 @@ function wbRecordCaptureResult(r) {
   };
 }
 
-async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
+async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb", opts = {}) {
   const zh = p === "wbai" ? "WorkBuddy AI" : "WorkBuddy";
   if (wbCapState.active) {
     const secs = Math.round((Date.now() - wbCapState.startedAt) / 1000);
     throw new Error(`上一次获取还在进行中（已等待 ${secs} 秒）。请在 ${zh} 客户端里发一条消息，或稍候重试`);
   }
-  const script = await findWbCliScript(p);
-  if (!script) throw new Error(`未找到 ${zh} 程序（请确认本机已安装对应版本的客户端）`);
+  // 在第一个异步操作前占用捕获槽，避免两个渠道并发覆盖同一份备份和状态。
+  wbCapState = { active: true, startedAt: Date.now(), p, result: null, phase: "locating" };
+  let script = null;
   const outFile = path.join(DATA_DIR, "wb-captured-token.json");
+  try {
+  script = await findWbCliScript(p);
+  if (!script) throw new Error(`未找到 ${zh} 程序（请确认本机已安装对应版本的客户端）`);
   await fsPromises.rm(outFile, { force: true }).catch(() => { });
   const original = await fsPromises.readFile(script, "utf8");
   if (original.includes("BAI-CAPTURE-HOOK")) {
@@ -2900,7 +3189,7 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
     writeFileSync(WB_BACKUP_FILE, JSON.stringify({
       script, md5: wbMd5(backup), savedAt: new Date().toISOString(), content: backup,
     }), "utf8");
-  } catch (e) { log("WorkBuddy 令牌捕获：磁盘备份写入失败（本次内存备份仍有效）：" + e.message); }
+  } catch (e) { throw new Error("无法保存客户端脚本备份，已停止捕获：" + e.message); }
   const hook = WB_CAPTURE_HOOK.replace("__path_capture", JSON.stringify(outFile));
   // 注入到 shebang 之后（保留首行 #!，Node 才能正常执行）
   const lines = backup.split("\n");
@@ -2909,13 +3198,23 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
     active: true, startedAt: Date.now(), error: null, script, backup, wrote: false, got: "",
     phase: "injecting", phaseText: "正在注入临时钩子…", kick: null, p,
     restarted: false,          // 客户端是否已在本次注入之后重启过（钩子是否已生效）
+    restarting: false,         // 此刻是不是正在由程序自动重启客户端（界面据此提示「请勿操作」）
+    restart: null,             // 自动重启的结果（action + detail），状态接口原样带给前端
     /* 新一轮开始就清掉上一轮的结果：否则前端刚点下按钮的头两秒轮询就会读到上一次
        留下的 done，把它当成这一次的结局报出去。 */
     result: null,
   };
-  await fsPromises.writeFile(script, patched, "utf8");
   wbCapState.wrote = true;
+  try {
+    await fsPromises.writeFile(script, patched, "utf8");
+  } catch (e) {
+    // 写入可能先截断文件再失败，不能用钩子标记是否存在来判断需不需要还原。
+    wbCapState.injectionFailed = true;
+    throw e;
+  }
   wbCapState.phase = "injected";
+  const deadline = Date.now() + timeoutMs;
+  const kickOpts = { provider: p, exe: wbClientExeFromScript(script, p) };
   /* v1.0.65 实测修正：**改磁盘文件对已在运行的客户端无效**。
    * Node/Electron 启动时就把入口脚本读进内存了，钩子写进去之后，
    * 客户端仍按内存里的旧代码发请求 —— 于是「发三条消息都没抓到」。
@@ -2935,7 +3234,8 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
     + (stale ? "（注意：该客户端在注入前已在运行，必须完全退出重启后钩子才会生效）" : ""));
   // 踢侧车必须在注入**之后**：被重启拉起的新 CLI 进程才会读到带钩子的脚本
   try {
-    const k = await wbKickHostSession();
+    const k = kickOpts.exe ? await wbKickHostSession(kickOpts)
+      : { action: "pid_unverified", detail: "无法定位本次客户端，已跳过后台会话重启（未终止任何进程）" };
     wbCapState.kick = k;
     wbCapState.phase = "waiting";
     /* needRestart 时**不要**用 kick 的文案覆盖：kick 只会说"发一条消息即可"，
@@ -2952,22 +3252,95 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
     wbCapState.phaseText = `后台重启未执行（${e.message}）。若 WorkBuddy 已开着，钩子要等它的进程下次重启才会被加载`;
     log("WorkBuddy 令牌捕获：踢侧车异常 " + e.message);
   }
-  const deadline = Date.now() + timeoutMs;
+  /* ---------- v1.0.82：自动重启客户端 —— 「用户零操作」缺的就是这一步 ----------
+   *
+   * 放在 kick **之后**：钩子已经写盘，被重启拉起的新进程才读得到它。
+   * 放在等待循环**之前**：新进程起来后才会主动出网，顺序反了就白等。
+   *
+   * 「客户端在不在」由 wbAutoRestartClient 自己的进程表探测决定，不用上面那个
+   * wbClientRunningBefore 推断 —— 那个探针失败时也返回 false（探测失败 ≠ 没在跑），
+   * 拿它当开关会在探针出错时把「该重启的」当成「不用重启」。
+   * 客户端没开 → 一个进程都不动，只提示打开（用户本来就该自己打开它）。
+   *
+   * 🔴 动手之前必说的一句话（红线 ③ 的文案义务）：我们要关掉的是**用户正在用的窗口**，
+   *    不能默默杀用户的应用，所以 phaseText 里明写「窗口会被关掉并重新打开、
+   *    未保存的对话可能丢失」，由 onBeforeTerminate 在真正动手的那一刻打出去。 */
+  let prewarmRekicked = false;
+  let armedAt = 0;
+  try {
+    wbCapState.phase = "restarting";
+    wbCapState.restarting = true;
+    wbCapState.phaseText = `正在检查 ${zh} 客户端的状态…`;
+    const r = opts.autoRestart === true ? await wbAutoRestartClient(p, {
+      script, zh,
+      onBeforeTerminate(pid) {
+        wbCapState.phase = "restarting";
+        wbCapState.phaseText =
+          `正在自动重启 ${zh} 客户端：**你的客户端窗口会被关掉并重新打开**，未保存的对话内容可能丢失。`
+          + "这是自动获取令牌必须的一步（只有全新进程才会加载刚注入的钩子）。"
+          + "客户端里开着的终端会话会随客户端一起结束，请稍等几秒，窗口会自动重新出现。";
+        log(`${zh} 令牌捕获：即将自动重启客户端主进程（仅按 PID，身份已核对）pid=${pid}`);
+      },
+    }) : { action: "disabled", killed: 0, detail: `自动重启已关闭。请手动完全退出并重开 ${zh} 客户端，然后在本轮等待结束前发一条消息；也可使用「手动填写令牌」。` };
+    wbCapState.restart = r;
+    if (r.action === "restarted") {
+      /* 重启是我们自己做的，所以不必再等探测去确认，也不再需要用户手动重启。
+       * needRestart 归零：那个前提（"客户端跑着旧代码、等你手动重启"）已经不存在了。 */
+      wbCapState.needRestart = false;
+      wbCapState.restarted = true;
+      wbCapState.phase = "armed";
+      armedAt = Date.now();
+      wbCapState.phaseText = `${zh} 客户端已自动重启，新进程正在加载钩子。`
+        + "正在等待带鉴权的请求；若 25 秒后仍未捕获，可在客户端里发一条消息触发。";
+    } else {
+      /* 原样展示真实结局；spawn_failed 时旧窗口已退出。 */
+      wbCapState.phase = "waiting";
+      wbCapState.phaseText = r.detail;
+    }
+    log(`${zh} 令牌捕获：自动重启客户端 → ${r.action}：${r.detail}`);
+  } catch (e) {
+    wbCapState.restart = { action: "error", detail: String((e && e.message) || e), killed: 0 };
+    wbCapState.phase = "waiting";
+    wbCapState.phaseText = `自动重启 ${zh} 客户端时出错（${e.message}）。`
+      + `请手动完全退出并重开 ${zh} 客户端后发一条消息，或改用「手动填写令牌」。`;
+    log("WorkBuddy 令牌捕获：自动重启客户端异常 " + e.message);
+  } finally {
+    wbCapState.restarting = false;
+  }
   // 已捕获到的最新一条（accessToken 可能已抓到、刷新令牌还没有）——用于给前端实时进度
   let seen = null;
   /* 「客户端已重启、钩子已生效」的探测节流：每 3 秒查一次即可。
    * 查到就把状态翻过去——用户不必自己判断"我是不是做对了一步"。 */
   let restartProbeAt = 0;
-  try {
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 1000));
       if (wbCapState.needRestart && !wbCapState.restarted && Date.now() - restartProbeAt > 3000) {
         restartProbeAt = Date.now();
         if (await wbClientRestartedAfter(p)) {
           wbCapState.restarted = true;
+          armedAt = Date.now();
           wbCapState.phase = "armed";
           wbCapState.phaseText = "客户端已在本次注入之后重启，钩子已生效——现在在客户端里发一条消息即可抓到令牌";
           log(`WorkBuddy 令牌捕获：检测到 ${zh} 客户端已在注入后重启，钩子已生效，等待请求…`);
+        }
+      }
+      /* 兜底（唯一还没被自动化覆盖的那一环）：钩子生效之后预热池 worker **空载出网的
+       * 那些请求到底带不带 Authorization，目前没有真机证据**。带了 → 用户零操作就成立；
+       * 不带 → 白等。所以超过宽限时间还没抓到，就再踢一次常驻会话，让用户下一条消息
+       * 必然落到一个**带着钩子的新进程**上，并把话说清楚「发一条消息即可，这不是失败」。 */
+      if (wbCapState.restarted && !prewarmRekicked && armedAt && Date.now() - armedAt > WB_PREWARM_GRACE_MS) {
+        prewarmRekicked = true;
+        try {
+          const k2 = kickOpts.exe ? await wbKickHostSession(kickOpts)
+            : { action: "pid_unverified", detail: "无法确认客户端，已跳过后台会话重启" };
+          wbCapState.rekick = k2;
+          wbCapState.phaseText = `客户端已重启，但尚未捕获到带鉴权的请求，无法据此确定预热请求是否携带鉴权。`
+            + `${k2.detail}。请在 ${zh} 客户端里发一条消息（或新建一个对话），本轮仍在等待捕获。`;
+          log(`WorkBuddy 令牌捕获：预热宽限期到，追加一次踢常驻会话 → ${k2.action}：${k2.detail}`);
+        } catch (e) {
+          wbCapState.rekick = { action: "error", detail: String((e && e.message) || e) };
+          wbCapState.phaseText = `尚未捕获到带鉴权的请求。请在 ${zh} 客户端里发一条消息；追加重启后台时出错 ${e.message}`;
+          log("WorkBuddy 令牌捕获：追加踢常驻会话异常 " + e.message);
         }
       }
       try {
@@ -3019,22 +3392,37 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
       throw new Error("等待超时：已捕获到访问令牌，但未能写入配置。请重试「一键获取令牌」。");
     }
     const kact = (wbCapState.kick && wbCapState.kick.action) || "unknown";
+    /* v1.0.82：先按**自动重启**的结局分档。自动重启是主路径，它成功而没抓到，
+     * 没捕获到不能推出预热请求不带 Authorization，超时后必须开启新一轮。 */
+    const ract = (wbCapState.restart && wbCapState.restart.action) || "unknown";
     const secs = Math.round(timeoutMs / 1000);
     let hint;
-    if (kact === "killed" || kact === "sidecar_killed") {
+    if (ract === "restarted") {
+      hint = `已自动重启 ${zh} 客户端，但这 ${secs} 秒内未捕获到令牌，预热请求是否带鉴权仍未确认。`
+        + "本轮已结束，临时脚本将还原。请重新点「获取令牌」开启新一轮，并在等待期间发一条消息。";
+    } else if (ract === "disabled") {
+      hint = `自动重启已关闭，本轮已结束。请重新点「获取令牌」，再手动完全退出并重开 ${zh} 后发一条消息，或使用「手动填写令牌」。`;
+    } else if (ract === "not_running") {
+      hint = `${zh} 客户端当时没有在运行，所以没有重启它。请重新开启获取，然后打开 ${zh} 并登录，在等待期间发一条消息。`;
+    } else if (ract === "unverified" || ract === "probe_fail" || ract === "no_exe" || ract === "no_main" || ract === "kill_failed" || ract === "spawn_failed" || ract === "error") {
+      hint = `自动重启 ${zh} 客户端没有完成（${(wbCapState.restart && wbCapState.restart.detail) || "未知原因"}）。`
+        + `请手动完全退出并重开 ${zh} 客户端后发一条消息，或直接用「手动填写令牌」。`;
+    } else if (kact === "killed") {
       hint = `已重启 WorkBuddy 后台（旧的常驻 CLI 进程已终止），但这 ${secs} 秒内没有任何进程发起带 Authorization 的请求。请确认 WorkBuddy 客户端已打开并登录，然后新建一个对话或发一条消息（重启后的进程会自动加载钩子），再重试。`;
     } else if (kact === "no_sidecar") {
       hint = "WorkBuddy 客户端似乎没有在运行。钩子已注入：启动 WorkBuddy 并登录后随便发一条消息即可被自动抓取，再重试。";
     } else if (kact === "no_host") {
       hint = "WorkBuddy 后台在运行但还没有常驻会话通道——直接在客户端里发一条消息（会自动新建带钩子的进程）；若已发过消息仍失败，请重试一次。";
-    } else if (kact === "pipe_fail" || kact === "error" || kact === "pid_unverified") {
-      /* pid_unverified 一并归到这里：那次**一个进程都没杀**（PID 文件里的 PID 没能证实
-       * 还是当初那个进程，宁可不动也不误杀）。文案用 kick 的原始 detail，把核对结论带出来。 */
-      hint = `WorkBuddy 后台重启失败（${(wbCapState.kick && wbCapState.kick.detail) || "未知原因"}），钩子可能尚未被任何进程加载。可关闭并重新打开 WorkBuddy 客户端后重试。`;
+    } else if (kact === "pipe_fail" || kact === "error" || kact === "pid_unverified" || kact === "pipe_unreachable") {
+      /* 这几个 action 有一个共同点：**一个进程都没杀**（管道不通就不去动 sidecar ——
+       * 它后面挂着用户自己开的终端；PID 核对不过就不动手）。所以文案要说清「没动任何进程」，
+       * 并把真实的核对/管道结论原样带出来。 */
+      hint = `WorkBuddy 后台重启失败（${(wbCapState.kick && wbCapState.kick.detail) || "未知原因"}），那一步**没有终止任何进程**，钩子可能尚未被任何进程加载。`
+        + "可完全退出并重新打开 WorkBuddy 客户端后重试，或用「手动填写令牌」。";
     } else {
       hint = "请确认 WorkBuddy 客户端已打开并已登录，然后在里面随便发一条消息或新建一个对话（客户端会拉起内部 CLI 并带上 Authorization 头），再点一次「一键获取令牌」。";
     }
-    throw new Error(`等待超时（${secs} 秒）：未捕获到任何令牌。${hint}若仍失败，可展开下方「手动填写令牌」作为备用方式。`);
+    throw new Error(`等待超时（${secs} 秒）：未捕获到任何令牌。${hint}本轮已结束，后续操作前请先重新点「获取令牌」开启新一轮；也可使用「手动填写令牌」。`);
   } catch (e) {
     /* 失败（含等待超时）同样要留存终局 —— 否则前端轮询永远看不到「结束了」，
        界面就一直转圈；而 POST 那边早把这次捕获报成「读取超时」了。 */
@@ -3045,10 +3433,10 @@ async function wbCaptureToken(timeoutMs = WB_CAPTURE_TIMEOUT_MS, p = "wb") {
     await fsPromises.rm(outFile, { force: true }).catch(() => { });
     // 磁盘备份：确认脚本已干净才删；还原失败就留着，下次启动 wbCaptureSelfHeal() 自愈
     try {
-      if (existsSync(script) && !readFileSync(script, "utf8").includes("BAI-CAPTURE-HOOK")) {
+      if (script && wbCapState.backup && existsSync(script) && readFileSync(script, "utf8") === wbCapState.backup) {
         rmSync(WB_BACKUP_FILE, { force: true });
       } else if (existsSync(WB_BACKUP_FILE)) {
-        log("WorkBuddy 令牌捕获：还原后脚本仍带钩子，保留磁盘备份等待下次启动自愈");
+        log("WorkBuddy 令牌捕获：脚本尚未确认恢复原文，保留磁盘备份等待下次启动自愈");
       }
     } catch { }
     wbCapState.active = false;
@@ -3078,6 +3466,13 @@ function wbCaptureStatusPayload() {
     // v1.0.70：客户端是否已在注入之后重启过 —— 为真表示钩子此刻已经生效，
     // 前端据此把提示从「必须完全退出重启」翻成「发一条消息即可」，并显示剩余时间。
     restarted: wbCapState.restarted === true,
+    // v1.0.82：自动重启的两段状态。restarting=true 期间界面必须说清
+    // 「窗口会被关掉并重新打开、未保存内容可能丢失」；restart 是那一手的结论
+    // （action + detail），前端原样展示，不自己编一套说法。
+    restarting: wbCapState.restarting === true,
+    restart: wbCapState.restart || null,
+    // 预热宽限期到之后追加的那一次踢会话（兜底：预热请求不带鉴权时的那条路）
+    rekick: wbCapState.rekick || null,
     timeoutMs: WB_CAPTURE_TIMEOUT_MS,
     startedAt: wbCapState.startedAt,
     elapsedMs: wbCapState.active ? Date.now() - wbCapState.startedAt : 0,
@@ -3105,7 +3500,7 @@ async function wbCaptureBody(body) {
   // 缺省 wb —— 旧调用方行为不变。
   const p = (body && body.provider) === "wbai" ? "wbai" : "wb";
   try {
-    const r = await wbCaptureToken(WB_CAPTURE_TIMEOUT_MS, p);
+    const r = await wbCaptureToken(WB_CAPTURE_TIMEOUT_MS, p, { autoRestart: body && body.autoRestart === true });
     return { ok: true, ...r, provider: p, message: "令牌已自动填入并保存" };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };

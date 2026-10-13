@@ -131,8 +131,9 @@ describe("① envelopeSchemaFor：空 / 单 / 多工具，const 锁名", () => {
     assert.deepEqual(unlocked, [undefined, undefined],
       "去掉 const 之后两个分支都不再区分工具名 —— 模型能选出任意名字");
     /* 两个分支此时完全同形 → anyOf 形同虚设。这就是 const 的作用。 */
-    assert.equal(JSON.stringify(broken.properties.calls.items.anyOf[0]),
-      JSON.stringify(broken.properties.calls.items.anyOf[1]));
+    const structural = ({ description, ...branch }) => branch;
+    assert.deepEqual(structural(broken.properties.calls.items.anyOf[0]),
+      structural(broken.properties.calls.items.anyOf[1]));
     assert.notDeepEqual(broken.properties.calls.items, real.properties.calls.items);
   });
 });
@@ -939,6 +940,107 @@ describe("⑨ ★ parts 的**内容**（不只是形状）——真实集成测�
     /* 补上目标模型后就是完整可发的载荷 */
     const fixed = anthropicToOpenCode(req, TOOLS2, { model: "space-bunny-free" });
     assert.deepEqual(fixed.payload.model, { providerID: "opencode", modelID: "space-bunny-free" });
+  });
+});
+
+describe("⑩ Claude Code 工具对话回归：描述、结果续接与新版结构化返回", () => {
+  test("工具说明完整进入模型可见的 schema，Anthropic/OpenAI 两种工具都保留", () => {
+    const schema = { type: "object", properties: { id: { type: "string" } }, required: ["id"] };
+    const offered = [
+      { name: "ResolveWidget", description: "Resolve an id before updating a widget.", input_schema: schema },
+      { function: { name: "UpdateWidget", description: "Update a previously resolved widget id.", parameters: schema } },
+    ];
+    const { payload } = anthropicToOpenCode({ messages: [{ role: "user", content: "Update the widget" }], tools: offered },
+      { model: "space-bunny-free" });
+    const branches = payload.format.schema.properties.calls.items.anyOf;
+    assert.deepEqual(branches.map((b) => b.description), offered.map((t) => t.description ?? t.function.description));
+    assert.deepEqual(branches.map((b) => b.properties.name.const), ["ResolveWidget", "UpdateWidget"]);
+    assert.deepEqual(branches[0].properties.arguments, schema, "保留说明不能改写入参约束");
+  });
+
+  test("tool_result 错误与成功关联各自调用，不插入强制结束多步任务的指令", () => {
+    const { payload } = anthropicToOpenCode({
+      messages: [
+        { role: "user", content: "Find the file, fix it, then verify the change." },
+        { role: "assistant", content: [
+          { type: "tool_use", id: "call_missing", name: "read_file", input: { path: "/missing" } },
+          { type: "tool_use", id: "call_found", name: "read_file", input: { path: "/found" } },
+        ] },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "call_missing", is_error: true, content: "File not found" },
+          { type: "tool_result", tool_use_id: "call_found", content: "Existing config" },
+        ] },
+      ], tools: TOOLS,
+    }, { model: "space-bunny-free" });
+    const text = payload.parts[0].text;
+    assert.ok(text.includes('Tool read_file({"path":"/missing"}) failed (is_error=true): "File not found" [tool_use_id="call_missing"]'));
+    assert.ok(text.includes('Tool read_file({"path":"/found"}) returned: "Existing config" [tool_use_id="call_found"]'));
+    assert.equal(text.includes("Now answer using only that result"), false);
+    assert.ok(text.includes("fix it, then verify"), "后续任务意图仍要保留");
+  });
+
+  test("标准 disable_parallel_tool_use 限制单个调用，即便接线层传 parallel:true", () => {
+    for (const type of ["auto", "any", "tool"]) {
+      const toolChoice = { type, ...(type === "tool" ? { name: "read_file" } : {}), disable_parallel_tool_use: true };
+      assert.equal(envelopeSchemaFor(TOOLS, { toolChoice, parallel: true }).properties.calls.maxItems, 1);
+      const { payload } = anthropicToOpenCode({ messages: [{ role: "user", content: "Inspect files" }], tools: TOOLS,
+        tool_choice: toolChoice }, TOOLS, { model: "space-bunny-free", parallel: true });
+      assert.equal(payload.format.schema.properties.calls.maxItems, 1);
+    }
+    assert.equal(envelopeSchemaFor(TOOLS, { toolChoice: { type: "auto", disable_parallel_tool_use: false } })
+      .properties.calls.maxItems, undefined, "未禁用并行时不能意外收紧");
+  });
+
+  test("any + 空工具的 schema 仍可满足，format 保留且 calls 为空", () => {
+    const { payload } = anthropicToOpenCode({ messages: [{ role: "user", content: "Hi" }], tools: [],
+      tool_choice: { type: "any" } }, { model: "space-bunny-free" });
+    assert.equal(payload.format.type, "json_schema");
+    const calls = payload.format.schema.properties.calls;
+    assert.equal(calls.maxItems, 0);
+    assert.equal(calls.minItems, undefined, "minItems:1 与 maxItems:0 不能同时出现");
+  });
+
+  test("普通 JSON 或畸形 JSON 信封原文透传，不能抛错或静默丢掉工具", () => {
+    for (const value of [{ result: "a normal JSON reply" }, { content: 1, calls: [] },
+      { content: "text", calls: null }, { content: "text", calls: '[{"name":"read_file","arguments":{}}]' }]) {
+      const text = JSON.stringify(value);
+      let out;
+      assert.doesNotThrow(() => { out = openCodeToAnthropic({ info: { finish: "stop" },
+        parts: [{ type: "text", text }] }, { tools: TOOLS }); });
+      assert.deepEqual(out.message.content, [{ type: "text", text }]);
+      assert.equal(out.message.stop_reason, "end_turn");
+      assert.ok(hasCode(out.diagnostics, DIAG.ENVELOPE_UNPARSED));
+      assert.ok(hasCode(out.diagnostics, DIAG.ENVELOPE_SHAPE_INVALID));
+    }
+  });
+
+  test("官方 info.structured_output 与兼容顶层 structured_output 都回译工具调用", () => {
+    const envelope = { content: "", calls: [{ name: "read_file", arguments: { path: "/probe" } }] };
+    for (const [resp, code] of [
+      [{ info: { finish: "stop", structured_output: envelope }, parts: [] }, DIAG.ENVELOPE_FROM_INFO_STRUCTURED_OUTPUT],
+      [{ info: { finish: "stop" }, structured_output: envelope, parts: [] }, DIAG.ENVELOPE_FROM_STRUCTURED_OUTPUT],
+    ]) {
+      const { message, diagnostics } = openCodeToAnthropic(resp, { tools: TOOLS });
+      assert.equal(message.stop_reason, "tool_use");
+      assert.equal(message.content[0].name, "read_file");
+      assert.deepEqual(message.content[0].input, { path: "/probe" });
+      assert.ok(hasCode(diagnostics, code));
+    }
+  });
+
+  test("某个 structured 别名形状不对时，继续读取有效别名与既有文本落点", () => {
+    const envelope = { content: "usable answer", calls: [] };
+    for (const resp of [
+      { structured: { content: 7 }, info: { structured: envelope } },
+      { structured: { content: 7 }, info: { structured_output: envelope } },
+      { info: { structured_output: { content: 7 } }, structured_output: envelope },
+      { info: { structured_output: { content: 7 } }, parts: [{ type: "text", text: JSON.stringify(envelope) }] },
+    ]) {
+      const { message, diagnostics } = openCodeToAnthropic(resp);
+      assert.deepEqual(message.content, [{ type: "text", text: "usable answer" }]);
+      assert.ok(hasCode(diagnostics, DIAG.ENVELOPE_SHAPE_INVALID));
+      assert.equal(hasCode(diagnostics, DIAG.ENVELOPE_UNPARSED), false);
+    }
   });
 });
 

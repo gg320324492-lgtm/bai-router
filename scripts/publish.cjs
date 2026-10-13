@@ -4,12 +4,22 @@ const { execSync, execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { decideProxyUse, buildGhEnv, runDirectProbe } = require("./publish-proxy.cjs");
+const { assertCleanSource, assertRemoteSource } = require("./publish-source.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
 const v = pkg.version;
 const owner = pkg.build.publish[0].owner, repo = pkg.build.publish[0].repo;
 const exe = `BARRouter-Setup-${v}.exe`;
+
+// 2026-10-13：历史发版只上传安装包，未推源码，gh 默认在旧 main 上打了新版 tag。
+// 构建前固定来源；直接查发布仓库，不能把本地 origin/main 缓存当作远端实况。
+const releaseRepository = `https://github.com/${owner}/${repo}.git`;
+const readGit = (args, env = process.env) => execFileSync("git", args, {
+  cwd: ROOT, encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"], env,
+});
+const releaseHead = assertCleanSource(readGit);
+assertRemoteSource(readGit, { repository: releaseRepository, head: releaseHead, tag: `v${v}` });
 
 // 更新日志来源（v1.0.51）：release-notes.md 是唯一权威来源。
 // 理由：该文件同时被 electron-builder（build.releaseInfo.releaseNotesFile）写进
@@ -170,6 +180,9 @@ try {
   } else console.log("» 未找到发布机配置，沿用仓库内 defaults 快照");
 } catch (e) { console.log("» 快照同步跳过:", e.message); }
 
+// 脚本同步出的 seed 也必须成为已提交源码，不能让安装包与发布 tag 内容漂移。
+assertCleanSource(readGit, releaseHead);
+
 if (fs.existsSync(path.join(ROOT, "dist", exe))) console.log(`⚠ dist/${exe} 已存在——若确认重发请先删除或升版本号`);
 
 // 清单/模板一致性闸门（v1.0.46）：五页收敛成「一份模板 + 一份清单」后，
@@ -245,6 +258,12 @@ const ghEnv = buildGhEnv(process.env, proxyDecision);
 console.log(`» 发版网络路径：${proxyDecision.useProxy ? "走代理上传（保留代理变量）" : "直连上传（本次已清掉代理变量）"}`);
 console.log(`  理由：${proxyDecision.reason}`);
 
+// 构建耗时数分钟；发布前再次检查本地来源、远端 main 和已存在的 tag。
+assertCleanSource(readGit, releaseHead);
+assertRemoteSource((args) => readGit(args, ghEnv), {
+  repository: releaseRepository, head: releaseHead, tag: `v${v}`,
+});
+
 const gh = (args) => {
   console.log("» gh", args.map((a) => (a.length > 60 ? a.slice(0, 57) + "…" : a)).join(" "));
   // env 显式给 ghEnv：上面那份是**新建**对象，构建阶段那份（process.env）没被动过。
@@ -259,6 +278,7 @@ const ghRc = (e) => (e && typeof e.status === "number" ? e.status : (e && e.sign
 try {
   gh([
     "release", "create", `v${v}`, "-R", `${owner}/${repo}`,
+    "--target", releaseHead,
     `dist/${exe}`, `dist/${exe}.blockmap`, "dist/upgrade.ps1", "dist/latest.yml",
     "--title", `v${v}`, "--notes", notes,
   ]);
@@ -277,7 +297,7 @@ try {
     `  ↺ 或手工重发上传：`,
     `      gh release create v${v} -R ${owner}/${repo} \\`,
     `        "dist/${exe}" "dist/${exe}.blockmap" dist/upgrade.ps1 dist/latest.yml \\`,
-    `        --title v${v} --notes-file release-notes.md`,
+    `        --target ${releaseHead} --title v${v} --notes-file release-notes.md`,
     ``,
   ].join("\n"));
   throw e;

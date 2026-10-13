@@ -27,7 +27,7 @@
  *
  * ② **带 `format` 时正文有时落 `structured`、有时落 text 块**。实测第 2 轮就出现过
  *    `structured` 为 undefined、正文在 text 块里的情况。所以 `openCodeToAnthropic`
- *    一共认**四个来源**，注释标了哪条是实测哪条是加固。
+ *    也兼容新版 SDK 的 `structured_output` 字段，保留既有正文落点。
  *
  * ③ **`const` 锁住工具名**，不支持的工具名在 schema 层面就选不出来
  *    （`calls.items.anyOf` 每个分支的 `name` 带 `const`）。
@@ -65,6 +65,8 @@ export const DIAG = Object.freeze({
   /* 信封从哪来（正常路径也要记，否则「正文没落到 structured」这件事查不出来） */
   ENVELOPE_FROM_STRUCTURED: "envelope_from_structured",
   ENVELOPE_FROM_INFO_STRUCTURED: "envelope_from_info_structured",
+  ENVELOPE_FROM_STRUCTURED_OUTPUT: "envelope_from_structured_output",
+  ENVELOPE_FROM_INFO_STRUCTURED_OUTPUT: "envelope_from_info_structured_output",
   ENVELOPE_FROM_STRUCTURED_OUTPUT_TOOL: "envelope_from_structured_output_tool",
   ENVELOPE_FROM_TEXT_JSON: "envelope_from_text_json",
   /* ★ 防误杀标记：解析不出信封 → 原文透传，不抛错 */
@@ -143,7 +145,9 @@ function normalizeTools(tools) {
     if (!name || seen.has(name)) continue;
     seen.add(name);
     const schema = t.input_schema ?? (t.function && t.function.parameters) ?? t.parameters ?? t.schema;
-    out.push({ name, schema: schema && typeof schema === "object" && !Array.isArray(schema) ? schema : { type: "object" } });
+    const description = typeof t.description === "string" ? t.description
+      : (t.function && typeof t.function.description === "string" ? t.function.description : "");
+    out.push({ name, description, schema: schema && typeof schema === "object" && !Array.isArray(schema) ? schema : { type: "object" } });
   }
   return out;
 }
@@ -152,7 +156,7 @@ function toolChoiceOf(toolChoice) {
   if (!toolChoice || typeof toolChoice !== "object") return { type: CHOICE_AUTO, name: null };
   const type = typeof toolChoice.type === "string" ? toolChoice.type : CHOICE_AUTO;
   const name = typeof toolChoice.name === "string" ? toolChoice.name.trim() : null;
-  return { type, name: name || null };
+  return { type, name: name || null, disable_parallel_tool_use: toolChoice.disable_parallel_tool_use === true };
 }
 
 /**
@@ -200,11 +204,14 @@ export function envelopeSchemaFor(tools, opts = {}) {
 
   const calls = { type: "array" };
   if (parallel === false) calls.maxItems = 1;
-  if (minItems) calls.minItems = minItems;
+  /* Anthropic 把禁用并行放在 tool_choice 内；接线层传 parallel:true 也不能覆盖它。 */
+  if (choice.disable_parallel_tool_use) calls.maxItems = 1;
+  if (minItems && allowed.length) calls.minItems = minItems;
   if (allowed.length) {
     calls.items = {
       anyOf: allowed.map((t) => ({
         type: "object",
+        ...(t.description ? { description: t.description } : {}),
         properties: { name: { type: "string", const: t.name }, arguments: t.schema },
         required: ["name", "arguments"],
         additionalProperties: false,
@@ -290,8 +297,8 @@ function toolResultText(content) {
  * 拼成最终那句人话是 `renderTranscript` 的事——两者分开是因为「单条消息逐字透传」
  * 这条判据只跟渲染有关，跟块解析无关，混在一起以后每加一种块都要重新判一次。
  *
- * tool_result 的措辞沿用**实测跑通过**的那一句：
- *   `Tool read_file({"path":"..."}) returned: "probe-host-42". Now answer using only that result.`
+ * tool_result 作为观察值回送，并保留调用关联与错误标记。
+ * 不在每条结果后添加「只根据此结果回答」：多步任务必须能继续请求下一项工具。
  */
 function flattenMessages(messages, diagnostics) {
   const images = [];
@@ -329,12 +336,13 @@ function flattenMessages(messages, diagnostics) {
         continue;
       }
       if (b.type === "tool_result") {
-        /* 措辞与实测脚本第 ③ 步逐字同形（`.research/oc-tool-e2e.mjs:146`）。 */
         const hit = typeof b.tool_use_id === "string" ? used.get(b.tool_use_id) : null;
         const body = toolResultText(b.content);
-        trailing.push(hit
-          ? `Tool ${hit.name}(${JSON.stringify(hit.arguments)}) returned: ${JSON.stringify(body)}. Now answer using only that result.`
-          : `Tool result returned: ${JSON.stringify(body)}. Now answer using only that result.`);
+        const outcome = b.is_error === true ? "failed (is_error=true)" : "returned";
+        const id = typeof b.tool_use_id === "string" ? ` [tool_use_id=${JSON.stringify(b.tool_use_id)}]` : "";
+        trailing.push((hit
+          ? `Tool ${hit.name}(${JSON.stringify(hit.arguments)}) ${outcome}: ${JSON.stringify(body)}`
+          : `Tool result ${outcome}: ${JSON.stringify(body)}`) + id);
         continue;
       }
       /* thinking / redacted_thinking / document / server_tool_use 等一律不外传。 */
@@ -557,7 +565,7 @@ const FINISH_MAP = {
 /**
  * OpenCode `/message` 的响应 → Anthropic message。
  *
- * 正文四个来源（**两处是实测，另外两处是加固**）：
+ * 正文来源（既有实测落点 + 新版 SDK 兼容字段）：
  *   ① `resp.structured`            —— 实测第 ② 步（`oc-tool-e2e.mjs:121`）
  *   ② `resp.info.structured`       —— 同上，另一处取值口
  *   ③ 已完成的 StructuredOutput 工具调用的 `state.input` —— OW Bridge 真实事故：
@@ -565,6 +573,8 @@ const FINISH_MAP = {
  *      （`.research/reports/A-ow-bridge-deepread.md:217`）
  *   ④ text 块里的 JSON            —— ★**实测**第 ③ 步：`structured` 为 undefined、
  *      正文在 text 块里
+ *   ⑤ `resp.info.structured_output` —— 官方 SDK structured output 返回字段
+ *   ⑥ `resp.structured_output`      —— 顶层兼容字段
  *
  * @param {object} resp OpenCode 响应（对象，或「消息数组」里的最后一条）
  * @param {object} [opts]
@@ -589,7 +599,7 @@ export function openCodeToAnthropic(resp, opts = {}) {
   const parts = Array.isArray(r.parts) ? r.parts : [];
   const text = parts.filter((p) => p && p.type === "text" && typeof p.text === "string").map((p) => p.text).join("");
 
-  /* ---- 四个来源，按可靠性依次试 ---- */
+  /* ---- 保留旧落点优先级，再尝试新版字段、格式工具与正文 ---- */
   let envelope = null;
   if (r.structured != null) {
     if (envelopeUsable(r.structured)) {
@@ -598,12 +608,28 @@ export function openCodeToAnthropic(resp, opts = {}) {
     } else {
       diagnostics.push(diag(DIAG.ENVELOPE_SHAPE_INVALID, "resp.structured 不是 {content:string, calls:[]}"));
     }
-  } else if (info.structured != null) {
+  }
+  if (!envelope && info.structured != null) {
     if (envelopeUsable(info.structured)) {
       envelope = info.structured;
       diagnostics.push(diag(DIAG.ENVELOPE_FROM_INFO_STRUCTURED, "正文来自 resp.info.structured"));
     } else {
       diagnostics.push(diag(DIAG.ENVELOPE_SHAPE_INVALID, "resp.info.structured 不是 {content:string, calls:[]}"));
+    }
+  }
+  /* 新版 SDK 使用 structured_output。旧字段无可用信封时仍要继续尝试新版落点。 */
+  if (!envelope) {
+    for (const [value, code, source] of [
+      [info.structured_output, DIAG.ENVELOPE_FROM_INFO_STRUCTURED_OUTPUT, "resp.info.structured_output"],
+      [r.structured_output, DIAG.ENVELOPE_FROM_STRUCTURED_OUTPUT, "resp.structured_output"],
+    ]) {
+      if (value == null) continue;
+      if (envelopeUsable(value)) {
+        envelope = value;
+        diagnostics.push(diag(code, `正文来自 ${source}`));
+        break;
+      }
+      diagnostics.push(diag(DIAG.ENVELOPE_SHAPE_INVALID, `${source} 不是 {content:string, calls:[]}`));
     }
   }
   if (!envelope) {
@@ -616,9 +642,11 @@ export function openCodeToAnthropic(resp, opts = {}) {
   }
   if (!envelope) {
     const fromText = envelopeFromText(text);
-    if (fromText) {
+    if (envelopeUsable(fromText)) {
       envelope = fromText;
       diagnostics.push(diag(DIAG.ENVELOPE_FROM_TEXT_JSON, "正文来自 text 块里的 JSON（实测：structured 为 undefined 时走这条）"));
+    } else if (fromText) {
+      diagnostics.push(diag(DIAG.ENVELOPE_SHAPE_INVALID, "text 块的 JSON 不是 {content:string, calls:[]}，按原文透传"));
     }
   }
 
