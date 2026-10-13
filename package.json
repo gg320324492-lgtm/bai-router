@@ -1,7 +1,7 @@
 {
   "name": "bai-router",
   "productName": "B.AI Router",
-  "version": "1.0.82",
+  "version": "1.0.83",
   "private": true,
   "description": "B.AI 模型路由台：Claude Code / Claude 桌面版 外接模型的一键切换与中转",
   "author": "pc",
@@ -45,7 +45,7 @@
           "oc-runtime.mjs",
           "oc-bridge.mjs",
           "oc-wiring.mjs",
-        "oc-tool-guard.mjs",
+          "oc-tool-guard.mjs",
           "oc-transport-info.mjs",
           "wb-pool.mjs",
           "wb-pool-wiring.mjs",

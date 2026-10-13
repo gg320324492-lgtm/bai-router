@@ -1125,3 +1125,62 @@ if (process.argv.includes("--sabotage")) {
   console.log(JSON.stringify({ file: "src/server/oc-bridge.mjs", ...s }, null, 2));
   process.exit(0);
 }
+
+/* ---------------------------------------------------------------------------
+ * v1.0.83：stop_reason=tool_use 只能由「真的有 tool_use 块」产生
+ *
+ * 实测踩到（2026-10-13）：OpenCode 在信封 calls 为空、只回正文时，
+ * 仍然把 info.finish 标成 `tool-calls`。旧代码落到 FINISH_MAP 分支，
+ * 交出去的是 stop_reason=tool_use + 零个 tool_use 块 ——
+ * 客户端据此去等一个永远不会来的 tool_result，**对话就此卡死**。
+ * 原注释写着「优先级：截断 > 有没有 tool_use > finish 标签」，
+ * 但代码最后那个 else if 把这道闸绕过去了。
+ * ------------------------------------------------------------------------- */
+describe("stop_reason 不得虚报 tool_use（v1.0.83）", () => {
+  const mk = (finish, calls) => ({
+    info: { finish },
+    structured: { content: "正文", calls: calls || [] },
+  });
+
+  test("★ finish=tool-calls 但 calls 为空 → 降级 end_turn（不能虚报 tool_use）", () => {
+    const out = openCodeToAnthropic(mk("tool-calls", []), { model: "m" });
+    const blocks = out.message.content;
+    assert.equal(blocks.some((b) => b.type === "tool_use"), false, "本就不该有工具块");
+    assert.equal(out.message.stop_reason, "end_turn",
+      "说 tool_use 会让客户端去等一个不存在的工具结果 —— 这正是「不能对话」的成因");
+    assert.ok(out.diagnostics.some((d) => /FINISH_TOOL_CALLS_WITHOUT_CALLS|finish_tool_calls_without_calls/.test(d.code || "")),
+      "必须留下诊断，否则下次又是一句没头没脑的卡死");
+  });
+
+  test("★ finish=tool-calls 且真有 calls → 仍然 tool_use（不许改坏正常路径）", () => {
+    const out = openCodeToAnthropic(mk("tool-calls", [{ name: "Read", arguments: { file_path: "/x" } }]),
+      { model: "m", tools: [{ name: "Read", input_schema: { type: "object" } }] });
+    assert.equal(out.message.stop_reason, "tool_use", "真有调用时必须照旧报 tool_use");
+    assert.equal(out.message.content.filter((b) => b.type === "tool_use").length, 1);
+  });
+
+  test("finish=stop 且 calls 为空 → end_turn（原本就对，锁住）", () => {
+    assert.equal(openCodeToAnthropic(mk("stop", []), { model: "m" }).message.stop_reason, "end_turn");
+  });
+
+  test("finish=length 最高优先，不受有无 tool_use 影响（锁住）", () => {
+    const a = openCodeToAnthropic(mk("length", []), { model: "m" });
+    assert.equal(a.message.stop_reason, "max_tokens");
+    const b = openCodeToAnthropic(mk("length", [{ name: "Read", arguments: {} }]),
+      { model: "m", tools: [{ name: "Read", input_schema: { type: "object" } }] });
+    assert.equal(b.message.stop_reason, "max_tokens", "截断优先于一切");
+  });
+
+  test("★ 反向对照：把降级分支拆掉，本组必须变红", () => {
+    // 坏实现：finish 标签说了算，不看有没有 tool_use 块
+    const naive = (finish, hasToolUse) => {
+      const m = { "tool-calls": "tool_use", stop: "end_turn", length: "max_tokens", error: "end_turn" };
+      if (finish === "length") return "max_tokens";
+      if (hasToolUse) return "tool_use";
+      return m[finish] || "end_turn";
+    };
+    assert.equal(naive("tool-calls", false), "tool_use", "坏实现的行为：没工具块也报 tool_use");
+    assert.equal(naive("tool-calls", true), "tool_use");
+    assert.equal(naive("stop", false), "end_turn");
+  });
+});

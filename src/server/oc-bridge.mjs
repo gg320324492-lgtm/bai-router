@@ -86,6 +86,8 @@ export const DIAG = Object.freeze({
   EMPTY_RESPONSE: "empty_response",
   USAGE_MISSING: "usage_missing",
   FINISH_UNKNOWN: "finish_unknown",
+  /* 上游标了 tool-calls、但信封里没有任何调用 → stop_reason 必须降级（见下面那段） */
+  FINISH_TOOL_CALLS_WITHOUT_CALLS: "finish_tool_calls_without_calls",
 });
 
 /* OpenCode 的 file part 需要 mime 与文件名；只认这四种（OW Bridge protocol.js:47 同款收窄）。 */
@@ -713,7 +715,16 @@ export function openCodeToAnthropic(resp, opts = {}) {
    * · 其次看有没有 tool_use：`finish` 偶发标 `stop` 而 `calls` 非空，
    *   而客户端不认 `tool_use` 就根本不会去执行这批调用。
    * · 最后才按 finish 映射：`tool-calls`→`tool_use`、`stop`/`error`→`end_turn`、
-   *   `length`→`max_tokens`（已在上一步拦掉）。 */
+   *   `length`→`max_tokens`（已在上一步拦掉）。
+   *
+   * ★★ v1.0.83 修正：**`stop_reason: "tool_use"` 只能由「真的有 tool_use 块」产生。**
+   * 实测踩到（2026-10-13）：OpenCode 在信封 `calls` 为空、只回了正文时，
+   * **仍然把 `info.finish` 标成 `tool-calls`**。旧代码落到
+   * `FINISH_MAP[finish] === "tool_use"` 那条分支，于是交出去的是
+   * `stop_reason=tool_use` + **零个 tool_use 块**——客户端据此认定「模型在等工具执行」，
+   * 去等一个永远不会来的 `tool_result`，**对话就此卡死，用户看到的现象就是「不能对话」**。
+   * 那道 `hasToolUse` 闸形同虚设：它只挡住了「有调用但 finish 不是 tool-calls」，
+   * 挡不住「finish 是 tool-calls 但没有调用」。 */
   const hasToolUse = content.some((b) => b.type === "tool_use");
   const finish = typeof info.finish === "string" ? info.finish : "";
   let stopReason;
@@ -721,6 +732,13 @@ export function openCodeToAnthropic(resp, opts = {}) {
     stopReason = "max_tokens";
   } else if (hasToolUse) {
     stopReason = "tool_use";
+  } else if (FINISH_MAP[finish] === "tool_use") {
+    /* 上游标了要调工具，却没有给出任何调用 → 对客户端说 end_turn，
+       绝不能说 tool_use（那会让它去等一个不存在的工具结果）。 */
+    stopReason = "end_turn";
+    diagnostics.push(diag(DIAG.FINISH_TOOL_CALLS_WITHOUT_CALLS,
+      `上游 info.finish 标「tool-calls」但信封里没有任何调用，`
+      + `stop_reason 降级为 end_turn（说 tool_use 会让客户端去等一个不存在的工具结果）`));
   } else if (FINISH_MAP[finish]) {
     stopReason = FINISH_MAP[finish];
   } else {
