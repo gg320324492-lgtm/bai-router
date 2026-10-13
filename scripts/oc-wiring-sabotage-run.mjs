@@ -28,8 +28,16 @@ const REPO = path.resolve(HERE, "..");
 const WIRING = path.join(REPO, "src", "server", "oc-wiring.mjs");
 const SERVER = path.join(REPO, "src", "server", "server.mjs");
 const TEST = path.join(REPO, "scripts", "oc-wiring-test.mjs");
+/* 工具守卫这一节的断言住在 oc-tool-guard-test.mjs 里（接线纪律那几条也在那儿），
+ * 所以按条选测试文件，而不是把整个守卫套件混进 ①～③ 的基线里。 */
+const GUARD_SRC = path.join(REPO, "src", "server", "oc-tool-guard.mjs");
+const GUARD_TEST = path.join(REPO, "scripts", "oc-tool-guard-test.mjs");
 
-const ORIGINALS = new Map([[WIRING, readFileSync(WIRING, "utf8")], [SERVER, readFileSync(SERVER, "utf8")]]);
+const ORIGINALS = new Map([
+  [WIRING, readFileSync(WIRING, "utf8")],
+  [SERVER, readFileSync(SERVER, "utf8")],
+  [GUARD_SRC, readFileSync(GUARD_SRC, "utf8")],
+]);
 
 /* 与测试文件里那张表逐字对应。from 必须**恰好命中一次**——命中 0 次说明源码变了，
  * 命中多次说明锚点不唯一，两种都直接判失败（不猜、不硬改）。 */
@@ -99,14 +107,38 @@ const SABOTAGE = [
     from: "        if (!ZEN_TRANSPORTS.includes(t)) {",
     to: "        if (false) {",
   },
+  /* ---- 工具守卫（oc-tool-guard）+ 它的接线 ---- */
+  {
+    file: GUARD_SRC, name: "swallow-immediate-rawtext", test: GUARD_TEST,
+    from: `    const rawText = await r.text();
+    return { status: r.status, json: JSON.parse(rawText), rawText };`,
+    to: "    return { status: r.status, json: await r.json(), rawText: '' };",
+  },
+  {
+    file: GUARD_SRC, name: "no-part-lookup-retry", test: GUARD_TEST,
+    from: "    for (let attempt = 0; attempt <= partLookupTries; attempt++) {",
+    to: "    for (let attempt = 0; attempt <= 0; attempt++) {",
+  },
+  {
+    file: GUARD_SRC, name: "allow-native-locally", test: GUARD_TEST,
+    from: "{ reply: 'reject', message }",
+    to: "{ reply: 'always', message }",
+  },
+  {
+    file: WIRING, name: "bypass-guard-in-wiring", test: GUARD_TEST,
+    from: "      const out = await postMessageWithToolGuard({",
+    to: `      const raw = await (fetchImpl || fetch)(base + "/session/" + encodeURIComponent(sess.sessionId) + "/message", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(built.payload), signal: AbortSignal.timeout(timeoutOf(cfg)) });
+      const out = { status: raw.status, json: raw.ok ? await raw.json() : null, rawText: raw.ok ? "" : await raw.text() };
+      if (false) await postMessageWithToolGuard({`,
+  },
 ];
 
-function runTests(only) {
+function runTests(only, testFile = TEST) {
   /* 默认只跑不起真进程、不打真上游的那部分用例；个别手法的守卫用例在端到端组里，
    * 用 `only` 单独点名跑它（否则这条反向对照会因为「守卫没被执行」而假绿）。 */
   const args = only
-    ? ["--test", "--test-name-pattern", only, TEST]
-    : ["--test", "--test-skip-pattern", "^(⑧|⑨)", TEST];
+    ? ["--test", "--test-name-pattern", only, testFile]
+    : ["--test", "--test-skip-pattern", "^(⑧|⑨)", testFile];
   const r = spawnSync(process.execPath, args, { encoding: "utf8", cwd: REPO });
   const out = (r.stdout || "") + (r.stderr || "");
   const m = /# fail (\d+)/.exec(out) || /ℹ fail (\d+)/.exec(out);
@@ -139,7 +171,7 @@ try {
     }
     writeFileSync(s.file, original.replace(s.from, s.to), "utf8");
     let r;
-    try { r = runTests(s.only); }
+    try { r = runTests(s.only, s.test); }
     finally { writeFileSync(s.file, original, "utf8"); }   // 任何情况下都还原
 
     const restored = readFileSync(s.file, "utf8") === original;

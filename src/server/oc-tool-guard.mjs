@@ -68,18 +68,22 @@ export function externalCallFor(part, permission, tools, toolChoice) {
 }
 
 async function guardedPost({ base, sessionId, payload, tools, toolChoice, fetchImpl = fetch,
-  timeoutMs = 180000, pollMs = 250, log = () => {} }) {
+  timeoutMs = 180000, pollMs = 250, partLookupTries = 10, log = () => {} }) {
   const route = `${base}/session/${encodeURIComponent(sessionId)}`;
   const work = new AbortController();
   const watch = new AbortController();
   const timeout = AbortSignal.timeout(timeoutMs);
   const signal = AbortSignal.any([work.signal, timeout]);
   const watchSignal = AbortSignal.any([signal, watch.signal]);
+  // ★ 正文必须逐字原样返回：先取 text，再从同一段 text 解析 JSON。
+  //   写成 `r.json()` 会把 rawText 留成 ''，正常对话（没有权限等待、上游直接回包）
+  //   的正文就被吞成空串。解析失败照样抛——与原先 r.json() 的行为一致。
   const request = async (url, method, body, s = signal) => {
     const r = await fetchImpl(url, { method, headers: { 'content-type': 'application/json' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: s });
-    if (r.ok) return { status: r.status, json: await r.json(), rawText: '' };
-    return { status: r.status, json: null, rawText: await r.text().catch(() => '') };
+    if (!r.ok) return { status: r.status, json: null, rawText: await r.text().catch(() => '') };
+    const rawText = await r.text();
+    return { status: r.status, json: JSON.parse(rawText), rawText };
   };
   const cleanupSignal = () => AbortSignal.timeout(5000);
   const abortSession = () => request(route + '/abort', 'POST', undefined, cleanupSignal()).catch(() => {});
@@ -91,6 +95,32 @@ async function guardedPost({ base, sessionId, payload, tools, toolChoice, fetchI
   });
   const replied = new Set();
   let handoff = false;
+
+  /* ★ 必须**有界重试**地找那个 tool part，不能只查一次。
+   *
+   * 实测（真 opencode serve，17xxx 端口，会话权限 ask）：权限对象比它对应的那条
+   * assistant 消息**先**到——权限一出现，`/message?limit=3` 还是 0 条。只查一次必然
+   * 拿不到 part，于是每一次都退化成「reject + 引导改用 StructuredOutput」，
+   * **交接这条路永远走不到**，Claude Code 永远拿不到 tool_use。
+   *
+   * 只在「part 还没出现」时重试；**查到了但映射不上**（缺必填参数 / 不认识的原生工具 /
+   * tool_choice 禁止）立刻拒绝，不做无谓等待。权限连 callID 都没有时也立刻拒绝——
+   * 没有可等的东西。这三条都仍有总截止兜底。 */
+  const findPart = async (permission) => {
+    if (!permission?.tool?.callID) return undefined;
+    for (let attempt = 0; attempt <= partLookupTries; attempt++) {
+      if (watchSignal.aborted) return undefined;
+      const history = await request(route + '/message?limit=3', 'GET', undefined,
+        AbortSignal.any([watchSignal, AbortSignal.timeout(5000)]));
+      const rows = Array.isArray(history.json) ? history.json : [];
+      const part = rows.flatMap(m => Array.isArray(m.parts) ? m.parts : [])
+        .find(p => p?.type === 'tool' && p.callID === permission.tool?.callID);
+      if (part) return part;
+      if (attempt < partLookupTries) await pause();
+    }
+    return undefined;
+  };
+
   const monitor = async () => {
     while (!watchSignal.aborted) {
       try {
@@ -98,11 +128,7 @@ async function guardedPost({ base, sessionId, payload, tools, toolChoice, fetchI
           AbortSignal.any([watchSignal, AbortSignal.timeout(5000)]));
         for (const permission of Array.isArray(pending.json) ? pending.json : []) {
           if (permission.sessionID !== sessionId || !permission.id || replied.has(permission.id)) continue;
-          const history = await request(route + '/message?limit=3', 'GET', undefined,
-            AbortSignal.any([watchSignal, AbortSignal.timeout(5000)]));
-          const rows = Array.isArray(history.json) ? history.json : [];
-          const part = rows.flatMap(m => Array.isArray(m.parts) ? m.parts : [])
-            .find(p => p?.type === 'tool' && p.callID === permission.tool?.callID);
+          const part = await findPart(permission);
           const call = externalCallFor(part, permission, tools, toolChoice);
           const message = call ? 'This native action will be executed by Claude Code. Do not execute it here.'
             : 'Native actions are not executed here. Use StructuredOutput to return a call using the external tool definitions and exact arguments, or explain why it cannot be performed.';
@@ -112,11 +138,12 @@ async function guardedPost({ base, sessionId, payload, tools, toolChoice, fetchI
           replied.add(permission.id);
           if (call) {
             handoff = true;
+            const envelope = {
+              structured: { content: '', calls: [call] }, info: { finish: 'tool-calls' },
+            };
             await abortSession();
             log(`OpenCode 工具交接：${call.name}（由 Claude Code 执行）`);
-            return { status: 200, rawText: '', json: {
-              structured: { content: '', calls: [call] }, info: { finish: 'tool-calls' },
-            } };
+            return { status: 200, rawText: JSON.stringify(envelope), json: envelope };
           }
         }
       } catch { /* Poll failure never grants approval; the main request retains its deadline. */ }
@@ -126,9 +153,18 @@ async function guardedPost({ base, sessionId, payload, tools, toolChoice, fetchI
   };
   // Attach both continuations before starting permission polling; a handoff can abort
   // the pending HTTP request without leaving an unhandled rejection behind.
+  // ★ 交接信封必须压过「被中止的 POST 自己返回的那个值」：abortSession() 一旦让挂起的
+  //   POST 落地（真服务交回错误正文，假服务直接交回正常包），直接进 Promise.race 的
+  //   response 就会抢先结算，交接被悄悄降级成一句普通回答。所以 response 不直接参与
+  //   race，改由 decide 转发；交接一旦发生就一律忽略它（顺带不留未处理的 rejection）。
+  let decide;
+  const outcome = new Promise((resolve, reject) => { decide = { resolve, reject }; });
   const response = request(route + '/message', 'POST', payload);
+  response.then(
+    (value) => { if (!handoff) decide.resolve(value); },
+    (error) => { if (!handoff) decide.reject(error); });
   try {
-    return await Promise.race([response, monitor()]);
+    return await Promise.race([outcome, monitor()]);
   } catch (e) {
     await abortSession();
     throw e;

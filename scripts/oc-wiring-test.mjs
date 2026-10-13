@@ -118,6 +118,14 @@ const TOOLS = [
   { name: "Bash", description: "跑一条命令", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
 ];
 
+/** 假上游必须像真 fetch 一样同时给出 json() 和 text()。
+ *  消息那一发现在走 oc-tool-guard，而守卫**逐字读 text() 再从同一段解析 json()**
+ *  （正文被吞成空串的那个 bug 就出在这里）。只给 json() 的桩会把这条契约藏起来。 */
+const ocOk = (body, status = 200) => new Response(JSON.stringify(body), {
+  status, headers: { "content-type": "application/json" },
+});
+const ocFail = (status, text) => new Response(text, { status });
+
 const REQ = (over = {}) => ({
   model: "claude-sonnet-4-5", max_tokens: 1024, stream: false,
   system: "You are Claude Code.",
@@ -405,7 +413,7 @@ describe("③ 网关：模型映射 / 会话映射 / 应答 / 零字节纪律 / 
   const mk = (o = {}) => createOcGateway({
     log: () => {},
     runtimeFactory: () => o.rt || fakeRuntime(),
-    fetchImpl: o.fetchImpl || (async () => ({ ok: true, status: 200, json: async () => OC_TOOL_RESPONSE })),
+    fetchImpl: o.fetchImpl || (async () => ocOk(OC_TOOL_RESPONSE)),
     portOf: () => 17899,
     timeoutOf: () => 3000,
     ...o.deps,
@@ -421,7 +429,7 @@ describe("③ 网关：模型映射 / 会话映射 / 应答 / 零字节纪律 / 
     let posted = null;
     const gw = mk({ fetchImpl: async (_url, init) => {
       posted = JSON.parse(init.body);
-      return { ok: true, status: 200, json: async () => OC_TOOL_RESPONSE };
+      return ocOk(OC_TOOL_RESPONSE);
     } });
     const res = fakeRes();
     await gw.exchange({ cfg: CFG_OPEN, j: REQ(), isProbe: false, res, mapModel: mapTo("space-bunny-free") });
@@ -448,16 +456,22 @@ describe("③ 网关：模型映射 / 会话映射 / 应答 / 零字节纪律 / 
 
   test("④ 会话映射：同一段对话复用同一个 session id，不同对话不同", async () => {
     const seen = [];
-    const gw = mk({ fetchImpl: async (url) => { seen.push(url); return { ok: true, status: 200, json: async () => OC_TOOL_RESPONSE }; } });
+    /* 消息那一发现在走守卫，守卫还会轮询 /permission；这里按路由如实应答，
+       断言只数 message 那一发（本测试要验的正是「每轮一次、session id 复用」）。 */
+    const gw = mk({ fetchImpl: async (url) => {
+      seen.push(url);
+      return new URL(url).pathname === "/permission" ? ocOk([]) : ocOk(OC_TOOL_RESPONSE);
+    } });
     const convA = REQ({ messages: [{ role: "user", content: "对话甲的第一句" }] });
     const convA2 = REQ({ messages: [{ role: "user", content: "对话甲的第一句" }, { role: "assistant", content: "好" }, { role: "user", content: "第二轮" }] });
     const convB = REQ({ messages: [{ role: "user", content: "对话乙的第一句" }] });
     for (const j of [convA, convA2, convB]) await go(gw, { j });
-    assert.equal(seen.length, 3);
+    const posts = seen.filter((u) => u.endsWith("/message"));
+    assert.equal(posts.length, 3);
     const urlOf = (u) => decodeURIComponent((u.match(/\/session\/([^/]+)\/message$/) || [])[1]);
-    assert.ok(urlOf(seen[0]), "URL 里必须带 session id");
-    assert.equal(urlOf(seen[0]), urlOf(seen[1]), "同一段对话两轮必须是同一个 session id（否则上下文会丢）");
-    assert.notEqual(urlOf(seen[0]), urlOf(seen[2]), "不同对话必须是不同的 session id");
+    assert.ok(urlOf(posts[0]), "URL 里必须带 session id");
+    assert.equal(urlOf(posts[0]), urlOf(posts[1]), "同一段对话两轮必须是同一个 session id（否则上下文会丢）");
+    assert.notEqual(urlOf(posts[0]), urlOf(posts[2]), "不同对话必须是不同的 session id");
   });
 
   test("④ 探针走固定会话键，不给每次探测都造一个新会话", async () => {
@@ -519,7 +533,7 @@ describe("③ 网关：模型映射 / 会话映射 / 应答 / 零字节纪律 / 
      * 错误体必须写出来，故障转移的影子 res 靠它判定该不该换下一家渠道
      * （failover.mjs：writeHead(>=400) 缓冲 / writeHead(<400) 立刻固化）。 */
     for (const [name, fetchImpl] of [
-      ["上游 500", async () => ({ ok: false, status: 500, text: async () => "Internal server error" })],
+      ["上游 500", async () => ocFail(500, "Internal server error")],
       ["连不上", async () => { throw new Error("ECONNREFUSED 127.0.0.1:17899"); }],
     ]) {
       const gw = mk({ fetchImpl });
@@ -535,7 +549,7 @@ describe("③ 网关：模型映射 / 会话映射 / 应答 / 零字节纪律 / 
   test("⑥ 影子 res：失败被缓冲，故障转移仍能接手（真用 failover.mjs 的 CaptureRes）", async () => {
     const real = fakeRes();
     const cap = new CaptureRes(real);
-    const gw = mk({ fetchImpl: async () => ({ ok: false, status: 500, text: async () => "Internal server error" }) });
+    const gw = mk({ fetchImpl: async () => ocFail(500, "Internal server error") });
     await go(gw, { j: REQ({ stream: true }), res: cap });
     assert.equal(cap.ok(), false, "影子 res 必须判为失败（否则永远不会转移）");
     assert.equal(cap.status, 500);
@@ -564,7 +578,7 @@ describe("③ 网关：模型映射 / 会话映射 / 应答 / 零字节纪律 / 
   });
 
   test("⑦ 空响应：当成上游失败，不把空回复当成功发出去", async () => {
-    const gw = mk({ fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ info: { finish: "stop", modelID: "big-pickle" }, parts: [] }) }) });
+    const gw = mk({ fetchImpl: async () => ocOk({ info: { finish: "stop", modelID: "big-pickle" }, parts: [] }) });
     const res = await go(gw, { j: REQ({ stream: true }) });
     assert.equal(res.statusCode, 502, "空响应必须报错让故障转移接手");
     assert.match(res.body, new RegExp(DIAG.ENVELOPE_UNPARSED), `必须点名 ${DIAG.ENVELOPE_UNPARSED}`);
@@ -572,7 +586,7 @@ describe("③ 网关：模型映射 / 会话映射 / 应答 / 零字节纪律 / 
   });
 
   test("⑦ 403 FreeTierError：说清唯一判据与 deny 的关系", async () => {
-    const gw = mk({ fetchImpl: async () => ({ ok: false, status: 403, text: async () => '{"error":{"type":"FreeTierError"}}' }) });
+    const gw = mk({ fetchImpl: async () => ocFail(403, '{"error":{"type":"FreeTierError"}}') });
     const res = fakeRes();
     await go(gw, { res });
     assert.equal(res.statusCode, 403);
@@ -958,6 +972,34 @@ const SABOTAGE = [
     to: `/* dropped */`,
     reds: "⑤ 流式事件序列 / ⑧ message_stop 必须收尾",
   },
+  /* ---- 工具守卫（oc-tool-guard）这一节三条 ---- */
+  {
+    name: "swallow-immediate-rawtext", where: "oc-tool-guard.mjs · request() 的成功分支",
+    from: `    const rawText = await r.text();
+    return { status: r.status, json: JSON.parse(rawText), rawText };`,
+    to: `    return { status: r.status, json: await r.json(), rawText: '' };`,
+    reds: "★ 正常正文原样返回（rawText 被吞成空串的那条）",
+  },
+  {
+    name: "no-part-lookup-retry", where: "oc-tool-guard.mjs · findPart 的等待",
+    from: `    for (let attempt = 0; attempt <= partLookupTries; attempt++) {`,
+    to: `    for (let attempt = 0; attempt <= 0; attempt++) {`,
+    reds: "★ 历史先是空的，几次之后才出现 → 必须等它，而不是退化成拒绝",
+  },
+  {
+    name: "allow-native-locally", where: "oc-tool-guard.mjs · 权限回复",
+    from: `{ reply: 'reject', message }`,
+    to: `{ reply: 'always', message }`,
+    reds: "★ 绝不本地执行（权限回复只能是 reject）/ 交接与全部 reject 分支",
+  },
+  {
+    name: "bypass-guard-in-wiring", where: "oc-wiring.mjs · ④ 发",
+    from: `      const out = await postMessageWithToolGuard({`,
+    to: `      const raw = await (fetchImpl || fetch)(base + "/session/" + encodeURIComponent(sess.sessionId) + "/message", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(built.payload), signal: AbortSignal.timeout(timeoutOf(cfg)) });
+      const out = { status: raw.status, json: raw.ok ? await raw.json() : null, rawText: raw.ok ? "" : await raw.text() };
+      if (false) await postMessageWithToolGuard({`,
+    reds: "★ 消息那一发真的走了守卫，不再是裸 POST",
+  },
 ];
 
 if (process.argv.includes("--list-sabotage")) {
@@ -969,6 +1011,9 @@ if (process.argv.includes("--sabotage")) {
   const name = process.argv[process.argv.indexOf("--sabotage") + 1];
   const s = SABOTAGE.find((x) => x.name === name);
   if (!s) { console.error(`没有这条手法：${name}。可用：${SABOTAGE.map((x) => x.name).join(", ")}`); process.exit(2); }
-  console.log(JSON.stringify({ file: s.where.includes("server.mjs") ? "src/server/server.mjs" : "src/server/oc-wiring.mjs", ...s }, null, 2));
+  const file = s.where.includes("server.mjs") ? "src/server/server.mjs"
+    : s.where.includes("oc-tool-guard") ? "src/server/oc-tool-guard.mjs"
+    : "src/server/oc-wiring.mjs";
+  console.log(JSON.stringify({ file, ...s }, null, 2));
   process.exit(0);
 }

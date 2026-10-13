@@ -41,6 +41,7 @@
 
 import { createRuntime, createReadyProbe, findOpenCodeBinary, sessionKeyOf } from "./oc-runtime.mjs";
 import { anthropicToOpenCode, openCodeToAnthropic, DIAG } from "./oc-bridge.mjs";
+import { postMessageWithToolGuard } from "./oc-tool-guard.mjs";
 import fs from "node:fs";
 
 /* ========================================================================== *
@@ -407,22 +408,33 @@ export function createOcGateway(deps = {}) {
     }
 
     // ---- ④ 发（一次性返回，所以这里不做增量转码）----
+    /* ★ 这一发走 `postMessageWithToolGuard`，不是裸 POST。
+     *
+     * 裸 POST 的后果正是用户报的那个 bug：模型一碰原生工具，OpenCode 就去弹权限请求，
+     * 而 message POST 一直不落地——**表现为「一涉及工具调用就卡住」**，直到超时。
+     * 守卫在等 message 的同时轮询 /permission，并按下面三种结果收口：
+     *   · 上游直接回包（正常对话）→ 逐字原样返回，不改 status / rawText / 载荷；
+     *   · 原生调用能一对一映射到本次请求里的外部工具 → reject 掉本地执行 + abort 本轮，
+     *     改交一个 `finish:"tool-calls"` 的信封，由桥回译成 tool_use 交回 Claude Code；
+     *   · 映射不上（参数不合 schema / tool_choice 禁止 / 名字歧义）→ 同样 reject，但附带
+     *     一句「改用 StructuredOutput」的指引，模型据此在**同一会话**里继续正常回答。
+     * 三条路都各自带截止（timeoutOf(cfg)），不存在无限挂起。 */
     const base = runtime(cfg).base;
-    const url = `${base}/session/${encodeURIComponent(sess.sessionId)}/message`;
     let json = null, status = 0, rawText = "";
     try {
-      const r = await (fetchImpl || fetch)(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(built.payload),
-        signal: AbortSignal.timeout(timeoutOf(cfg)),
+      const out = await postMessageWithToolGuard({
+        base,
+        sessionId: sess.sessionId,
+        payload: built.payload,
+        tools,
+        toolChoice: j && j.tool_choice,
+        fetchImpl: fetchImpl || fetch,
+        timeoutMs: timeoutOf(cfg),
+        log,
       });
-      status = r.status;
-      if (r.ok) {
-        json = await r.json();
-      } else {
-        rawText = await r.text().catch(() => "");
-      }
+      status = out.status;
+      json = out.json || null;
+      rawText = out.rawText || "";
     } catch (e) {
       const tail = ocChildLogTail(api);
       const msg = `连不上本机的 OpenCode 服务（${base}）：${String((e && e.message) || e).slice(0, 160)}`;
