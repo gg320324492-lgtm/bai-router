@@ -68,12 +68,17 @@ export function externalCallFor(part, permission, tools, toolChoice) {
 }
 
 async function guardedPost({ base, sessionId, payload, tools, toolChoice, fetchImpl = fetch,
-  timeoutMs = 180000, pollMs = 250, partLookupTries = 10, log = () => {} }) {
+  timeoutMs = 180000, pollMs = 250, partLookupTries = 10, cancelSignal = null, log = () => {} }) {
   const route = `${base}/session/${encodeURIComponent(sessionId)}`;
   const work = new AbortController();
   const watch = new AbortController();
   const timeout = AbortSignal.timeout(timeoutMs);
-  const signal = AbortSignal.any([work.signal, timeout]);
+  /* cancelSignal = 上层在**客户端已经断开**时给出的取消信号。
+   * 没有它，一个被客户端放弃的请求会在这里一直占着上游跑到 180 秒截止为止：
+   * 实测客户端收手后 OpenCode 还在继续生成（6.2s / 10.8s 仍有事件），
+   * 而这个窗口在我们这里最坏就是整个 timeoutMs。带上它，取消会走同一条
+   * catch -> abortSession() 的路，服务端那一轮立刻被 /session/{id}/abort 收掉。 */
+  const signal = AbortSignal.any([work.signal, timeout, ...(cancelSignal ? [cancelSignal] : [])]);
   const watchSignal = AbortSignal.any([signal, watch.signal]);
   // ★ 正文必须逐字原样返回：先取 text，再从同一段 text 解析 JSON。
   //   写成 `r.json()` 会把 rawText 留成 ''，正常对话（没有权限等待、上游直接回包）

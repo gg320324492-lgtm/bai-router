@@ -30,6 +30,7 @@
  */
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
@@ -40,12 +41,14 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "no
 
 import {
   createOcGateway, zenTransportOf, writeAnthropicMessage, classifyRuntimeFailure,
-  ocInstallHint, spawnableExists,
+  ocInstallHint, spawnableExists, classifyTransportError,
   ZEN_TRANSPORTS, ZEN_TRANSPORT_DIRECT, ZEN_TRANSPORT_OPENCODE, OC_PROBE_SESSION_KEY,
+  OC_IDLE_TIMEOUT_MS,
 } from "../src/server/oc-wiring.mjs";
 import { CaptureRes } from "../src/server/failover.mjs";
+import { shouldFailover } from "../src/server/failover.mjs";
 import { DIAG } from "../src/server/oc-bridge.mjs";
-import { sessionKeyOf } from "../src/server/oc-runtime.mjs";
+import { sessionKeyOf, createRuntime, IDLE_TIMEOUT_MS } from "../src/server/oc-runtime.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..");
@@ -896,6 +899,207 @@ describe("⑨ 端到端的关闭态：transport=direct 一个 OpenCode 进程都
   });
 });
 
+/* ================================================================== *
+ * ⑩ v1.0.84：客户端断线要掐上游，以及「连不上」这个说法是错的
+ * ================================================================== *
+ *
+ * 定位结论（2026-10-13，实测不是推断）：
+ *   ① 超时发生在**请求已送达、等不到回复**这一层，不是连不上 TCP。
+ *      对照：真连接失败 = `TypeError: fetch failed` + `cause=ECONNREFUSED`（4ms）；
+ *      线上那种 = `TimeoutError`，与 timeoutMs 逐毫秒对齐，且服务端已收到完整请求体、
+ *      同时并发 `GET /session` 10ms 就回 200（进程活着）。
+ *   ② **被掐断的请求不会毒化会话**（实测，见下方断言与报告），
+ *      所以「调大超时会拉长毒化窗口」这个顾虑不成立。
+ *   ③ 生效的空闲回收是 **2 小时**，不是 oc-runtime 的 10 分钟默认值；
+ *      实机日志全程 0 次 `空闲超过`，看着像回收的那几段其实是中转进程重启。
+ *
+ * 这一节钉的是**真因为修好而修**的那条：客户端断了，上游那一轮不能还占着。
+ */
+describe("⑩ 客户端断线即掐上游 + 失败归因不再谎称「连不上」", () => {
+  const CFG_T = { zen: { transport: "opencode", ocPort: 17899 } };
+
+  /** 带 EventEmitter 的 res——只有它能发出真实 res 会发的 `close`。 */
+  function closableRes() {
+    const r = new EventEmitter();
+    r.statusCode = 0; r.headers = null; r.body = ""; r.chunks = []; r.ended = false;
+    r.writableFinished = false;
+    r.writeHead = (s, h) => { r.statusCode = s; r.headers = h || {}; };
+    r.write = (c) => { const s = Buffer.isBuffer(c) ? c.toString("utf8") : String(c); r.chunks.push(s); r.body += s; };
+    r.end = (c) => { if (c) r.write(c); r.ended = true; r.writableFinished = true; };
+    Object.defineProperty(r, "headersSent", { get() { return r.statusCode > 0; } });
+    Object.defineProperty(r, "writableEnded", { get() { return r.ended; } });
+    return r;
+  }
+
+  /** 记下每个 URL；message 那条**永不回复**，直到 signal 掐断它。 */
+  function hangingFetch(seen) {
+    return async (url, init = {}) => {
+      seen.push(String(url));
+      const ok = (json) => ({ ok: true, status: 200, json: async () => json, text: async () => JSON.stringify(json) });
+      const bad = () => ({ ok: false, status: 400, json: async () => null, text: async () => "{}" });
+      if (String(url).endsWith("/abort")) return ok({ ok: true });
+      if (String(url).endsWith("/permission")) return ok([]);
+      if (String(url).includes("/message?limit=")) return bad();
+      if (String(url).includes("/message")) {
+        const s = init.signal;
+        await new Promise((_, reject) => {
+          if (!s) return;                                   // 没有 signal：永远挂着
+          if (s.aborted) return reject(s.reason);
+          s.addEventListener("abort", () => reject(s.reason), { once: true });
+        });
+      }
+      return ok({});
+    };
+  }
+
+  test("⑩-a 真连接失败与真截止是**两种不同的错误**（不是靠文案反推）", async () => {
+    // 运行时事实 ①：连接失败（用 17xxx 段上一个没人听的端口，避开特权端口的怪形状）
+    let connectErr = null;
+    try { await fetch("http://127.0.0.1:17999/never", { signal: AbortSignal.timeout(2000) }); } catch (e) { connectErr = e; }
+    assert.ok(connectErr, "该端口必然拒绝连接");
+    assert.equal(connectErr.name, "TypeError", `真连接失败应是 TypeError，实际 ${connectErr.name}`);
+    assert.match(String(connectErr.message), /fetch failed/);
+    assert.equal(connectErr.cause?.code, "ECONNREFUSED", `连接失败必须带 ECONNREFUSED cause，实际 ${JSON.stringify(connectErr.cause?.code)}`);
+
+    // 运行时事实 ②：我们自己的 AbortSignal.timeout
+    let deadlineErr = null;
+    try { await new Promise((_, rej) => { const s = AbortSignal.timeout(30); s.addEventListener("abort", () => rej(s.reason), { once: true }); }); } catch (e) { deadlineErr = e; }
+    assert.equal(deadlineErr.name, "TimeoutError", `截止应是 TimeoutError，实际 ${deadlineErr.name}`);
+    assert.match(String(deadlineErr.message), /aborted due to timeout/);
+
+    /* 这两条**同时**成立，才说明 classifyTransportError 按 name 分是可靠的。
+     * 如果哪天 Node 把两者合并成同一个错误类型，这一条会先红——那正是要重新定位的信号。 */
+    const c1 = classifyTransportError(connectErr, "http://127.0.0.1:17895");
+    assert.equal(c1.kind, "network");
+    assert.equal(c1.status, 502);
+    assert.match(c1.what, /连不上/);
+
+    const c2 = classifyTransportError(deadlineErr, "http://127.0.0.1:17895");
+    assert.equal(c2.kind, "timeout", "自己的截止必须归 timeout，不能归 network");
+    assert.equal(c2.status, 504);
+    assert.ok(!/连不上/.test(c2.what), `截止不是连不上，实际文案：${c2.what}`);
+
+    // 转移行为不变：504 与 502 一样要转移，所以改归因不会改掉故障转移
+    assert.equal(shouldFailover(504), true, "504 仍要转移");
+    assert.equal(shouldFailover(502), true);
+  });
+
+  test("⑩-b ★ 客户端断开 → 立刻收工，并且真的去 abort 掉上游那一轮", async () => {
+    const seen = [];
+    const gw = createOcGateway({
+      log: () => {}, runtimeFactory: () => fakeRuntime(), portOf: () => 17899,
+      timeoutOf: () => 60_000,                       // 截止给足 60 秒：提前收工才是本事
+      fetchImpl: hangingFetch(seen), noteRelayError: () => {}, anthroError: () => {},
+    });
+    const res = closableRes();
+    const p = gw.exchange({ cfg: CFG_T, j: REQ(), isProbe: false, res, mapModel: mapTo("space-bunny-free") });
+
+    await sleep(80);
+    assert.ok(!seen.some((u) => u.endsWith("/abort")), "还没断线，不该提前 abort");
+    const tClose = Date.now();
+    res.emit("close");                               // 客户端挂断
+
+    await p;                                          // 若修复被撤，这里会一直等到 60 秒截止
+    const elapsed = Date.now() - tClose;
+    assert.ok(elapsed < 5_000, `断线后 ${elapsed}ms 才收工——说明还在傻等截止`);
+
+    const abortUrl = seen.find((u) => u.endsWith("/abort"));
+    assert.ok(abortUrl, `断线后必须 POST {sessionId}/abort 把上游那一轮收掉；实际只打了：${seen.join(" | ")}`);
+    assert.match(abortUrl, /\/session\/[^/]+\/abort$/, "abort 必须打在会话路由上");
+  });
+
+  test("⑩-c 反向对照：没有 close 事件就**不许**提前收工（否则上一条恒真）", async () => {
+    const seen = [];
+    const gw = createOcGateway({
+      log: () => {}, runtimeFactory: () => fakeRuntime(), portOf: () => 17899,
+      timeoutOf: () => 60_000, fetchImpl: hangingFetch(seen), noteRelayError: () => {}, anthroError: () => {},
+    });
+    const res = closableRes();
+    const p = gw.exchange({ cfg: CFG_T, j: REQ(), isProbe: false, res, mapModel: mapTo("space-bunny-free") });
+    let settled = false; p.then(() => { settled = true; }, () => { settled = true; });
+    await sleep(400);
+    assert.equal(settled, false, "客户端还在，没理由收工");
+    assert.equal(seen.filter((u) => u.endsWith("/abort")).length, 0, "没断线就不该 abort 上游");
+    res.emit("close");                               // 收尾，别把测试吊在 60 秒截止上
+    await p;
+  });
+
+  test("⑩-d 正常收尾（writableFinished）不得被当成断线", async () => {
+    /* res.end() 之后 Node 也会发 close。不看 writableFinished 的话，
+     * 每个**成功**的请求都会在写完之后把自己 abort 掉。 */
+    const seen = [];
+    const gw = createOcGateway({
+      log: () => {}, runtimeFactory: () => fakeRuntime(), portOf: () => 17899,
+      timeoutOf: () => 3000,
+      fetchImpl: async (url, init = {}) => {
+        seen.push(String(url));
+        const ok = (json) => ({ ok: true, status: 200, json: async () => json, text: async () => JSON.stringify(json) });
+        if (String(url).endsWith("/permission")) return ok([]);
+        if (String(url).includes("/message?limit=")) return { ok: false, status: 400, json: async () => null, text: async () => "{}" };
+        if (String(url).includes("/message")) return ok(OC_TOOL_RESPONSE);
+        return ok({});
+      },
+      noteRelayError: () => {}, anthroError: () => {},
+    });
+    const res = closableRes();
+    await gw.exchange({ cfg: CFG_T, j: REQ(), isProbe: false, res, mapModel: mapTo("space-bunny-free") });
+    res.emit("close");                               // 成功之后 Node 发的那个 close
+    assert.equal(seen.filter((u) => u.endsWith("/abort")).length, 0, "正常收尾之后绝不该再 abort 上游");
+    assert.equal(res.statusCode, 200, "正常路径不受影响");
+  });
+
+  test("⑩-e 走网关时，自己的截止报 504/timeout 而不是 502/network", async () => {
+    const kinds = [];
+    const gw = createOcGateway({
+      log: () => {}, runtimeFactory: () => fakeRuntime(), portOf: () => 17899,
+      timeoutOf: () => 30,
+      noteRelayError: (_c, kind) => kinds.push(kind),
+      anthroError: (res, status, msg) => { res.writeHead(status); res.end(msg); },
+      fetchImpl: async (url, init = {}) => {
+        const ok = (json) => ({ ok: true, status: 200, json: async () => json, text: async () => JSON.stringify(json) });
+        if (String(url).endsWith("/permission")) return ok([]);
+        if (String(url).includes("/message?limit=")) return { ok: false, status: 400, json: async () => null, text: async () => "{}" };
+        if (String(url).includes("/message")) {
+          await new Promise((_, rej) => {
+            const s = AbortSignal.any([init.signal, AbortSignal.timeout(30)]);
+            s.addEventListener("abort", () => rej(s.reason), { once: true });
+          });
+        }
+        return ok({});
+      },
+    });
+    const res = closableRes();
+    await gw.exchange({ cfg: CFG_T, j: REQ(), isProbe: false, res, mapModel: mapTo("space-bunny-free") });
+    assert.equal(res.statusCode, 504, `自己的截止必须是 504，实际 ${res.statusCode}`);
+    assert.deepEqual(kinds, ["timeout"], `面板归因必须是 timeout，实际 ${JSON.stringify(kinds)}`);
+    assert.match(res.body, /不是「连不上」/, "文案必须说清这不是连不上");
+    assert.match(res.body, /\/session\/\{id\}\/abort/, "文案要说明上游那一轮已被收掉");
+  });
+
+  test("⑩-f 生效的空闲回收是 2 小时，不是 oc-runtime 的 10 分钟", () => {
+    assert.equal(OC_IDLE_TIMEOUT_MS, 2 * 60 * 60_000);
+    assert.notEqual(OC_IDLE_TIMEOUT_MS, IDLE_TIMEOUT_MS, "必须与 oc-runtime 的默认值不同，否则等于没改");
+    assert.ok(OC_IDLE_TIMEOUT_MS > IDLE_TIMEOUT_MS);
+
+    /* 行为断言：用网关实际传下去的那个值造一个运行时，空闲 10 分钟不许回收，
+     * 空闲超过 2 小时才回收。（10 分钟就回收 = 用户一回头这段对话就换了新会话） */
+    let clock = 1_000_000;
+    const rt = createRuntime({
+      port: 17901, host: "127.0.0.1", workDir: os.tmpdir(),
+      probeReady: async () => true, createSession: async () => ({ id: "ses_x", status: 200 }),
+      now: () => clock, sleep: async () => { }, idleTimeoutMs: OC_IDLE_TIMEOUT_MS,
+      findBinary: () => ({ ok: true, path: "opencode.exe", source: "test", spawnNeedsShell: false, tried: [] }),
+      spawn: () => ({ pid: 1234, stdout: null, stderr: null, on() { }, kill() { } }),
+      log: () => {},
+    });
+    rt.child = { pid: 1234 }; rt.exited = false; rt.lastUsedAt = clock;
+    clock += 10 * 60_000 + 1000;
+    assert.equal(rt.reclaimIfIdle(), false, "空闲 10 分钟就回收 = 会话缓存被清掉，那正是本条要防的事");
+    clock += 2 * 60 * 60_000;
+    assert.equal(rt.reclaimIfIdle(), true, "超过 2 小时必须真的回收");
+  });
+});
+
 /* ------------------------------------------------------------------ *
  * 反向对照的「把手册」：--list-sabotage / --sabotage
  * ------------------------------------------------------------------ *
@@ -991,6 +1195,28 @@ const SABOTAGE = [
     from: `{ reply: 'reject', message }`,
     to: `{ reply: 'always', message }`,
     reds: "★ 绝不本地执行（权限回复只能是 reject）/ 交接与全部 reject 分支",
+  },
+  {
+    name: "ignore-client-close", where: "oc-wiring.mjs · 客户端断线处理",
+    from: `    if (realRes && typeof realRes.on === "function") realRes.on("close", onClientClose);`,
+    to: `    if (false && realRes && typeof realRes.on === "function") realRes.on("close", onClientClose);`,
+    reds: "★ 断线即掐上游（⑩-b / ⑩-c）——撤掉后请求要一直等到 60 秒截止，且不会 POST /abort",
+  },
+  {
+    name: "drop-cancelsignal", where: "oc-tool-guard.mjs · signal 合流",
+    from: `  const signal = AbortSignal.any([work.signal, timeout, ...(cancelSignal ? [cancelSignal] : [])]);`,
+    to: `  const signal = AbortSignal.any([work.signal, timeout]);`,
+    reds: "★ 同上——守卫收不到上层给的取消信号，⑩-b 的「断线即收工」直接失效",
+  },
+  {
+    name: "call-everything-network", where: "oc-wiring.mjs · 传输失败归因",
+    from: `  if (name === "TimeoutError") {
+    return { kind: "timeout", status: 504, what: \`OpenCode 那一轮没在自己的截止前结束（\${where}）\`, detail };
+  }`,
+    to: `  if (name === "TimeoutError") {
+    return { kind: "network", status: 502, what: \`连不上本机的 OpenCode 服务（\${where}）\`, detail };
+  }`,
+    reds: "★ ⑩-a / ⑩-e——自己的截止又变回「连不上」+ network/502",
   },
   {
     name: "bypass-guard-in-wiring", where: "oc-wiring.mjs · ④ 发",

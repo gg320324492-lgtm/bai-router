@@ -74,6 +74,18 @@ export function zenTransportOf(cfg) {
  *  等于凭空给上游灌会话记录。与 server.mjs 的 `ZEN_PROBE_SESSION` 同一思路。 */
 export const OC_PROBE_SESSION_KEY = "bai-oc-probe";
 
+/**
+ * 空闲回收：2 小时，**不是** `oc-runtime.mjs` 里 `IDLE_TIMEOUT_MS`（10 分钟）那个默认值。
+ *
+ * 实测核对（2026-10-13 的真机 `server-child.log`）：全程 0 次 `空闲超过`，
+ * 09:48→09:49→09:52 那段看着像「回收」，其实日志里没有回收行，
+ * 紧跟着的是 `路由台启动`（整个中转进程重启）——重启换了新的运行时对象，
+ * 所以重新起了一个 opencode，**跟空闲回收没关系**。理由见下面 `runtime()` 处的注释。
+ *
+ * 导成常量是为了让「生效的到底是哪个值」可被测试钉死，而不是只能靠读注释。
+ */
+export const OC_IDLE_TIMEOUT_MS = 2 * 60 * 60_000;
+
 /* ========================================================================== *
  * 安装指引（找不到二进制时）
  * ========================================================================== */
@@ -270,6 +282,44 @@ function upstreamMessage(status, text) {
   return `OpenCode 上游拒绝了请求（HTTP ${status}）：${t}`;
 }
 
+/**
+ * 传输层抛出的异常 → 这一档**到底**发生了什么。
+ *
+ * v1.0.84 实测（两组对照，同一台机器、同一份代码）：
+ *   · 真的连不上 → `TypeError: fetch failed`，`cause=ECONNREFUSED`，**4ms** 就返回；
+ *   · 线上日志里那种 → `TimeoutError: The operation was aborted due to timeout`，
+ *     与 `timeoutMs` 逐毫秒对齐（4000ms 的截止 → 4006ms 抛出），而且同一时刻
+ *     服务端**已经收到了完整请求体**（t+23ms，66 字节）、
+ *     并发的 `GET /session` **10ms** 就回 200 —— 进程活着，而且正在正常服务。
+ *
+ * 也就是说线上那些「连不上」**一次都不是连不上**：请求送到了、OpenCode 也在生成，
+ * 只是**我们自己那 180 秒截止**先到了。记成 `network` 会让面板归因错，
+ * 也正是「根因一直找不到」的原因——所有人都去查网络了。
+ *
+ * 三者分开是必须的：`AbortSignal.timeout()` 与「连接失败」在 Node 里**不共用**同一个
+ * 错误类型（前者 `TimeoutError`，后者 `TypeError: fetch failed` + `cause.code`），
+ * 所以这里按 `name` 分是可靠的，不是靠文案反推。
+ *
+ * 状态码仍取 504（不是 502）：`shouldFailover(504)` 为真，转移行为与改前一致，
+ * 变的只是面板上归到 `timeout` 而不是 `network`。
+ *
+ * @param {unknown} e
+ * @param {string} base 仅用于把地址带进给人看的文案
+ * @returns {{kind:string, status:number, what:string, detail:string}}
+ */
+export function classifyTransportError(e, base) {
+  const name = String((e && e.name) || "");
+  const detail = String((e && e.message) || e || "").slice(0, 160);
+  const where = String(base || "");
+  if (name === "TimeoutError") {
+    return { kind: "timeout", status: 504, what: `OpenCode 那一轮没在自己的截止前结束（${where}）`, detail };
+  }
+  if (name === "AbortError") {
+    return { kind: "network", status: 502, what: `客户端已断开，这一轮随之取消（${where}）`, detail };
+  }
+  return { kind: "network", status: 502, what: `连不上本机的 OpenCode 服务（${where}）`, detail };
+}
+
 /* ========================================================================== *
  * 网关
  * ========================================================================== */
@@ -302,7 +352,7 @@ export function createOcGateway(deps = {}) {
      *  想调：`cfg.zen.ocTimeoutMs`（毫秒）。调小 = 更快让故障转移接手，代价是慢响应被误杀。 */
     timeoutOf = (c) => Number(c && c.zen && c.zen.ocTimeoutMs) || 180_000,
     readyTimeoutMs,
-    idleTimeoutMs = 2 * 60 * 60_000,   // 见下面「为什么不是默认的 10 分钟」
+    idleTimeoutMs = OC_IDLE_TIMEOUT_MS,   // 见下面「为什么不是默认的 10 分钟」
     findBinary,
     runtimeFactory,
     createSession,
@@ -421,6 +471,31 @@ export function createOcGateway(deps = {}) {
      * 三条路都各自带截止（timeoutOf(cfg)），不存在无限挂起。 */
     const base = runtime(cfg).base;
     let json = null, status = 0, rawText = "";
+
+    /* ★ 客户端一断就把上游那一轮掐掉（v1.0.84）。
+     *
+     * 以前这里只是被动地等：客户端（Claude Code）自己的截止到了、连接断了，
+     * 我们这边**毫不知情**，那一轮会一直占着 OpenCode 直到我们自己的 180 秒截止。
+     * 实测（探针 G，订阅 opencode 的 SSE `/event`）：客户端收手后，OpenCode
+     * 仍在继续生成——不通知它的话，+6.2s 和 +10.8s 还有事件；通知它之后，
+     * 最后一个事件落在 abort 之后 **30ms**。
+     *
+     * 为什么这件事值得修：免费档实测并发峰值只有 2（面板里那行「实测 9 个免费模型
+     * （并发峰值 2）」）。一个已经没人等的请求白占 180 秒的名额，客户端早就重试了，
+     * 于是**越失败越叠、越叠越慢**——这正是「用着用着突然 502」的形状。
+     *
+     * `res.real` 是故障转移的影子 res 包着的**真实** res（failover.mjs 的 CaptureRes）；
+     * 监听影子自己没用，它只在自己 end() 时才发 close。
+     * `writableFinished === true` 是正常收尾，必须放过——否则每个成功请求都会
+     * 在自己写完之后把自己 abort 掉。 */
+    const clientGone = new AbortController();
+    const realRes = (res && res.real) ? res.real : res;
+    const onClientClose = () => {
+      if (!realRes || realRes.writableFinished === true) return;
+      clientGone.abort();
+    };
+    if (realRes && typeof realRes.on === "function") realRes.on("close", onClientClose);
+
     try {
       const out = await postMessageWithToolGuard({
         base,
@@ -430,6 +505,7 @@ export function createOcGateway(deps = {}) {
         toolChoice: j && j.tool_choice,
         fetchImpl: fetchImpl || fetch,
         timeoutMs: timeoutOf(cfg),
+        cancelSignal: clientGone.signal,
         log,
       });
       status = out.status;
@@ -437,11 +513,19 @@ export function createOcGateway(deps = {}) {
       rawText = out.rawText || "";
     } catch (e) {
       const tail = ocChildLogTail(api);
-      const msg = `连不上本机的 OpenCode 服务（${base}）：${String((e && e.message) || e).slice(0, 160)}`;
-      noteRelayError(chan, "network", msg);
-      log(`OpenCode 传输：连不上 ${base} —— ${String((e && e.message) || e).slice(0, 120)}`
+      const cls = classifyTransportError(e, base);
+      const extra = cls.kind === "timeout"
+        ? `。这不是「连不上」：请求已经完整送到 OpenCode、它也正在生成，`
+          + `是我们自己的 ${timeoutOf(cfg)}ms 截止先到了（可改 cfg.zen.ocTimeoutMs）。`
+          + `这一轮已由 /session/{id}/abort 收掉，不会继续占着上游。`
+        : "";
+      const msg = `${cls.what}：${cls.detail}${extra}`;
+      noteRelayError(chan, cls.kind, msg.slice(0, 180));
+      log(`OpenCode 传输：${cls.kind === "timeout" ? "自己截止" : "连不上"} ${base} —— ${cls.detail}`
         + (tail ? `｜opencode 自己的输出：${tail.slice(-600)}` : ""));
-      return anthroError(res, 502, msg);
+      return anthroError(res, cls.status, msg);
+    } finally {
+      if (realRes && typeof realRes.removeListener === "function") realRes.removeListener("close", onClientClose);
     }
 
     if (status !== 200) {
