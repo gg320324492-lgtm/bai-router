@@ -308,7 +308,8 @@ window.BAI_PROVIDERS = {
       "claude-haiku-4-5": "DeepSeek-V4.1-Flash",
     },
 
-    conclusion: "捕获到 JWT 且未过期就算就绪；本渠道不比对 key（令牌由客户端带、中转只转发）。",
+    conclusion: "捕获到 JWT 且未过期就算就绪；本渠道不比对 key（令牌由客户端带、中转只转发）。上游同样会按 system prompt 的**内容**认客户端（与国际版同一套逻辑，中转发出前会自动剥除已知指纹，实测可正常对话与调工具）；上游日后若新增尚未覆盖的指纹，才会返回 400「Illegal API invocation from an unapproved channel」。",
+    caveat: "与国际版同一套客户端指纹校验：已知指纹中转会自动剥除。若报 400「unapproved channel」，多半是上游新增了尚未覆盖的指纹",
     remedy: "点「一键获取令牌」重取。没有刷新令牌，到期需重新捕获；国际版请到「WorkBuddy AI」格单独捕获，两个版本的令牌互不相同。",
 
     settingsLabels: { relayPort: "WorkBuddy 中转端口" },
@@ -352,11 +353,11 @@ window.BAI_PROVIDERS = {
       "claude-haiku-4-5": "DeepSeek-V4.1-Flash",
     },
 
-    conclusion: "捕获到国际版 JWT 且未过期就算就绪；本渠道不比对 key（令牌由客户端带、中转只转发）。已知限制：国际版上游对 system prompt 做内容风控，Claude Code 那种长 system（含工具定义与本机环境信息）会被判为非官方客户端并返回 400「Illegal API invocation from an unapproved channel」；模型目录、倍率、切换都不受影响，受影响的只有真实对话。",
+    conclusion: "捕获到国际版 JWT 且未过期就算就绪；本渠道不比对 key（令牌由客户端带、中转只转发）。上游会对 system prompt 做**内容**指纹校验（不是看长度）：认得 Claude Code 的几处标识就判「非官方客户端」并返回 400「Illegal API invocation from an unapproved channel」。中转在发出前会自动剥除这些标识（开场指纹行、计费指纹行、反馈链接行），实测**国内外两版**带真实 Claude Code system + 12 个工具的请求都能正常应答，工具调用也通。所以这不是这条渠道的既有限制；真正的残余风险是**上游日后新增了新的指纹**——规则表没覆盖到时才会真被拒，届时报上面那个 400。",
     // caveat：卡片上直接显示的限制提示（短句版）。完整解释在 conclusion/remedy 里。
     // 闸门 C1/C12 只校验必填字段的**存在**，不禁止额外字段，所以加这个是安全的。
-    caveat: "国际版上游对 Claude Code 的长 system 做了内容风控：目录/倍率/切换正常，真实对话可能被拒（400）",
-    remedy: "先启动「国际版」客户端（国内版那个不行，两者令牌文件不同）再点「一键获取令牌」。没有刷新令牌，到期需重新捕获。模型清单以面板「刷新模型列表」从上游拉到的为准，本格出厂的三项只是兜底。真实对话若报上面那个 400，是上游风控而非本机配置问题——国内版 WorkBuddy（/wb）没有此限制，可用。",
+    caveat: "上游按 system prompt 的**内容**认客户端，不是看长度；已知指纹中转会自动剥除，实测可正常对话与调工具。若报 400「unapproved channel」，多半是上游新增了尚未覆盖的指纹",
+    remedy: "先启动「国际版」客户端（国内版那个不行，两者令牌文件不同）再点「一键获取令牌」。没有刷新令牌，到期需重新捕获。模型清单以面板「刷新模型列表」从上游拉到的为准，本格出厂的三项只是兜底。真实对话若报上面那个 400，是上游新增指纹未覆盖，不是本机配置问题——国内外两版都一样，此时可先用 OpenCode Zen 等不挑客户端的渠道顶上。",
 
     settingsLabels: { relayPort: "WorkBuddy AI 中转端口" },
   },
