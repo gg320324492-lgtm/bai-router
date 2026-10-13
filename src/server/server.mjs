@@ -43,6 +43,11 @@ import {
   wbPoolOf, wbPickAccount, wbNoteFailure, wbNoteRefreshFailure, wbPoolStatus,
   wbPaidSameName, wbMappingRows, wbUnusableStatus, redact as redactWiring,
 } from "./wb-pool-wiring.mjs";
+/* WorkBuddy 令牌的 JWT 声明解码（wb-token.mjs）：纯逻辑、零 IO。
+ * 独立成文件是为了能**被测试直接 import**——server.mjs 一 import 就起服务，
+ * 住在这里的解码器就成了「测了替身、没测本体」的重灾区（v1.0.76 漏 `* 1000`
+ * 就是这么上线的，见该文件顶部的单位契约）。⚠ wbTokenExp 返回的是**毫秒**。 */
+import { wbJwtPayload, wbTokenExp, wbTokenSub } from "./wb-token.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -1379,28 +1384,6 @@ function directHttp(target, { method, headers, body, timeoutMs }) {
 // WorkBuddy 上游（www.workbuddy.ai/v2/chat/completions）只讲 OpenAI 协议且仅支持流式；
 // 这里把 Claude Code 的 /v1/messages 请求翻译过去，再把 OpenAI SSE 流翻回 Anthropic SSE。
 
-/* 解 JWT 载荷（**不验签**，只取声明里的字段做诊断）。
- * 验不验签跟我们要回答的问题无关：要判断的是「这串令牌是谁的」，
- * 而 sub 是令牌自己声明的签发对象——要的正是"它自称是谁"，
- * 拿去和登录文件里的 account.uid 对一下即可。 */
-function wbJwtPayload(tok) {
-  try {
-    const seg = String(tok || "").split(".")[1];
-    if (!seg) return null;
-    const p = JSON.parse(Buffer.from(seg.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
-    return p && typeof p === "object" ? p : null;
-  } catch { return null; }
-}
-function wbTokenExp(tok) {
-  const p = wbJwtPayload(tok);
-  return p && typeof p.exp === "number" ? p.exp : null;
-}
-/** 令牌自称的账号 id（JWT 的 sub）。不是 JWT / 取不到就 null。 */
-function wbTokenSub(tok) {
-  const p = wbJwtPayload(tok);
-  const s = p && p.sub;
-  return typeof s === "string" && s ? s : null;
-}
 async function readAllBody(r) {
   if (!r || !r.body) return "";
   const out = [];
@@ -1468,7 +1451,7 @@ function wbRefreshToken(cfg, p, account) {
     }
     saveCfg(cfg);
     const exp = wbTokenExp(na);
-    log(`${zh} 令牌已自动续期${exp ? "（新有效期至 " + new Date(exp * 1000).toLocaleDateString("zh-CN") + "）" : ""}`);
+    log(`${zh} 令牌已自动续期${exp ? "（新有效期至 " + new Date(exp).toLocaleDateString("zh-CN") + "）" : ""}`);
     return w.accessToken;
   })();
 }
@@ -6412,8 +6395,8 @@ async function statusPayload() {
       // 令牌体检：有无令牌、访问令牌到期时间、是否带刷新令牌
       token: {
         configured: !!cfg.wb?.accessToken,
-        expAt: wbExp ? new Date(wbExp * 1000).toISOString() : null,
-        expiresInDays: wbExp ? Math.max(0, Math.round((wbExp * 1000 - Date.now()) / 86400000)) : null,
+        expAt: wbExp ? new Date(wbExp).toISOString() : null,
+        expiresInDays: wbExp ? Math.max(0, Math.round((wbExp - Date.now()) / 86400000)) : null,
         hasRefresh: !!cfg.wb?.refreshToken,
         // 令牌自称的账号 vs 国内登录态里的账号。不一致 = 装错了频道的令牌，
         // 而这种错配其它信号全都指错方向（见 wbTokenOwnership 的注释）。
@@ -6435,8 +6418,8 @@ async function statusPayload() {
       authDomain: wbaiAuthNow.domain,
       token: {
         configured: !!cfg.wbai?.accessToken,
-        expAt: wbaiExp ? new Date(wbaiExp * 1000).toISOString() : null,
-        expiresInDays: wbaiExp ? Math.max(0, Math.round((wbaiExp * 1000 - Date.now()) / 86400000)) : null,
+        expAt: wbaiExp ? new Date(wbaiExp).toISOString() : null,
+        expiresInDays: wbaiExp ? Math.max(0, Math.round((wbaiExp - Date.now()) / 86400000)) : null,
         hasRefresh: !!cfg.wbai?.refreshToken,
         ownership: wbTokenOwnership('wbai', cfg),
       },

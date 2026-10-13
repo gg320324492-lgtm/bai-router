@@ -1814,17 +1814,29 @@
    *
    * 为什么必须轮询而不是延长 timeout：一次探测最坏 9 分钟。用一个大 timeout 去等它，
    * 用户全程毫无反馈，而且**真超了还是假失败**——与改之前一模一样。
-   * 轮询的每一次读都只有几毫秒（/api/status 是纯本地组包 + 9 秒内的本机探测），
-   * 12 秒的默认值绰绰有余，于是根本不存在「读被掐断」这件事。
+   * 轮询的每一次读都只有几毫秒（/api/status 是纯本地组包 + 9 秒内的本机探测；
+   * 实测空载 p50≈315ms、探测在跑时最大 1311ms），12 秒的默认值绰绰有余，
+   * 所以**不去动它、也不给这个调用点加 timeoutMs**（加了会让
+   * api-timeout-budget-test 的「快接口不许被加预算」当场变红，而那是有意的纪律）。
+   * 真遇到慢机器读被掐断也不慌：下面按「读失败」如实说，不冒充「正在排队」。
    */
   async function waitTestDone(P, slot) {
     const t0 = Date.now();
+    /* 最近一次**真的读到过**的那份 upstream。读失败时用它兜底 ——
+       「这一轮没读到」不等于「探测不在跑」，把前者当成后者就会把一次还在跑着的
+       探测说成「正在排队」，而用户恰恰分不出这两者，只能一直干等。 */
+    let lastUp = null;
     for (;;) {
       let s = null;
       /* 单次读失败（服务重启中/某一轮慢）**不等于探测失败**：下一轮再说。
          这里若 throw，外层 withBusy 会把一次还在正常跑的探测写成一坨红字。 */
       try { s = await api("/api/status"); } catch { /* 下一轮 */ }
-      const up = s ? (stOf(P).upstream || {}) : {};
+      /* ⚠ 必须读**刚拿到的这一份** s。原来读的是模块级 stOf(P) —— 那是 poll() 五秒前的
+         旧状态，而 s 就在手边：poll 一旦没跟上（刚进页面、或某一轮它自己失败），
+         就等于**拿到了新状态却去读旧的**，running 恒读到 false，一次好端端跑着的
+         探测被一轮轮地说成「正在排队/发起探测」。这正是实测复现的那句文案。 */
+      if (s) lastUp = sliceOf(s, P).upstream || {};
+      const up = lastUp || {};
       const secs = Math.round((Date.now() - t0) / 1000);
       if (up.running) {
         showResult(slot, `⏳ 正在逐档探测…（已 ${secs}s）\n`
@@ -1838,7 +1850,13 @@
          所以还要看 at 不早于本次发起（t0 之前 1 秒内不算旧账）。 */
       if (up.at && Date.parse(up.at) >= t0 - 1000) return up;
       if (Date.now() - t0 > TEST_WAIT_LIMIT_MS) return null;
-      showResult(slot, `⏳ 正在排队/发起探测…（已 ${secs}s）`, true);
+      /* 没读到 s 时**不许说「正在排队」** —— 排队/发起探测是**后端**的状态，
+         我们这一轮压根没问到后端，就没有依据说它在排队。读超时也不是失败：
+         探测在服务端照跑，如实说「没读到、稍后重试」，下一轮读到了自己就接上。 */
+      showResult(slot, s
+        ? `⏳ 正在排队/发起探测…（已 ${secs}s）`
+        : `⏳ 这一轮没读到本机状态（已 ${secs}s），稍后重试。\n`
+          + "探测在服务端跑着，面板不会掐断它，也不用刷新页面。", true);
       await new Promise((r) => setTimeout(r, TEST_POLL_MS));
     }
   }

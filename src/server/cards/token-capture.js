@@ -96,6 +96,13 @@ window.BAI_CARDS["token-capture"] = {
     async function settle(sc, run) {
       if (!run || run.settled) return;
       run.settled = true;
+      /* 收摊就**必须把等待面板收掉**。settle 是两条路径唯一的公共收尾点：
+         POST 抢先 claimReport 成功时走的就是这里，而它原来只 stopTimers 不隐藏 ——
+         于是定时器停了、文案冻在最后一帧（还剩 9:46），绿条说成功、面板却一直挂着，
+         用户以为没抓到。finishFromPoll 自己藏过一次，这里再藏一遍是幂等的。
+         ⚠ keepPolling 时**不**调 settle（见下），面板要留给轮询直到捕获真正结束。 */
+      const box = sc.$('[data-role="prog"]');
+      if (box) box.style.display = "none";
       stopTimers(sc);
       if (run.btn) { run.btn.disabled = false; run.btn.textContent = run.old; }
       if (run.restartBox) run.restartBox.disabled = false;

@@ -283,6 +283,11 @@ export async function wbPickAccount(cfg, p, opts = {}) {
      （改动前 wbEnsureToken 就是这么判的；漏掉这一段，老用户令牌彻底过期之后
      会从「一句话说清」退化成「上游 401 + 一段猜谜」。） */
   const expMs = expOf(token);
+  /* ⚠ 单位契约：opts.tokenExpOf **必须返回 epoch 毫秒**（wb-token.mjs 的 wbTokenExp
+     已经乘过 1000）。这里跟 now 比、跟 tokenExpiring 的 120000 比，都是毫秒。
+     v1.0.76 迁移这段时把旧代码里的 `* 1000` 丢了，而注入的解码器返回秒，
+     于是 `1.79e9 <= 1.79e12` 恒真 —— 每一枚令牌都被判成已过期。
+     scripts/wb-token-test.mjs 把真 wbTokenExp 接进这条路径，专门钉住它。 */
   if (Number.isFinite(expMs) && expMs <= now && !acct.refreshToken) {
     const reason = "expired";
     const remedy = "这枚访问令牌已经过期，而它没有配套的刷新令牌：到 WorkBuddy 桌面端重新登录并重新捕获一次。";

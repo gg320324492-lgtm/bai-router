@@ -638,7 +638,20 @@ function cutFrontendTestSource() {
 }
 
 /** 把抠出来的真源码挂进一个最小沙箱：只注入它用得到的依赖，其余一律 undefined。
- *  返回 { testTiers, results } —— results 是 showResult 收到的所有文案与好坏。 */
+ *  返回 { testTiers, results } —— results 是 showResult 收到的所有文案与好坏。
+ *
+ *  ⚠ sliceOf 也**必须抠真的**：waitTestDone 读的是「刚拿到的那份 s」经 sliceOf 切片，
+ *    注入一份仿造的实现等于把「读哪一份状态」这个断言本身架空了。
+ *    stOf 仍留在 ctx 里：testTiers 以外的同段代码不碰它，留着是无害的冗余注入。 */
+function cutSliceOf() {
+  const lines = PANEL_SRC.split(/\r?\n/);
+  const start = lines.findIndex((l) => l.includes("const sliceOf = (obj, key) =>"));
+  if (start < 0) throw new Error("panel-common.js 里找不到 sliceOf —— 锚点移位了");
+  let stop = start;
+  while (stop < lines.length && lines[stop].trim() !== "};") stop++;
+  if (stop >= lines.length) throw new Error("抠不出 sliceOf 的收尾 —— 锚点移位了");
+  return lines.slice(start, stop + 1).join("\n");
+}
 function makeFrontendHarness(api, postJSON, stOf) {
   const src = cutFrontendTestSource();
   const results = [];
@@ -652,7 +665,7 @@ function makeFrontendHarness(api, postJSON, stOf) {
     console, Promise, setTimeout, clearTimeout, Date, JSON, Math,
   };
   const fn = new vm.Script(
-    `(() => {\n${src}\n return { testTiers, TEST_POLL_MS, TEST_WAIT_LIMIT_MS };\n})()`
+    `(() => {\n${cutSliceOf()}\n${src}\n return { testTiers, TEST_POLL_MS, TEST_WAIT_LIMIT_MS };\n})()`
   ).runInNewContext(vm.createContext(ctxObj));
   return { ...fn, results };
 }
