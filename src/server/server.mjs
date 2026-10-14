@@ -2200,7 +2200,7 @@ const QD_PRICE_FALLBACK = {
   lite: 0, auto: 0.5, performance: 1.1, ultimate: 2,
   qmodel: 0.04, mmodel: 0.2, dmodel: 0.5, kmodel: 0.8, gmodel: 0.8,
 };
-// 错峰折扣：key → 原价（快照 2026-10-03 23:58 UTC+8，���于折后窗口内）
+// 错峰折扣：key → 原价（快照 2026-10-03 23:58 UTC+8，处于折后窗口内）
 const QD_PEAK_PRICE = { qmodel: 0.1, qmodel_38max: 0.5 };
 // 目录读不到时也要如实标注价格，否则用户会以为下拉里都是一样的。
 function qdStaticCatalog(S) {
@@ -2298,7 +2298,7 @@ function qdReadCatalog(cfg) {
           ? `${factorText(m.priceFactor)}（原价 ${factorText(m.peakPrice)}）`
           : factorText(m.priceFactor));
       // 付费档把倍率写进显示名，用户在下拉里一眼看出哪个在烧积分；
-      // ultimate 再��一句实测结论，别让人以为是本机配错了。
+      // ultimate 再加一句实测结论，别让人以为是本机配错了。
       labels[m.key] = [base, tier, cost, m.flaky ? "Qoder 侧偶发失败" : ""].filter(Boolean).join(" · ");
     }
     labels.lite = "Qwen3.8-Flash · 免费档 · 免费";
@@ -4241,7 +4241,7 @@ function orParse429(txt, resHeaders) {
    ════════════════════════════════════════════════════════════════════════
    实测（2026-10-11 国际版，同一时刻同一令牌）：
        hy3 → 200   deepseek-v4.1-flash → 429   hy4-preview → 200   glm-5.3-flash → 200
-   hy3 与 deepseek-v4.1-flash 倍率同为 x0.00（都免费），只有后者被限 —— ��明
+   hy3 与 deepseek-v4.1-flash 倍率同为 x0.00（都免费），只有后者被限 —— 说明
    **免费额度按模型独立计**，不是按账号。所以 failover 那套「换渠道」在这里帮不上：
    同一个渠道内的模型没有退路（failover.mjs 换的是渠道）。
    这里补的是同渠道内的模型级退路，语义与 OpenRouter 的 orAdvance 一致
