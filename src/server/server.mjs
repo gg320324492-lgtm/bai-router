@@ -48,6 +48,20 @@ import {
  * 住在这里的解码器就成了「测了替身、没测本体」的重灾区（v1.0.76 漏 `* 1000`
  * 就是这么上线的，见该文件顶部的单位契约）。⚠ wbTokenExp 返回的是**毫秒**。 */
 import { wbJwtPayload, wbTokenExp, wbTokenSub } from "./wb-token.mjs";
+/* 上游「响应头预算」按请求体大小分档（v1.0.85）：纯逻辑、零 IO、零网络。
+ * 独立成文件同样是为了能**被测试直接 import** —— server.mjs 一 import 就起服务，
+ * 住在这里的分档规则只能「测了替身没测本体」（wb-token.mjs 顶部的教训）。
+ * ⚠ 单位是**字节**：调用方一律走 upstreamBodyBytes()，不许手写 bodyStr.length
+ * （中文 3 字节/字，字符数会低估到 1/3）。 */
+import {
+  upstreamBodyBytes, upstreamHeaderBudgetMs, upstreamFirstEventBudgetMs,
+  upstreamBudgetTierLabel, UPSTREAM_HEADER_TIMEOUT_MS,
+} from "./upstream-budget.mjs";
+/* 429 的「上下文体积超限」判据（wb-429.mjs）：纯逻辑、零 IO。
+ * 独立成文件同样是为了能**被测试直接 import**——server.mjs 一 import 就起服务，
+ * 住在这里的判据就只能靠「注入替身」来测，而那正是 v1.0.76 漏 `* 1000` 的形状。
+ * ⚠ wbBodyBytes 返回的是**字节数**（Buffer.byteLength），不是字符数。 */
+import { wb429ContextHint } from "./wb-429.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -1199,7 +1213,7 @@ function noteRelayError(p, kind, message) {
   slot.at = new Date().toISOString();
 }
 
-function sendRateLimitError(res, upstream) {
+function sendRateLimitError(res, upstream, provider, bodyStr) {
   const retryAfter = upstream.headers.get("retry-after");
   const headers = {
     "content-type": "application/json; charset=utf-8",
@@ -1207,11 +1221,26 @@ function sendRateLimitError(res, upstream) {
   };
   if (retryAfter) headers["retry-after"] = retryAfter;
   res.writeHead(429, headers);
+  /* ★ v1.0.85：429 的文案要按**渠道 + 请求体体积**分开说。
+   *
+   * 改前的原话是「暂时限流，请在 N 秒后重试。这不是代理或配置错误。」——
+   * 最后一句是对的，但它把用户引到了一个错方向：对 wb/wbai 的大上下文请求，
+   * 429 的根因是**请求体体积越过上游红线**，重试一万次也不会好（实测见
+   * wb-429.mjs 顶部：0.42MB → 200，1.25MB / 2.50MB → 429）。用户于是照着
+   * 「等 30 秒」白等半小时，而唯一的解是**开新对话**。
+   *
+   * 判据刻意**不通用化**：这条体积红线只有 wb / wbai 有（B.AI / SenseNova /
+   * Zen / Qoder / OpenRouter 都不吃它），所以 `provider` 必须是本渠道自己的 key，
+   * 由 wb429ContextHint 自己把关；其它渠道一个字都不变，仍是「稍后重试」。
+   * `bodyStr` 是**真正发出去的那份正文**（openaiExchange 里的 bodyStr，不是
+   * 客户端原文）——拿不到就传 null，那时判据自动失效，文案退回改动前。 */
+  const ctxTail = wb429ContextHint(provider, bodyStr);
   res.end(JSON.stringify({
     type: "error",
     error: {
       type: "rate_limit_error",
-      message: `上游 API 暂时限流（HTTP 429）${retryAfter ? `，请在 ${retryAfter} 秒后重试` : "，请稍后重试"}。这不是代理或配置错误。`,
+      message: `上游 API 暂时限流（HTTP 429）${retryAfter ? `，请在 ${retryAfter} 秒后重试` : "，请稍后重试"}。这不是代理或配置错误`
+        + (ctxTail ? `。${ctxTail}` : "。"),
     },
   }));
 }
@@ -1245,7 +1274,12 @@ const PROBE_HINTS = {
   401: "，常见原因是：API Key 没填或填错",
   403: "，常见原因是：这个 Key 没有该模型权限，或额度已用尽",
   404: "，常见原因是：上游地址或模型名写错",
-  429: "，常见原因是：免费渠道并发限流，等 30 秒左右再试",
+  /* ★ v1.0.85：原话是「免费渠道并发限流，等 30 秒左右再试」——**最误导的一条**。
+   * 对 wb/wbai 的大上下文请求，429 的根因是请求体体积越过上游红线（实测
+   * 0.42MB → 200、1.25MB → 429），**等是没用的**，解是开新对话。用户照旧文案
+   * 白等半小时。这里不再承诺「等 30 秒」，改成把两种可能都列出来：
+   * 体积红线（wb/wbai 专属，见 wb-429.mjs）与真的并发限流。 */
+  429: "，常见原因是：①上下文/请求体太大越过上游体积红线（wb/wbai 实测存在，等再久也不会好，请开新对话或压缩历史）；②真的并发限流（等 30 秒左右再试）",
 };
 // 响应体是合法 JSON 但带 error 字段——上游最常见的拒绝格式，写法有五六种：
 //   {"error":{"message":…}} / {"error":"Forbidden"} / {"error":{"code":…,"type":…}} / {"message":…} / {"msg":…}
@@ -3814,7 +3848,7 @@ const EMPTY_STREAM_ATTRIBUTIONS = {
     label: "上游拒绝了这次请求",
     zh: "上游**回了**一个错误响应（不是没有回答）——限制、内容策略、鉴权或服务端故障都长这样。",
     hint: "这句话说的是上游的态度，不是本程序没读懂回答。",
-    do: "建议：按上面括号里的 HTTP 状态码对号入座（429=限流、401/403=账号或权限、5xx=上游自身故障）；具体处置见本条后面的归因文字。",
+    do: "建议：按上面括号里的 HTTP 状态码对号入座（429=限流、401/403=账号或权限、5xx=上游自身故障）；具体处置见本条后面的归因文字。⚠ 429 有两种且处置相反：上下文/请求体太大时（wb/wbai 实测存在）等再久也不会好，要开新对话；真的并发限流才等 30 秒左右再试。",
   },
   upstream_nothing: {
     label: "上游一个字都没返回",
@@ -4869,11 +4903,26 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs }) {
     return h;
   };
   let bodyStr = JSON.stringify(ob);   // OpenRouter 轮换会改写 model，故为 let
-  /* 探测档的 10 秒短超时来自 zen-probe.mjs 的 ZEN_PROBE_TIMEOUT_MS —— 能力探测与
-     真实对话共用同一个常量，否则「探针用的是哪档超时」就只剩口头约定。 */
+  /* 响应头预算按**请求体字节数**分档（v1.0.85）。
+   *
+   * 原来这里是一刀切的 30 秒、没有任何余量，于是 wbai 的大上下文请求被我们自己的
+   * 中转掐断（直连上游实测：1.25MB 要 15~19s、2.5MB 要 30s，而 30 秒就是全部预算）。
+   * 用户看到的现象是「对话 1 分钟断一次，然后一直重连」。
+   *
+   * 分档规则与实测依据在 upstream-budget.mjs 顶部；这里只负责按**当前这一发**的
+   * 体量取档。两个要点：
+   *   · 取字节数走 upstreamBodyBytes()，**不是 bodyStr.length** —— 中文 UTF-8
+   *     是 3 字节/字，拿字符数分档会把最需要放宽的那一档发到底噪预算上。
+   *   · bodyStr 每轮换一次 model 就会被改写，所以预算也在 doCall 里**当场**取，
+   *     不缓存到闭包外 —— 缓存下来的会是第一轮的体量。
+   *
+   * 探测档的 10 秒短超时来自 zen-probe.mjs 的 ZEN_PROBE_TIMEOUT_MS —— 能力探测与
+   * 真实对话共用同一个常量，否则「探针用的是哪档超时」就只剩口头约定。
+   * ⚠ 分档**只作用于真实对话**：isProbe 时语义一字不变，仍是那个 10 秒。 */
+  const headerBudgetMs = () => isProbe ? ZEN_PROBE_TIMEOUT_MS : upstreamHeaderBudgetMs(upstreamBodyBytes(bodyStr));
   const doCall = (tok) => useProxy
-    ? fetch(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, signal: AbortSignal.timeout(isProbe ? ZEN_PROBE_TIMEOUT_MS : 30000) })
-    : directHttp(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, timeoutMs: isProbe ? ZEN_PROBE_TIMEOUT_MS : 30000 });
+    ? fetch(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, signal: AbortSignal.timeout(headerBudgetMs()) })
+    : directHttp(url, { method: "POST", headers: mkHeaders(tok), body: bodyStr, timeoutMs: headerBudgetMs() });
 
   let r;
   // 声明必须在 try 之外：下面 try/catch 之后（r.status !== 200 分支）还要用它们，
@@ -5181,12 +5230,26 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs }) {
        * 把它们混成一句，就是 1.7.7 事故。 */
       const kind = wbFed && wbFed.failure ? wbFed.failure.kind : null;
       const whyText = wbFed && wbFed.failure ? wbFed.failure.why : "";
+      /* ★ v1.0.85：429 的第二种成因 —— **请求体体积越过上游红线**。
+       * 池子的分类（rate_limit）只回答「这个号/模型要不要冷却」，回答不了
+       * 「用户该等还是该开新对话」。而这两件事对用户是相反的：
+       * 实测（只改历史条数）0.42MB → 200、1.25MB → 429、2.50MB → 429，
+       * 判据是体积不是条数也不是并发，**等再久也不会好**，唯一的解是开新对话。
+       * 尾巴由 wb429ContextHint 自己把关（渠道 + 字节数同时满足才给内容），
+       * 所以这里无条件取、由它返回空串；非 wb/wbai 或小 body 时一个字都不加。
+       * ⚠ 只在**限流**这一类上追加：quota（额度用尽，等多久都不会好但解是充值）与
+       *    auth_dead（重新登录）各有自己正确的下一步，把「开新对话」拼上去就是把
+       *    对的指引搅浑 —— 那正是 1.7.7 事故的形状。 */
+      const wbCtxTail = r.status === 429 ? wb429ContextHint(p, bodyStr) : "";
       if (kind === "auth_dead") {
         why = ` —— ${whyText}`;
       } else if (kind === "quota") {
         why = ` —— ${whyText}（本渠道的其它账号会自动顶上，面板「WorkBuddy 账号池」页看得出是哪一个）`;
       } else if (kind === "rate_limit") {
-        why = ` —— ${whyText}这一档的免费额度被限流，**等一会就会自己好**，不用重新登录。`;
+        /* 池子说「等一会就会自己好」—— 那是对**真并发限流**说的。体积超线时
+           这句话是错的，所以先如实补上体积尾巴，再保留原文（不加尾巴时行为逐字不变）。 */
+        why = ` —— ${whyText}这一档的免费额度被限流，**等一会就会自己好**，不用重新登录。`
+          + (wbCtxTail ? ` ${wbCtxTail}` : "");
         /* ⑥ 同名付费行：用户认的是**显示名**，不是 id 前缀。按显示名在映射表里找
            同名的付费行，直接告诉他「换哪一行」—— 这是他能执行的最短路径。 */
         const paid = wbPaidSameName({
@@ -5198,7 +5261,11 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs }) {
         });
         if (paid) { why += " " + paid.text; wbLastPaidHint.set(p, { ...paid, at: new Date().toISOString() }); }
       } else if (wbFed && wbFed.failure && wbFed.failure.why) {
-        why = ` —— ${whyText}`;
+        why = ` —— ${whyText}` + (wbCtxTail ? ` ${wbCtxTail}` : "");
+      } else if (wbCtxTail) {
+        /* 池子没给出归因（拿不到账号/池子没配）但体积明显超线：照样告诉用户真相，
+           不能因为「没有账号池」就把人引去白等半小时。 */
+        why = wbCtxTail;
       }
       noteRelayError(p, r.status === 429 ? "rate_limit" : `upstream_${r.status}`,
         `${NAME} 上游 HTTP ${r.status}${kind ? "（账号池判为 " + kind + "）" : ""}`);
@@ -5231,9 +5298,22 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs }) {
   }
   // 首事件闸门的时限：比响应头超时宽（深度思考模型可能几十秒才吐第一个 token），
   // 但必须有上限——否则「上游连上了却一直不吐字」会永远挂着，转移也等不到。
+  //
+  // v1.0.85：响应头预算改成按体量分档之后，这里**必须跟着放大**，否则会出一种
+  // 新的更难查的故障：头等到了（比如 2.5MB 档给了 75 秒），首事件却还按
+  // 90 秒算 —— 那次请求等于白等。「头已到、首事件被掐」会让用户看到一次
+  // 「明明连上了却又断」，比不修更糟。所以这里统一走
+  // upstreamFirstEventBudgetMs()：它保证 max(90 秒, 头预算 × 2)，天然不窄于头预算。
+  //
+  // ⚠ 探测档**不是** upstreamFirstEventBudgetMs 的一个参数，而是另一条独立分支：
+  // 改动前是 Math.max(60000, 10s×3) = 60000，与真实对话的 90 秒是两个不同的数。
+  // 探测语义不许变，所以照旧显式写出来，不并进那个纯函数的参数表里 ——
+  // 并进去的话「探测到底该拿多少」就变成一个藏在分档逻辑里的隐式约定，
+  // 而它今天本该是 zen-probe.mjs 里那个明说的 ZEN_PROBE_TIMEOUT_MS 档位。
   await wbPipe(r, res, {
     model: j.model, clientStream: j.stream === true, inputJson: j,
-    timeoutMs: Math.max(60000, (isProbe ? ZEN_PROBE_TIMEOUT_MS : 30000) * 3),
+    timeoutMs: isProbe ? Math.max(60000, ZEN_PROBE_TIMEOUT_MS * 3)
+      : upstreamFirstEventBudgetMs(upstreamBodyBytes(bodyStr)),
   }); // Anthropic 默认非流式
 }
 
@@ -5510,8 +5590,12 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
 async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
         const headers = {};
         for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
-        // isProbe 由入口算好后传入（同时决定中转观察与超时档位），这里不再重算
-        const headerTimeoutMs = isProbe ? ZEN_PROBE_TIMEOUT_MS : 30000;
+        // isProbe 由入口算好后传入（同时决定中转观察与超时档位），这里不再重算。
+        // v1.0.85：响应头预算同样按体量分档（与 openaiExchange 的 doCall 用同一个纯函数）。
+        // 这条透传路径（bai/sn）的 body 是 Buffer，字节数直接就是 body.length，
+        // 不需要 upstreamBodyBytes() 那个「只认字符串」的包装。
+        const headerTimeoutMs = isProbe ? ZEN_PROBE_TIMEOUT_MS
+          : upstreamHeaderBudgetMs(body && body.length ? body.length : 0);
         // WorkBuddy（fo.opts.openai）：上游只讲 OpenAI 且仅流式——独立协议桥处理，
         // 请求（Anthropic→OpenAI）与响应（OpenAI SSE→Anthropic SSE）都在桥内翻译。
         if (fo.opts.openai) {
@@ -5554,7 +5638,7 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
           // 429 可能是不带 Content-Type 的空响应；先单独处理，不能误判为代理 HTML。
           if (r.status === 429) {
             noteRelayError(fo.provider, "rate_limit", "上游 429 限流（免费渠道并发敏感）");
-            return sendRateLimitError(res, r);
+            return sendRateLimitError(res, r, fo.provider, body);
           }
           // Anthropic API 端点只应返回 JSON 或 SSE；其余类型通常是代理/WAF
           // 的 HTML 页面。转换为标准 JSON 错误，避免调用端误报 JSON 解析异常。
