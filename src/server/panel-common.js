@@ -1563,6 +1563,51 @@
       }
     }
 
+    /* ④c 静默换人（v1.0.88）。
+     *
+     * 「你选的是 A，实际回答你的是 B」这条必须有两个落点：故障转移视图顶部（大块、
+     * 不折叠），以及**这里**——诊断抽屉是用户不进故障转移视图时的默认去处，
+     * 只做一个落点就等于默认看不见。
+     *
+     * 语气分两档，判据只有一条：实际服务的那家是不是**计费**渠道（badge.kind 为
+     * paid/cn），而入口那家是免费的（free/intl）。是 → err（扣钱，红）；否 → warn。
+     * 数据一律来自 /api/status 的 failover.silentJump，服务端只记事实、不定价，
+     * 所以这里报的是「换了谁」而不是替上游报价。 */
+    {
+      const sj = (status && status.failover && status.failover.silentJump) || null;
+      const act = sj && Array.isArray(sj.active) ? sj.active.filter((e) => e && e.from && e.to && e.from !== e.to) : [];
+      if (act.length) {
+        const kindOf = (k) => (((MANIFEST[k] || {}).badge) || {}).kind || "";
+        const money = act.some((e) => ["paid", "cn"].includes(kindOf(e.to)) && ["free", "intl"].includes(kindOf(e.from)));
+        const wmin = sj.windowMin > 1 ? Math.round(sj.windowMin / 60) : 1;
+        const whenAg = (iso) => {
+          const m = (Date.now() - Date.parse(iso || "")) / 60000;
+          if (!isFinite(m)) return "时间未知";
+          if (m < 1) return "刚刚";
+          if (m < 60) return `${Math.round(m)} 分钟前`;
+          if (m < 1440) return `${Math.round(m / 60)} 小时前`;
+          return `${Math.round(m / 1440)} 天前`;
+        };
+        const lines = act.slice(0, 4).map((e) => {
+          const n = `${nameOf(e.from)} → ${nameOf(e.to)}`;
+          const cnt = e.count > 0 ? `最近 ${wmin} 小时 ${e.count} 次` : "最近 1 小时内没有";
+          return `${whenAg(e.lastAt)}　${n}　${cnt}（累计 ${e.total} 次）${e.model ? `　模型 ${e.model}` : ""}`;
+        });
+        const top = act[0];
+        items.push({
+          s: money ? "err" : "warn",
+          t: money
+            ? `你选的渠道没有回答你，${nameOf(top.to)} 在替你回答（并且要计费）`
+            : `你选的渠道没有回答你，${nameOf(top.to)} 正在替它回答`,
+          m: `自动故障转移开着的时候，${nameOf(top.from)} 一失败就由下一家接手，请求照样成功——`
+            + "所以界面看不出任何异常，但回答你的已经不是你选的那家了。\n"
+            + (money ? "注意：接手的那家是计费渠道，上面这些对话记在它的账上。\n" : "")
+            + lines.join("\n")
+            + `\n要停掉：进「故障转移」视图，把后面那几家从顺序里删掉，或关掉自动故障转移。`,
+        });
+      }
+    }
+
     /* ⑤ 额度余量：上游不提供就如实说没有，不编数字（真实数据源留给阶段二） */
     items.push({ s: "idle", t: "额度余量：暂无数据", m: "上游没有给本路由台可读的额度接口，页面上不显示任何估算数字。" });
 

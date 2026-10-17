@@ -14,7 +14,7 @@ import { execFile, spawn } from "node:child_process";
 import os from "node:os";
 import {
   CaptureRes, failoverCooldown, failoverClear, failoverAvailable, failoverSnapshot, failoverQuotaBlocked,
-  shouldFailover, FAILOVER_COOLDOWN_MS,
+  shouldFailover, FAILOVER_COOLDOWN_MS, noteSilentJump, silentJumpSnapshot,
 } from "./failover.mjs";
 import { qpApply, qpRevert, qpStatus } from "./qoder-patch.mjs";
 /* 逐模型能力探测（v1.0.74 · T3+T6）：只探免费模型、只在用户显式点「检测可用性」时跑。
@@ -5412,7 +5412,12 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     if (cap.ok()) {
       failoverClear(provider);
       tries.push({ provider, ok: true });
-      if (tries.length > 1) noteFailoverEvent(fo.provider, tries);
+      /* 静默换人留痕（v1.0.88）：把「实际服务的渠道 + 实际发出去的模型」一起记进有界结构，
+         面板据此在故障转移视图顶部显式告诉用户「你选的是 A、回答你的是 B」。
+         sub.rewritten.model 就是真正发出去的那个名字（每个目标渠道都按自己的映射重解析过），
+         所以面板能说清「钱花到哪个模型上」，而不只是「换了个渠道」。
+         🔴 只记录，不改任何判定——noteSilentJump 返回 null 时（没换人）什么都不会发生。 */
+      if (tries.length > 1) noteFailoverEvent(fo.provider, tries, (sub.rewritten || {}).model || null, cfg);
       return;
     }
     // 影子判定为失败：换一个
@@ -5451,7 +5456,9 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
         `转移走（HTTP ${status}${quotaNow ? "，额度用尽" : ""}）：${String(lastErr).slice(0, 120)}`);
     }
   }
-  noteFailoverEvent(fo.provider, tries);
+  /* 全线失败：没有一家接过手，所以 noteSilentJump 自己会返回 null —— 不留痕。
+     那条 502 已经把「最后是谁、为什么」如实回给客户端了，面板不必再重复一遍。 */
+  noteFailoverEvent(fo.provider, tries, null, cfg);
   return wbAnthroError(res, 502,
     `所有渠道都失败了。最后一次：${lastErr || "未知"}（链路：${tries.map((t) => t.provider + (t.ok ? "✓" : t.skipped ? "(" + t.skipped + ")" : "✗")).join(" → ")}）`);
 }
@@ -5472,8 +5479,52 @@ function describeTries(tries) {
   return tries.map((t) => `${t.provider}:${t.ok ? "成功" : t.skipped || ("失败[st=" + t.status + (t.err ? "/" + String(t.err).slice(0,40) : "") + "]")}`).join("；");
 }
 
-function noteFailoverEvent(from, tries) {
+/** 这次换人之后，真正发出去的那个模型**要不要花钱**。
+ *
+ *  ⚠ 为什么不能用渠道的 badge.kind 当判据（v1.0.88 实测打脸）：
+ *  providers.js 里 `kind:"cn"` **同时**挂在「境内付费」(sn) 和「0 积分」(wb) 两家身上，
+ *  它表示的是**境内**不是**收费**。按它判，会把 wb 的 0 积分模型（实测 hy3 / step-5-preview
+ *  都是 credits=x0.00）报成「在你的账上花钱」——**误报比不报更坏**，用户会为一个不存在的
+ *  扣费去排查、去改配置。
+ *
+ *  所以判据只能是**那个模型自己的 credits**（来自该渠道的目录）：
+ *  · 查得到且为 0 → 免费，不升级语气
+ *  · 查得到且 >0  → 确实计费，报红
+ *  · 查不到        → **不知道就不下结论**（沿用「宁可不升级语气」这条老规矩）
+ *
+ * @returns {true|false|null} true=计费 false=免费 null=查不到
+ */
+function servedModelCostsMoney(provider, model, cfg) {
+  const id = String(model || "").trim();
+  if (!id) return null;
+  if (!isWk(provider)) return null;          // 非 WorkBuddy：没有逐模型 credits 口径
+  const pool = cfg ? wbPoolOf(cfg, provider) : null;
+  const fps = [];
+  if (pool && Array.isArray(pool.accounts)) {
+    for (const a of pool.accounts) {
+      const fp = wbAccountFp(a && a.accessToken);
+      if (fp) fps.push(fp);
+    }
+  }
+  for (const fp of fps) {                   // 先翻各账号自己的目录
+    const hit = (wbCatModels(provider, fp) || []).find((m) => String((m && m.id) || "").trim() === id);
+    if (hit && hit.credits != null) return !wbIsFreeCredits(hit.credits);
+  }
+  for (const fp of [""]) {                  // 再退到该渠道的默认目录
+    const hit = (wbCatModels(provider, fp) || []).find((m) => String((m && m.id) || "").trim() === id);
+    if (hit && hit.credits != null) return !wbIsFreeCredits(hit.credits);
+  }
+  return null;
+}
+
+function noteFailoverEvent(from, tries, servedModel, cfg) {
   log(`故障转移（入口 ${from}）→ ${describeTries(tries)}`);
+  /* 静默换人留痕（v1.0.88）：除了日志，还要让面板看得见——这曾经只写 server-child.log，
+     于是「面板一切正常、实际在 WorkBuddy 上花钱」那桩事故整整看不出来。
+     servedModel 可空（全线失败时为 null）；留痕结构在 failover.mjs，是有界的。
+     costs 一并带下去：**判据在这里算好**（那个模型自己的 credits），面板只负责照着说，
+     不许在前端猜渠道贵不贵。 */
+  noteSilentJump(from, tries, servedModel, servedModelCostsMoney(from, servedModel, cfg));
 }
 
 // 与 noteFailoverEvent 的区别：这里**没有**发生渠道转移——命中不该转移的错误（如 400），
@@ -6450,7 +6501,13 @@ async function statusPayload() {
       script: SERVER_SELF,
       build: /[\\/]resources[\\/]server[\\/]/i.test(SERVER_SELF) ? "installed" : "source",
     },
-  failover: { enabled: cfg.failover?.enabled === true, chain: cfg.failover?.chain || [], cooling: failoverSnapshot() },
+  failover: {
+    enabled: cfg.failover?.enabled === true, chain: cfg.failover?.chain || [], cooling: failoverSnapshot(),
+    /* 静默换人（v1.0.88）：入口渠道 ≠ 实际服务的渠道，带次数与时间窗。
+       放 failover 下面而不是新开一个顶级字段，是因为它就是故障转移的**后果**，
+       面板故障转移卡与诊断抽屉读的是同一处，不会两处各读一遍数据源。 */
+    silentJump: silentJumpSnapshot(),
+  },
     panel: { port: cfg.panelPort, up: true },
     clash,
     proxy: cfg.proxy || "直连",
