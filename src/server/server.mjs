@@ -31,7 +31,8 @@ import {
 import { createOcGateway, zenTransportOf, ZEN_TRANSPORT_OPENCODE, ZEN_TRANSPORTS } from "./oc-wiring.mjs";
 /* 传输开关给面板的只读事实（v1.0.75）：当前是哪一档 + 打开它需要的那件前置条件
  * 在本机满足没有。探测本身（TTL 缓存 / 三态判据）在那个文件里。 */
-import { ocTransportFields } from "./oc-transport-info.mjs";
+import { ocTransportFields, probeOcBinary, resetOcBinaryCache } from "./oc-transport-info.mjs";
+import { installOpenCodeCli, OC_CLI_VERSION } from "./oc-install.mjs";
 /* 进程身份核对（v1.0.77）：只按 PID 终止之前先确认这个 PID 还是当初那个进程，
  * 免得 PID 被系统回收后误杀无关程序。判定是纯函数，实测启动时间靠 PowerShell CIM
  * （写的一侧零成本，见 SERVICE_START_MS）。 */
@@ -1734,10 +1735,23 @@ function zenExternalOk(id, cfg) {
   return { external: ZEN_EXTERNAL_OK.has(id), probed: false, rec: null, snap };
 }
 
+/** 「id 里没有 free 后缀、但确实是免费档」的 stealth 模型（2026-10-17 目录实测：目前只有 big-pickle）。
+ *  客户端中转形态的放行判据会用到它；将来出现新的 stealth 免费模型，加在这里。 */
+const ZEN_STEALTH_FREE = new Set(["big-pickle"]);
+
 /** 面板直接显示的一组字段（文案全在服务端算，渲染层不认识任何渠道名）。 */
 function zenCapFields(cfg) {
   const snap = zenProbeSnapshot(cfg);
   const n = Object.keys(snap.models || {}).length;
+  /* ★ 2026-10-17：客户端中转形态下，直连探测的结论与入口都不适用（原因见 /api/models 的
+   * zen 分支注释）。这里给形态说明，不再展示「上次检测时间」（那是另一种形态下的事实）。 */
+  if (zenTransportOf(cfg) === ZEN_TRANSPORT_OPENCODE) {
+    return {
+      at: snap.at || null, stale: false, count: n, atLabel: null,
+      hint: "当前是「OpenCode 客户端中转」形态：免费模型由本机 OpenCode 客户端真实发出（带工具、真客户端身份），"
+        + "直连时代的围栏与「检测可用性」结论都不适用——下拉里的免费模型视为可用，以实际请求为准。",
+    };
+  }
   return {
     at: snap.at || null,
     stale: snap.stale === true,
@@ -4582,10 +4596,34 @@ async function fetchCatalogFor(p, cfg) {
     const cat = await zenReadCatalog(cfg);
     const tier = zenTierInfo(cfg);
     const cap = zenCapFields(cfg);
-    /* v1.0.74 T3/T6：`external` **改读探测结果**（zenExternalOk），不再是那个
+    /* ★ 2026-10-17：「OpenCode 客户端中转」形态下的放行分支。
+     *
+     * 直连时代「免费档一律 403 FreeTierError、只有 space-bunny 例外」的判据，
+     * 在客户端中转形态下**整个不成立**：请求由本机真 OpenCode 客户端身份发出、
+     * 且始终带工具——本机实测 12 个免费模型里 11 个直接可用（deepseek-v4.1-flash-free
+     * 1.8s、glm-5.3-flash-free 2.2s、mimo-v2.6 1.6s…）。继续拿直连探测结论筛下拉，
+     * 会把能用的免费模型全挡在外面（2026-10-17 用户实测：刷新后下拉只剩 space-bunny，
+     * 因为其余全被直连时代的「探不通」标记筛掉）。所以这一形态下免费模型一律放行；
+     * 付费模型不混入（没有余额时选了必然报错）。
+     *
+     * jev-* 是 SystemOne 评估器（非对话模型），虽有 free 后缀也不能当聊天模型，排除。 */
+    const ocTransport = zenTransportOf(cfg) === ZEN_TRANSPORT_OPENCODE;
+    const isFreeLike = (id) => {
+      if (id.startsWith("jev-")) return false;
+      return id.includes("free") || ZEN_STEALTH_FREE.has(id);
+    };
+    /* v1.0.74 T3/T6（直连形态）：`external` **改读探测结果**（zenExternalOk），不再是那个
      * 已于 2026-10-12 被实测推翻的出厂常量。没探过的模型回落常量并如实标
      * 「未检测」——把"没测过"当成"不能用"和当初那个过期常量是同一种错误。 */
     const all = cat.map((id) => {
+      if (ocTransport && isFreeLike(id)) {
+        return {
+          key: id, name: id, free: true,
+          external: true, probed: false,
+          capLabel: "可用 · 经客户端中转",
+          capHint: "经本机 OpenCode 客户端发出（带工具、真客户端身份），直连时代的 FreeTierError 围栏不适用；以实际请求为准。",
+        };
+      }
       const v = zenExternalOk(id, cfg);
       const rec = v.rec || null;
       return {
@@ -4614,13 +4652,15 @@ async function fetchCatalogFor(p, cfg) {
       all, freeCount: freeN,
       note: (cat.length
         ? `${tier.label}目录（${zenCatalogEndpointLabel(cfg)}）共 ${all.length} 个模型，其中 ${freeN} 个标 free；`
-          + (tier.subRequired
-            ? "⚠ 上游已明确回「需要 Go 订阅」——这一档现在一个模型都调不通，请先到 https://opencode.ai/auth 订阅。"
-            : cap.at
-              /* 有实测就只讲实测，不再复述那句已经过期的「其余 -free 会被 FreeTierError 拒」——
-               * 那句话现在既无出处也无日期，正是它当初让白名单活到了今天。 */
-              ? `实测 ${probedN} 个免费模型：${toolN} 个支持工具调用；${cap.atLabel} 检出，可能已过期，点「检测可用性」可重跑。`
-              : `出厂白名单标注 ${okN} 个可外部调用，但该白名单已于 2026-10-12 实测复核为不成立——点「检测可用性」用真实请求逐个探测。`)
+          + (ocTransport
+            ? "当前为「OpenCode 客户端中转」形态：免费模型经本机 OpenCode 客户端发出，直连围栏不适用、全部列入下拉（可用性以实际请求为准）。"
+            : tier.subRequired
+              ? "⚠ 上游已明确回「需要 Go 订阅」——这一档现在一个模型都调不通，请先到 https://opencode.ai/auth 订阅。"
+              : cap.at
+                /* 有实测就只讲实测，不再复述那句已经过期的「其余 -free 会被 FreeTierError 拒」——
+                 * 那句话现在既无出处也无日期，正是它当初让白名单活到了今天。 */
+                ? `实测 ${probedN} 个免费模型：${toolN} 个支持工具调用；${cap.atLabel} 检出，可能已过期，点「检测可用性」可重跑。`
+                : `出厂白名单标注 ${okN} 个可外部调用，但该白名单已于 2026-10-12 实测复核为不成立——点「检测可用性」用真实请求逐个探测。`)
           + "付费模型不在检测范围内（探了要花钱），需 API Key 有余额。"
         /* 目录没拉到时**照样要说订阅**：这一条与目录读没读到无关，
          * 而它恰恰是最要紧的一句——只报「没读到目录」会把用户引去查网络。 */
@@ -4752,6 +4792,9 @@ const wkZh = (p) => (p === "wbai" ? "WorkBuddy AI" : "WorkBuddy");
  * 所以模块级只造一个壳，不起进程、不探测二进制、不发任何请求。 */
 const OC_WORK_DIR = path.join(DATA_DIR, "opencode");
 try { mkdirSync(OC_WORK_DIR, { recursive: true }); } catch { /* 目录建不出来时oc-runtime 会回落到临时目录 */ }
+
+/* 一键安装（2026-10-17）的单飞：面板按钮可能被连点，同一时刻只跑一趟下载。 */
+let ocInstallPending = null;
 const ocGateway = createOcGateway({
   /* opencode 的 cwd 固定落在本产品自己的数据目录下，而不是系统临时目录：
    * 临时目录是全局共享的（两台机器上跑两个实例会互相踩状态），而且系统清理临时目录时
@@ -6839,6 +6882,15 @@ const panel = http.createServer(async (req, res) => {
      */
     if (req.method === "POST" && u.pathname === "/api/models/probe-zen") {
       const cfg = loadCfg();
+      /* ★ 2026-10-17：客户端中转形态下**不做直连探测**。探测打的是上游直连路径，而这个形态
+       * 的可用性与它无关（本机实测：直连全 403 的同时，经客户端中转 11/12 可用）。继续跑
+       * 只会用直连结论把能用的模型误标「探不通」，还会把下拉筛选连带洗掉。 */
+      if (zenTransportOf(cfg) === ZEN_TRANSPORT_OPENCODE) {
+        return json(res, 400, {
+          error: "当前是「OpenCode 客户端中转」形态：直连探测不适用——免费模型由本机 OpenCode 客户端真实发出，"
+            + "下拉里的免费模型都可以直接用。要验某个模型，直接在 Claude Code 里发一条消息即可。",
+        });
+      }
       if (!((cfg.zen || {}).apiKey)) return json(res, 400, { error: "尚未填写 OpenCode Zen API Key——没有 Key 探测只会一律拿到 401，白白打上游" });
       // 目录按当前 upstream 走（两档是两套清单，混了会探到这一档根本没有的模型）
       const cat = await zenReadCatalog(cfg);
@@ -7045,6 +7097,39 @@ const panel = http.createServer(async (req, res) => {
         message: found
           ? (applied ? `检测到可用通道 ${found === "DIRECT" ? "直连(TUN/全局)" : found}，已切换并重启服务` : `当前配置已是可用通道 ${found === "DIRECT" ? "直连" : found}`)
           : "未检测到可用代理/直连——请确认 Clash 已开启（系统代理或 TUN 均可）后重试",
+      });
+    }
+
+    /* POST /api/oc/install（2026-10-17）：一键安装 OpenCode CLI——「OpenCode 客户端中转」的前置。
+     *
+     * 原则修订说明见 oc-install.mjs 文件头：旧纪律防的是「猜装法硬装」；这条路由来源固定
+     * （npm 官方 registry）、版本固定（OC_CLI_VERSION，完整验证过的版本）、落地前 sha512 校验、
+     * 落点是官方安装位置，而且**只有用户点了面板按钮才会走到这**，没有任何自动触发。
+     * 单飞：ocInstallPending 是模块级的，连点只跑一趟下载。 */
+    if (req.method === "POST" && u.pathname === "/api/oc/install") {
+      await readBody(req);
+      const cur = probeOcBinary({ force: true });
+      if (cur.state === "found") {
+        /* 已经有了就不重装：把现状如实回给面板（用户点了按钮才发现装着，也说得通）。 */
+        return json(res, 200, { ok: true, already: true, path: cur.path, source: cur.source, version: OC_CLI_VERSION });
+      }
+      if (!ocInstallPending) {
+        log(`OpenCode 一键安装：开始（npm 官方源，固定版本 ${OC_CLI_VERSION}）`);
+        ocInstallPending = installOpenCodeCli({ log: (m) => log(m) })
+          .catch((e) => ({ ok: false, reason: "unexpected", message: String((e && e.message) || e).slice(0, 200) }))
+          .finally(() => { ocInstallPending = null; });
+      }
+      const r = await ocInstallPending;
+      if (!r || !r.ok) {
+        log(`OpenCode 一键安装：失败 ${JSON.stringify({ reason: (r && r.reason) || "unknown", message: (r && r.message) || "" })}`);
+        return json(res, 502, { error: `安装失败（${(r && r.reason) || "unknown"}）：${(r && r.message) || ""}` });
+      }
+      resetOcBinaryCache();   // 让下一次探测（以及面板轮询）立刻看到新装的二进制
+      const after = probeOcBinary({ force: true });
+      log(`OpenCode 一键安装：完成 ${r.path}（${r.bytes} 字节）`);
+      return json(res, 200, {
+        ok: true, already: false, path: r.path, bytes: r.bytes, version: r.version,
+        probe: { state: after.state, path: after.path, source: after.source },
       });
     }
 
