@@ -43,6 +43,7 @@ import { createRuntime, createReadyProbe, findOpenCodeBinary, sessionKeyOf } fro
 import { anthropicToOpenCode, openCodeToAnthropic, DIAG } from "./oc-bridge.mjs";
 import { postMessageWithToolGuard } from "./oc-tool-guard.mjs";
 import fs from "node:fs";
+import path from "node:path";
 
 /* ========================================================================== *
  * 传输开关
@@ -93,16 +94,19 @@ export const OC_IDLE_TIMEOUT_MS = 2 * 60 * 60_000;
 /**
  * 没找到 opencode 时给用户的话。
  *
- * **故意不下载**：装法因人而异（npm 全局 / 官方脚本 / 手放 `~/.opencode`），
- * 猜一种装下去比不给更糟——用户会以为装好了，实际上只是换了个坏路径。
- * 所以这里给的是「可以自己确认的候选 + 一条最主流的命令」，并如实列出试过的路径。
+ * **原则修订（2026-10-17）**：旧版写着「本模块不会替你下载」——那条纪律防的是
+ * 「猜一种装法硬装下去」。现在产品提供了**官方来源 + 固定版本 + sha512 校验**的
+ * 「一键安装」，所以文案改成：**只在你点了「一键安装」时才下载，除此之外不自动下载**。
+ * 自行安装的两条老路照旧有效。
  */
 export function ocInstallHint(tried) {
   const lines = [
     "这一档需要先在本机装 OpenCode：找不到 opencode 二进制，所以这条请求没能发出去。",
-    "装法因人而异，下面两条任选其一，装完重开会话即可（本模块不会替你下载）：",
-    "  ① npm 全局装：在一个新终端里执行 `npm i -g opencode-ai`，然后跑 `opencode --version` 确认；",
-    "  ② 或按官网 https://opencode.ai 的说明安装。",
+    "装法两条路，任选其一，装完重开会话即可：",
+    "  ① 一键安装：回到面板「OpenCode Zen」页的「传输方式」卡，点「一键安装 OpenCode CLI」——",
+    "     从官方源下载固定版本并在落地前做 sha512 校验，装到本机 ~/.opencode/bin/opencode.exe；",
+    "  ② 自己装：在一个新终端里执行 `npm i -g opencode-ai`，然后跑 `opencode --version` 确认（官网：https://opencode.ai）。",
+    "本产品只在你点了「一键安装」时才下载，除此之外不会自动替你下载任何东西。",
     "已经按顺序找过但没找到的路径：" + (Array.isArray(tried) && tried.length
       ? tried.map((t) => `${t.path}（${t.how}）`).join("、")
       : "（无）"),
@@ -321,6 +325,52 @@ export function classifyTransportError(e, base) {
 }
 
 /* ========================================================================== *
+ * spawn 环境隔离（2026-10-17）
+ * ========================================================================== */
+
+/**
+ * 给 spawn 的 `opencode` 子进程准备**隔离过的环境**（XDG 四件套）。
+ *
+ * ## 为什么必须隔离（2026-10-17 本机实测，非推断）
+ *
+ * opencode 1.x 的 CLI 与 OpenCode 桌面版 2.x **共用同一个默认数据目录**
+ * （`~/.local/share/opencode`）。机器上装了桌面版时，1.x 一启动就撞上 2.x 写的库
+ * 并**当场退出**：
+ *
+ *     Error: Unexpected error
+ *     Database is not empty and has no session table
+ *
+ * （2.x 的库表叫 `session_v2`，没有 1.x 要的 `session`——sqlite3 已核实。）
+ * 子进程输出默认不进日志（oc-runtime 只留在环形缓冲里、由调用方显式取），
+ * 所以现场表现只是「OpenCode 没起来」，归因极难。
+ *
+ * 隔离后实测（同一台机器）：`serve --pure` 正常起、真调 `space-bunny-free`
+ * 返回 OK、`scripts/oc-native-tool-e2e.mjs` 两种形态全过（2649ms / 4515ms）。
+ *
+ * ## 语义
+ *
+ * - 落点优先 `base`（本产品自己的 workDir），没有就退回 `env.TEMP` / `env.TMP`；
+ *   两者都没有时**原样返回**——不猜、不编造路径。
+ * - 不改传入的 `env` 对象本身，返回新对象。
+ *
+ * @param {object} env 原始环境（一般是 process.env）
+ * @param {string|undefined} base 隔离根目录
+ * @returns {object} 给子进程用的环境
+ */
+export function ocSpawnEnv(env, base) {
+  const root = base || (env && (env.TEMP || env.TMP));
+  if (!root) return env;
+  const xdg = path.join(root, "xdg");
+  return {
+    ...env,
+    XDG_DATA_HOME: path.join(xdg, "data"),
+    XDG_CONFIG_HOME: path.join(xdg, "config"),
+    XDG_CACHE_HOME: path.join(xdg, "cache"),
+    XDG_STATE_HOME: path.join(xdg, "state"),
+  };
+}
+
+/* ========================================================================== *
  * 网关
  * ========================================================================== */
 
@@ -370,10 +420,14 @@ export function createOcGateway(deps = {}) {
     if (rt) { try { rt.dispose(); } catch { } rt = null; }
     rtPort = want;
     if (typeof runtimeFactory === "function") { rt = runtimeFactory(); return rt; }
+    /* 数据目录隔离（2026-10-17）：不隔离时会撞上桌面版 2.x 的库、子进程一启动即退出
+     * （「Database is not empty and has no session table」）。见 ocSpawnEnv 的注释与实测记录。
+     * 注意：二进制发现仍用原始 env（探测路径是 PATH/APPDATA，与 XDG 无关）。 */
+    const wd = workDir || env.TEMP || env.TMP || undefined;
     rt = createRuntime({
       port: want, host,
-      workDir: workDir || env.TEMP || env.TMP || undefined,
-      env,
+      workDir: wd,
+      env: ocSpawnEnv(env, wd),
       probeReady: createReadyProbe({ fetchImpl: fetchImpl || fetch }),
       createSession: createSession || (async ({ base, body }) => {
         const r = await (fetchImpl || fetch)(base + "/session", {

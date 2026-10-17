@@ -172,11 +172,12 @@ describe("② 服务端探测：找到 / 没装 / 检测出错 是三件事", ()
     assert.equal(p.cached, false);
   });
 
-  test("没装 → missing，且给出**可以自己执行**的安装命令并明说不会替你下载", () => {
+  test("没装 → missing，且给出可执行的安装命令 + 一键安装指引，并明说只在点击时下载", () => {
     const p = probeMissing();
     assert.equal(p.state, "missing");
     assert.match(p.hint, /npm i -g opencode-ai/, "找不到时必须给出可执行的安装命令");
-    assert.match(p.hint, /不会替你下载/, "必须明说本产品不会替用户下载（装法因人而异，猜错比不给更糟）");
+    assert.match(p.hint, /一键安装/, "必须告诉用户面板上的一键安装（2026-10-17 起）");
+    assert.match(p.hint, /不会自动替你下载/, "必须明说只有点击时才下载（旧纪律防的是「猜装法硬装」，一键安装不是猜）");
     assert.equal(p.error, "", "missing 不是错误，不该带 error 字段");
   });
 
@@ -226,14 +227,16 @@ describe("③ 渲染：三种状态三样东西，检测出错 ≠ 没装", () =
     assert.equal(/未安装/.test(b), false, "找到时不该出现「未安装」");
     assert.equal(/检测失败/.test(b), false, "找到时不该出现「检测失败」");
     assert.equal(/npm i -g/.test(b), false, "★ 找到了还叫人装一遍 = 把一台能用的机器说成不能用");
+    assert.equal(/data-role="oc-install"/.test(b), false, "找到了还画安装按钮 = 把一台能用的机器说成不能用");
   });
 
-  test("没装：红色语义 + 可执行命令 + 明说不会替你下载", () => {
+  test("没装：红色语义 + 一键安装按钮 + 可执行命令 + 明说只在点击时下载", () => {
     const b = probeBlock(htmlMissing());
     assert.match(b, /未安装/, "没装时要说未安装");
     assert.match(b, /class="v err"/, "没装要用红的");
+    assert.match(b, /data-role="oc-install"/, "没装时必须画出一键安装按钮（2026-10-17 起）");
     assert.match(b, /npm i -g opencode-ai/, "必须显示可执行的安装命令");
-    assert.match(b, /不会替你下载/, "必须明说本产品不会替你下载");
+    assert.match(b, /不会自动替你下载/, "必须明说只有点击时才下载");
     assert.equal(/检测失败/.test(b), false, "没装不是检测失败");
   });
 
@@ -247,6 +250,8 @@ describe("③ 渲染：三种状态三样东西，检测出错 ≠ 没装", () =
       "★ 「检测出错」绝不能被渲染成「没装」：两者的处置完全不同（重试 vs 去装东西）");
     assert.equal(/npm i -g opencode-ai/.test(b), false,
       "★ 检测出错时不该叫人去装——他很可能早就装了，叫他重装会弄坏一个能用的机器");
+    assert.equal(/data-role="oc-install"/.test(b), false,
+      "★ 检测出错时不该画安装按钮——先说清「装没装」，再谈装");
   });
 
   test("三段 HTML 两两不同（真画出了不同的东西）", () => {
@@ -596,6 +601,48 @@ describe("⑧ 挂载：落点正确，只在清单声明的渠道上显示", () 
     assert.match(html, /value="opencode" checked/, "当前档位要选中");
     assert.match(html, /已安装/, "检测结果要画出来");
     assert.match(html, /data-role="oc-effect"/, "生效说明要画出来");
+  });
+
+  test("一键安装：missing 态画出按钮，点击 → 发 /api/oc/install → 成功后自动拨到 opencode 档", async () => {
+    const stub = domStub();
+    domStubDoc = stub.document;
+    status[key].transport = "direct";
+    status[key].transportProbe = { state: "missing", path: "", source: null, hint: "假提示（missing）", error: "", reason: "opencode-not-found", checkedAt: "2026-10-17T00:00:00.000Z", cached: false };
+    loadCard(stub.document).mount(ctx);
+    const bodyEl = stub.byId["oc-transport"].children[0];
+    const btns = bodyEl.querySelectorAll('[data-role="oc-install"]');
+    assert.equal(btns.length, 1, "missing 时必须有且只有一个一键安装按钮");
+    const fire = btns[0].listeners.find(([t]) => t === "click");
+    assert.ok(fire, "按钮必须接上监听器（否则点了什么都不会发生）");
+
+    /* 安装接口用假响应（本套件不联网）；只截取点击之后新增的调用记录。 */
+    const mark = seen.length;
+    const origPost = ctx.postJSON;
+    ctx.postJSON = async (path, body) => {
+      seen.push({ post: path, body });
+      if (path === "/api/oc/install") {
+        return { ok: true, already: false, path: "C:\\fake\\.opencode\\bin\\opencode.exe", bytes: 181000000, version: "1.19.3" };
+      }
+      return { ok: true };
+    };
+    await fire[1]();
+    await new Promise((r) => setTimeout(r, 0));
+    ctx.postJSON = origPost;
+
+    const added = seen.slice(mark);
+    const posts = added.map((x) => x.post).filter(Boolean);
+    assert.ok(posts.includes("/api/oc/install"), `必须发出安装请求，实际：${JSON.stringify(posts)}`);
+    const cfgPost = added.filter((x) => x.post === "/api/config").pop();
+    assert.ok(cfgPost, "安装成功后应自动把开关拨到 opencode（复用 /api/config）");
+    assert.equal(cfgPost.body.transport, "opencode");
+    assert.equal(cfgPost.body.provider, key, "拨开关也必须带对渠道");
+    const said = added.filter((x) => x.text).map((x) => x.text);
+    assert.ok(said.some((t) => /已安装 OpenCode CLI/.test(t)), `安装成功要有提示，实际：${JSON.stringify(said)}`);
+    assert.ok(said.some((t) => /已切换到/.test(t)), "自动切换成功也要说出来");
+
+    /* 还原共享状态，免得影响后面的用例 */
+    status[key].transport = "opencode";
+    status[key].transportProbe = { state: "found", path: "C:\\fake\\opencode.exe", source: "where" };
   });
 });
 

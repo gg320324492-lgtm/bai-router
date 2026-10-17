@@ -41,7 +41,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "no
 
 import {
   createOcGateway, zenTransportOf, writeAnthropicMessage, classifyRuntimeFailure,
-  ocInstallHint, spawnableExists, classifyTransportError,
+  ocInstallHint, spawnableExists, classifyTransportError, ocSpawnEnv,
   ZEN_TRANSPORTS, ZEN_TRANSPORT_DIRECT, ZEN_TRANSPORT_OPENCODE, OC_PROBE_SESSION_KEY,
   OC_IDLE_TIMEOUT_MS,
 } from "../src/server/oc-wiring.mjs";
@@ -340,6 +340,40 @@ describe("① 传输开关：出厂与兜底一律 direct", () => {
 });
 
 /* ================================================================== *
+ * ①.5 spawn 环境隔离：子进程的数据目录必须独立（2026-10-17）
+ * ================================================================== */
+describe("①.5 spawn 环境隔离：ocSpawnEnv 四件套", () => {
+  test("四个 XDG 目录全部落在 base/xdg/ 下，且不改传入的 env", () => {
+    const base = path.join(TMPROOT, "wd");
+    const src = { TEMP: "C:/tmp-t", KEEP: "1" };
+    const out = ocSpawnEnv(src, base);
+    assert.equal(out.XDG_DATA_HOME, path.join(base, "xdg", "data"));
+    assert.equal(out.XDG_CONFIG_HOME, path.join(base, "xdg", "config"));
+    assert.equal(out.XDG_CACHE_HOME, path.join(base, "xdg", "cache"));
+    assert.equal(out.XDG_STATE_HOME, path.join(base, "xdg", "state"));
+    assert.equal(out.KEEP, "1", "原 env 的字段必须原样保留");
+    assert.equal(src.XDG_DATA_HOME, undefined, "不得改动传入的 env 对象");
+  });
+
+  test("没有 base 时退回 TEMP/TMP；两者都没有时原样返回（不猜路径）", () => {
+    const viaTemp = ocSpawnEnv({ TEMP: path.join(TMPROOT, "t-emp") }, undefined);
+    assert.equal(viaTemp.XDG_DATA_HOME, path.join(TMPROOT, "t-emp", "xdg", "data"));
+    const viaTmp = ocSpawnEnv({ TMP: path.join(TMPROOT, "t-mp") }, undefined);
+    assert.equal(viaTmp.XDG_STATE_HOME, path.join(TMPROOT, "t-mp", "xdg", "state"));
+    const bare = { A: "1" };
+    assert.equal(ocSpawnEnv(bare, undefined), bare, "没有任何落点时原样返回（不猜）");
+  });
+
+  test("接线真的用了它：runtime() 必须把隔离 env 传给 createRuntime（源码级，防改回）", () => {
+    const W = readFileSync(path.join(REPO, "src", "server", "oc-wiring.mjs"), "utf8");
+    assert.ok(W.includes("env: ocSpawnEnv(env, wd)"),
+      "runtime() 必须把 ocSpawnEnv 的结果传给 createRuntime——改回原始 env 会在装有桌面版的机器上再次撞库退出（2026-10-17 实测）");
+    assert.ok(W.includes("findOpenCodeBinary({ env, exists: spawnableExists() })"),
+      "二进制发现仍须用原始 env（探测路径是 PATH/APPDATA，与 XDG 隔离无关）");
+  });
+});
+
+/* ================================================================== *
  * ② 关闭态：transport=direct 时原路不变，一个 OpenCode 进程都不起
  * ================================================================== */
 describe("② 关闭态：transport=direct 完全走原路径", () => {
@@ -362,9 +396,23 @@ describe("② 关闭态：transport=direct 完全走原路径", () => {
     assert.ok(gate < tokenAt, `分流判据必须在取令牌之前（判据 ${gate}，取令牌 ${tokenAt}）`);
   });
 
-  test("分流只出现一次，且另一次使用在 providerConfigured 的准入判定里", () => {
-    const hits = SRC.match(/zenTransportOf\(cfg\)/g) || [];
-    assert.equal(hits.length, 2, `zenTransportOf 在 server.mjs 里应只出现 2 次（分流 + 准入），实际 ${hits.length} 次`);
+  test("分流条件唯一；形态判据在准入/目录/能力表/探测门各有一处（2026-10-17 客户端中转适配后）", () => {
+    /* 旧断言是「zenTransportOf(cfg) 恰好 2 次」——那是「分流 + 准入」时期的数字。
+     * 客户端中转形态需要四处判据（分流 / 准入 / 目录放行 / 能力表 / 探测门），
+     * 数量不再有意义，**位置**才有：分流的条件字符串必须唯一，其余各处必须是「有」。 */
+    const gateCount = (SRC.match(/p === "zen" && zenTransportOf\(cfg\) === ZEN_TRANSPORT_OPENCODE/g) || []).length;
+    assert.equal(gateCount, 1, `openaiExchange 的分流条件必须唯一，实际 ${gateCount} 次`);
+    const pc = SRC.indexOf("function providerConfigured(");
+    assert.ok(pc > 0 && SRC.slice(pc, pc + 4000).includes("zenTransportOf(cfg)"),
+      "providerConfigured 的准入判定必须带形态判据");
+    assert.ok(SRC.includes("const ocTransport = zenTransportOf(cfg)"),
+      "目录分支必须有形态放行判据（客户端中转下免费模型全体放行）");
+    const zc = SRC.indexOf("function zenCapFields(");
+    assert.ok(zc > 0 && SRC.slice(zc, zc + 1200).includes("zenTransportOf(cfg)"),
+      "zenCapFields 必须区分两种形态（能力表文案）");
+    const probe = SRC.indexOf('"/api/models/probe-zen"');
+    assert.ok(probe > 0 && SRC.slice(probe, probe + 900).includes("zenTransportOf(cfg)"),
+      "probe-zen 必须先判形态（客户端中转下不做直连探测）");
   });
 
   test("providerConfigured：直连仍要 Zen Key，opencode 档不读它", () => {
@@ -400,11 +448,12 @@ describe("② 关闭态：transport=direct 完全走原路径", () => {
       "真的不存在的文件仍然要判不存在");
   });
 
-  test("ocInstallHint：给出可执行的安装命令，且明说不会替你下载", () => {
+  test("ocInstallHint：给出可执行的安装命令 + 一键安装指引，且明说只在点击时下载", () => {
     const h = ocInstallHint([{ how: "where", path: "C:\\x\\npm\\opencode" }]);
     assert.match(h, /npm i -g opencode-ai/, "必须给出可执行的安装命令");
     assert.match(h, /opencode\.ai/, "必须给出官网");
-    assert.match(h, /不会替你下载/, "必须明说本模块不下载");
+    assert.match(h, /一键安装/, "必须告诉用户面板上的一键安装（2026-10-17 起）");
+    assert.match(h, /不会自动替你下载/, "必须明说只有点击时才下载、除此之外不自动下载");
     assert.match(h, /C:\\x\\npm\\opencode/, "必须如实列出试过的路径");
   });
 });
@@ -577,7 +626,7 @@ describe("③ 网关：模型映射 / 会话映射 / 应答 / 零字节纪律 / 
     assert.equal(res.statusCode, 503);
     const msg = JSON.parse(res.body).error.message;
     assert.match(msg, /npm i -g opencode-ai/, "必须给出可执行的安装命令");
-    assert.match(msg, /不会替你下载/, "必须明说本模块不下载");
+    assert.match(msg, /不会自动替你下载/, "必须明说只有点击时才下载、除此之外不自动下载");
   });
 
   test("⑦ 空响应：当成上游失败，不把空回复当成功发出去", async () => {

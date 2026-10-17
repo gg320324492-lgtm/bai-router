@@ -15,7 +15,8 @@
  *
  * ── 三种探测状态必须画成三种东西 ──
  *   found   → 绿 + 路径，可以直接打开这一档
- *   missing → 红 + 一条**可以自己执行**的安装命令，并明说本产品不会替你下载
+ *   missing → 红 + 「一键安装 OpenCode CLI」按钮（官方源、固定版本、sha512 校验，
+ *             仅在点击时下载）+ 一条**可以自己执行**的安装命令
  *   error   → 「检测失败」+ 原因，并明说这**不等于没装**
  * 最后一条最容易省掉，省掉就是在误导人：把 error 画成 missing，处置会从
  * 「再试一次」变成「去装一个可能早就装好的东西」。
@@ -69,6 +70,10 @@ window.BAI_CARDS["oc-transport"] = {
         + (probe.source ? `<div class="fpline"><span class="k">来源</span><span class="v zh">${esc(probe.source)}</span></div>` : "");
     } else if (state === "missing") {
       probeLine = `<div class="fpline"><span class="k">本机检测</span><span class="v err">未安装</span></div>`
+        + `<div class="btnrow" style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">`
+        + `<button class="btn sm" type="button" data-role="oc-install">一键安装 OpenCode CLI</button>`
+        + `<span class="hint" style="margin:0">官方源 · 固定版本 · sha512 校验 · 约 60MB · 仅点击时下载</span>`
+        + `</div>`
         + `<div class="hint" data-role="oc-probe-hint" style="margin-top:6px;white-space:pre-wrap">${esc(probe.hint || "")}</div>`;
     } else if (state === "error") {
       /* ★ 与「未安装」严格分开：这里说的是「面板此刻说不出装没装」。 */
@@ -177,6 +182,60 @@ window.BAI_CARDS["oc-transport"] = {
       if (prevText && ctx.showResult) ctx.showResult(resultSlot(), prevText, prevGood);
       for (const el of body.querySelectorAll('[data-role="oc-transport-opt"]')) {
         el.addEventListener("change", () => onPick(el.value, P));
+      }
+      /* 一键安装按钮（只有 missing 态画得出来）：接上监听；下载进行中要抗住重画。 */
+      for (const el of body.querySelectorAll('[data-role="oc-install"]')) {
+        el.addEventListener("click", () => onInstall(P));
+      }
+      if (installing) markInstalling();
+    }
+
+    /* ============ 一键安装（2026-10-17）============
+     * 只在用户**点击**时才走这条路：POST /api/oc/install（服务端从官方源下载 +
+     * sha512 校验 + 装到 ~/.opencode/bin）。装完顺手把开关拨到「OpenCode 客户端中转」，
+     * 因为点这个按钮的目的本来就是用它。拨动失败不算安装失败，如实分开说。
+     * `installing` 对这张卡是全局的——共享层 5 秒轮询会重画 innerHTML，
+     * 靠它把「下载中」的禁用状态从重画里救回来，避免用户以为没点上又点一次。 */
+    let installing = false;
+    const INSTALL_BUSY_TEXT = "下载中…（约 60MB · 官方源 · sha512 校验，请勿关闭本窗口）";
+    function markInstalling() {
+      const b = body.querySelector('[data-role="oc-install"]');
+      if (b) { b.disabled = true; b.textContent = INSTALL_BUSY_TEXT; }
+    }
+    async function onInstall(P) {
+      if (installing) return;
+      installing = true;
+      markInstalling();
+      const slot = resultSlot();
+      if (ctx.showResult && slot) ctx.showResult(slot, "开始下载 OpenCode CLI（npm 官方源，落地前做 sha512 校验）……", true);
+      let text = "", good = false;
+      try {
+        const r = await ctx.postJSON("/api/oc/install", {});
+        if (r && r.already) {
+          text = `本机已有可用的 OpenCode：${(r && r.path) || ""}。`;
+        } else {
+          const mb = Math.round((((r && r.bytes) || 0) / 1048576));
+          text = `已安装 OpenCode CLI v${(r && r.version) || ""} → ${(r && r.path) || ""}（${mb} MB）。`;
+        }
+        good = true;
+        const cur = String(((ctx.stOf(key()) || {}).transport) || "");
+        if (cur !== "opencode") {
+          const op = (P.transportOptions || []).find((x) => x.value === "opencode");
+          const res = await self.applyTransport({ post: ctx.postJSON, onResult: () => {} }, {
+            provider: key(), value: "opencode",
+            label: (op && op.label) || "OpenCode 客户端中转", hint: "",
+          });
+          text += (res && res.ok)
+            ? " 已切换到「OpenCode 客户端中转」。"
+            : ` 安装已完成，但自动切换没成功：${(res && res.error) || ""}（可在上面手动选择）。`;
+        }
+      } catch (e) {
+        text = `安装失败：${String((e && e.message) || e)}`;
+        good = false;
+      } finally {
+        installing = false;
+        if (ctx.showResult && slot) ctx.showResult(slot, text, good);
+        if (typeof ctx.poll === "function") { Promise.resolve(ctx.poll()).then(paint, () => paint()); } else paint();
       }
     }
 

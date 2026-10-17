@@ -105,10 +105,10 @@ const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
  * 本模块**不会**替用户下载任何东西。
  */
 export const OPENCODE_MISSING_HINT = [
-  "没找到 opencode 二进制。本模块不会替你下载——装法因人而异，请自行确认后重试：",
-  "  ① 已用 npm 全局装：在一个新终端里跑 `opencode --version` 确认 PATH 已生效（PATH 改动要重开终端）；",
-  "  ② 用官方安装脚本装的：通常落在用户目录下的 .opencode\\bin\\opencode.exe，本模块也会找那里；",
-  "  ③ 以上都没有：按官方文档安装 OpenCode 后重试。",
+  "没找到 opencode 二进制。两条路（装法不同机器可混用）：",
+  "  ① 点面板「OpenCode Zen」页「传输方式」卡上的「一键安装 OpenCode CLI」——从官方源下载固定版本、sha512 校验后装到 ~/.opencode/bin；",
+  "  ② 自己装：在一个新终端里跑 `npm i -g opencode-ai`（或按官方脚本安装，通常落在 ~/.opencode/bin/opencode.exe）。",
+  "本产品只在你点了「一键安装」时才下载，除此之外不会自动替你下载任何东西。",
   "已按顺序尝试过的路径见 tried 字段。",
 ].join("\n");
 
