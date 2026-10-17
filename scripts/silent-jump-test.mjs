@@ -53,14 +53,18 @@ function cutThrough(src, from, to, what) {
   return cutN(src, from, to, what, 1);
 }
 /** 同上，但多带 extra 行（收尾是「字面量的 };」+「函数的 }」时用 extra=2）。 */
-function cutN(src, from, to, what, extra) {
+function cutN(src, from, to, what, extra = 0) {
   const ls = lines(src);
   const a = ls.findIndex((l) => l.includes(from));
   if (a < 0) throw new Error(`${what}：锚点「${from}」在源码里找不到 —— 代码被挪走了？`);
   const b = ls.findIndex((l, i) => i >= a && l.includes(to));
   if (b < 0) throw new Error(`${what}：抠不出收尾「${to}」—— 锚点移位了`);
-  if (b + extra >= ls.length) throw new Error(`${what}：收尾后面没有行了 —— 锚点移位了`);
-  return ls.slice(a, b + 1 + extra).join("\n");
+  /* ⚠ extra 必须有默认值。少了它，`b + 1 + undefined` = NaN，`slice(a, NaN)` 返回
+     **空数组**，于是 cutN 静悄悄返回空串、不报错 —— 断言拿着空串必然红，而报错信息里
+     只看得到「抠到的代码=""」，极难定位。踩过一次，记在这里。 */
+  const n = Number.isFinite(extra) ? extra : 0;
+  if (b + n >= ls.length) throw new Error(`${what}：收尾后面没有行了 —— 锚点移位了`);
+  return ls.slice(a, b + 1 + n).join("\n");
 }
 
 /* ====================================================================== *
@@ -288,8 +292,8 @@ const MINI = {
   bai: { name: "B.AI", badge: { text: "付费", kind: "paid" } },
   sn: { name: "SenseNova", badge: { text: "境内付费", kind: "cn" } },
   zen: { name: "OpenCode Zen", badge: { text: "免费 · 海外", kind: "intl" } },
-  wb: { name: "WorkBuddy", badge: { text: "0 积分", kind: "cn" } },
-  wbai: { name: "WorkBuddy AI", badge: { text: "0 积分 · 海外", kind: "intl" } },
+  wb: { name: "WorkBuddy", badge: { text: "有免费款", kind: "cn" } },
+  wbai: { name: "WorkBuddy AI", badge: { text: "有免费款 · 海外", kind: "intl" } },
   or: { name: "OpenRouter", badge: { text: "免费 · 海外", kind: "intl" } },
 };
 const nameOf = (k) => (MINI[k] && MINI[k].name) || k;
@@ -365,6 +369,51 @@ describe("② 面板文案：说人话，且不误报", () => {
       `摆错了那一条：${a.title}`);
     assert.ok(a.lines.some((l) => /另有 1 种组合/.test(l)),
       `没告诉用户还有别的组合：${JSON.stringify(a.lines)}`);
+  });
+
+  /* ★★ v1.0.88 修：冷却汇总那行读的是 `cooling[k].until`，而 update() 映射出来的
+   * 字段叫 **leftSec**（failover.mjs 的原始名 cooldownLeftSec 到这儿已换过两次）。
+   * `until` 恒 undefined ⇒ 筛选恒空 ⇒ 「冷却中」那行**从来没显示过**，而同一段
+   * 下面渲染时用的恰恰是 leftSec。字段名在这一段里并存过，且坏的那个没人碰。 */
+  test("★ 冷却汇总的筛选用 leftSec（不是不存在的 until）", () => {
+    const seg = cutN(CARD_SRC, 'const cool = $("foCool");', "if (!ks.length)", "冷却汇总段");
+    /* ⚠ 断言前必须**剥掉注释**：这段代码里有一段解释 bug 来由的注释，正文里写着
+     * 「原来这里筛的是 cooling[k].until」——不剥的话否定断言会被自己的说明文字打中，
+     * 测试就成了永假的摆设（这坑本项目踩过：注释写着与代码相反，藏了很久）。
+     * 失败消息用 JSON.stringify 而不是直接插值：多行原文会被 node 的 reporter 吃掉，
+     * 报错时只看到一个空白的冒号，等于没给信息。 */
+    const code = seg.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    const hasFilter = /\(cooling\[k\]\.leftSec\s*\|\|\s*0\)\s*>\s*0/.test(code);
+    const usesUntil = /cooling\[k\]\.until/.test(code);
+    const rendersLeft = /cooling\[k\]\.leftSec/.test(code);
+    assert.ok(hasFilter, `冷却筛选没有按 leftSec 判（剩余秒数 0 的会被算成仍在冷却）· 抠到的代码=${JSON.stringify(code)}`);
+    assert.ok(!usesUntil, `又用了 until —— update() 里没这个字段（恒 undefined），那行永远为空 · ${JSON.stringify(code)}`);
+    assert.ok(rendersLeft, `同一段里渲染没读 leftSec，会「筛出来却显示不出来」· ${JSON.stringify(code)}`);
+  });
+
+  /* ★★ v1.0.88：WorkBuddy 两张卡的徽章曾写「0 积分」，**会被读成整家免费**。
+   * 实测（2026-10-17 本机目录）：wb 31 款里只有 2 款 credits=x0.00
+   * （hy3、step-5-preview），其余 29 款收费；wbai 28 款里 3 款免费。
+   * 徽章写「0 积分」+ tagline 写「三款 0 积分模型」——**数目就不对**，
+   * 且严重误导：用户在这家选个别的模型就开始烧积分而毫无提示。
+   * ⚠ 这条特意钉在**文案本身**上：反向验证时发现 check-manifest 对 badge 只校验
+   * 「是非空字符串」，把文案改回「0 积分」它照样 0 error —— 也就是说**文案准确性
+   * 目前没有任何闸门**，只能靠测试钉住。 */
+  test("★ WorkBuddy 徽章不得声称整家 0 积分", () => {
+    const src = readFileSync(path.join(REPO, "src", "server", "providers.js"), "utf8");
+    for (const key of ["wb", "wbai"]) {
+      /* 剥注释再断言：改动的说明性注释里**写着旧文案原文**（「原来写「0 积分」+「三款 0 积分模型」」），
+       * 不剥的话断言会被自己的解释文字打中，测试就成了永假的摆设。 */
+      const seg = cutN(src, `  ${key}: {`, "chainable:", `${key} 卡片`)
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/^\s*\/\/.*$/gm, "");
+      assert.ok(!/badge:\s*\{\s*text:\s*"0 积分/.test(seg),
+        `${key} 的徽章又写成「0 积分」了 —— 会被读成这家全部免费，而实际只有个别模型是 0 积分`);
+      assert.ok(/badge:\s*\{\s*text:\s*"有免费款/.test(seg),
+        `${key} 的徽章应改成「有免费款」，只陈述「有免费款」这个事实`);
+      assert.ok(!/三款 0 积分/.test(seg),
+        `${key} 的 tagline 还写着「三款 0 积分模型」—— 实测数目与免费/付费占比都对不上`);
+    }
   });
 
   test("建议要可执行：点明「删掉谁」或「关掉」，而不是只描述现象", () => {
@@ -444,8 +493,8 @@ const CARD_MANIFEST = {
   bai: { key: "bai", name: "B.AI", badge: { text: "付费", kind: "paid" }, chainable: true },
   sn: { key: "sn", name: "SenseNova", badge: { text: "境内付费", kind: "cn" }, chainable: true },
   zen: { key: "zen", name: "OpenCode Zen", badge: { text: "免费 · 海外", kind: "intl" }, chainable: true },
-  wb: { key: "wb", name: "WorkBuddy", badge: { text: "0 积分", kind: "cn" }, chainable: true },
-  wbai: { key: "wbai", name: "WorkBuddy AI", badge: { text: "0 积分 · 海外", kind: "intl" }, chainable: true },
+  wb: { key: "wb", name: "WorkBuddy", badge: { text: "有免费款", kind: "cn" }, chainable: true },
+  wbai: { key: "wbai", name: "WorkBuddy AI", badge: { text: "有免费款 · 海外", kind: "intl" }, chainable: true },
   or: { key: "or", name: "OpenRouter", badge: { text: "免费 · 海外", kind: "intl" }, chainable: true },
   ccswitch: { key: "ccswitch", name: "交还区", badge: { text: "非本台渠道", kind: "neutral" }, chainable: false },
 };

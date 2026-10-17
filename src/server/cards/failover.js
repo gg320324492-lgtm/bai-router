@@ -201,7 +201,13 @@ window.BAI_CARDS["failover"] = {
 
       const cool = $("foCool");
       if (cool) {
-        const ks = Object.keys(cooling).filter((k) => (cooling[k].until || 0) * 1000 > Date.now());
+        /* ⚠ v1.0.88 修：原来这里筛的是 `cooling[k].until` —— 但 update() 映射出来的
+         * 字段是 **leftSec**（failover.mjs 的 failoverSnapshot 给的原始名是
+         * `cooldownLeftSec`，到这儿已经换过两次了）。`until` 恒为 undefined，
+         * 于是筛选恒为空，**这行「冷却中」汇总从来没显示过**——而下面第 210 行
+         * 用的恰恰是 leftSec，同一段代码里两个名字并存，坏的那个还没人碰。
+         * 判据改用 leftSec（它就是剩余秒数，不用再乘 1000）。 */
+        const ks = Object.keys(cooling).filter((k) => (cooling[k].leftSec || 0) > 0);
         if (!ks.length) { cool.innerHTML = ""; cool.style.display = "none"; }
         else {
           cool.style.display = "";

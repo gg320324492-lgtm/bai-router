@@ -290,8 +290,15 @@ window.BAI_PROVIDERS = {
 
     letter: "WB",
     name: "WorkBuddy",
-    tagline: "腾讯 · 国内版 · 三款 0 积分模型",
-    badge: { text: "0 积分", kind: "cn" },
+    tagline: "腾讯 · 国内版 · 31 款里仅 2 款 0 积分",
+    /* ⚠ v1.0.88 改：原来写「0 积分」+「三款 0 积分模型」，**两处都不准**——
+     * 实测本机目录（2026-10-17，31 款）只有 **2 款** 是 credits=x0.00
+     * （hy3、step-5-preview），其余 **29 款全部收费**（hy4-preview x0.29、
+     * space-bunny x0.08、deepseek-v4.1-flash x0.11 …）。
+     * 一个「0 积分」的徽章会被读成「这家全免费」，于是用户在该家选个别的模型
+     * 就开始烧积分而毫无提示——这跟「静默换人被换到计费渠道」是同一类伤害。
+     * 徽章只说**有一款免费**这个事实，不概括整家。 */
+    badge: { text: "有免费款", kind: "cn" },
     chainable: true,
     /* 账号池卡（v1.0.77）：这一格可以挂多个账号，按「同一段对话粘一个号、
        那个号真用不了才换」的规矩自动轮换。老配置只有一个令牌时池子合成为
@@ -339,8 +346,10 @@ window.BAI_PROVIDERS = {
 
     letter: "WAI",
     name: "WorkBuddy AI",
-    tagline: "腾讯 · 国际版 · 出海",
-    badge: { text: "0 积分 · 海外", kind: "intl" },
+    tagline: "腾讯 · 国际版 · 出海 · 28 款里仅 3 款 0 积分",
+    /* ⚠ 同 wb：实测 28 款里只有 3 款 credits=x0.00（deepseek-v4.1-flash、hy3、
+     * step-5-preview），其余收费。写「0 积分」会被读成整家免费。 */
+    badge: { text: "有免费款 · 海外", kind: "intl" },
     chainable: true,
     /* 账号池卡（v1.0.77）：见 wb.accountPool。与 wb **分池不混** ——
        两版令牌互不通用，装进同一个池子必然有一半是死的。 */
