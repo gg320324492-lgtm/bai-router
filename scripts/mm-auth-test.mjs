@@ -56,8 +56,8 @@ import { createRequire } from "node:module";
 import { runInNewContext } from "node:vm";
 
 import {
-  createMmTokenStore, mmBuildHeaders, mmAuthFilePath, readMmAuthRecord, mmCanonicalModel,
-  mmNormalizeTools, mmNormalizeBodyTools, writeBackAuth,
+  createMmTokenStore, mmBuildHeaders, mmAuthFilePath, mmAuthStateFilePath, readMmAuthRecord, mmCanonicalModel,
+  mmNormalizeTools, mmNormalizeBodyTools, writeBackAuth, writeBackState,
   MM_TOKEN_ENDPOINT, MM_INFER_BASE, MM_MODEL, MM_CLIENT_ID, MM_SCOPE, MM_AUDIENCE,
   MM_ORIGIN, MM_REFERER, MM_USER_AGENT, MM_PLACEHOLDER_KEY, MM_LOGIN_INVALID_MSG,
   MM_RECHECK_MS,
@@ -586,26 +586,42 @@ describe("mm 令牌不外泄", () => {
     assert.ok(!snapText.includes(OLD_REFRESH), "状态快照里出现了刷新令牌");
     assert.equal(snap.accessLen, NEW_ACCESS.length, "快照里只许有令牌**长度**");
 
-    /* ④ 源文件里的写盘 API **只许**出现在 writeBackAuth 里（机械检查，不靠肉眼）。
-     *    规矩是：只许写「登录态文件」与它的临时文件，不许碰别的路径。 */
+    /* ④ 源文件里的写盘 API **只许**出现在两个写回函数里（机械检查，不靠肉眼）。
+     *    规矩是：只许写 MiniMax Code 自己的登录态文件（凭据库 + 状态库）与它们的临时文件，
+     *    不许碰别的路径。
+     *    ⚠ 状态库（auth-state.json）是 2026-10-20 加进来的：MiniMax Code 判的是
+     *      **两个文件的 generation 相等**，只写凭据库会把 MiniMax Code 弄成 error。
+     *      它**明令不许存令牌**（它自己的代码里 assertNoSensitiveKeys 会拒绝），
+     *      所以这里额外钉一条：writeBackState 的函数体里不许出现任何令牌字段。 */
     const fnStart = MM_AUTH_SRC.indexOf("export function writeBackAuth");
     const fnEnd = MM_AUTH_SRC.indexOf("\n}", fnStart);
     assert.ok(fnStart > 0 && fnEnd > fnStart, "mm-auth.mjs 里必须有 writeBackAuth 这个函数");
+    const stStart = MM_AUTH_SRC.indexOf("export function writeBackState");
+    const stEnd = MM_AUTH_SRC.indexOf("\n}", stStart);
+    assert.ok(stStart > 0 && stEnd > stStart, "mm-auth.mjs 里必须有 writeBackState 这个函数");
     /* import 行不算「写盘」—— 它只是把 fs 的函数引进来。
-     * 真正要禁的是**调用点**：writeBackAuth 之外一处都不许有。 */
-    const outside = (MM_AUTH_SRC.slice(0, fnStart) + MM_AUTH_SRC.slice(fnEnd))
+     * 真正要禁的是**调用点**：这两个写回函数之外一处都不许有。 */
+    const outside = (MM_AUTH_SRC.slice(0, fnStart) + MM_AUTH_SRC.slice(fnEnd, stStart) + MM_AUTH_SRC.slice(stEnd))
       .split("\n").filter((l) => !/^\s*import\b/.test(l)).join("\n");
     const writeApis = ["writeFileSync", "appendFileSync", "createWriteStream", "mkdirSync",
       "rmSync", "unlinkSync", "renameSync", "copyFileSync", "writeFile", "appendFile", "mkdir", "rm"];
     for (const api of writeApis) {
       assert.ok(!new RegExp(`\\b${api}\\b`).test(outside),
-        `mm-auth.mjs 里 writeBackAuth 之外出现了写盘 API ${api} —— `
-        + "B.AI Router 自己的文件里不许落令牌（写回只许落在登录态文件上）");
+        `mm-auth.mjs 里 writeBackAuth / writeBackState 之外出现了写盘 API ${api} —— `
+        + "B.AI Router 自己的文件里不许落令牌（写回只许落在 MiniMax Code 的登录态文件上）");
+    }
+    /* 状态库那份**不许带令牌**（它只是状态：status / generation / expiresAtMs）。 */
+    const stBody = MM_AUTH_SRC.slice(stStart, stEnd);
+    for (const t of ["accessToken", "refreshToken", "access_token", "refresh_token"]) {
+      assert.equal(stBody.includes(t), false,
+        `writeBackState 里出现了 ${t} —— 状态文件只许写状态，不许带令牌`);
     }
     /* 而 writeBackAuth 里写的是**临时文件 + rename**，不是直接覆盖（原子写）。 */
     const fnBody = MM_AUTH_SRC.slice(fnStart, fnEnd);
     assert.match(fnBody, /\.bai-router\.tmp/, "写回必须走临时文件（原子写）");
     assert.match(fnBody, /renameSync\(tmp, file\)/, "写回必须用 rename 覆盖（原子）");
+    assert.match(stBody, /\.bai-router\.tmp/, "状态文件写回也必须走临时文件（原子写）");
+    assert.match(stBody, /renameSync\(tmp, file\)/, "状态文件写回也必须用 rename 覆盖（原子）");
   });
 
   test("写回只发生在续期成功之后（读文件不算写）", async () => {
@@ -728,6 +744,185 @@ describe("mm 写回登录态文件", () => {
     const f2 = path.join(d, "missing.json");
     const r2 = writeBackAuth(f2, KEY, { accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: 1, generation: 8 }, null);
     assert.equal(r2.ok, false);
+  });
+});
+
+/* ====================================================================== *
+ * ⑦ 写回**状态文件**：MiniMax Code 的两个文件必须同代
+ *
+ *   背景（2026-10-20 实测出来的，不是推断）：MiniMax Code 有**两个**文件：
+ *     · auth.json       —— 凭据库（accessToken / refreshToken / generation …）
+ *     · auth-state.json —— 状态库（status / generation / expiresAtMs …，**明令不许存令牌**）
+ *   它自己的代码（`@mavis/oauth-core` 的 `auth-core.js`）判的是**两个文件的 generation 相等**：
+ *     getStatus()            → `credential.generation !== state.generation` ⇒ 状态判成 **error**
+ *     readUsableCredential() → `state.generation !== credential.generation`  ⇒ 抛 **AuthRequiredError**
+ *
+ *   ⇒ **只写凭据库会把 MiniMax Code 弄坏**：我们续期后把凭据写成第 N+1 代，
+ *     状态库还停在第 N 代，它下次启动就变成「登录出错、要凭据时被拒」。
+ *   ⇒ 所以写回必须**两个文件一起写**，写完它们必须同代。
+ * ====================================================================== */
+
+describe("mm 写回状态文件（两个文件必须同代）", () => {
+  const KEY = "fake-account-key-0";
+  const dir = () => mkdtempSync(path.join(os.tmpdir(), "mm-ws-"));
+  /** MiniMax Code 的状态文件长这样（照它自己的 baseState + authenticatedState）。 */
+  const stateDoc = (over = {}) => ({
+    schemaVersion: 2,
+    status: "authenticated",
+    storeKind: "file",
+    clientId: MM_CLIENT_ID,
+    scopes: ["agent.default"],
+    audience: MM_AUDIENCE,
+    buildEnv: "prod",
+    region: "cn",
+    generation: 7,
+    expiresAtMs: 111,
+    ...over,
+  });
+  /** 假凭据文件。 */
+  const credDoc = (over = {}) => ({
+    schemaVersion: 1,
+    records: {
+      [KEY]: {
+        accessToken: OLD_ACCESS, refreshToken: OLD_REFRESH, expiresAtMs: 0,
+        tokenType: "Bearer", clientId: MM_CLIENT_ID, scopes: ["agent.default"],
+        audience: MM_AUDIENCE, generation: 7, ...over,
+      },
+    },
+  });
+
+  test("★ 写回后：generation / expiresAtMs / status 跟凭据同代，其余字段原样保留", () => {
+    const d = dir();
+    const f = path.join(d, "auth-state.json");
+    writeFileSync(f, JSON.stringify(stateDoc(), null, 2));
+
+    const r = writeBackState(f, { generation: 8, expiresAtMs: 999, status: "authenticated" }, readFileSync(f, "utf8"));
+
+    assert.equal(r.ok, true, "写回应成功：" + r.reason);
+    const after = JSON.parse(readFileSync(f, "utf8"));
+    assert.equal(after.generation, 8, "generation 必须与凭据文件同代");
+    assert.equal(after.expiresAtMs, 999, "expiresAtMs 必须与凭据文件一致");
+    assert.equal(after.status, "authenticated");
+    /* 结构保持：其余字段一个字都不许动（它的校验认这些字段）。 */
+    assert.equal(after.schemaVersion, 2);
+    assert.equal(after.storeKind, "file");
+    assert.equal(after.clientId, MM_CLIENT_ID);
+    assert.deepEqual(after.scopes, ["agent.default"]);
+    assert.equal(after.audience, MM_AUDIENCE);
+    assert.equal(after.buildEnv, "prod");
+    assert.equal(after.region, "cn");
+  });
+
+  test("★ 原子写：不留临时文件", () => {
+    const d = dir();
+    const f = path.join(d, "auth-state.json");
+    writeFileSync(f, JSON.stringify(stateDoc(), null, 2));
+    writeBackState(f, { generation: 8, expiresAtMs: 1, status: "authenticated" }, readFileSync(f, "utf8"));
+    assert.deepEqual(readdirSync(d).filter((x) => x.includes(".tmp")), [], "残留了临时文件");
+    assert.deepEqual(readdirSync(d), ["auth-state.json"], "目录里只该有状态文件");
+  });
+
+  test("★ 并发保护：状态文件在我们读之后被改过 → 放弃写入，一个字节都不动", () => {
+    const d = dir();
+    const f = path.join(d, "auth-state.json");
+    const before = JSON.stringify(stateDoc(), null, 2);
+    writeFileSync(f, before);
+    const expectRaw = before;                                  // 我们「读到」的那一份
+    writeFileSync(f, JSON.stringify(stateDoc({ generation: 9 }), null, 2));  // MiniMax Code 刚续过
+
+    const r = writeBackState(f, { generation: 8, expiresAtMs: 1, status: "authenticated" }, expectRaw);
+
+    assert.equal(r.ok, false, "必须放弃写入");
+    assert.match(r.reason, /被改过/);
+    assert.equal(JSON.parse(readFileSync(f, "utf8")).generation, 9, "文件必须还是 MiniMax Code 写的那份");
+  });
+
+  test("★ 状态文件不存在 / 结构不认识 → 放弃写入，不抛异常，原文件不动", () => {
+    const d = dir();
+    const f1 = path.join(d, "missing.json");
+    const r1 = writeBackState(f1, { generation: 8, expiresAtMs: 1, status: "authenticated" }, null);
+    assert.equal(r1.ok, false);
+    assert.match(r1.reason, /不存在/);
+
+    const f2 = path.join(d, "bad.json");
+    writeFileSync(f2, "[1,2,3]");
+    const r2 = writeBackState(f2, { generation: 8, expiresAtMs: 1, status: "authenticated" }, "[1,2,3]");
+    assert.equal(r2.ok, false);
+    assert.equal(readFileSync(f2, "utf8"), "[1,2,3]", "原文件必须一字未动");
+  });
+
+  test("★ 端到端：续期成功后，两个文件的 generation 与 expiresAtMs 必须相等", async () => {
+    const d = dir();
+    const f = path.join(d, "auth.json");
+    const sf = path.join(d, "auth-state.json");
+    writeFileSync(f, JSON.stringify(credDoc(), null, 2));
+    writeFileSync(sf, JSON.stringify(stateDoc(), null, 2));
+
+    const fetchImpl = fakeFetch(() => ({
+      status: 200, body: { access_token: NEW_ACCESS, refresh_token: NEW_REFRESH, expires_in: 3600 },
+    }));
+    const store = createMmTokenStore({
+      fetchImpl, now: () => Date.now(), authPath: f, statePath: sf, log: () => { },
+    });
+    await store.ensure();   // 令牌已过期 → 续期 → 写回两个文件
+
+    const cred = JSON.parse(readFileSync(f, "utf8")).records[KEY];
+    const stt = JSON.parse(readFileSync(sf, "utf8"));
+    assert.equal(cred.generation, 8, "凭据文件应当是第 8 代");
+    assert.equal(stt.generation, cred.generation,
+      "★ 状态文件必须与凭据文件同代 —— 不同代 MiniMax Code 就判 error 并拒绝用凭据");
+    assert.equal(stt.expiresAtMs, cred.expiresAtMs, "两个文件的到期时间也必须一致");
+    assert.equal(stt.status, "authenticated");
+  });
+
+  test("★ 照 MiniMax Code 自己的规则复算：只写凭据 → 它不认；两个都写 → 它认", () => {
+    /* 这条判据是 MiniMax Code 自己的（@mavis/oauth-core）：
+     *   getStatus(): credential.generation !== state.generation ⇒ status = 'error'
+     *   readUsableCredential(): state.generation !== credential.generation ⇒ AuthRequiredError */
+    const mmcAccepts = (cred, state) => cred.generation === state.generation;
+
+    const d = dir();
+    const f = path.join(d, "auth.json");
+    const sf = path.join(d, "auth-state.json");
+    writeFileSync(f, JSON.stringify(credDoc(), null, 2));
+    writeFileSync(sf, JSON.stringify(stateDoc(), null, 2));
+
+    /* 只写凭据库（改动前的做法）→ 两个文件代不同 → MiniMax Code 不认。 */
+    writeBackAuth(f, KEY, { accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: 999, generation: 8 },
+      readFileSync(f, "utf8"));
+    const credOnly = JSON.parse(readFileSync(f, "utf8")).records[KEY];
+    const sttOld = JSON.parse(readFileSync(sf, "utf8"));
+    assert.equal(mmcAccepts(credOnly, sttOld), false,
+      "★ 只写凭据库时 MiniMax Code 一定不认（这正是 2026-10-20 踩到的坑）");
+
+    /* 再把状态文件也写回 → 同代 → 它认。 */
+    writeBackState(sf, { generation: 8, expiresAtMs: 999, status: "authenticated" }, readFileSync(sf, "utf8"));
+    const sttNew = JSON.parse(readFileSync(sf, "utf8"));
+    assert.equal(mmcAccepts(credOnly, sttNew), true,
+      "★ 两个文件同代时 MiniMax Code 才认（这就是必须一起写的原因）");
+  });
+
+  test("★ 接线：续期成功后必须调 writeState（锚到 renew() 那一处）", () => {
+    /* ⚠ 锚到 renew() 的函数体本身：只断言「文件里出现过 writeState」会假绿
+       （函数定义了不等于被调用过）。 */
+    const i = MM_AUTH_SRC.indexOf("async function renew()");
+    assert.ok(i > 0, "renew() 得找得到");
+    const j = MM_AUTH_SRC.indexOf("\n  }", i);
+    const body = MM_AUTH_SRC.slice(i, j);
+    assert.match(body, /writeState\(/, "renew() 里必须调 writeState（否则状态文件停在旧一代，MiniMax Code 判 error）");
+    assert.match(body, /st\.generation/, "写回时用的代数必须与凭据文件同代");
+    assert.ok(body.indexOf("writeBack(") < body.indexOf("writeState("),
+      "★ 必须先写凭据库、再写状态文件（顺序反了会出现短暂的不同代）");
+  });
+
+  test("★ 状态文件路径：与凭据文件同一个目录（不写死本机绝对路径）", () => {
+    const p = mmAuthStateFilePath("/fake/home");
+    assert.equal(p, path.join("/fake/home", ".minimax", "auth", "prod", "cn", "mcode-public", "auth-state.json"));
+    assert.equal(path.dirname(p), path.dirname(mmAuthFilePath("/fake/home")),
+      "两个文件必须在同一个目录（MiniMax Code 自己就是这么放的）");
+    /* 红线：源码里不许出现任何本机绝对路径（路径必须由 os.homedir() 拼出来）。 */
+    assert.equal(/[A-Za-z]:\\\\/.test(MM_AUTH_SRC), false,
+      "mm-auth.mjs 里不许出现盘符开头的绝对路径（契约红线，config.defaults.json 还会被 C13 扫）");
   });
 });
 

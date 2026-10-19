@@ -286,6 +286,99 @@ export function writeBackAuth(file, recordKey, token, expectRaw) {
   }
 }
 
+/**
+ * MiniMax Code 的**状态文件**路径（与凭据文件同一个目录）。
+ *
+ * ⚠ 源码里不许出现本机绝对路径 —— 用 os.homedir() 拼（同 mmAuthFilePath）。
+ *
+ * @param {string} [homeDir]
+ * @returns {string}
+ */
+export function mmAuthStateFilePath(homeDir) {
+  const h = homeDir || os.homedir();
+  return path.join(h, ".minimax", "auth", "prod", "cn", "mcode-public", "auth-state.json");
+}
+
+/**
+ * 把 MiniMax Code 的**状态文件**同步到我们刚续出来的那一代。
+ *
+ * ## 为什么必须写它（2026-10-20 实测出来的，不是推断）
+ *
+ * MiniMax Code 有**两个**文件：
+ *   · `auth.json`      —— 凭据库（accessToken / refreshToken / generation …）
+ *   · `auth-state.json` —— 状态库（status / generation / expiresAtMs …，**明令不许存令牌**）
+ *
+ * 它自己的代码（`@mavis/oauth-core`，`auth-core.js`）判据是**两个文件的 generation 必须相等**：
+ *
+ *   getStatus()          → `credential.generation !== state.generation` ⇒ 状态判成 **error**
+ *   readUsableCredential() → `state.generation !== credential.generation` ⇒ 抛 **AuthRequiredError**
+ *
+ * 也就是说：**只写凭据库、不写状态库，会把 MiniMax Code 弄成「登录出错、要用凭据时被拒」。**
+ * 我们把凭据写回（新一代）而状态文件还停在旧一代 → 两边对不上 → 它下次启动就报错。
+ * 实跑它自己的代码（假凭据、零网络）四格矩阵：
+ *
+ *   凭据 45 / 状态 44（只写凭据库）→ status=error，取凭据=AuthRequiredError  ← 我们原来的做法
+ *   凭据 45 / 状态 45（两个都写）  → status=authenticated，取凭据=可用          ← 现在这个做法
+ *   凭据 45 / 状态 45 但都过期    → status=expired，取凭据=可用（它会自己去续期）
+ *   凭据 44 / 状态 45（反方向）    → status=error，取凭据=AuthRequiredError
+ *
+ * ## 它自己的写法定长什么样（照抄它的 `baseState` + `authenticatedState`）
+ *
+ *   { schemaVersion:2, status, storeKind:"file", clientId:"mcode-public",
+ *     scopes:[…], audience:"agent-backend", buildEnv, region, generation, expiresAtMs }
+ *
+ * 我们**只改 3 个字段**（status / generation / expiresAtMs），其余原样保留 ——
+ * 这样它那套校验（clientId 必须是 mcode-public、scopes 必须是字符串数组…）天然成立。
+ *
+ * ## 安全措施与 writeBackAuth 一致
+ *
+ *   ① 原子写（临时文件 → rename） ② 并发保护（原文比对） ③ 结构保持
+ *   ④ 失败不动原文件 ⑤ 文件不存在/结构不认识 → **放弃写入**（不替它重建一个状态文件）
+ *
+ * @param {string} file     状态文件路径
+ * @param {object} state    { generation, expiresAtMs, status }
+ * @param {string} expectRaw 我们读到时的原文；与写之前的原文不一致就放弃写入
+ * @returns {{ok:boolean, reason:string, raw?:string}}
+ */
+export function writeBackState(file, state, expectRaw) {
+  try {
+    let raw;
+    try {
+      raw = readFileSync(file, "utf8");
+    } catch {
+      /* ⑤ 没有状态文件 → 没有「同代」这回事可维持（MiniMax Code 本来就是未登录态）。 */
+      return { ok: false, reason: "状态文件不存在 —— 放弃写入" };
+    }
+    /* ② 并发保护：MiniMax Code 刚写过 → 放弃，绝不覆盖它的更新。 */
+    if (typeof expectRaw === "string" && raw !== expectRaw) {
+      return { ok: false, reason: "状态文件在我们读取之后被改过（MiniMax Code 刚续过？）—— 放弃写入，避免覆盖它的更新" };
+    }
+    const doc = JSON.parse(raw);
+    if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+      return { ok: false, reason: "状态文件结构不认识 —— 放弃写入" };
+    }
+    /* ③ 结构保持：只动这 3 个字段，其余原样。 */
+    doc.status = String(state.status || "authenticated");
+    doc.generation = Number(state.generation) || 0;
+    doc.expiresAtMs = Number(state.expiresAtMs) || 0;
+    const out = JSON.stringify(doc, null, 2);
+
+    /* ① 原子写。 */
+    const tmp = file + ".bai-router.tmp";
+    writeFileSync(tmp, out, "utf8");
+    try {
+      renameSync(tmp, file);
+    } catch (e) {
+      try { unlinkSync(tmp); } catch { /* 清理失败就算了，临时文件里没有令牌 */ }
+      return { ok: false, reason: "状态文件写回失败（rename 报错）：" + String((e && e.message) || e).slice(0, 120) };
+    }
+    return { ok: true, reason: "", raw: out };
+  } catch (e) {
+    /* ④ 任何异常都不动原文件。 */
+    return { ok: false, reason: "状态文件写回失败：" + String((e && e.message) || e).slice(0, 120) };
+  }
+}
+
 /* ---------- 请求头 ---------- */
 
 /**
@@ -417,7 +510,11 @@ export function createMmTokenStore(opts = {}) {
     ? opts.readRaw
     : (f) => { try { return readFileSync(f, "utf8"); } catch { return null; } };
   const writeBack = typeof opts.writeBack === "function" ? opts.writeBack : writeBackAuth;
+  const writeState = typeof opts.writeState === "function" ? opts.writeState : writeBackState;
   const authPath = opts.authPath || mmAuthFilePath(opts.home);
+  /* 状态文件与凭据文件同一个目录（MiniMax Code 自己就是这么放的）。
+   * 默认从 authPath 推出来，测试里传 authPath 就自动对得上。 */
+  const statePath = opts.statePath || path.join(path.dirname(authPath), "auth-state.json");
   const log = typeof opts.log === "function" ? opts.log : () => { };
   const timeoutMs = Number(opts.timeoutMs) || MM_TOKEN_TIMEOUT_MS;
 
@@ -437,6 +534,9 @@ export function createMmTokenStore(opts = {}) {
     /** 我们读到登录态文件时的**原文** —— 写回时的并发保护就靠它
      *  （文件在我们读之后被 MiniMax Code 改过 → 放弃写入，不覆盖它的更新）。 */
     authRaw: "",
+    /** 状态文件（auth-state.json）的原文，同上用途。
+     *  ⚠ MiniMax Code 要求**两个文件的 generation 相等**，写回时必须一起更新。 */
+    stateRaw: "",
     loaded: false,
     invalid: false,      // invalid_grant 之后为真：不再自动重试，等用户重新登录
     error: null,
@@ -484,6 +584,11 @@ export function createMmTokenStore(opts = {}) {
     /* 记下原文：写回时用它做并发保护（文件在我们读之后被改过就别写）。 */
     const raw = readRaw(authPath);
     if (typeof raw === "string") st.authRaw = raw;
+    /* 状态文件也要记原文：写回时它同样有并发保护。
+     * ⚠ 读不到就算了（文件可能还不存在）：注入的 readRaw 实现未必吞异常。 */
+    let sraw = null;
+    try { sraw = readRaw(statePath); } catch { sraw = null; }
+    if (typeof sraw === "string") st.stateRaw = sraw;
 
     /* 🔴 该不该采用文件里那份？
      *
@@ -626,6 +731,36 @@ export function createMmTokenStore(opts = {}) {
       }
     } catch (e) {
       log(`MiniMax：写回登录态文件出错（${scrub(String((e && e.message) || e)).slice(0, 100)}）`);
+    }
+
+    /* 🔴🔴 紧接着把**状态文件**也同步到同一代（MiniMax Code 的 auth-state.json）。
+     *
+     *   为什么必须一起写：MiniMax Code 判的是**两个文件的 generation 相等**——
+     *   凭据库（auth.json）是我们写的第 N+1 代，状态库（auth-state.json）还停在第 N 代，
+     *   它自己的代码（`@mavis/oauth-core`）就会：
+     *     · getStatus()            → 状态判成 **error**
+     *     · readUsableCredential() → 抛 **AuthRequiredError**（要凭据的调用全被拒）
+     *   也就是说：**只写凭据库会把 MiniMax Code 弄坏**。实测（2026-10-20，
+     *   拿它自己的代码跑假凭据）四格矩阵：只写凭据 → error + AuthRequiredError；
+     *   两个都写 → authenticated + 凭据可用。
+     *
+     *   写失败**不影响本模块继续工作**（内存里那把是好的）—— 只记日志，
+     *   并且说清后果：MiniMax Code 下次启动可能要重新登录一次。 */
+    try {
+      const ws = writeState(statePath, {
+        generation: st.generation,
+        expiresAtMs: st.expiresAtMs,
+        status: "authenticated",
+      }, st.stateRaw);
+      if (ws && ws.ok) {
+        if (typeof ws.raw === "string") st.stateRaw = ws.raw;
+        log(`MiniMax：已把状态文件也同步到第 ${st.generation} 代（两个文件同代，MiniMax Code 才认）`);
+      } else {
+        log(`MiniMax：状态文件未同步成功（${scrub((ws && ws.reason) || "未知原因")}）—— `
+          + "本模块仍可继续用，但 MiniMax Code 可能需要重新登录一次");
+      }
+    } catch (e) {
+      log(`MiniMax：同步状态文件出错（${scrub(String((e && e.message) || e)).slice(0, 100)}）`);
     }
     return st.accessToken;
   }
