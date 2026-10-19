@@ -131,6 +131,122 @@ function makeStore({ fetchImpl, readAuth, now, log } = {}) {
 }
 
 /* ====================================================================== *
+ * ①b 刷新令牌是**一次性**的，两端共用同一把 → 谁续谁就把对方的作废
+ *
+ *   背景：登录态文件（~/.minimax/auth/.../auth.json）是 **MiniMax Code 的凭据库**，
+ *   而路由台也从同一个文件取刷新令牌。刷新令牌一次性轮换 —— 续一次，旧的那把
+ *   当场作废（invalid_grant）。于是两端会**互相把对方作废**。
+ *
+ *   2026-10-19 的真实事故场景：MiniMax Code 先续了期（文件里 generation 42→43），
+ *   路由台还抱着 42 那把已作废的令牌去续期 → invalid_grant → 面板报
+ *   「登录态已失效」——**而用户明明好好地登录着 MiniMax Code**。
+ *
+ *   修法：用文件里的 `generation` 判「谁更新」——
+ *     · 文件的 generation 更大 → 那是 MiniMax Code 刚续出来的，**跟着换**；
+ *     · 内存里的更大 → 那是路由台自己续出来的，**保留**（文件没跟上）。
+ * ====================================================================== */
+
+describe("mm 刷新令牌一次性轮换（两端共用同一把）", () => {
+  const NOW = 1789000000000;
+  const past = NOW - 60000;
+  const future = NOW + 3600 * 1000;
+
+  test("★ MiniMax Code 续了期 → 路由台自动跟着换，一次网络请求都不发", async () => {
+    const fetchImpl = fakeFetch(() => ({ status: 200, body: { access_token: "unused", refresh_token: "unused" } }));
+    const store = makeStore({ fetchImpl, now: () => NOW });
+    /* 路由台手上是第 4 代（访问令牌已过期）；文件里已经是第 5 代（MiniMax Code 刚续的）。 */
+    seedLoaded(store, { generation: 4, expiresAtMs: past });
+    store.state.generation = 4;
+    store.readAuthFile = store.readAuthFile; // 保持真实实现
+
+    const rec = fakeRecord({
+      generation: 5, accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: future,
+    });
+    const store2 = makeStore({ fetchImpl, now: () => NOW, readAuth: () => rec });
+    seedLoaded(store2, { generation: 4, expiresAtMs: past });
+    store2.state.generation = 4;
+
+    const tok = await store2.ensure();
+
+    assert.equal(tok, NEW_ACCESS, "必须采用文件里那把（第 5 代）");
+    assert.equal(store2.state.refreshToken, NEW_REFRESH, "刷新令牌也要跟着换");
+    assert.equal(store2.state.generation, 5, "generation 要更新到 5");
+    assert.equal(fetchImpl.calls.length, 0, "不该发任何续期请求 —— 文件里已经有活的了");
+  });
+
+  test("★ 路由台自己续过（内存里的更新）→ 不把文件里那把已作废的换回来", async () => {
+    const fetchImpl = fakeFetch(() => ({
+      status: 200, body: { access_token: NEW_ACCESS, refresh_token: NEW_REFRESH, expires_in: 3600 },
+    }));
+    /* 文件里是第 4 代（已过期的那把） */
+    const rec = fakeRecord({ generation: 4, accessToken: OLD_ACCESS, refreshToken: OLD_REFRESH, expiresAtMs: past });
+    const store = makeStore({ fetchImpl, now: () => NOW, readAuth: () => rec });
+    seedLoaded(store, { generation: 4, expiresAtMs: past });
+    store.state.generation = 4;
+
+    const tok = await store.ensure();   // 过期 → 续期（我们赢了这一轮）
+
+    assert.equal(tok, NEW_ACCESS, "我们续成功了");
+    assert.equal(store.state.refreshToken, NEW_REFRESH, "内存里是我们续出来的那把");
+    assert.equal(store.state.generation, 5, "我们这把比文件里的新一代");
+    assert.equal(fetchImpl.calls.length, 1, "只续了一次");
+
+    /* 现在再读一次文件：文件里还是第 4 代（我们把它用了，它已作废）——
+       **不能**用它把内存里那把好的换掉。 */
+    store.readAuthFile();
+    assert.equal(store.state.refreshToken, NEW_REFRESH, "不能把已作废的第 4 代换回来");
+    assert.equal(store.state.generation, 5, "generation 不能被旧的文件拉回去");
+  });
+
+  test("★ invalid_grant 之后，文件换出新令牌 → 自动恢复（不必用户点「重新读取」）", async () => {
+    let rec = fakeRecord({ generation: 4, accessToken: OLD_ACCESS, refreshToken: OLD_REFRESH, expiresAtMs: past });
+    const fetchImpl = fakeFetch(() => ({
+      status: 400, body: { error: "invalid_grant", error_description: "this refresh token can no longer be used, start a new authorization" },
+    }));
+    const store = makeStore({ fetchImpl, now: () => NOW, readAuth: () => rec });
+    seedLoaded(store, { generation: 4, expiresAtMs: past });
+    store.state.generation = 4;
+
+    await assert.rejects(() => store.ensure(), /登录态已失效/);
+    assert.equal(store.state.invalid, true);
+    assert.equal(fetchImpl.calls.length, 1, "第一次确实打了网络（撞上已作废的令牌）");
+
+    /* MiniMax Code 续了期：文件里换成第 5 代，访问令牌是活的。 */
+    rec = fakeRecord({ generation: 5, accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: future });
+
+    const tok = await store.ensure();
+    assert.equal(tok, NEW_ACCESS, "文件里那把是活的 → 应当自动恢复");
+    assert.equal(store.state.invalid, false, "恢复后不该还报「已失效」");
+    assert.equal(fetchImpl.calls.length, 1, "恢复**不该**再打网络（文件里已经有活的了）");
+  });
+
+  test("★ invalid_grant 之后文件没变 → 不再撞上游（不拿它当靶子刷）", async () => {
+    const rec = fakeRecord({ generation: 4, accessToken: OLD_ACCESS, refreshToken: OLD_REFRESH, expiresAtMs: past });
+    const fetchImpl = fakeFetch(() => ({
+      status: 400, body: { error: "invalid_grant", error_description: "this refresh token can no longer be used, start a new authorization" },
+    }));
+    const store = makeStore({ fetchImpl, now: () => NOW, readAuth: () => rec });
+    seedLoaded(store, { generation: 4, expiresAtMs: past });
+    store.state.generation = 4;
+
+    await assert.rejects(() => store.ensure(), /登录态已失效/);
+    assert.equal(fetchImpl.calls.length, 1);
+
+    /* 再要两次令牌：文件没变 → 不许再打网络。 */
+    await assert.rejects(() => store.ensure(), /登录态已失效/);
+    await assert.rejects(() => store.ensure(), /登录态已失效/);
+    assert.equal(fetchImpl.calls.length, 1, "同一把死令牌不许反复去撞上游");
+  });
+
+  test("generation 记账：读文件时取文件的、续期时自己 +1", async () => {
+    const rec = fakeRecord({ generation: 7, accessToken: OLD_ACCESS, refreshToken: OLD_REFRESH, expiresAtMs: future });
+    const store = makeStore({ now: () => NOW, readAuth: () => rec });
+    store.readAuthFile();
+    assert.equal(store.state.generation, 7, "读文件 → 取文件里的 generation");
+  });
+});
+
+/* ====================================================================== *
  * ① 续期轮换
  * ====================================================================== */
 
@@ -589,7 +705,15 @@ describe("mm 接线完整性", () => {
     assert.match(text, /开放平台/, "要说清与开放平台按量计费是两回事");
     assert.match(text, /MiniMax Code/, "要说清凭据来自 MiniMax Code 的登录态");
     assert.match(text, /只存在内存|只在内存/, "要说清令牌只存在内存");
-    assert.match(text, /指纹/, "要说清上游做客户端指纹校验");
+    /* ⚠ 2026-10-19 实测后改的断言：上游真正挑刺的只有**鉴权令牌**与
+     *   **工具定义的形状**；UA / Origin / Referer / system prompt 都不是校验对象。
+     *   旧文案说「上游按 system prompt 的内容做客户端指纹校验」——那是**错的**
+     *   （9 种头组合 + 4 种 system prompt 形状实测全部 200），而且已经发出去过。
+     *   所以这里既钉住正确说法，也**禁止**旧说法回来。 */
+    assert.match(text, /鉴权令牌/, "要说清上游真正校验的是鉴权令牌");
+    assert.match(text, /工具定义/, "要说清上游真正校验的是工具定义的形状");
+    assert.doesNotMatch(text, /system prompt.{0,12}指纹|指纹校验/,
+      "❌ 不要再声称「上游按 system prompt 的内容做客户端指纹校验」——实测不成立");
   });
 
   test("面板的只读凭据行与卡片都在（渲染层那一侧）", () => {
@@ -626,8 +750,11 @@ describe("mm 会员额度卡", () => {
     assert.match(html, /登录态/, "② 要写明凭据来自它的登录态");
     assert.match(html, /只在内存|只存在内存/, "③ 要写明令牌只存在内存");
     assert.match(html, /重启/, "③ 要写明重启路由台要重新读");
-    assert.match(html, /指纹/, "④ 要写明上游做客户端指纹校验");
-    assert.match(html, /UA \/ Origin \/ Referer|UA、Origin、Referer/, "④ 要写明我们已经带上了正确的头");
+    /* ⚠ 同上：改成钉实测事实，并禁止旧说法回来（它已经随 v1.0.89 发出去过）。 */
+    assert.match(html, /鉴权令牌/, "④ 要写明上游真正校验的是鉴权令牌");
+    assert.match(html, /工具定义/, "④ 要写明上游真正校验的是工具定义的形状");
+    assert.doesNotMatch(html, /指纹/,
+      "❌ 不要再声称「上游做客户端指纹校验」——实测不成立（UA / Origin / Referer / system prompt 都不是校验对象）");
   });
 
   test("登录态失效时，卡片报红并把该做什么说清楚", () => {

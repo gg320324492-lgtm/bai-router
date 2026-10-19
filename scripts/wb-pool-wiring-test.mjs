@@ -1025,8 +1025,8 @@ function sseEvents(text) {
  * 🔴 假凭据是 wbdummy-*，**不是**任何真实令牌的形状。
  */
 async function bootServer() {
-  const ports = await freePorts(8);
-  const P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7] };
+  const ports = await freePorts(9);
+  const P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
   const dataDir = mkdtempSync(path.join(TMPROOT, "boot-"));
   const SSE_MARK = "pool-wiring-marker";
 
@@ -1060,7 +1060,7 @@ async function bootServer() {
   cfg.failover.enabled = false;
   cfg.proxy = "http://127.0.0.1:7897";     // 防 applyProxy 自重启（见 oc-wiring-test 的同一段说明）
   cfg.relayPort = P.bai; cfg.panelPort = P.panel;
-  for (const k of ["sn", "wb", "wbai", "zen", "qd", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
+  for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
   /* wb 保持**老配置形态**：只有 accessToken、没有 accounts —— 池子必须自动合成
      单条目，行为与改动前逐字一致（这一格就是「默认行为不变」的证据）。 */
   cfg.wb.accessToken = DUMMY_A;

@@ -382,8 +382,11 @@ window.BAI_PROVIDERS = {
   /* ================= MiniMax 会员（/mm）—— 转移链在 wbai 之后、or 之前 =================
    * **会员额度**通道：凭据是 MiniMax Code 桌面端登录态里换来的 Bearer 令牌，
    * 只存在内存（不落 config.json / 不进日志 / 面板上看不到明文）。
-   * 上游是 Anthropic Messages **原生协议**（不做协议翻译），但会按 system prompt 的
-   * 内容做**客户端指纹校验**——中转转发时已带上正确的 UA/Origin/Referer，实测能过。
+   * 上游是 Anthropic Messages **原生协议**（不做协议翻译）。
+   * ⚠ 实测（2026-10-19，MiniMax Code 3.1.4）：上游真正硬要求的只有**两样**——
+   *   鉴权令牌（`authorization: Bearer`）与 `content-type: application/json`；
+   *   UA / Origin / Referer / system prompt **都不是校验对象**（去掉照样 200）。
+   *   真正被挑刺的是**工具定义的形状**（本中转已做转换）。
    * ⚠ 与「开放平台 BYOK（按量计费）」是两回事，面板上必须分开说。 */
   mm: {
     key: "mm",
@@ -428,12 +431,14 @@ window.BAI_PROVIDERS = {
     conclusion: "本机读到了 MiniMax Code 的登录态就算就绪（会员令牌在内存里，快到期会自动续期）。"
       + "这一格走的是**会员额度**——MiniMax Code 登录的那个账号自带的免费/会员额度，"
       + "**不是**开放平台按量计费的 API Key：能用多少取决于你自己的套餐，两回事，别混。",
-    caveat: "会员额度通道 · 令牌只存内存 · 上游做客户端指纹校验",
+    caveat: "会员额度通道 · 令牌只存内存 · 上游只认鉴权令牌与工具定义的形状",
     remedy: "先在 **MiniMax Code 里登录**（凭据从它的登录态拿），再回本页点「重新读取登录态」。"
       + "令牌**只存在内存**里：不写进 config.json、不写进日志、面板上也看不到明文；"
       + "重启路由台要重新读一次（重新登录 MiniMax Code 即可恢复）。"
-      + "⚠ 上游会按 system prompt 的**内容**做客户端指纹校验——中转转发时已带上正确的 "
-      + "UA/Origin/Referer，所以实测能过；若上游日后新增了尚未覆盖的指纹，会回 400，那时先用别的渠道顶上。",
+      + "⚠ 上游真正挑刺的只有两处：**鉴权令牌**与**工具定义的形状**"
+      + "（本中转已把嵌套形状转成上游要的扁平形状，能正常对话与调工具）；"
+      + "请求头与 system prompt 都不是校验对象——换句话说，这一格出问题时"
+      + "先看这两处，而不是去调 UA。",
 
     settingsLabels: { relayPort: "MiniMax 会员中转端口" },
   },

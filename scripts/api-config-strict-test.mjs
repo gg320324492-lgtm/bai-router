@@ -43,7 +43,7 @@ describe("POST /api/config：不再静默成功", () => {
   child = null; dataDir = ""; panel = 0;
 
   before(async () => {
-    const [bai, sn, wb, wbai, zen, qd, or, pnl] = await freePorts(8);
+    const [bai, sn, wb, wbai, zen, qd, or, pnl, mm] = await freePorts(9);
     panel = pnl;
     dataDir = path.join(TMPROOT, "data");
     fs.mkdirSync(dataDir, { recursive: true });
@@ -53,7 +53,8 @@ describe("POST /api/config：不再静默成功", () => {
     Object.assign(cfg, {
       sn: { ...cfg.sn, relayPort: sn }, wb: { ...cfg.wb, relayPort: wb },
       wbai: { ...cfg.wbai, relayPort: wbai }, zen: { ...cfg.zen, relayPort: zen },
-      qd: { ...cfg.qd, relayPort: qd }, or: { ...cfg.or, relayPort: or },
+      qd: { ...cfg.qd, relayPort: qd }, mm: { ...cfg.mm, relayPort: mm },
+      or: { ...cfg.or, relayPort: or },
     });
     cfg.failover.enabled = false;
     /* ⚠ 必须预置 cfg.proxy，否则服务启动后会跑代理探测、探到本机 7897 就写进配置

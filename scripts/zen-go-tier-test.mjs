@@ -447,15 +447,16 @@ describe("T4 e2e：Go 档 / 免费档 请求头与错误归因", () => {
   let upstreamReply = null; // 每个用例自己设
 
   before(async () => {
-    const [bai, sn, wb, wbai, zen, qd, or, panel, upstream] = await freePorts(9);
-    P = { bai, sn, wb, wbai, zen, qd, or, panel, upstream };
+    const [bai, sn, wb, wbai, zen, qd, or, panel, upstream, mm] = await freePorts(10);
+    P = { bai, sn, wb, wbai, zen, qd, or, panel, upstream, mm };
     dataDir = mkdtempSync(path.join(TMPROOT, "boot-"));
 
     const cfg = JSON.parse(readFileSync(path.join(REPO, "src", "server", "config.defaults.json"), "utf8"));
     cfg.relayPort = bai; cfg.panelPort = panel;
     Object.assign(cfg, { sn: { ...cfg.sn, relayPort: sn }, wb: { ...cfg.wb, relayPort: wb },
       wbai: { ...cfg.wbai, relayPort: wbai }, zen: { ...cfg.zen, relayPort: zen },
-      qd: { ...cfg.qd, relayPort: qd }, or: { ...cfg.or, relayPort: or } });
+      qd: { ...cfg.qd, relayPort: qd }, mm: { ...cfg.mm, relayPort: mm },
+      or: { ...cfg.or, relayPort: or } });
     cfg.failover.enabled = false;
     /* ⚠ **必须预置 cfg.proxy**，否则服务启动后会跑一次代理探测：
      * detectWorkingProxy() 探到本机 7897 就 applyProxy() 写进 config 并**自重启**

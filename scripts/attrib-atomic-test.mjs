@@ -214,15 +214,16 @@ describe("T1 端到端：真 server.mjs 跑一次流式故障", () => {
   let child, fake, dataDir, P;
 
   before(async () => {
-    const [bai, sn, wb, wbai, zen, qd, or, panel, upstream] = await freePorts(9);
-    P = { bai, sn, wb, wbai, zen, qd, or, panel, upstream };
+    const [bai, sn, wb, wbai, zen, qd, or, panel, upstream, mm] = await freePorts(10);
+    P = { bai, sn, wb, wbai, zen, qd, or, panel, upstream, mm };
     dataDir = mkdtempSync(path.join(TMPROOT, "boot-"));
 
     const cfg = JSON.parse(readFileSync(path.join(REPO, "src", "server", "config.defaults.json"), "utf8"));
     cfg.relayPort = bai; cfg.panelPort = panel;
     Object.assign(cfg, { sn: { ...cfg.sn, relayPort: sn }, wb: { ...cfg.wb, relayPort: wb },
       wbai: { ...cfg.wbai, relayPort: wbai }, zen: { ...cfg.zen, relayPort: zen },
-      qd: { ...cfg.qd, relayPort: qd }, or: { ...cfg.or, relayPort: or } });
+      qd: { ...cfg.qd, relayPort: qd }, mm: { ...cfg.mm, relayPort: mm },
+      or: { ...cfg.or, relayPort: or } });
     cfg.failover.enabled = false;                 // 不让故障转移到别的渠道，污染断言
     // 假凭据（明显不是真 key）+ 全部拨到本机假上游
     cfg.zen = { ...cfg.zen, useProxy: true, apiKey: "sk-dummy-not-a-real-key", upstream: `http://127.0.0.1:${upstream}/v1` };

@@ -686,7 +686,7 @@ describe("③ POST /api/test：提交 + 轮询（不阻塞、能看见 running�
   let child, dataDir, panel;
 
   before(async () => {
-    const [bai, sn, wb, wbai, zen, qd, or, pnl, dead] = await freePorts(9);
+    const [bai, sn, wb, wbai, zen, qd, or, pnl, dead, mm] = await freePorts(10);
     panel = pnl;
     dataDir = path.join(TMPROOT, "data");
     fs.mkdirSync(dataDir, { recursive: true });
@@ -697,7 +697,7 @@ describe("③ POST /api/test：提交 + 轮询（不阻塞、能看见 running�
       sn: { ...cfg.sn, relayPort: sn, upstream: `http://127.0.0.1:${dead}/v1` },
       wb: { ...cfg.wb, relayPort: wb }, wbai: { ...cfg.wbai, relayPort: wbai },
       zen: { ...cfg.zen, relayPort: zen }, qd: { ...cfg.qd, relayPort: qd },
-      or: { ...cfg.or, relayPort: or },
+      mm: { ...cfg.mm, relayPort: mm }, or: { ...cfg.or, relayPort: or },
     });
     cfg.failover.enabled = false;
     /* ⚠ 必须预置 cfg.proxy，否则启动后会跑代理探测、探到本机 7897 就写进配置并自重启。 */

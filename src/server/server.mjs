@@ -5641,10 +5641,12 @@ function providerConfigured(provider, cfg) {
 
 /* mm（MiniMax 会员）转发前的请求头准备。
  *
- * 上游同时校验四样东西：**Bearer 令牌 + 完整 MiniMaxAgent 浏览器 UA + Origin + Referer**。
- * 实测过 7 种组合，只有这一全套返回 200（`token` 头、无 UA、无 Origin 的变体全部 401
- * auth failed）。所以这里**整份重建**头：客户端送来的 authorization / x-api-key /
- * user-agent / origin / referer 一律作废，由我们自己的顶上。
+ * ⚠️ 实测（2026-10-19，MiniMax Code 3.1.4，9 种头组合）：上游真正硬要求的只有
+ *   **两样** —— `authorization: Bearer <令牌>` 与 `content-type: application/json`。
+ *   x-api-key / origin / referer / anthropic-version / user-agent **去掉仍然 200**
+ *   （`token` 头代替 authorization 则 401）。
+ *   所以这里**整份重建**头（客户端送来的同名头一律作废、UA 也换成 MiniMaxAgent 的），
+ *   理由是「与真客户端保持一致、留一手」，**不是**「缺了会 401」。
  *
  * 顺带把**令牌续期**放在这里：快到期（剩不到 5 分钟）时用刷新令牌换新的，
  * 换回来的新刷新令牌**立刻存进内存**（旧的已作废）。续期失败会把**不含令牌值**的

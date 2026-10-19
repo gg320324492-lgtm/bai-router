@@ -671,8 +671,8 @@ function live(port) {
 
 /** 真 server.mjs 起一份。端口动态挑空闲（17xxx 段），数据目录是临时目录。 */
 async function bootServer() {
-  const ports = await freePorts(8);
-  const P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7] };
+  const ports = await freePorts(9);
+  const P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
   const dataDir = mkdtempSync(path.join(TMPROOT, "boot-"));
 
   const cfg = JSON.parse(readFileSync(DEFAULTS_JSON, "utf8"));
@@ -681,7 +681,7 @@ async function bootServer() {
    * ② 同时把代理环境变量从子进程环境里摘掉。两件事缺一不可（见 oc-wiring-test 的同款注释）。 */
   cfg.proxy = "http://127.0.0.1:7897";
   cfg.relayPort = P.bai; cfg.panelPort = P.panel;
-  for (const k of ["sn", "wb", "wbai", "zen", "qd", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
+  for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
   fs.writeFileSync(path.join(dataDir, "config.json"), JSON.stringify(cfg, null, 2));
 
   const out = [];

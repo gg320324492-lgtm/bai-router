@@ -187,10 +187,11 @@ async function startServer(dataDir, P, upstreamPort, patch) {
   /* 预置成探测必选中的值，否则服务启动时 applyProxy 自重启（exit(0)）把本进程带走 */
   cfg.proxy = "http://127.0.0.1:7897";
   cfg.relayPort = P.bai; cfg.panelPort = P.panel;
-  for (const k of ["sn", "wb", "wbai", "zen", "qd", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
+  for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
   /* 其他渠道一律空凭据 + 指到同一个假上游：启动期的目录同步只会拿到 404，
-     不会碰到真实网络，也不会改写我们夹在下面的那份映射。 */
-  for (const k of ["sn", "wb", "wbai", "zen", "qd", "or"]) {
+     不会碰到真实网络，也不会改写我们夹在下面的那份映射。
+     ⚠ mm 也要在内：它的上游是**真的** agent.minimax.cn，不改就会打到真网络。 */
+  for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) {
     cfg[k].upstream = `http://127.0.0.1:${upstreamPort}`;
     cfg[k].accessToken = ""; cfg[k].refreshToken = ""; cfg[k].apiKey = "";
   }
@@ -256,8 +257,8 @@ describe("T9 ★①② 活体：静默回落必须留痕", () => {
   const hits = [];
 
   before(async () => {
-    const ports = await portsInRange(8);
-    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7] };
+    const ports = await portsInRange(9);
+    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
     dataDir = path.join(TMPROOT, "data-fallback");
     upstream = await startFakeUpstream(hits);
     server = await startServer(dataDir, P, upstream.address().port, patchSn);
@@ -299,7 +300,7 @@ describe("T9 ★①② 活体：静默回落必须留痕", () => {
      *   bai 那家在 /api/status 里是**平铺**的（历史字段名，见 statusPayload），其余各家在自己的子对象下。 */
     assert.deepEqual(st.modelFallback, [],
       `★ 没发生回落的那家（bai）必须是空数组。实际 ${JSON.stringify(st.modelFallback)}`);
-    for (const k of ["wb", "wbai", "zen", "qd", "or"]) {
+    for (const k of ["wb", "wbai", "zen", "qd", "mm", "or"]) {
       assert.deepEqual((st[k] || {}).modelFallback, [],
         `★ 没发生回落的那家（${k}）必须是空数组。实际 ${JSON.stringify((st[k] || {}).modelFallback)}`);
     }
@@ -355,8 +356,8 @@ describe("T9 ★③ 活体：模型名在映射里时与改动前逐字一致", 
   const hits = [];
 
   before(async () => {
-    const ports = await portsInRange(8);
-    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7] };
+    const ports = await portsInRange(9);
+    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
     dataDir = path.join(TMPROOT, "data-normal");
     upstream = await startFakeUpstream(hits);
     server = await startServer(dataDir, P, upstream.address().port, patchSn);
@@ -422,8 +423,8 @@ describe("T9 ★②⑤ 活体：换模之后面板显示的是真实服务的模
   const hits = [];
 
   before(async () => {
-    const ports = await portsInRange(8);
-    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7] };
+    const ports = await portsInRange(9);
+    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
     dataDir = path.join(TMPROOT, "data-swap");
     upstream = await startFakeUpstream(hits);
     server = await startServer(dataDir, P, upstream.address().port, patchWb);
@@ -580,7 +581,7 @@ describe("T9 ★④ 源码判据：面板必须一眼看出「以为在用 A 其
 
   test("★ 渲染层不许认识渠道名（C11）：面板那两处一个渠道字面量都不许出现", () => {
     const fn = sliceBetween(PANEL_SRC, "  function modelIdentityItems(S, name) {", "  function buildDiag() {");
-    for (const k of ["bai", "sn", "wb", "wbai", "zen", "qd", "or"]) {
+    for (const k of ["bai", "sn", "wb", "wbai", "zen", "qd", "mm", "or"]) {
       assert.equal(new RegExp(`["'\`]${k}["'\`]`).test(fn), false,
         `★ 渲染层不许出现渠道名 ${k}（渠道名由调用方 nameOf 传进来）。片段：\n${fn.slice(0, 400)}`);
     }

@@ -360,15 +360,16 @@ describe("D. e2e：客户端真正看到的东西", () => {
   let upstreamBody = "";    // 每个用例自己设
 
   before(async () => {
-    const [bai, sn, wb, wbai, zen, qd, or, panel, upstream] = await freePorts17(9);
-    P = { bai, sn, wb, wbai, zen, qd, or, panel, upstream };
+    const [bai, sn, wb, wbai, zen, qd, or, panel, upstream, mm] = await freePorts17(10);
+    P = { bai, sn, wb, wbai, zen, qd, or, panel, upstream, mm };
     dataDir = mkdtempSync(path.join(TMPROOT, "boot-"));
 
     const cfg = JSON.parse(readFileSync(path.join(REPO, "src", "server", "config.defaults.json"), "utf8"));
     cfg.relayPort = bai; cfg.panelPort = panel;
     Object.assign(cfg, { sn: { ...cfg.sn, relayPort: sn }, wb: { ...cfg.wb, relayPort: wb },
       wbai: { ...cfg.wbai, relayPort: wbai }, zen: { ...cfg.zen, relayPort: zen },
-      qd: { ...cfg.qd, relayPort: qd }, or: { ...cfg.or, relayPort: or } });
+      qd: { ...cfg.qd, relayPort: qd }, mm: { ...cfg.mm, relayPort: mm },
+      or: { ...cfg.or, relayPort: or } });
     cfg.failover.enabled = false;
     /* 预置 cfg.proxy：否则 server.mjs 启动后会跑代理探测、applyProxy 后**自重启**
      * （server.mjs:876 spawn 继任者后 exit(0)），本进程被杀 → 后面全 ECONNREFUSED。

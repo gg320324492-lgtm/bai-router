@@ -130,8 +130,8 @@ describe("活体 429：诊断 / 回灌 / 换号", () => {
   let limitA = true;
 
   before(async () => {
-    const ports = await portsInRange(8);
-    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7] };
+    const ports = await portsInRange(9);
+    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
     dataDir = path.join(TMPROOT, "data");
     fs.mkdirSync(dataDir, { recursive: true });
 
@@ -172,7 +172,7 @@ describe("活体 429：诊断 / 回灌 / 换号", () => {
     /* 预置成探测必选中的值，否则服务启动会 applyProxy 自重启（exit(0)）把本进程带走 */
     cfg.proxy = "http://127.0.0.1:7897";
     cfg.relayPort = P.bai; cfg.panelPort = P.panel;
-    for (const k of ["sn", "wb", "wbai", "zen", "qd", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
+    for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
     cfg.wb.accessToken = ""; cfg.wb.refreshToken = "";
     cfg.wb.upstream = `http://127.0.0.1:${upPort}`;
     cfg.wb.defaultModel = MODEL;

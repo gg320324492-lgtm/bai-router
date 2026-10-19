@@ -192,7 +192,7 @@ async function startServer(dataDir, P, upstreamPort, patch) {
   /* 预置成探测必选中的值，否则服务启动时 applyProxy 自重启（exit(0)）把本进程带走 */
   cfg.proxy = "http://127.0.0.1:7897";
   cfg.relayPort = P.bai; cfg.panelPort = P.panel;
-  for (const k of ["sn", "wb", "wbai", "zen", "qd", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
+  for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
   cfg.wb.accessToken = ""; cfg.wb.refreshToken = "";
   cfg.wb.upstream = `http://127.0.0.1:${upstreamPort}`;
   /* 兜底清单第一个是任何目录里都没有的 FALLBACK_ONLY：
@@ -241,8 +241,8 @@ describe("T8 ①②③ 活体：目录按账号分桶、倍率跟着本次请求
   const hits = [];
 
   before(async () => {
-    const ports = await portsInRange(8);
-    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7] };
+    const ports = await portsInRange(9);
+    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
     dataDir = path.join(TMPROOT, "data-multi");
     upstream = await startFakeUpstream(hits);
     /* round-robin：两次目录抓取分别落在 A、B 上（粘性只对带 sessionKey 的模型请求
@@ -359,8 +359,8 @@ describe("T8 ④ 活体：单账号与改动前逐字一致", () => {
   const hits = [];
 
   before(async () => {
-    const ports = await portsInRange(8);
-    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7] };
+    const ports = await portsInRange(9);
+    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
     dataDir = path.join(TMPROOT, "data-solo");
     upstream = await startFakeUpstream(hits);
     /* ★ 旧配置形态：**只有 accessToken、没有 accounts** → 合成单条目池。

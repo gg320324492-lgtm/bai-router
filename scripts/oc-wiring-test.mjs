@@ -197,8 +197,8 @@ process.on("exit", () => {
 
 /** 真 server.mjs 起一份：临时 DATA_DIR、端口全部动态挑空闲的、预设 proxy 防自重启。 */
 async function bootServer(cfgOverrides) {
-  const ports = await freePorts(10);
-  const P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], upstream: ports[8], oc: ports[9] };
+  const ports = await freePorts(11);
+  const P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], upstream: ports[8], oc: ports[9], mm: ports[10] };
   const dataDir = mkdtempSync(path.join(TMPROOT, "boot-"));
 
   const cfg = JSON.parse(readFileSync(DEFAULTS_JSON, "utf8"));
@@ -220,7 +220,7 @@ async function bootServer(cfgOverrides) {
   /* 端口**最后**统一改写：override 若整块替换了某个渠道的子对象（`{...DEFAULTS.zen}`），
    * 会在前面把它带回出厂端口 15752 —— 那正是真实装机在用的端口，绝不能去抢。 */
   cfg.relayPort = P.bai; cfg.panelPort = P.panel;
-  for (const k of ["sn", "wb", "wbai", "zen", "qd", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
+  for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
   writeFileSync(path.join(dataDir, "config.json"), JSON.stringify(cfg, null, 2));
 
   const out = [];

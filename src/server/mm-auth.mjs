@@ -40,13 +40,28 @@
  *   凭据轮换是本渠道最容易出错的一环（续期、轮换、失败处置），
  *   所以把它放进一个**零副作用、可注入假 fetch** 的纯模块，由 scripts/mm-auth-test.mjs 直接求值。
  *
- * ## 头的事（踩过的坑）
+ * ## 头的事（2026-10-19 实测，MiniMax Code 3.1.4）
  *
- *   缺 Origin/Referer 就 401 auth failed。实测过 7 种组合，
- *   **只有「Bearer + 完整 MiniMaxAgent 浏览器 UA + Origin + Referer」这一种返回 200**
- *   （`token` 头、无 UA、无 Origin 的变体全部 401）。
- *   所以 mmBuildHeaders 是**整份重建**而不是"补几个头"：客户端送来的
- *   authorization / x-api-key / user-agent / origin / referer 一律作废、由我们自己的顶上。
+ *   实测了 9 种头组合，结论和最初的猜测**不一样**，以这里为准：
+ *
+ *   | 头 | 必需？ | 证据 |
+ *   |---|---|---|
+ *   | `authorization: Bearer <accessToken>` | **必需** | 去掉 → 401 `auth failed` |
+ *   | `content-type: application/json` | **必需** | 去掉 → 400 `invalid params` |
+ *   | `x-api-key` | 可选 | 去掉仍然 200 |
+ *   | `origin` / `referer` | 可选 | 去掉仍然 200 |
+ *   | `anthropic-version` | 可选 | 去掉仍然 200 |
+ *   | `user-agent` | 可选 | 去掉仍然 200（换任何 UA 也都 200） |
+ *   | `token` 头（代替 authorization） | 无效 | 401 `auth failed` |
+ *
+ *   ⚠️ **UA / Origin / Referer 都不是校验对象**——我照样全套发出去，是为了
+ *   和真客户端保持一致、也留一手，但**它们不是「缺了就 401」的原因**。
+ *   真正的两处硬要求是：**鉴权令牌** 与 **content-type**。
+ *
+ *   ⚠️ 同理，**system prompt 的内容与形状也不参与校验**（Claude Code 的原文 /
+ *   一句普通提示 / 完全不写 / 数组多块形状，四种都 200）。
+ *   真正被上游挑刺的是**工具定义的形状**（见 {@link mmNormalizeTools}）：
+ *   嵌套形状 → 400 `invalid params, function name is empty (2013)`。
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -128,7 +143,7 @@ export function mmAuthFilePath(homeDir) {
  * 读不到 / 解析失败 / 一条都没有 → 返回 null（调用方据此说「没登录」，不许瞎猜）。
  *
  * @param {string} file
- * @returns {{accessToken:string, refreshToken:string, expiresAtMs:number, clientId:string, scopes:string, audience:string, recordKey:string}|null}
+ * @returns {{accessToken:string, refreshToken:string, expiresAtMs:number, clientId:string, scopes:string, audience:string, recordKey:string, generation:number}|null}
  */
 export function readMmAuthRecord(file) {
   let doc = null;
@@ -152,6 +167,12 @@ export function readMmAuthRecord(file) {
       scopes: typeof r.scopes === "string" && r.scopes ? r.scopes : MM_SCOPE,
       audience: typeof r.audience === "string" && r.audience ? r.audience : MM_AUDIENCE,
       recordKey: String(k),
+      /* 🔴 `generation` 是**判断「谁的令牌更新」的唯一依据**。
+       *   刷新令牌是一次性轮换的：MiniMax Code 续一次期，文件里的 generation +1，
+       *   而**旧的那把刷新令牌当场作废**。本模块和 MiniMax Code 用的是同一把，
+       *   谁先续谁就把对方的作废掉 —— 所以必须能分清「文件里的是新轮换出来的」
+         还是「我内存里的是新轮换出来的（文件还没跟上）」，否则两边会互相把对方作废。 */
+      generation: Number(r.generation) || 0,
     };
   }
   return null;
@@ -162,10 +183,16 @@ export function readMmAuthRecord(file) {
 /**
  * 造转发用的**整份**请求头。
  *
- * 为什么是「整份重建」而不是「在客户端头的基础上补几个」：上游同时校验
- * authorization / x-api-key / user-agent / origin / referer，客户端送来的同名头
- * 必须**作废**（客户端的 base URL 上游根本认，UA 也不是 MiniMaxAgent）。
- * 只保留两个无害的协议头：anthropic-beta（Beta 特性开关）与 accept（流式协商）。
+ * 为什么是「整份重建」而不是「在客户端头的基础上补几个」：
+ * 客户端送来的 authorization / x-api-key / user-agent / origin / referer
+ * **一律作废**（客户端的 base URL 上游根本不认，UA 也不是 MiniMaxAgent 的），
+ * 由我们自己的顶上。只保留两个无害的协议头：anthropic-beta（Beta 特性开关）
+ * 与 accept（流式协商）。
+ *
+ * ⚠️ 实测（2026-10-19，MiniMax Code 3.1.4）：**只有 `authorization: Bearer` 与
+ *   `content-type: application/json` 是硬要求**，其余（x-api-key / origin /
+ *   referer / anthropic-version / user-agent）**去掉仍然 200**。
+ *   全套照发是为了与真客户端一致、也留一手；**不是**因为缺了会 401。
  *
  * @param {string} accessToken 本渠道自己的访问令牌
  * @param {object} [clientHeaders] 客户端送来的头（只取 anthropic-beta / accept / content-type / anthropic-version）
@@ -286,6 +313,13 @@ export function createMmTokenStore(opts = {}) {
     refreshToken: "",
     expiresAtMs: 0,
     recordKey: "",
+    /** 我们手上这把刷新令牌是第几代（= 文件里 `generation` 的同口径）。
+     *  用来分清「文件里的更新」与「我们内存里的更新」—— 刷新令牌一次性轮换，
+     *  认错了就会把 MiniMax Code 的那把作废掉（或者反过来把自己的扔掉）。 */
+    generation: 0,
+    /** 已经被上游作废的那把刷新令牌（值本身）。
+     *  记下来是为了**不重复去撞**：明知它死了还拿它去续期，就是拿上游当靶子刷。 */
+    deadRefresh: "",
     loaded: false,
     invalid: false,      // invalid_grant 之后为真：不再自动重试，等用户重新登录
     error: null,
@@ -311,9 +345,8 @@ export function createMmTokenStore(opts = {}) {
    *
    * @param {object} [o]
    * @param {boolean} [o.force] true = 无条件用文件里的刷新令牌覆盖内存里的。
-   *   默认（false）只在内存里还没有刷新令牌、或文件里是**另一个账号**时才覆盖——
-   *   因为本模块自己轮换过之后，内存里的那份比磁盘上的**新**（磁盘那份已作废），
-   *   这时候再读一遍文件会把新令牌覆盖成旧的，凭据链当场断掉。
+   *   默认（false）只在「内存里还没有刷新令牌」「文件里是**另一个账号**」
+   *   「文件里的是**更新的一代**」或「文件明显比我们内存里的新」时才覆盖。
    * @returns {{ok:boolean, reason:string|null, changed:boolean}}
    */
   function readAuthFile(o = {}) {
@@ -326,26 +359,40 @@ export function createMmTokenStore(opts = {}) {
     }
     const sameAccount = st.recordKey && st.recordKey === rec.recordKey;
     const incExp = Number(rec.expiresAtMs) || 0;
+    const fileGen = Number(rec.generation) || 0;
+    const fileAccessLive = incExp > now();                       // 文件里的访问令牌还有效
+    const fileNewer = fileGen > (Number(st.generation) || 0);    // 文件是 MiniMax Code 续出来的
     const changed = st.refreshToken !== rec.refreshToken || st.accessToken !== rec.accessToken;
-    /* 访问令牌：只在「我们手上没有」或「文件里那份更新」时才覆盖。
-     * 本模块自己轮换过之后，内存里那份比磁盘上的**新**（磁盘那份已作废）——
-     * 这时候再读一遍文件、拿磁盘那份盖掉内存里的，就等于把凭据链打断。 */
-    if (o.force || !st.accessToken || incExp > st.expiresAtMs) {
+
+    /* 🔴 该不该采用文件里那份？
+     *
+     *   刷新令牌是**一次性**的：MiniMax Code 续一次期，旧的当场作废。
+     *   本模块和 MiniMax Code 用的是**同一把**，所以：
+     *     · 文件里的更新（generation 更大 / 访问令牌还有效）→ 它是 MiniMax Code
+     *       刚续出来的，**必须跟着换**，否则我们拿着已作废的那把去续期，
+     *       只会得到 invalid_grant，然后**误报「登录态已失效」**——
+     *       而用户明明好好地登录着 MiniMax Code。
+     *     · 我们内存里的更新（我们续过、文件还没跟上）→ 保留内存里那份，
+     *       否则会把我们自己的好令牌换成一把已经作废的。
+     */
+    const fileIsStale = !o.force && st.refreshToken && sameAccount && !fileAccessLive && !fileNewer;
+    if (!fileIsStale) {
       st.accessToken = rec.accessToken || "";
       st.expiresAtMs = incExp;
-    }
-    /* 刷新令牌：只在「我们手上没有」「换了账号」或「用户显式点了重新读取」时才覆盖。
-     * 同账号时保留内存里那份——它可能正是本模块轮换出来的最新那把。 */
-    if (o.force || !st.refreshToken || !sameAccount) {
       st.refreshToken = rec.refreshToken;
       st.recordKey = rec.recordKey;
+      st.generation = fileGen;
       st.invalid = false;
       st.error = null;
       st.nextAttemptAt = 0;
+      /* 文件给的是一把**没被我们撞死过**的令牌 → 死令牌那笔账可以清了 */
+      if (st.deadRefresh && st.deadRefresh !== rec.refreshToken) st.deadRefresh = "";
+    } else {
+      log("MiniMax：登录态文件比我们内存里的旧（我们续过、文件还没跟上）——保留内存里那份");
     }
     st.loaded = true;
-    log(`MiniMax：已从本机登录态读到凭据（账号键 ${scrub(rec.recordKey)}，刷新令牌长度 ${rec.refreshToken.length}）`);
-    return { ok: true, reason: null, changed: changed && !!(o.force || !sameAccount) };
+    log(`MiniMax：已从本机登录态读到凭据（账号键 ${scrub(rec.recordKey)}，刷新令牌长度 ${rec.refreshToken.length}，第 ${fileGen} 代）`);
+    return { ok: true, reason: null, changed: changed && !fileIsStale };
   }
 
   /** 发一次续期请求。**只在这里**出现 refresh token 的明文。 */
@@ -395,6 +442,9 @@ export function createMmTokenStore(opts = {}) {
          * 唯一的出路是用户去 MiniMax Code 重新登录。 */
         st.invalid = true;
         st.accessToken = "";
+        /* 记下这把已经死了的刷新令牌：下一次 ensure() 见到它还握在手上，
+         * 就不再去撞上游（换句话说：**文件换了新令牌才允许再试**）。 */
+        st.deadRefresh = st.refreshToken;
         st.error = MM_LOGIN_INVALID_MSG;
         log(`MiniMax：续期被拒（invalid_grant）——登录态已失效，等待用户重新登录`);
         throw new Error(MM_LOGIN_INVALID_MSG);
@@ -419,6 +469,9 @@ export function createMmTokenStore(opts = {}) {
     if (j.refresh_token && typeof j.refresh_token === "string" && j.refresh_token.trim()) {
       st.refreshToken = j.refresh_token.trim();
     }
+    /* 我们这把比文件里那份新了一代 → 文件里那把已经作废（我们把它用了）。
+     * 记下来是为了下次读文件时**不**把已作废的那把换回来。 */
+    st.generation = (Number(st.generation) || 0) + 1;
     const exp = Number(j.expires_in) || 3600;
     st.expiresAtMs = now() + exp * 1000;
     st.invalid = false;
@@ -437,18 +490,41 @@ export function createMmTokenStore(opts = {}) {
    * @throws {Error} 消息里**不含**令牌值
    */
   async function ensure() {
-    if (st.invalid) {
-      st.error = MM_LOGIN_INVALID_MSG;
-      throw new Error(MM_LOGIN_INVALID_MSG);
-    }
-    if (!st.loaded) readAuthFile();
+    /* 手上这把还够新 → 直接用（不碰文件、不碰网络）。 */
     if (st.accessToken && st.expiresAtMs && st.expiresAtMs - now() > MM_RENEW_WINDOW_MS) {
       return st.accessToken;
+    }
+    if (!st.loaded) readAuthFile();
+
+    /* 到期了（或此前被判过失效）→ **先读一遍文件**：MiniMax Code 可能刚续过。
+     * 登录态文件是它的凭据库，它续了期我们这边就该跟着换；抱着已经被它
+     * 轮换掉的那把刷新令牌去续期，只会拿到 invalid_grant，然后**误报
+     * 「登录态已失效」**——而用户明明好好地登录着 MiniMax Code。 */
+    readAuthFile();
+    if (st.accessToken && st.expiresAtMs && st.expiresAtMs - now() > MM_RENEW_WINDOW_MS) {
+      /* 文件里那把是活的 → 跟着换了，作废状态一并清掉（不必打扰用户）。 */
+      st.invalid = false;
+      st.error = null;
+      st.nextAttemptAt = 0;
+      return st.accessToken;
+    }
+
+    if (st.invalid) {
+      /* 已知这把刷新令牌被上游作废，而文件也没给出新的 →
+       * 再撞一次只会得到同一句 invalid_grant（拿上游当靶子刷）。
+       * 文件一旦换了新令牌，readAuthFile() 会清掉 deadRefresh，续期才被允许。 */
+      st.error = MM_LOGIN_INVALID_MSG;
+      throw new Error(MM_LOGIN_INVALID_MSG);
     }
     if (!st.refreshToken) {
       /* 文件里没有 / 没读到 → 只有一条出路：去 MiniMax Code 登录。 */
       st.error = "本机没读到 MiniMax 登录态——请先在 MiniMax Code 里登录";
       throw new Error(st.error);
+    }
+    if (st.deadRefresh && st.deadRefresh === st.refreshToken) {
+      /* 这把已经死过一次，文件也没换新的 → 不再撞上游。 */
+      st.error = MM_LOGIN_INVALID_MSG;
+      throw new Error(MM_LOGIN_INVALID_MSG);
     }
     if (st.nextAttemptAt && now() < st.nextAttemptAt) {
       throw new Error("MiniMax 续期刚刚失败过，稍后再试（不会反复重试）");
