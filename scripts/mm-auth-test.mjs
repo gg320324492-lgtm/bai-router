@@ -60,6 +60,7 @@ import {
   mmNormalizeTools, mmNormalizeBodyTools, writeBackAuth,
   MM_TOKEN_ENDPOINT, MM_INFER_BASE, MM_MODEL, MM_CLIENT_ID, MM_SCOPE, MM_AUDIENCE,
   MM_ORIGIN, MM_REFERER, MM_USER_AGENT, MM_PLACEHOLDER_KEY, MM_LOGIN_INVALID_MSG,
+  MM_RECHECK_MS,
 } from "../src/server/mm-auth.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -245,6 +246,86 @@ describe("mm 刷新令牌一次性轮换（两端共用同一把）", () => {
     const store = makeStore({ now: () => NOW, readAuth: () => rec });
     store.readAuthFile();
     assert.equal(store.state.generation, 7, "读文件 → 取文件里的 generation");
+  });
+});
+
+/* ====================================================================== *
+ * ①d 「先装路由台、之后才登录 MiniMax Code」——这一格必须自己恢复
+ *
+ *   死锁的成因（2026-10-19 实测复现）：令牌仓库只在**启动时**读一次登录态文件；
+ *   `providerConfigured("mm")` 只问内存，不读磁盘。于是用户装好路由台、
+ *   之后才登录 MiniMax Code → 内存里没有令牌 → mm 被**永久**跳过 →
+ *   请求落到链上的下一家（实测就是 WorkBuddy 的 hy3）。
+ *   修法：判据走 recheck() —— 内存里没有可用令牌时再去读一遍文件（节流 15 秒）。
+ * ====================================================================== */
+
+describe("mm 登录态晚出现 → 自动生效（不靠用户点按钮）", () => {
+  const NOW = 1789000000000;
+  const future = NOW + 3600 * 1000;
+
+  test("★ 启动时没有登录态，之后文件出现 → recheck() 应当捡到它", () => {
+    let hasFile = false;
+    const readAuth = () => {
+      if (!hasFile) return null;
+      return fakeRecord({ generation: 3, accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: future });
+    };
+    const store = makeStore({ readAuth, now: () => NOW });
+
+    assert.equal(store.snapshot().configured, false, "启动时应当是未配置");
+    hasFile = true;                                   // 用户此刻登录了 MiniMax Code
+    const s = store.recheck();
+    assert.equal(s.configured, true, "recheck() 必须去读一遍文件，否则这一格永远被跳过");
+    assert.equal(store.state.refreshToken, NEW_REFRESH, "捡到的必须是文件里那把");
+  });
+
+  test("★ 已经可用时 recheck() 不许重复读文件（每条请求都读磁盘是浪费）", () => {
+    let reads = 0;
+    const store = makeStore({
+      now: () => NOW,
+      readAuth: () => { reads++; return fakeRecord({ generation: 3, expiresAtMs: future }); },
+    });
+    store.recheck();
+    const first = reads;
+    for (let i = 0; i < 50; i++) store.recheck();
+    assert.equal(reads, first, `可用时不该再读文件：读了 ${reads} 次（第一次 ${first} 次）`);
+  });
+
+  test("★ 未配置时 recheck() 有节流（不会每条请求都读磁盘）", () => {
+    let reads = 0;
+    const store = makeStore({ now: () => NOW, readAuth: () => { reads++; return null; } });
+    store.recheck();                                  // 第一次：读
+    assert.equal(reads, 1);
+    for (let i = 0; i < 20; i++) store.recheck();     // 仍在 15 秒窗口内
+    assert.equal(reads, 1, `节流失效：20 次 recheck 读了 ${reads} 次文件`);
+
+    /* 节流窗口之后应当再读一次 —— 否则用户登录后这一格永远不恢复。 */
+    const later = NOW + MM_RECHECK_MS + 1;
+    const store2 = makeStore({ now: () => later, readAuth: () => null });
+    store2.state.lastRecheckAt = NOW;
+    store2.recheck();
+    assert.ok(store2.state.lastRecheckAt >= later, "窗口过期后必须重新读");
+  });
+
+  test("★ 登录态作废（invalid_grant）后，文件换新令牌 → recheck 自动恢复", async () => {
+    let rec = null;
+    const store = makeStore({
+      now: () => NOW,
+      readAuth: () => rec,
+      fetchImpl: fakeFetch(() => ({
+        status: 400, body: { error: "invalid_grant", error_description: "this refresh token can no longer be used" },
+      })),
+    });
+    rec = fakeRecord({ generation: 4, expiresAtMs: NOW - 1000 });
+    store.recheck();
+    assert.equal(store.snapshot().configured, true);
+    await store.ensure().catch(() => { });
+    assert.equal(store.state.invalid, true, "前置：续期失败，这一格被判失效");
+
+    rec = fakeRecord({ generation: 5, accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: future });
+    store.state.lastRecheckAt = 0;                    // 绕过节流（生产里靠时间窗口）
+    const s = store.recheck();
+    assert.equal(s.configured, true, "文件里有新令牌 → 应当自动恢复");
+    assert.equal(s.invalid, false, "恢复后不许还报「已失效」");
   });
 });
 
@@ -768,8 +849,7 @@ describe("mm 工具定义形状转换", () => {
     assert.equal(mmNormalizeBodyTools(null), null);
   });
 
-  test("★ 接线：mm 渠道必须挂上 prepareBody（否则带工具的请求全被 400）", () => {
-    /* ⚠ 必须**两处注册点分别**断言。
+  test("★ 接线：mm 渠道必须挂上 prepareBody（否则带工具的请求全被 400）", () => {    /* ⚠ 必须**两处注册点分别**断言。
      *   只断言「文件里出现过 prepareBody: mmPrepareBody」是不够的——
      *   删掉其中一处，另一处还在，正则会照样匹配上，测试假绿。
      *   （这正是 wb-token-test.mjs 的老教训：判据被替身顶替，等于没有判据。） */
@@ -878,6 +958,22 @@ describe("mm 接线完整性", () => {
     const cardSrc = readFileSync(path.join(REPO, "src", "server", "cards", "mm-member.js"), "utf8");
     assert.match(cardSrc, /memberQuota/, "会员额度卡要按清单声明认领");
     assert.match(PROVIDERS_SRC, /"mm-member"/, "视图表里要挂上 mm-member 卡");
+  });
+
+  test("★ 接线：转移链的 mm 判据必须走 recheck()，不能只问内存", () => {
+    /* 只问内存 = 死锁。令牌仓库只在启动时读一次登录态文件，而
+       `providerConfigured` 不读磁盘 → 「先装路由台、之后才登录 MiniMax Code」
+       这一格**永远**被跳过，请求落到链上的下一家（实测就是 WorkBuddy 的 hy3）。
+       2026-10-20 复现：启动时无登录态 → 请求 502；登录态文件出现 → **仍然**未配置；
+       只有点「重新读取登录态」才恢复。 */
+    const i = SERVER_SRC.indexOf("function providerConfigured(");
+    assert.ok(i >= 0, "server.mjs 里必须有 providerConfigured");
+    const fn = SERVER_SRC.slice(i, SERVER_SRC.indexOf("\n}", i));
+    const mmBranch = fn.slice(fn.indexOf('provider === "mm"'));
+    assert.match(mmBranch, /mmTokens\.recheck\(\)/,
+      "providerConfigured 的 mm 分支必须调 recheck()（它会重读登录态文件）");
+    assert.doesNotMatch(mmBranch, /mmTokens\.snapshot\(\)/,
+      "❌ 只问内存快照 = 死锁；判据必须允许「晚出现的登录态」");
   });
 });
 

@@ -156,10 +156,10 @@ describe("① 服务端留痕：有跳转就记，没有就不记", () => {
 
   test("★ 内存有界：连打 5000 次也不能长大（最坏占用是个常数）", () => {
     _resetSilentJumpForTest();
-    /* 5000 次跳转，按**时间先后**落在 7 家渠道的所有有序对上、跨约 7 小时。
+    /* 5000 次跳转，按**时间先后**落在 8 家渠道的所有有序对上、跨约 7 小时。
        ⚠ 必须顺着时间记：留痕记的是「这一对最后一次发生在什么时候」，乱序记会让
          lastAt 落到很早的分钟，测的就不是真实情形了。 */
-    const CH = ["qd", "bai", "sn", "zen", "wb", "wbai", "or"];
+    const CH = ["qd", "bai", "sn", "zen", "wb", "wbai", "mm", "or"];
     const LAST_MIN = 420;
     let n = 0;
     for (let i = 0; i < 5000; i++) {
@@ -176,11 +176,11 @@ describe("① 服务端留痕：有跳转就记，没有就不记", () => {
       `明细环留了 ${s.kept} 条 > 上界 ${SILENT_JUMP_LOG} —— 这是在无限增长`);
     assert.equal(s.kept, SILENT_JUMP_LOG, `连打 5000 次之后环应当正好是满的 ${SILENT_JUMP_LOG}`);
     assert.ok(s.recent.length <= 8, "recent 是给面板看的那几条，不该把整个环倒出去");
-    /* ② 组合表是**按渠道对**开的，不是按流量开的：7 家最多 49 对。 */
+    /* ② 组合表是**按渠道对**开的，不是按流量开的：8 家最多 64 对。 */
     assert.ok(s.active.length <= SILENT_JUMP_MAX_PAIRS,
       `组合 ${s.active.length} 个 > 兜底上界 ${SILENT_JUMP_MAX_PAIRS}`);
-    assert.ok(s.active.length <= 49,
-      `7 家渠道最多 49 对，却记了 ${s.active.length} 对 —— 说明它是按流量而不是按渠道对开的`);
+    assert.ok(s.active.length <= 64,
+      `8 家渠道最多 64 对，却记了 ${s.active.length} 对 —— 说明它是按流量而不是按渠道对开的`);
     /* ③ 快照整体不能随运行时长变大：序列化后仍然是个小对象。 */
     assert.ok(JSON.stringify(s).length < 40 * 1024,
       `快照 ${JSON.stringify(s).length} 字节，太大了`);
@@ -294,6 +294,10 @@ const MINI = {
   zen: { name: "OpenCode Zen", badge: { text: "免费 · 海外", kind: "intl" } },
   wb: { name: "WorkBuddy", badge: { text: "有免费款", kind: "cn" } },
   wbai: { name: "WorkBuddy AI", badge: { text: "有免费款 · 海外", kind: "intl" } },
+  /* ⚠ 这份夹具必须跟 providers.js 的清单同数量：v1.0.89 加第 8 家（mm）时这里漏了，
+     于是「mm 入口被换人」那一格的文案在测试里**不存在** —— 闸门查的是真清单，
+     不会报这份夹具的漂移。下面的数量断言就是防这个。 */
+  mm: { name: "MiniMax 会员", badge: { text: "会员额度", kind: "cn" } },
   or: { name: "OpenRouter", badge: { text: "免费 · 海外", kind: "intl" } },
 };
 const nameOf = (k) => (MINI[k] && MINI[k].name) || k;
@@ -303,6 +307,84 @@ const badgeKindOf = (k) => ((MINI[k] || {}).badge || {}).kind || "";
 const sj = (act, extra) => Object.assign({ windowMin: 60, total: 0, recent: [] }, extra || {}, { active: act });
 const JUMP = (from, to, count, extra) => Object.assign(
   { from, to, count, total: count, lastAt: iso(BASE), model: "hy3" }, extra || {});
+
+/* ====================================================================== *
+ * ①b 第 8 家（mm）进链之后：两个实测踩到的坑
+ *
+ *   背景（2026-10-19，用户在另一台机器上的真实现象）：
+ *   接入的是 MiniMax 会员，但 CC Switch 的请求日志里模型**一直是 hy3**（WorkBuddy）。
+ *   复现确认机制：入口是 mm 中转 → `providerConfigured("mm")` 为假 → mm 被**跳过**
+ *   → 链上的下一家接手 → 发出去的模型是 wb 的 hy3。
+ * ====================================================================== */
+
+describe("①b 入口被跳过（未配置）也必须记，且判据不许用入口渠道", () => {
+  test("★ mm 未配置被跳过、wb 接上 → 记成 mm|wb（这正是用户体感到的现象）", () => {
+    _resetSilentJumpForTest();
+    const tries = [
+      { provider: "mm", skipped: "未配置" },
+      { provider: "qd", ok: false, status: 502 },
+      { provider: "bai", skipped: "未配置" },
+      { provider: "sn", skipped: "未配置" },
+      { provider: "zen", skipped: "未配置" },
+      { provider: "wb", ok: true },
+    ];
+    const r = noteSilentJump("mm", tries, "hy3", false, BASE);
+    assert.deepEqual(r, { from: "mm", to: "wb" },
+      "入口被跳过也必须记 —— 否则面板完全看不见「接入的是 MiniMax，回答的是 WorkBuddy」");
+    const s = snapAt();
+    assert.equal(s.active[0].from, "mm");
+    assert.equal(s.active[0].to, "wb");
+    assert.equal(s.active[0].model, "hy3", "实际发出去的模型名必须一起记下来");
+  });
+
+  test("★ 组合上界必须**严格大于**渠道对数（第 8 家进链后 8×8=64 正好撞线）", () => {
+    /* 可进链的渠道集合（providers.js 里 chainable !== false 的）。 */
+    const CH = ["bai", "sn", "wb", "wbai", "zen", "qd", "mm", "or"];
+    const pairs = CH.length * (CH.length - 1);
+    assert.ok(SILENT_JUMP_MAX_PAIRS > pairs,
+      `可进链 ${CH.length} 家 ⇒ ${pairs} 对，而兜底上界只有 ${SILENT_JUMP_MAX_PAIRS}。`
+      + "上界 ≤ 真实对数时，淘汰会在**没有超界**的情况下触发，面板静悄悄少报一种换人组合。");
+  });
+
+  test("★ 扣钱判据必须按**实际服务的那一家**查，不是按入口（接线断言）", () => {
+    /* 为什么这条重要：`mm → wb` 这一跳里发出去的 hy3 属于 wb。
+       按入口 mm 查 → servedModelCostsMoney 里 `isWk("mm")` 为假 → 返回 null
+       → 面板只说「换人」，**永远说不出**「这些对话是在 WorkBuddy 的账上完成的」。
+       而「到底花的是谁的钱」正是 v1.0.88 修这类事故的核心。 */
+    const serverSrc = readFileSync(path.join(REPO, "src", "server", "server.mjs"), "utf8");
+    assert.match(serverSrc, /servedModelCostsMoney\(served\.provider/,
+      "noteFailoverEvent 必须按实际服务的渠道查 credits —— 按入口查是用错了渠道");
+    assert.doesNotMatch(serverSrc, /servedModelCostsMoney\(from\b/,
+      "❌ 不许把入口渠道传给 servedModelCostsMoney：入口不是计费的那一家");
+    /* 而且必须先找出「实际服务的那一家」，找不到就不下结论（null）。 */
+    assert.match(serverSrc, /t\.ok === true && t\.provider && t\.provider !== from/,
+      "必须先定位实际接手的渠道；没有接手者时 costs 应当是 null");
+  });
+
+  test("★ 测试夹具不许漏渠道（漏一家 = 那一格的文案永远测不到）", () => {
+    /* check-manifest 查的是**真清单** vs 种子配置，它查不到测试夹具里的这份副本。
+       v1.0.89 加第 8 家（mm）时两份夹具（MINI / CARD_MANIFEST）都漏了 mm，
+       于是「mm 入口被换人」那一格在测试里根本不存在，而闸门全绿。 */
+    const sb = { window: {} };
+    vm.createContext(sb);
+    new vm.Script(readFileSync(path.join(REPO, "src", "server", "providers.js"), "utf8"), { filename: "providers.js" }).runInContext(sb);
+    const real = sb.window.BAI_PROVIDERS || {};
+    const chainable = Object.keys(real).filter((k) => real[k] && real[k].chainable !== false);
+
+    for (const [name, fixture] of [["MINI", MINI], ["CARD_MANIFEST", CARD_MANIFEST]]) {
+      const keys = Object.keys(fixture).filter((k) => fixture[k] && fixture[k].chainable !== false);
+      const miss = chainable.filter((k) => !keys.includes(k));
+      const extra = keys.filter((k) => !chainable.includes(k));
+      assert.deepEqual(miss, [], `${name} 缺这些渠道（真清单有、夹具没有）：${miss.join(",")} —— 那一格的面板文案测不到`);
+      assert.deepEqual(extra, [], `${name} 多这些渠道：${extra.join(",")}`);
+      /* 名字也要跟真清单一致，否则断言里的标题是编的。 */
+      for (const k of chainable) {
+        assert.equal((fixture[k] || {}).name, real[k].name,
+          `${name} 里 ${k} 的名字「${(fixture[k] || {}).name}」与真清单「${real[k].name}」不一致 —— 标题断言会测错`);
+      }
+    }
+  });
+});
 
 describe("② 面板文案：说人话，且不误报", () => {
   test("★ 入口 ≠ 实际服务 → 必须出提示，标题里两个渠道名都要有", () => {
@@ -448,6 +530,18 @@ describe("② 面板文案：说人话，且不误报", () => {
     assert.ok(!/计费/.test(all), `查不到却下了计费结论：${all}`);
   });
 
+  test("★ 用户报的场景：入口是 MiniMax 会员、接手的是 WorkBuddy，标题必须指名两家", () => {
+    /* 2026-10-19 真实场景：另一台机器接入 MiniMax 会员，但请求日志里模型一直是 hy3。
+       面板必须把这一跳写出来，而不是沉默。 */
+    const f = loadJumpAdvice(BASE);
+    const a = f(sj([JUMP("mm", "wb", 12, { costs: false, model: "hy3" })], { total: 30 }), nameOf, badgeKindOf);
+    assert.ok(a, "mm → wb 换人必须提示");
+    assert.equal(a.title, "你选的是 MiniMax 会员，实际回答你的是 WorkBuddy", `标题不对：${a.title}`);
+    const all = [a.title, ...a.lines, a.advice].join(" | ");
+    assert.ok(/hy3/.test(all), `文案里必须说清实际发出去的模型：${all}`);
+    assert.ok(!/计费|账上/.test(all), "hy3 实测是 0 积分，不能说成扣钱：" + all);
+  });
+
   test("「最近一次 X 前」的时间话术分档正确", () => {
     const t = (mins) => loadJumpAdvice(at(BASE, mins))(sj([JUMP("zen", "wb", 0, { lastAt: iso(BASE) })]), nameOf, badgeKindOf);
     assert.match(t(0).lines.join(" "), /刚刚/);
@@ -495,10 +589,14 @@ const CARD_MANIFEST = {
   zen: { key: "zen", name: "OpenCode Zen", badge: { text: "免费 · 海外", kind: "intl" }, chainable: true },
   wb: { key: "wb", name: "WorkBuddy", badge: { text: "有免费款", kind: "cn" }, chainable: true },
   wbai: { key: "wbai", name: "WorkBuddy AI", badge: { text: "有免费款 · 海外", kind: "intl" }, chainable: true },
+  /* ⚠ 这份夹具必须跟 providers.js 的清单同数量。v1.0.89 加第 8 家（mm）时这里漏了，
+     于是「mm 入口被换人」那一格在测试里**根本不存在** —— 夹具漏一家，
+     面板文案测不到那一格，而闸门也不会报（它查的是真清单，不是这份夹具）。 */
+  mm: { key: "mm", name: "MiniMax 会员", badge: { text: "会员额度", kind: "cn" }, chainable: true },
   or: { key: "or", name: "OpenRouter", badge: { text: "免费 · 海外", kind: "intl" }, chainable: true },
   ccswitch: { key: "ccswitch", name: "交还区", badge: { text: "非本台渠道", kind: "neutral" }, chainable: false },
 };
-const CHAIN = ["qd", "bai", "sn", "zen", "wb", "wbai", "or"];
+const CHAIN = ["qd", "bai", "sn", "zen", "wb", "wbai", "mm", "or"];
 
 /**
  * 把**整份** cards/failover.js 挂进沙箱并 mount 一次。

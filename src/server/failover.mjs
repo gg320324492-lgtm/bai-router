@@ -86,16 +86,19 @@ export function failoverSnapshot() {
  * —— 内存为什么是有界的（这是长期运行的服务，必须说清楚）——
  *   ① 明细环 silentJumpLog：定长 SILENT_JUMP_LOG 条，unshift + 溢出 pop。
  *   ② 组合表 silentJumpPairs：**按渠道对**（from|to）开条目，不是按流量开条目。
- *      渠道集合是封闭的（providers.js 清单，最多 7 家可进链），所以条目数上界是
- *      7×7=49，与跑了多久、多少条请求无关。再加一道 SILENT_JUMP_MAX_PAIRS 兜底，
+ *      渠道集合是封闭的（providers.js 清单，可进链的渠道有 8 家：
+ *      bai/sn/wb/wbai/zen/qd/mm/or），所以条目数上界是 8×8=64，与跑了多久、
+ *      多少条请求无关。再加一道 SILENT_JUMP_MAX_PAIRS 兜底，
  *      万一将来传入的 from/to 变成不可枚举的动态值，也不会失控。
+ *      ⚠ 上界必须**严格大于** 渠道对数：v1.0.89 加第 8 家（mm）时 64 正好等于
+ *      8×8，于是淘汰逻辑会在"没超界"的情况下触发，面板会静悄悄少报一种换人组合。
  *   ③ 每条里的 minutes 是定长 SILENT_JUMP_WINDOW_MIN 的分钟桶环；minutes 本身也只
  *      增不删地按分钟数滚动，不是无限增长。
  *   三层都是"按固定上界"而不是"按时间清理"，所以最坏占用是个常数，跟运行时长无关。
  */
 export const SILENT_JUMP_LOG = 50;          // 保留的最近明细条数
 export const SILENT_JUMP_WINDOW_MIN = 60;  // 面板「最近 1 小时」的窗口 = 60 个分钟桶
-export const SILENT_JUMP_MAX_PAIRS = 64;   // 组合表硬上界（渠道对 7×7=49 远小于它）
+export const SILENT_JUMP_MAX_PAIRS = 96;   // 组合表硬上界（可进链 8 家 ⇒ 渠道对 64，留裕度）
 
 const silentJumpLog = [];    // 最近若干条 {at, from, to, model}，最新的在 [0]
 const silentJumpPairs = new Map(); // "from|to" -> {from,to,total,lastAt,model,minutes:[{m,c}]}

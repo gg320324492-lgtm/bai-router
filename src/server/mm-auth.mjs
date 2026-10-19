@@ -146,6 +146,9 @@ export const MM_RENEW_WINDOW_MS = 5 * 60 * 1000;
 export const MM_LOGIN_INVALID_MSG = "MiniMax 登录态已失效，请在 MiniMax Code 里重新登录";
 /** 续期请求的默认超时。 */
 export const MM_TOKEN_TIMEOUT_MS = 15000;
+/** 「这一格能不能用」的判据去重读登录态文件的节流间隔（本地读文件很便宜，
+ *  但每条请求都读没必要；15 秒足够让用户登录后 15 秒内生效）。 */
+export const MM_RECHECK_MS = 15000;
 /** 临时性失败后的冷却：这段时间内不再打续期端点（不刷上游）。 */
 export const MM_RETRY_COOLDOWN_MS = 60 * 1000;
 
@@ -440,6 +443,7 @@ export function createMmTokenStore(opts = {}) {
     lastRenewAt: 0,
     renewCount: 0,
     nextAttemptAt: 0,    // 临时性失败后的冷却
+    lastRecheckAt: 0,    // recheck() 的节流时刻
   };
   /** 并发去重：同一时刻只允许一次续期在飞（否则十个并发请求打十次上游，
    *  而 refresh token 是一次性轮换的——十次并发会前九次直接 invalid_grant）。 */
@@ -683,6 +687,29 @@ export function createMmTokenStore(opts = {}) {
   }
 
   /**
+   * 「这一格能不能用」的判据 —— 内存里没有可用令牌时，**再去读一遍登录态文件**。
+   *
+   * 🔴 为什么这是承重的：登录态文件是 MiniMax Code 的凭据库，用户完全可能
+   *   **在路由台启动之后**才登录 MiniMax Code（先装路由台、后来才登录，
+   *   这是最常见的顺序）。此时内存里没有令牌，而转移链的判据只问内存
+   *   → mm 被**永久跳过** → 请求落到链上的下一家 → 用户以为在用 MiniMax，
+   *   实际用的是别家。2026-10-19 实测：登录态文件出现后再请求，mm 仍报
+   *   「未配置」，只有点「重新读取登录态」才恢复 —— 那是死锁。
+   *
+   * 节流：本地读一个 JSON 很便宜，但每条请求都读没必要；默认 15 秒一次，
+   *   所以用户登录后最多 15 秒这一格就生效，不需要用户做任何操作。
+   */
+  function recheck() {
+    const s0 = snapshot();
+    if (s0.configured && !s0.invalid) return s0;
+    const t = now();
+    if (st.lastRecheckAt && t - st.lastRecheckAt < MM_RECHECK_MS) return s0;
+    st.lastRecheckAt = t;
+    try { readAuthFile(); } catch { /* 读不到就按「未配置」处理，不抛 */ }
+    return snapshot();
+  }
+
+  /**
    * 状态快照。**不含任何令牌值**——只有长度、有效期、是否有效。
    * 这个对象会原样进 /api/status（面板能看见），所以它必须先经过审查。
    */
@@ -715,5 +742,5 @@ export function createMmTokenStore(opts = {}) {
     };
   }
 
-  return { ensure, renew, readAuthFile, snapshot, get state() { return st; } };
+  return { ensure, renew, readAuthFile, recheck, snapshot, get state() { return st; } };
 }

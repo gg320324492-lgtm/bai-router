@@ -5599,8 +5599,15 @@ function noteFailoverEvent(from, tries, servedModel, cfg) {
      于是「面板一切正常、实际在 WorkBuddy 上花钱」那桩事故整整看不出来。
      servedModel 可空（全线失败时为 null）；留痕结构在 failover.mjs，是有界的。
      costs 一并带下去：**判据在这里算好**（那个模型自己的 credits），面板只负责照着说，
-     不许在前端猜渠道贵不贵。 */
-  noteSilentJump(from, tries, servedModel, servedModelCostsMoney(from, servedModel, cfg));
+     不许在前端猜渠道贵不贵。
+
+     🔴 查 credits 必须按**实际服务的那一家**，不是按入口：
+     `mm → wb` 这一跳里，发出去的模型 hy3 属于 wb；按入口 mm 查 →
+     `isWk("mm")` 为假 → 返回 null → 面板只说「换人」，**永远说不出**
+     「这些对话是在 WorkBuddy 的账上完成的」。v1.0.88 修的是「用徽章猜计费」，
+     这一处是同一类错误的另一面：判据用错了渠道。 */
+  const served = (tries || []).find((t) => t && t.ok === true && t.provider && t.provider !== from);
+  noteSilentJump(from, tries, servedModel, served ? servedModelCostsMoney(served.provider, servedModel, cfg) : null);
 }
 
 // 与 noteFailoverEvent 的区别：这里**没有**发生渠道转移——命中不该转移的错误（如 400），
@@ -5632,8 +5639,20 @@ function providerConfigured(provider, cfg) {
    *   读到了登录态（有刷新令牌）→ 算已配置（中转请求时会自己续期）；
    *   登录态作废（invalid_grant 之后）→ 不算已配置，转移链会跳过这一格，
    *   并由面板把「请在 MiniMax Code 里重新登录」摆在明处。 */
+  /* mm（MiniMax 会员）：判据是**内存里的会员登录态**，不是配置里的任何字段。
+   * 配置里本来就没有凭据字段（令牌不落盘）——所以只能问令牌仓库：
+   *   读到了登录态（有刷新令牌）→ 算已配置（中转请求时会自己续期）；
+   *   登录态作废（invalid_grant 之后）→ 不算已配置，转移链会跳过这一格，
+   *   并由面板把「请在 MiniMax Code 里重新登录」摆在明处。
+   *
+   * ⚠ 这里用 **recheck() 而不是 snapshot()**：用户很可能**先装路由台、之后才登录
+   *   MiniMax Code**（最常见的顺序）。启动时读一次文件，内存里没有令牌；
+   *   而 snapshot() 不读磁盘 → mm 被**永久**跳过 → 请求落到链上的下一家
+   *   （实测就是 WorkBuddy 的 hy3）。recheck() 在「没有可用令牌」时再去读一遍
+   *   登录态文件（节流 15 秒），所以登录后最多 15 秒这一格就生效，
+   *   不需要用户点任何按钮。（2026-10-19 实测的死锁见 mm-auth.mjs 的 recheck 注释。） */
   if (provider === "mm") {
-    const snap = mmTokens.snapshot();
+    const snap = mmTokens.recheck();
     return snap.configured && !snap.invalid;
   }
   return false;
@@ -6688,9 +6707,12 @@ async function statusPayload() {
   // 传输开关的只读事实（v1.0.75）：当前档位 + 前置条件在本机满足没有（三态分清）。
   const zenTransportNow = ocTransportFields(cfg);
   // MiniMax 会员通道（mm）：令牌快照 + 一句话提示。
-  // 🔴 快照来自 mmTokens.snapshot()，里面**只有长度/有效期/是否有效**，没有令牌值。
+  // 🔴 快照里**只有长度/有效期/是否有效**，没有令牌值。
+  // ⚠ 用 recheck() 而不是 snapshot()：**判据必须与转移链同源**。两处用不同判据
+  //   （面板说「未配置」、链却按另一个答案走）正是这类事故最难排查的原因；
+  //   recheck 内部有 15 秒节流，面板 5 秒轮询不会造成磁盘 churn。
   const mmStatus = providerStatus(cfg, "mm", recentCallsMm);
-  const mmTokenSnapshot = mmTokens.snapshot();
+  const mmTokenSnapshot = mmTokens.recheck();
   const mmTokenHint = mmTokenSnapshot.invalid
     ? MM_LOGIN_INVALID_MSG
     : mmTokenSnapshot.configured
@@ -7791,10 +7813,10 @@ async function unknownMappingTargets(p, mapping, cfg) {
         }
       }
       /* mm（MiniMax 会员）：凭据不在配置里（只在内存），所以「配没配好」只能问令牌仓库。
-       * 这里**不**强制重读登录态——用户点「一键接入」是接线动作，不是「我刚登录了」；
-       * 刚登录完请点凭据行上的「重新读取登录态」（那才是会重读磁盘的动作）。 */
+       * 用 recheck()：用户很可能**先装路由台、之后才登录 MiniMax Code**，
+       * 只问内存快照会让这一格永远被判未配置（与转移链的判据同源，见 providerConfigured）。 */
       if (P === "mm") {
-        const snap = mmTokens.snapshot();
+        const snap = mmTokens.recheck();
         if (snap.invalid) {
           return json(res, 400, { error: MM_LOGIN_INVALID_MSG + "——请在 MiniMax Code 里重新登录，然后回到本页点「重新读取登录态」" });
         }
