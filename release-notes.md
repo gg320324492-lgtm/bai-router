@@ -43,7 +43,6 @@
 > `content-type: application/json`；UA / Origin / Referer / system prompt
 > **都不是校验对象**。真正被挑刺的是**工具定义的形状**（见下一节）。
 > 下一版已把这处文案改对。
-
 ---
 
 ### 二、修一个隐蔽的毛病：带工具的对话会断

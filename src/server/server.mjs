@@ -6694,7 +6694,9 @@ async function statusPayload() {
   const mmTokenHint = mmTokenSnapshot.invalid
     ? MM_LOGIN_INVALID_MSG
     : mmTokenSnapshot.configured
-      ? "会员令牌只在内存里，到期自动续期；重启路由台要重新读（在 MiniMax Code 里登录即可恢复）"
+      ? "会员令牌只存在路由台内存里（不落 config.json，日志与页面都没有明文）；"
+        + "到期自动续期，续期后的新令牌会写回 MiniMax Code 自己的登录态文件——"
+        + "不写回的话，两边会互相把对方的一次性令牌作废掉。所以重启路由台不用重新读。"
       : "没读到本机 MiniMax 登录态——请先在 MiniMax Code 里登录，再点「重新读取登录态」";
   return {
     now: new Date().toISOString(),

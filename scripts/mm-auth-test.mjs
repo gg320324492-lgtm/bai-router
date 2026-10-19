@@ -51,13 +51,13 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { runInNewContext } from "node:vm";
 
 import {
   createMmTokenStore, mmBuildHeaders, mmAuthFilePath, readMmAuthRecord, mmCanonicalModel,
-  mmNormalizeTools, mmNormalizeBodyTools,
+  mmNormalizeTools, mmNormalizeBodyTools, writeBackAuth,
   MM_TOKEN_ENDPOINT, MM_INFER_BASE, MM_MODEL, MM_CLIENT_ID, MM_SCOPE, MM_AUDIENCE,
   MM_ORIGIN, MM_REFERER, MM_USER_AGENT, MM_PLACEHOLDER_KEY, MM_LOGIN_INVALID_MSG,
 } from "../src/server/mm-auth.mjs";
@@ -117,13 +117,15 @@ function seedLoaded(store, over = {}) {
 }
 
 /** 令牌仓库的默认装配：假 readAuth（不读真实文件）+ 可注入的 fetch + 假 now。 */
-function makeStore({ fetchImpl, readAuth, now, log } = {}) {
+function makeStore({ fetchImpl, readAuth, readRaw, writeBack, now, log, authPath } = {}) {
   const logs = [];
   const store = createMmTokenStore({
     fetchImpl: fetchImpl || fakeFetch(() => ({ status: 200, body: {} })),
     readAuth: readAuth || (() => fakeRecord()),
+    readRaw: readRaw || (() => null),
+    writeBack: writeBack || (() => ({ ok: true, reason: "" })),
     now: now || (() => Date.now()),
-    authPath: path.join(os.tmpdir(), "mm-auth-test-not-real", "auth.json"),
+    authPath: authPath || path.join(os.tmpdir(), "mm-auth-test-not-real", "auth.json"),
     log: log || ((m) => logs.push(String(m))),
   });
   store.logs = logs;
@@ -406,9 +408,14 @@ describe("mm 令牌不外泄", () => {
     }
   });
 
-  test("完整生命周期里：没有令牌值落进任何文件、日志或错误消息", async () => {
+  test("完整生命周期里：令牌只落在 MiniMax Code 自己的登录态文件里，别处一个都没有", async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "mm-auth-leak-"));
     const authFile = path.join(dir, "auth.json");
+    /* 造一个**真的**登录态文件（写回要落到它上面）。 */
+    writeFileSync(authFile, JSON.stringify({
+      records: { "fake-account-key-0": fakeRecord({ generation: 7, extraField: "keep-me" }) },
+      someOtherTopLevel: { keep: true },
+    }, null, 2));
 
     const fetchImpl = fakeFetch(() => ({
       status: 200,
@@ -418,7 +425,10 @@ describe("mm 令牌不外泄", () => {
     const store = makeStore({
       fetchImpl,
       log: (m) => logs.push(String(m)),
-      readAuth: () => fakeRecord(),
+      readAuth: () => fakeRecord({ generation: 7 }),
+      readRaw: (f) => readFileSync(f, "utf8"),
+      writeBack: writeBackAuth,
+      authPath: authFile,
     });
 
     /* 走一遍完整生命周期：读登录态 → 过期 → 续期（轮换）→ 再读快照 → 再续期。 */
@@ -449,17 +459,24 @@ describe("mm 令牌不外泄", () => {
     assert.ok(!String(leakyStore.snapshot().error || "").includes(OLD_REFRESH),
       "状态快照的 error 字段里出现了刷新令牌");
 
-    /* ① 落盘文件：把期间写下的每个文件内容读回来 grep。 */
+    /* ① 写盘：令牌**只许**落在登录态文件里。
+     *    （v1.0.90 起路由台会把轮换后的令牌写回那个文件 —— 那是 MiniMax Code 自己的
+     *      凭据库，令牌本来就在那儿；不写回的话两边会互相把对方的令牌作废掉。
+     *      见 mm-auth.mjs 的 writeBackAuth 注释与「实测记录」。） */
+    const authAbs = path.resolve(authFile);
     for (const w of writes) {
+      const target = path.resolve(String(w.args[0] || ""));
+      if (target === authAbs || target === authAbs + ".bai-router.tmp") continue;
       const text = w.args.join(" ");
       assert.ok(!text.includes(NEW_ACCESS), `fs.${w.api} 写下的内容里出现了访问令牌`);
       assert.ok(!text.includes(NEW_REFRESH), `fs.${w.api} 写下的内容里出现了刷新令牌`);
       assert.ok(!text.includes(OLD_ACCESS), `fs.${w.api} 写下的内容里出现了访问令牌`);
       assert.ok(!text.includes(OLD_REFRESH), `fs.${w.api} 写下的内容里出现了刷新令牌`);
     }
-    /* 目录里一个文件都不该多出来（凭据只存内存）。 */
+    /* 目录里**除登录态文件以外**一个文件都不该有令牌。 */
     const files = readdirSync(dir);
     for (const f of files) {
+      if (f === "auth.json") continue;
       const p = path.join(dir, f);
       if (!statSync(p).isFile()) continue;
       const text = readFileSync(p, "utf8");
@@ -467,6 +484,10 @@ describe("mm 令牌不外泄", () => {
         && !text.includes(OLD_ACCESS) && !text.includes(OLD_REFRESH),
         `文件 ${f} 里出现了令牌值`);
     }
+    /* 而登录态文件里**必须**有最新那把（否则 MiniMax Code 会掉线）。 */
+    const authText = readFileSync(authFile, "utf8");
+    assert.ok(authText.includes(NEW_ACCESS), "登录态文件里没有新访问令牌 —— 写回没生效");
+    assert.ok(authText.includes(NEW_REFRESH), "登录态文件里没有新刷新令牌 —— 写回没生效");
 
     /* ② 日志字符串 */
     for (const l of logs) {
@@ -484,13 +505,43 @@ describe("mm 令牌不外泄", () => {
     assert.ok(!snapText.includes(OLD_REFRESH), "状态快照里出现了刷新令牌");
     assert.equal(snap.accessLen, NEW_ACCESS.length, "快照里只许有令牌**长度**");
 
-    /* ④ 源文件里根本没有写盘 API（机械检查，不靠肉眼）。 */
-    for (const api of ["writeFileSync", "appendFileSync", "createWriteStream", "mkdirSync",
-      "rmSync", "unlinkSync", "renameSync", "copyFileSync"]) {
-      assert.ok(!new RegExp(`\\b${api}\\b`).test(MM_AUTH_SRC),
-        `mm-auth.mjs 里出现了写盘 API ${api} —— 凭据只存内存，不许落盘`);
+    /* ④ 源文件里的写盘 API **只许**出现在 writeBackAuth 里（机械检查，不靠肉眼）。
+     *    规矩是：只许写「登录态文件」与它的临时文件，不许碰别的路径。 */
+    const fnStart = MM_AUTH_SRC.indexOf("export function writeBackAuth");
+    const fnEnd = MM_AUTH_SRC.indexOf("\n}", fnStart);
+    assert.ok(fnStart > 0 && fnEnd > fnStart, "mm-auth.mjs 里必须有 writeBackAuth 这个函数");
+    /* import 行不算「写盘」—— 它只是把 fs 的函数引进来。
+     * 真正要禁的是**调用点**：writeBackAuth 之外一处都不许有。 */
+    const outside = (MM_AUTH_SRC.slice(0, fnStart) + MM_AUTH_SRC.slice(fnEnd))
+      .split("\n").filter((l) => !/^\s*import\b/.test(l)).join("\n");
+    const writeApis = ["writeFileSync", "appendFileSync", "createWriteStream", "mkdirSync",
+      "rmSync", "unlinkSync", "renameSync", "copyFileSync", "writeFile", "appendFile", "mkdir", "rm"];
+    for (const api of writeApis) {
+      assert.ok(!new RegExp(`\\b${api}\\b`).test(outside),
+        `mm-auth.mjs 里 writeBackAuth 之外出现了写盘 API ${api} —— `
+        + "B.AI Router 自己的文件里不许落令牌（写回只许落在登录态文件上）");
     }
-    void authFile;
+    /* 而 writeBackAuth 里写的是**临时文件 + rename**，不是直接覆盖（原子写）。 */
+    const fnBody = MM_AUTH_SRC.slice(fnStart, fnEnd);
+    assert.match(fnBody, /\.bai-router\.tmp/, "写回必须走临时文件（原子写）");
+    assert.match(fnBody, /renameSync\(tmp, file\)/, "写回必须用 rename 覆盖（原子）");
+  });
+
+  test("写回只发生在续期成功之后（读文件不算写）", async () => {
+    const writes = [];
+    const store = makeStore({
+      fetchImpl: fakeFetch(() => ({ status: 200, body: { access_token: NEW_ACCESS, refresh_token: NEW_REFRESH, expires_in: 3600 } })),
+      writeBack: (...a) => { writes.push(a); return { ok: true, reason: "" }; },
+    });
+    store.readAuthFile();
+    assert.equal(writes.length, 0, "只是读登录态不该触发写回");
+    store.state.expiresAtMs = Date.now() - 1000;
+    await store.ensure();
+    assert.equal(writes.length, 1, "续期成功之后必须写回一次");
+    const [, key, token] = writes[0];
+    assert.equal(key, store.state.recordKey, "写回必须写进对应的那个账号记录");
+    assert.equal(token.accessToken, NEW_ACCESS);
+    assert.equal(token.refreshToken, NEW_REFRESH);
   });
 
   test("读登录态的函数本身不写盘、也不把令牌吐进异常消息", () => {
@@ -498,6 +549,104 @@ describe("mm 令牌不外泄", () => {
     /* 指向一个不存在的文件：应当安静地返回 null（读不到 = 没登录），不抛异常。 */
     const rec = readMmAuthRecord(path.join(dir, "nope.json"));
     assert.equal(rec, null, "读不到登录态时返回 null，不是抛异常");
+  });
+});
+
+/* ====================================================================== *
+ * ①c 写回登录态文件（MiniMax Code 自己的凭据库）
+ *
+ *   刷新令牌是一次性的，路由台与 MiniMax Code 共用同一把 → 路由台一续期，
+ *   文件里那把就作废。不写回 → MiniMax Code 掉线要重新登录，路由台重启也救不回来。
+ *
+ *   所以写回必须**绝对安全**：写坏用户的登录态比不写更糟。
+ * ====================================================================== */
+
+describe("mm 写回登录态文件", () => {
+  const KEY = "fake-account-key-0";
+  const dir = () => mkdtempSync(path.join(os.tmpdir(), "mm-wb-"));
+  const doc = (over = {}) => ({
+    records: { [KEY]: fakeRecord({ generation: 7, extraField: "keep-me", ...over }) },
+    otherRecord: { some: "thing" },
+    topLevel: { keep: true },
+  });
+
+  test("★ 写回后：令牌更新了，其余字段与其余记录原样保留", () => {
+    const d = dir();
+    const f = path.join(d, "auth.json");
+    writeFileSync(f, JSON.stringify(doc(), null, 2));
+
+    const r = writeBackAuth(f, KEY, {
+      accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: 999, generation: 8,
+    }, readFileSync(f, "utf8"));
+
+    assert.equal(r.ok, true, "写回应成功：" + r.reason);
+    const after = JSON.parse(readFileSync(f, "utf8"));
+    assert.equal(after.records[KEY].accessToken, NEW_ACCESS);
+    assert.equal(after.records[KEY].refreshToken, NEW_REFRESH);
+    assert.equal(after.records[KEY].expiresAtMs, 999);
+    assert.equal(after.records[KEY].generation, 8, "generation 必须 +1（与 MiniMax Code 同一口径）");
+    assert.equal(after.records[KEY].extraField, "keep-me", "未涉及的字段必须原样保留");
+    assert.equal(after.records[KEY].clientId, MM_CLIENT_ID);
+    assert.deepEqual(after.otherRecord, { some: "thing" }, "其余顶层内容必须原样保留");
+    assert.deepEqual(after.topLevel, { keep: true });
+  });
+
+  test("★ 原子写：不留临时文件", () => {
+    const d = dir();
+    const f = path.join(d, "auth.json");
+    writeFileSync(f, JSON.stringify(doc(), null, 2));
+    writeBackAuth(f, KEY, { accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: 1, generation: 8 },
+      readFileSync(f, "utf8"));
+    const left = readdirSync(d).filter((x) => x.includes(".tmp"));
+    assert.deepEqual(left, [], "残留了临时文件：" + left.join(", "));
+    assert.deepEqual(readdirSync(d), ["auth.json"], "目录里只该有登录态文件");
+  });
+
+  test("★ 并发保护：文件在我们读之后被改过 → 放弃写入，一个字节都不动", () => {
+    const d = dir();
+    const f = path.join(d, "auth.json");
+    const before = JSON.stringify(doc(), null, 2);
+    writeFileSync(f, before);
+    const expectRaw = before;                       // 我们「读到」的那一份
+    writeFileSync(f, JSON.stringify(doc({ generation: 9 }), null, 2));  // MiniMax Code 刚续过
+
+    const r = writeBackAuth(f, KEY, { accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: 1, generation: 8 }, expectRaw);
+
+    assert.equal(r.ok, false, "必须放弃写入");
+    assert.match(r.reason, /被改过/);
+    const after = JSON.parse(readFileSync(f, "utf8"));
+    assert.equal(after.records[KEY].generation, 9, "文件必须还是 MiniMax Code 写的那份");
+    assert.ok(!readFileSync(f, "utf8").includes(NEW_ACCESS), "不该把我们的令牌写进去");
+  });
+
+  test("★ 结构不认识 / 记录不存在 → 放弃写入，原文件不动", () => {
+    const d = dir();
+    const f1 = path.join(d, "a.json");
+    writeFileSync(f1, JSON.stringify({ nope: 1 }, null, 2));
+    const r1 = writeBackAuth(f1, KEY, { accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: 1, generation: 8 }, readFileSync(f1, "utf8"));
+    assert.equal(r1.ok, false);
+    assert.match(r1.reason, /结构/);
+    assert.equal(readFileSync(f1, "utf8"), JSON.stringify({ nope: 1 }, null, 2), "原文件必须一字未动");
+
+    const f2 = path.join(d, "b.json");
+    writeFileSync(f2, JSON.stringify(doc(), null, 2));
+    const r2 = writeBackAuth(f2, "no-such-key", { accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: 1, generation: 8 }, readFileSync(f2, "utf8"));
+    assert.equal(r2.ok, false);
+    assert.match(r2.reason, /找不到/);
+    assert.ok(!readFileSync(f2, "utf8").includes(NEW_ACCESS), "不该写入");
+  });
+
+  test("★ 文件坏了 / 不存在 → 放弃写入，不抛异常", () => {
+    const d = dir();
+    const f1 = path.join(d, "bad.json");
+    writeFileSync(f1, "{ not json");
+    const r1 = writeBackAuth(f1, KEY, { accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: 1, generation: 8 }, "{ not json");
+    assert.equal(r1.ok, false);
+    assert.equal(readFileSync(f1, "utf8"), "{ not json", "坏文件必须原样留着");
+
+    const f2 = path.join(d, "missing.json");
+    const r2 = writeBackAuth(f2, KEY, { accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH, expiresAtMs: 1, generation: 8 }, null);
+    assert.equal(r2.ok, false);
   });
 });
 
@@ -704,7 +853,13 @@ describe("mm 接线完整性", () => {
     assert.match(text, /会员额度/, "要说清走的是会员额度");
     assert.match(text, /开放平台/, "要说清与开放平台按量计费是两回事");
     assert.match(text, /MiniMax Code/, "要说清凭据来自 MiniMax Code 的登录态");
-    assert.match(text, /只存在内存|只在内存/, "要说清令牌只存在内存");
+    assert.match(text, /只存在.{0,4}内存|只在.{0,4}内存/, "要说清令牌只存在路由台的内存里");
+    assert.match(text, /不写进 config\.json/, "要说清不落 config.json");
+    /* v1.0.90：续期后会把新令牌**写回 MiniMax Code 自己的登录态文件**
+     *（刷新令牌是一次性的，不写回两边会互相作废）。这条必须说在明处 ——
+     *   用户有权知道自己的登录态文件会被改。 */
+    assert.match(text, /写回/, "要说清续期后会把令牌写回 MiniMax Code 自己的登录态文件");
+    assert.match(text, /MiniMax Code/, "要说清写回的是哪个文件");
     /* ⚠ 2026-10-19 实测后改的断言：上游真正挑刺的只有**鉴权令牌**与
      *   **工具定义的形状**；UA / Origin / Referer / system prompt 都不是校验对象。
      *   旧文案说「上游按 system prompt 的内容做客户端指纹校验」——那是**错的**
@@ -748,8 +903,12 @@ describe("mm 会员额度卡", () => {
     assert.match(html, /不是.*开放平台按量计费|不是<\/b>开放平台/, "① 要写明与开放平台按量计费是两回事");
     assert.match(html, /MiniMax Code/, "② 要写明要先在 MiniMax Code 里登录");
     assert.match(html, /登录态/, "② 要写明凭据来自它的登录态");
-    assert.match(html, /只在内存|只存在内存/, "③ 要写明令牌只存在内存");
-    assert.match(html, /重启/, "③ 要写明重启路由台要重新读");
+    assert.match(html, /只存在.{0,4}内存|只在.{0,4}内存/, "③ 要写明令牌只存在路由台的内存里");
+    assert.match(html, /不落 config\.json/, "③ 要写明不落 config.json");
+    assert.doesNotMatch(html, /重启路由台后要重新读|重启路由台要重新读/,
+      "③ 写回后文件里就是最新那把 —— 不该再说要「重启后重新读」");
+    /* v1.0.90：写回 MiniMax Code 自己的登录态文件这件事必须说在明处。 */
+    assert.match(html, /写回/, "③ 要写明续期后会写回 MiniMax Code 自己的登录态文件");
     /* ⚠ 同上：改成钉实测事实，并禁止旧说法回来（它已经随 v1.0.89 发出去过）。 */
     assert.match(html, /鉴权令牌/, "④ 要写明上游真正校验的是鉴权令牌");
     assert.match(html, /工具定义/, "④ 要写明上游真正校验的是工具定义的形状");

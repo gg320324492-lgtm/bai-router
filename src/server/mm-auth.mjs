@@ -23,16 +23,43 @@
  *
  * ## 🔴 三条硬红线
  *
- *   ① **凭据只存内存**。启动时从
+ *   ① **凭据只存本模块的内存**。启动时从
  *      `~/.minimax/auth/prod/cn/mcode-public/auth.json` 读 refresh token 放进本模块的
- *      内存态；进程退出即失效。**任何时候都不把令牌写进 config.json / 日志 / 面板 / 任何文件。**
- *      本文件里**没有一行 fs 写操作**（只有一次 readFileSync），这不是巧合，是约束。
+ *      内存态；进程退出即失效。**任何时候都不把令牌写进 B.AI Router 自己的
+ *      config.json / 日志 / 面板 / 任何文件。**
+ *      ⚠️ **唯一的例外**：续期轮换之后，把新令牌**写回 MiniMax Code 自己的那个
+ *      登录态文件**（见 {@link writeBackAuth}）。这不是「把令牌落到别处」——
+ *      那个文件本来就放着同一把令牌，MiniMax Code 每次续期也自己写回去；
+ *      不写回的话，路由台一续期就把 MiniMax Code 那把**一次性**令牌作废掉
+ *      （invalid_grant），两边都完蛋（2026-10-19 实测，见下）。
  *   ② **日志、错误消息、状态快照里都不许出现令牌值**。只许出现「长度 / 是否有效 / 前缀形状」。
  *      scrub() 是兜底：任何要往外说的字符串都先过它一遍。
  *   ③ **refresh token 是一次性轮换的**：刷新成功后旧的立即作废
  *      （invalid_grant: this refresh token can no longer be used, start a new authorization）。
  *      所以**每次刷新成功后必须立刻把返回的新 refresh_token 存进内存**，
  *      否则下一次续期必然 invalid_grant，整条凭据链就断了。
+ *
+ * ## 🔴 与 MiniMax Code 共用同一把一次性令牌（2026-10-19 实测）
+ *
+ *   登录态文件是 **MiniMax Code 的凭据库**（它自己写，`generation` 每次续期 +1：
+ *   实测 39 → 41 → 42），而本模块也从同一个文件取刷新令牌。刷新令牌一次性 ⇒
+ *   **本模块一续期，MiniMax Code 手里那把就死了。**
+ *
+ *   实测到的真实事故：
+ *   ```
+ *   15:19:02  路由台续期成功（日志：刷新令牌已轮换）
+ *             文件仍是 generation 42、mtime 没变   ← 没写回
+ *             拿文件里那把去续期 → 400 invalid_grant
+ *             "this refresh token can no longer be used, start a new authorization"
+ *   ```
+ *   后果有两层：MiniMax Code 掉线要重新登录；**路由台自己重启后也救不回来**
+ *   （重启会读到那把已死的令牌）。
+ *
+ *   所以两件事必须同时做：
+ *   ① **写回**（{@link writeBackAuth}）：续期后把新令牌原子写回那个文件；
+ *   ② **按 `generation` 判「谁更新」**（{@link readAuthFile}）：
+ *      文件的 generation 更大 → 那是 MiniMax Code 刚续出来的，**跟着换**；
+ *      内存里的更大 → 那是本模块自己续出来的，**保留**（文件还没跟上）。
  *
  * ## 为什么单独成文件
  *
@@ -63,7 +90,7 @@
  *   真正被上游挑刺的是**工具定义的形状**（见 {@link mmNormalizeTools}）：
  *   嵌套形状 → 400 `invalid params, function name is empty (2013)`。
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
@@ -176,6 +203,84 @@ export function readMmAuthRecord(file) {
     };
   }
   return null;
+}
+
+/* ---------- 写回登录态文件（只写 MiniMax Code 自己的凭据库） ---------- */
+
+/**
+ * 把续期轮换出来的新令牌**写回**登录态文件。
+ *
+ * ## 为什么必须写回
+ *
+ *   刷新令牌是**一次性**的，而本模块与 MiniMax Code 共用同一个文件里的**同一把**。
+ *   路由台一续期，MiniMax Code 手里那把就作废（invalid_grant）——
+ *   实测 2026-10-19 15:19：路由台续期成功、文件没更新，
+ *   拿文件里那把去续期立刻 `400 invalid_grant: this refresh token can no longer be used`。
+ *   后果：MiniMax Code 掉线要重新登录，**路由台自己重启后也救不回来**。
+ *
+ *   写回之后，文件里的令牌始终是**最新那把**，两边都接着用。
+ *
+ * ## 这不是「把令牌落到 B.AI Router 的文件里」
+ *
+ *   写的是 **MiniMax Code 自己的凭据库** —— 令牌本来就在那儿，
+ *   MiniMax Code 每次续期也自己写回去。本模块不写 config.json / 日志 / 面板。
+ *
+ * ## 安全措施（每一道都是为了「绝不把用户的登录态写坏」）
+ *
+ *   ① **原子写**：先写同目录的临时文件，再 rename 覆盖 ——
+ *      崩溃 / 断电 / 写一半都不会留下半个文件（rename 在同一文件系统上是原子的）。
+ *   ② **并发保护**：写之前重新读一遍原文；与我们读到的**不一致**（说明
+ *      MiniMax Code 刚写过）就**放弃这次写入**，绝不覆盖别人的更新。
+ *   ③ **结构保持**：只改目标记录的 4 个字段
+ *      （accessToken / refreshToken / expiresAtMs / generation），
+ *      其余字段与其余记录**原样保留**。
+ *   ④ **失败不动原文件**：任何一步出错就放弃写入并记日志，绝不写出一个坏文件。
+ *   ⑤ **只写自己刚续出来的那把**：写的是刚刚从上游拿到的令牌，不掺别的东西。
+ *
+ * @param {string} file     登录态文件路径
+ * @param {string} recordKey 目标记录的键（账号标识）
+ * @param {object} token    { accessToken, refreshToken, expiresAtMs, generation }
+ * @param {string} expectRaw 我们**读到时**的原文；与写之前的原文不一致就放弃写入
+ * @returns {{ok:boolean, reason:string}}
+ */
+export function writeBackAuth(file, recordKey, token, expectRaw) {
+  try {
+    const raw = readFileSync(file, "utf8");
+    /* ② 并发保护：文件在我们读之后被别人改过 → 放弃，绝不覆盖。 */
+    if (typeof expectRaw === "string" && raw !== expectRaw) {
+      return { ok: false, reason: "登录态文件在我们读取之后被改过（MiniMax Code 刚续过？）—— 放弃写入，避免覆盖它的更新" };
+    }
+    const doc = JSON.parse(raw);
+    const records = doc && doc.records;
+    if (!records || typeof records !== "object" || Array.isArray(records)) {
+      return { ok: false, reason: "登录态文件结构不认识（没有 records）—— 放弃写入" };
+    }
+    const rec = records[recordKey];
+    if (!rec || typeof rec !== "object" || Array.isArray(rec)) {
+      return { ok: false, reason: "登录态文件里找不到对应的账号记录 —— 放弃写入" };
+    }
+    /* ③ 结构保持：只动这 4 个字段。 */
+    rec.accessToken = String(token.accessToken || "");
+    rec.refreshToken = String(token.refreshToken || "");
+    rec.expiresAtMs = Number(token.expiresAtMs) || 0;
+    rec.generation = Number(token.generation) || 0;
+    const out = JSON.stringify(doc, null, 2);
+
+    /* ① 原子写：同目录临时文件 → rename 覆盖。 */
+    const tmp = file + ".bai-router.tmp";
+    writeFileSync(tmp, out, "utf8");
+    try {
+      renameSync(tmp, file);
+    } catch (e) {
+      /* rename 失败：把临时文件清掉，原文件一个字节都没动。 */
+      try { unlinkSync(tmp); } catch { /* 清理失败就算了，临时文件里也是同一份令牌 */ }
+      return { ok: false, reason: "写回失败（rename 报错）：" + String((e && e.message) || e).slice(0, 120) };
+    }
+    return { ok: true, reason: "", raw: out };
+  } catch (e) {
+    /* ④ 任何异常都不动原文件。 */
+    return { ok: false, reason: "写回失败：" + String((e && e.message) || e).slice(0, 120) };
+  }
 }
 
 /* ---------- 请求头 ---------- */
@@ -303,6 +408,12 @@ export function createMmTokenStore(opts = {}) {
   const fetchImpl = typeof opts.fetchImpl === "function" ? opts.fetchImpl : (...a) => fetch(...a);
   const now = typeof opts.now === "function" ? opts.now : () => Date.now();
   const readAuth = typeof opts.readAuth === "function" ? opts.readAuth : readMmAuthRecord;
+  /* 读原文（写回的并发保护要用）与写回，都做成可注入的：
+   * 测试里不碰真实文件，生产里用真的那套（原子写 + 结构保持）。 */
+  const readRaw = typeof opts.readRaw === "function"
+    ? opts.readRaw
+    : (f) => { try { return readFileSync(f, "utf8"); } catch { return null; } };
+  const writeBack = typeof opts.writeBack === "function" ? opts.writeBack : writeBackAuth;
   const authPath = opts.authPath || mmAuthFilePath(opts.home);
   const log = typeof opts.log === "function" ? opts.log : () => { };
   const timeoutMs = Number(opts.timeoutMs) || MM_TOKEN_TIMEOUT_MS;
@@ -317,9 +428,12 @@ export function createMmTokenStore(opts = {}) {
      *  用来分清「文件里的更新」与「我们内存里的更新」—— 刷新令牌一次性轮换，
      *  认错了就会把 MiniMax Code 的那把作废掉（或者反过来把自己的扔掉）。 */
     generation: 0,
-    /** 已经被上游作废的那把刷新令牌（值本身）。
+    /** 已知这把刷新令牌被上游作废了（值本身）。
      *  记下来是为了**不重复去撞**：明知它死了还拿它去续期，就是拿上游当靶子刷。 */
     deadRefresh: "",
+    /** 我们读到登录态文件时的**原文** —— 写回时的并发保护就靠它
+     *  （文件在我们读之后被 MiniMax Code 改过 → 放弃写入，不覆盖它的更新）。 */
+    authRaw: "",
     loaded: false,
     invalid: false,      // invalid_grant 之后为真：不再自动重试，等用户重新登录
     error: null,
@@ -363,6 +477,9 @@ export function createMmTokenStore(opts = {}) {
     const fileAccessLive = incExp > now();                       // 文件里的访问令牌还有效
     const fileNewer = fileGen > (Number(st.generation) || 0);    // 文件是 MiniMax Code 续出来的
     const changed = st.refreshToken !== rec.refreshToken || st.accessToken !== rec.accessToken;
+    /* 记下原文：写回时用它做并发保护（文件在我们读之后被改过就别写）。 */
+    const raw = readRaw(authPath);
+    if (typeof raw === "string") st.authRaw = raw;
 
     /* 🔴 该不该采用文件里那份？
      *
@@ -480,6 +597,32 @@ export function createMmTokenStore(opts = {}) {
     st.lastRenewAt = now();
     st.renewCount += 1;
     log(`MiniMax：续期成功（访问令牌长度 ${st.accessToken.length}，有效期 ${exp} 秒，刷新令牌已轮换）`);
+
+    /* 🔴 写回登录态文件（MiniMax Code 自己的凭据库）。
+     *
+     *   刷新令牌是一次性的：我们刚把旧的那把用掉了，**文件里那份已经是死的**。
+     *   不写回的话：MiniMax Code 下次要发请求时撞 invalid_grant → 要重新登录；
+     *   **本模块自己重启后也救不回来**（重启会读到那把已死的令牌）。
+     *   写回之后，文件里始终是最新那把，两边都接着用。
+     *
+     *   写失败**不影响本模块继续工作**（内存里那把是好的）—— 只记日志。 */
+    try {
+      const wr = writeBack(authPath, st.recordKey, {
+        accessToken: st.accessToken,
+        refreshToken: st.refreshToken,
+        expiresAtMs: st.expiresAtMs,
+        generation: st.generation,
+      }, st.authRaw);
+      if (wr && wr.ok) {
+        if (typeof wr.raw === "string") st.authRaw = wr.raw;
+        log(`MiniMax：已把轮换后的令牌写回登录态文件（第 ${st.generation} 代）`);
+      } else {
+        log(`MiniMax：写回登录态文件未成功（${scrub((wr && wr.reason) || "未知原因")}）—— `
+          + "本模块仍可继续用，但 MiniMax Code 可能需要重新登录一次");
+      }
+    } catch (e) {
+      log(`MiniMax：写回登录态文件出错（${scrub(String((e && e.message) || e)).slice(0, 100)}）`);
+    }
     return st.accessToken;
   }
 

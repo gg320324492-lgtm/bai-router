@@ -64,7 +64,7 @@ window.BAI_CARDS["mm-member"] = {
       <div class="fpline"><span class="k">额度性质</span><span class="v ${stateCls}">${esc(state)}</span></div>
       <div class="fpline"><span class="k">计费口径</span><span class="v">会员额度（MiniMax Code 登录的账号自带）· <b>不是</b>开放平台按量计费</span></div>
       <div class="fpline"><span class="k">凭据来源</span><span class="v">本机 <b>MiniMax Code</b> 的登录态（不是手填的 key）</span></div>
-      <div class="fpline"><span class="k">令牌存放</span><span class="v">只在内存里 · 不落 config.json · 日志与页面都没有明文</span></div>
+      <div class="fpline"><span class="k">令牌存放</span><span class="v">只在路由台内存里 · 不落 config.json · 日志与页面都没有明文</span></div>
       ${remainTxt ? `<div class="fpline"><span class="k">有效期</span><span class="v">${esc(remainTxt)}</span></div>` : ""}
       ${t.renewCount ? `<div class="fpline"><span class="k">已续期</span><span class="v">${esc(String(t.renewCount))} 次</span></div>` : ""}
       ${t.authPath ? `<div class="fpline"><span class="k">登录态文件</span><span class="v" style="font-family:var(--mono);white-space:normal;word-break:break-all">${esc(t.authPath)}</span></div>` : ""}
@@ -76,9 +76,11 @@ window.BAI_CARDS["mm-member"] = {
         回到本页点凭据行上的「重新读取登录态」，再点这一格的「接入」。
       </div>
       <div class="hint" style="margin-top:7px;white-space:pre-wrap">
-        <b>令牌只存在内存</b>：路由台退出即失效，磁盘上没有任何副本（连 config.json 都不写）。
-        所以<b>重启路由台后要重新读一次</b>——重新登录 MiniMax Code 即可恢复，
-        不需要（也不应该）去别处找明文。
+        <b>令牌只存在路由台的内存里</b>：不写进 config.json、不写进日志，页面上也看不到明文。
+        唯一一处例外是<b>续期之后</b>——新令牌会<b>写回 MiniMax Code 自己的登录态文件</b>
+        （就是它令牌本来就在的那个文件）。不写回不行：刷新令牌是一次性的，
+        路由台一续期就会把 MiniMax Code 那把作废，两边都会掉线。
+        所以<b>重启路由台不用重新读</b>，登录态文件里就是最新的那把。
       </div>
       <div class="hint" style="margin-top:7px;white-space:pre-wrap">
         <b>上游到底挑什么刺</b>：实测只有两处会拒绝——<b>鉴权令牌</b>（必须是
