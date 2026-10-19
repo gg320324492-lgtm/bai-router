@@ -612,6 +612,12 @@
     const S = stOf(key);
     const t = S.token || {};
     if (typeof t.configured === "boolean") {
+      /* 凭据已作废（上游说登录态失效）：**报红并说清该做什么**。
+       * 这不是「未配置」——东西曾经是好的，是被上游作废了；处置也不同
+       * （要重新登录，不是第一次去配）。 */
+      if (t.invalid === true) {
+        return { s: "err", txt: "凭据已失效", detail: t.error || "登录态已失效，请到对应客户端重新登录" };
+      }
       if (!t.configured) return { s: "idle", txt: "未配置", detail: (P.credential || {}).label || "凭据未就绪" };
       /* 轮换型令牌（jobToken）：令牌文件还在 ≠ 还在用。客户端没找到 = 上一次运行
          留下的陈旧文件，中转读到它只会 401 —— 这种要说"需留意"而不是"已就绪"。 */
@@ -621,6 +627,12 @@
       }
       if (p && p.tokenFresh === false) {
         return { s: "warn", txt: "令牌未刷新", detail: "客户端没开或没发过带鉴权的请求" };
+      }
+      /* 自动续期型凭据（会员托管那一类）：到期**不是**问题——它会自己续。
+       * 报成黄色的「剩 0 天」会让人以为要手工处理；真正要处理的是续不上，
+       * 那由上面的 invalid 分支报红。 */
+      if (t.autoRenew === true) {
+        return { s: "ok", txt: "已就绪", detail: S.tokenHint || "令牌到期自动续期" };
       }
       const days = t.expiresInDays;
       if (keyCount(t) > 1) {
@@ -1125,7 +1137,20 @@
       const act = q('[data-role="act"]', row);
       clsx(row, key === selected, "sel");
 
-      if (kind === "apiKey") {
+      /* 凭据**不由用户填写**（自取型）：中转从本机的客户端登录态自取令牌。
+       * 画成**只读**：没有输入框、没有「保存」——让用户去填一个用不上的密钥，
+       * 只会让人以为还差一步，实际那一步在客户端里（登录）。
+       * 唯一的动作是「重新读取登录态」：用户在客户端登录完，点它把新凭据捡回来。
+       * 端点与按钮文案都由清单给（credentialReadonly.api / .label），渲染层不认识渠道名。
+       *
+       * ⚠ 这一支**排在 kind 分派之前**：自取型的性质盖过 kind 说它是哪一类
+       * （kind 只决定"凭据视图给不给输入框"），顺序放错就会出现"声明了自取型却仍画输入框"。 */
+      if (P.credentialReadonly && typeof P.credentialReadonly === "object") {
+        const ro = P.credentialReadonly;
+        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
+          + (st.detail ? `<span class="fp zh">${esc(st.detail)}</span>` : "");
+        act.innerHTML = `<button class="btn sm" type="button" data-act="reread">${esc(ro.label || "重新读取登录态")}</button>`;
+      } else if (kind === "apiKey") {
         const C = cfgOf(key);
         const shown = C.apiKey ? esc(fp(C.apiKey)) : "";
         stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
@@ -1246,6 +1271,25 @@
           poll();
         }, $("applyResult"));
         showResult($("applyResult"), `✔ ${nameOf(key)} 的密钥已保存（明文只落在本机 config.json，页面不回显）。`, true);
+      } else if (act === "reread") {
+        /* 自取型凭据的「重新读取」：让中转再去本机的客户端登录态里读一遍。
+         * 端点在清单里给（credentialReadonly.api）——渲染层不认识渠道名（C11）。
+         * 服务端只会回**状态快照**（长度/有效期/是否有效），不会回令牌明文。 */
+        const ro = P.credentialReadonly || {};
+        const url = ro.api || "";
+        if (!url) {
+          showResult($("applyResult"), "这一行没有配置「重新读取」的接口（清单里缺 credentialReadonly.api）。", false);
+          return;
+        }
+        await withBusy(btn, async () => {
+          const r = await postJSON(url, {});
+          if (r && r.error) throw new Error(r.error);
+        }, $("applyResult"));
+        await refreshConfig();
+        poll();
+        showResult($("applyResult"),
+          `✔ ${nameOf(key)}：已重新读取本机登录态。`
+          + "（令牌只存在内存里，页面与日志都不会显示它的明文。）", true);
       } else if (act === "capture") {
         const h = captureHandlers[key];
         if (typeof h === "function") { await h(btn); return; }   // 卡片接管（token-capture）

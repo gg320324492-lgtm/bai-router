@@ -155,6 +155,7 @@
       "zen",
       "wb",
       "wbai",
+      "mm",
       "or"
     ]
   },
@@ -260,6 +261,33 @@
     "refreshToken": "",
     "deviceToken": "",
     "userId": "",
+    "useProxy": false
+  },
+  "mm": {
+    "relayPort": 15792,
+    "upstream": "https://agent.minimax.cn/mavis/api/v1/llm",
+    "defaultModel": "MiniMax-M3.1-Flash",
+    "availableModels": [
+      "MiniMax-M3.1-Flash"
+    ],
+    "mapping": {
+      "claude-fable-5": {
+        "target": "MiniMax-M3.1-Flash",
+        "label": "MiniMax-M3.1-Flash"
+      },
+      "claude-sonnet-5": {
+        "target": "MiniMax-M3.1-Flash",
+        "label": "MiniMax-M3.1-Flash"
+      },
+      "claude-opus-5": {
+        "target": "MiniMax-M3.1-Flash",
+        "label": "MiniMax-M3.1-Flash"
+      },
+      "claude-haiku-4-5": {
+        "target": "MiniMax-M3.1-Flash",
+        "label": "MiniMax-M3.1-Flash"
+      }
+    },
     "useProxy": false
   },
   "or": {

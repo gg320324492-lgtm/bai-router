@@ -19,10 +19,17 @@ window.BAI_CARDS["model-catalog"] = {
     const hosts = (typeof ctx.rowsOfKind === "function" ? ctx.rowsOfKind("jobToken") : []) || [];
     if (!hosts.length) return { update() { }, refresh() { } };
 
+    const MANIFEST = window.BAI_PROVIDERS || {};
     const scoped = hosts.map((host) => {
       const row = host.closest(".credrow");
       const key = row && row.dataset ? row.dataset.k : null;
       const name = key ? ctx.nameOf(key) : "该渠道";
+      /* ⚠ **凭据自取型**的行（清单声明了 credentialReadonly）**不在本卡的射程内**。
+       * 本卡讲的是「令牌每次客户端启动都会轮换 / 存在哪 / 补丁装没装」——那是 Qoder
+       * （worker 补丁 + 令牌文件）那一类的形状。自取型那一类（会员登录态）没有补丁、
+       * 令牌也不在文件里，它有自己的一张卡（mm-member）。讲错形状比不讲更糟：
+       * 用户会去找一个根本不存在的补丁按钮。 */
+      if (key && MANIFEST[key] && MANIFEST[key].credentialReadonly) return null;
       host.innerHTML = `
         <div class="cardbody">
           <div class="tokstat" data-role="patchstat">正在检查补丁状态…</div>
@@ -44,7 +51,7 @@ window.BAI_CARDS["model-catalog"] = {
         </div>`;
       const scope = host.firstElementChild;
       return { scope, key, $: (sel) => scope.querySelector(sel) };
-    });
+    }).filter(Boolean);
 
     function paint(sc, status) {
       const box = sc.$('[data-role="patchstat"]');

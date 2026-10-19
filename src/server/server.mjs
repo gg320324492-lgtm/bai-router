@@ -63,6 +63,14 @@ import {
  * 住在这里的判据就只能靠「注入替身」来测，而那正是 v1.0.76 漏 `* 1000` 的形状。
  * ⚠ wbBodyBytes 返回的是**字节数**（Buffer.byteLength），不是字符数。 */
 import { wb429ContextHint } from "./wb-429.mjs";
+/* MiniMax 会员托管通道（渠道键 `mm`）的凭据与请求头（mm-auth.mjs）。
+ * 独立成文件是为了能**被测试直接 import**——server.mjs 一 import 就起服务，
+ * 住在这里的续期/轮换逻辑就只能「测了替身、没测本体」（wb-token.mjs 顶部的教训）。
+ * 🔴 凭据**只存内存**：模块里没有一行 fs 写操作，进程退出即失效。 */
+import {
+  createMmTokenStore, mmBuildHeaders, mmCanonicalModel, mmNormalizeTools, mmNormalizeBodyTools,
+  MM_INFER_BASE, MM_MODEL, MM_LOGIN_INVALID_MSG,
+} from "./mm-auth.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -111,8 +119,8 @@ const TIERS = [
  *
  * PROVIDERS（展示名）与 RELAY_LABELS（中转错误前缀用的展示名）合并为同一张表——
  * 它们本来就逐字节相同，两份各自维护只会漂移。 */
-const CHANNELS = ["bai", "sn", "wb", "wbai", "zen", "qd", "or"];
-const CHANNEL_LABELS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", wbai: "WorkBuddy AI", zen: "OpenCode Zen", qd: "Qoder", or: "OpenRouter" };
+const CHANNELS = ["bai", "sn", "wb", "wbai", "zen", "qd", "mm", "or"];
+const CHANNEL_LABELS = { bai: "B.AI", sn: "SenseNova", wb: "WorkBuddy", wbai: "WorkBuddy AI", zen: "OpenCode Zen", qd: "Qoder", mm: "MiniMax 会员", or: "OpenRouter" };
 // cliMode/desktopMode 返回体里 keyMatch* 字段名（bai 是历史遗留的无后缀名，不能改）
 const KEYMATCH_FIELDS = { bai: "keyMatch", sn: "keyMatchSn", wb: "keyMatchWb", zen: "keyMatchZen", qd: "keyMatchQd", or: "keyMatchOr" };
 /* 把请求里的 provider 参数收敛成渠道键：认识的渠道原样返回，其余（含缺省 "bai"、未知值）
@@ -199,7 +207,9 @@ const DEFAULTS = {
     // 转移顺序（当前提供方永远排第一，手动选的才是首选）。未配置凭据的会被自动跳过。
     // or（OpenRouter）**永远排最后**：用户原话「没有任何模型可用时的兜底」。
     // wbai 紧跟 wb：两版 WorkBuddy 在链上各占一位（契约 v18 §4.2），且同族相邻更好读。
-    chain: ["qd", "bai", "sn", "zen", "wb", "wbai", "or"],
+    // mm（MiniMax 会员额度）排在 or 之前：它是**会员额度**通道，没登录时会被自动跳过，
+    // 对存量行为零影响；而 or 必须留在兜底位。
+    chain: ["qd", "bai", "sn", "zen", "wb", "wbai", "mm", "or"],
   },
 
   // Qoder（qoder.com 桌面端附带的 Free 套餐）—— 第五个可路由提供方。
@@ -276,6 +286,26 @@ const DEFAULTS = {
     useProxy: false,
   },
 
+  // MiniMax 会员托管通道（mm）—— **会员额度**，不是开放平台按量计费的 API Key。
+  // 走的是 MiniMax Code 桌面端登录的那份账号自带的额度：凭据从本机登录态读
+  // （~/.minimax/auth/prod/cn/mcode-public/auth.json），**只存内存**，不落本文件、不落 config.json。
+  //
+  // 上游是 **Anthropic Messages 原生协议**（直接吃 /v1/messages），所以**不做协议翻译**，
+  // 但**必须**带浏览器指纹头（Origin/Referer/完整 MiniMaxAgent UA）——缺一个就是 401。
+  // 头由 mm-auth.mjs 的 mmBuildHeaders 整份重建（客户端送来的同名头一律作废）。
+  //
+  // upstream 存的是**去掉末段 /v1** 的基址：中转拼 `upstream + req.url`，
+  // 而 req.url = /v1/messages → https://agent.minimax.cn/mavis/api/v1/llm/v1/messages ✓
+  // （与 Anthropic SDK 拼 baseURL + '/v1/messages' 的结果一致）。
+  mm: {
+    relayPort: 15792,          // 15722/15732/15742/15752/15762/15772/15782 都占了
+    upstream: MM_INFER_BASE,   // https://agent.minimax.cn/mavis/api/v1/llm
+    defaultModel: MM_MODEL,    // MiniMax-M3.1-Flash
+    availableModels: [MM_MODEL],
+    mapping: defaultMapping(MM_MODEL, "MiniMax-M3.1-Flash"),
+    useProxy: false,           // agent.minimax.cn 是境内域，直连
+  },
+
   // OpenRouter（v1.0.59）—— 第六个可路由提供方，**免费兜底区**（用户原话：没有任何
   // 模型可用时的兜底）。上游只讲 OpenAI 协议，复用通用协议桥；端口 15772。
   // 与前五家的三处不同：
@@ -315,6 +345,18 @@ const DEFAULTS = {
     useProxy: false, // 实测 openrouter.ai 直连可达；被墙时在面板勾「走本机代理」
   },
 };
+
+/* ---------- MiniMax 会员托管通道（mm）：令牌仓库（**只存内存**） ----------
+ *
+ * 整个进程只有这一个实例，令牌只活在它的内存里：
+ *   · 进程退出 → 令牌随之消失，磁盘上没有任何副本（连 config.json 都没有）。
+ *   · 启动时从本机登录态（~/.minimax/auth/prod/cn/mcode-public/auth.json）读一次。
+ *   · 访问令牌快到期时用刷新令牌换新的，**新刷新令牌立刻存回内存**
+ *     （旧的立即作废——这是 MiniMax 的「一次性轮换」语义，见 mm-auth.mjs 顶部）。
+ *
+ * 🔴 这个对象**不写盘**、日志里也只出现长度与「是否有效」。
+ *    面板要看它的状态，走 mmTokens.snapshot()——那个快照里没有任何令牌值。 */
+const mmTokens = createMmTokenStore({ log: (m) => { try { log(m); } catch { } } });
 
 // ---------- WorkBuddy 版别检测（v1.0.59）：按登录域名自动选上游 ----------
 // WorkBuddy 分两版，令牌**不通用**——国内版令牌打国际端点必然 401：
@@ -516,6 +558,15 @@ function loadCfg() {
       mapping: { ...DEFAULTS.wbai.mapping, ...(wbaiIn.mapping || {}) },
       availableModels: Array.isArray(wbaiIn.availableModels) && wbaiIn.availableModels.length ? wbaiIn.availableModels : [...DEFAULTS.wbai.availableModels],
     };
+    // mm（MiniMax 会员托管通道）深合并：形状与其它家一样。
+    // 🔴 这里**没有**任何凭据字段——会员令牌只存在内存里（mm-auth.mjs），
+    //    落盘的 config.json 里连字段名都不给它（免得以后有人顺手把令牌写进去）。
+    const mmIn = c.mm || {};
+    merged.mm = {
+      ...DEFAULTS.mm, ...mmIn,
+      mapping: { ...DEFAULTS.mm.mapping, ...(mmIn.mapping || {}) },
+      availableModels: Array.isArray(mmIn.availableModels) && mmIn.availableModels.length ? mmIn.availableModels : [...DEFAULTS.mm.availableModels],
+    };
     // failover 深合并
     merged.failover = { ...DEFAULTS.failover, ...(c.failover || {}) };
     if (!Array.isArray(merged.failover.chain) || !merged.failover.chain.length) {
@@ -536,6 +587,14 @@ function loadCfg() {
       const ch = [...merged.failover.chain];
       const at = ch.indexOf("wb");
       ch.splice(at < 0 ? ch.length : at + 1, 0, "wbai");
+      merged.failover.chain = ch;
+    }
+    // mm（MiniMax 会员额度）同理补一个，**插在 or 之前**：or 永远排最后（兜底位），
+    // 不能把 mm 追加到尾巴上把 or 挤走。mm 没登录时会被自动跳过，对存量行为零影响。
+    if (Array.isArray(merged.failover.chain) && !merged.failover.chain.includes("mm")) {
+      const ch = [...merged.failover.chain];
+      const at = ch.indexOf("or");
+      ch.splice(at < 0 ? ch.length : at, 0, "mm");
       merged.failover.chain = ch;
     }
     // or 深合并（同上：旧 config.json 没有 or 块时整块补默认）
@@ -576,7 +635,7 @@ function loadCfg() {
     return merged;
   } catch (e) {
     log("config.json 读取失败，用默认配置:", e.message);
-    const fallback = { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, wbai: { ...DEFAULTS.wbai, mapping: { ...DEFAULTS.wbai.mapping }, availableModels: [...DEFAULTS.wbai.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] }, or: { ...DEFAULTS.or, mapping: { ...DEFAULTS.or.mapping }, availableModels: [...DEFAULTS.or.availableModels], keys: [] }, failover: { ...DEFAULTS.failover, chain: [...DEFAULTS.failover.chain] } };
+    const fallback = { ...DEFAULTS, mapping: { ...DEFAULTS.mapping }, sn: { ...DEFAULTS.sn, mapping: { ...DEFAULTS.sn.mapping }, availableModels: [...DEFAULTS.sn.availableModels] }, zen: { ...DEFAULTS.zen, mapping: { ...DEFAULTS.zen.mapping }, availableModels: [...DEFAULTS.zen.availableModels] }, wb: { ...DEFAULTS.wb, mapping: { ...DEFAULTS.wb.mapping }, availableModels: [...DEFAULTS.wb.availableModels] }, wbai: { ...DEFAULTS.wbai, mapping: { ...DEFAULTS.wbai.mapping }, availableModels: [...DEFAULTS.wbai.availableModels] }, qd: { ...DEFAULTS.qd, mapping: { ...DEFAULTS.qd.mapping }, availableModels: [...DEFAULTS.qd.availableModels] }, mm: { ...DEFAULTS.mm, mapping: { ...DEFAULTS.mm.mapping }, availableModels: [...DEFAULTS.mm.availableModels] }, or: { ...DEFAULTS.or, mapping: { ...DEFAULTS.or.mapping }, availableModels: [...DEFAULTS.or.availableModels], keys: [] }, failover: { ...DEFAULTS.failover, chain: [...DEFAULTS.failover.chain] } };
     wbHealUpstream(fallback.wb, "wb");
     wbHealUpstream(fallback.wbai, "wbai");
     return fallback;
@@ -893,6 +952,10 @@ if (needEnvRestart) {
   process.exit(0);
 }
 log(`路由台启动 relay=:${cfg0.relayPort} panel=:${cfg0.panelPort} (pid ${process.pid}) 代理=${cfg0.proxy || "直连"}`);
+/* MiniMax 会员通道：启动时把本机登录态读进**内存**（令牌不落盘）。
+ * 放在启动自检之后——那个自检可能让本进程 exit(0) 重启自己，没必要先读一遍文件。
+ * 读不到很正常（用户没在 MiniMax Code 里登录），面板会如实说「未配置」。 */
+try { mmTokens.readAuthFile(); } catch (e) { log("MiniMax：读登录态失败（" + String((e && e.message) || e) + "）"); }
 // 壳进程已声明 env 就位（BAI_ENV_FIXED=1）却发现 NO_PROXY 对不上：只告警、绝不自动重启。
 // 自动重启在这里是有害的——每次自重启都会 exit(0)，壳进程的看门狗把它计成崩溃并再拉起一个，
 // 于是端口互抢 + "服务已自动恢复运行"弹窗反复弹出，形成死循环（v1.0.37 真实发生过）。
@@ -1184,6 +1247,7 @@ const recentCallsWb = [];
 const recentCallsWbai = [];
 const recentCallsZen = [];
 const recentCallsQd = [];
+const recentCallsMm = [];   // MiniMax 会员托管通道
 const recentCallsOr = [];   // OpenRouter（第 6 家）
 function activeTier(store) {
   // 最近 30 分钟内被"真实会话"用过的档位；没有观察则返回 null（不再默认猜 Haiku）
@@ -4531,6 +4595,18 @@ async function fetchCatalogFor(p, cfg) {
     }
   }
 
+  if (p === "mm") {
+    /* MiniMax 会员托管通道**没有公开目录接口**（它是会员账号的托管端点），
+     * 所以清单就是出厂那一份。这里如实说清「来源是出厂兜底」，
+     * 免得面板把「目录里没有」说成「上游没有这个模型」。
+     * ⚠ 别去打上游 /v1/models：那条路要会员令牌，且打一次就消耗一次会员额度。 */
+    const models = [...(S.availableModels || [])];
+    return {
+      ok: true, count: models.length, models,
+      note: "MiniMax 会员通道没有公开模型目录接口，这份清单是出厂兜底（当前只有 MiniMax-M3.1-Flash 一款）。",
+    };
+  }
+
   if (p === "qd") {
     // Qoder 的目录没有公开接口，但 worker 拉回后在本地解密再 parse——补丁把那份明文
     // 写到了 tokenFile 同级的 qoder-models.json，这里直接读，不必复刻 Cosy 签名。
@@ -5551,7 +5627,49 @@ function providerConfigured(provider, cfg) {
   }
   if (provider === "or") return orKeys(cfg).length > 0;   // 轮换区：至少 1 把 key 就算配置好
   if (provider === "qd") { try { qdEnsureToken(cfg); return true; } catch { return false; } }
+  /* mm（MiniMax 会员）：判据是**内存里的会员登录态**，不是配置里的任何字段。
+   * 配置里本来就没有凭据字段（令牌不落盘）——所以只能问令牌仓库：
+   *   读到了登录态（有刷新令牌）→ 算已配置（中转请求时会自己续期）；
+   *   登录态作废（invalid_grant 之后）→ 不算已配置，转移链会跳过这一格，
+   *   并由面板把「请在 MiniMax Code 里重新登录」摆在明处。 */
+  if (provider === "mm") {
+    const snap = mmTokens.snapshot();
+    return snap.configured && !snap.invalid;
+  }
   return false;
+}
+
+/* mm（MiniMax 会员）转发前的请求头准备。
+ *
+ * 上游同时校验四样东西：**Bearer 令牌 + 完整 MiniMaxAgent 浏览器 UA + Origin + Referer**。
+ * 实测过 7 种组合，只有这一全套返回 200（`token` 头、无 UA、无 Origin 的变体全部 401
+ * auth failed）。所以这里**整份重建**头：客户端送来的 authorization / x-api-key /
+ * user-agent / origin / referer 一律作废，由我们自己的顶上。
+ *
+ * 顺带把**令牌续期**放在这里：快到期（剩不到 5 分钟）时用刷新令牌换新的，
+ * 换回来的新刷新令牌**立刻存进内存**（旧的已作废）。续期失败会把**不含令牌值**的
+ * 原因抛出去，由调用点转成 401 交回客户端。
+ *
+ * @returns {Promise<object>} 整份请求头
+ */
+async function mmPrepareHeaders({ req }) {
+  const token = await mmTokens.ensure();   // 失败会抛（消息里没有令牌值）
+  return mmBuildHeaders(token, req.headers);
+}
+
+/**
+ * mm 专属的**请求体**改写：把 Anthropic 嵌套形状的工具定义换成 MiniMax 认的扁平形状。
+ *
+ * ⚠ 详见 mm-auth.mjs 的 mmNormalizeTools 注释（那里有实测证据）。
+ *   少了这一步，**任何带工具的请求都会被上游 400 拒掉**，
+ *   而无工具的请求正常 —— 症状是「能聊天、一让模型用工具就断」。
+ *
+ * @param {object} o
+ * @param {Buffer} o.body 原始请求体
+ * @returns {Buffer} 改写后的请求体；无需改写时原样返回
+ */
+function mmPrepareBody({ body }) {
+  return mmNormalizeBodyTools(body);
 }
 
 function relaySpec(provider, cfg) {
@@ -5562,6 +5680,12 @@ function relaySpec(provider, cfg) {
     wbai: ["WorkBuddy AI", () => cfg.wbai?.useProxy === true, { openai: true }],
     zen: ["OpenCode Zen", () => cfg.zen?.useProxy === true, { openai: true }],
     qd: ["Qoder", () => cfg.qd?.useProxy === true, { openai: true }],
+    /* mm（MiniMax 会员）：上游是 **Anthropic 原生协议**（不吃 OpenAI 桥），
+       但**必须**换一整份请求头（Bearer + 完整 MiniMaxAgent UA + Origin + Referer，
+       缺一个就是 401 auth failed）。所以这里给的是 prepareHeaders 而不是 openai。
+       gateV1：只承接 POST /v1/*，count_tokens 与 /v1/models 由本机应答
+       （与 openai 桥同一条准入门，但不走上游协议翻译）。 */
+    mm: ["MiniMax 会员", () => cfg.mm?.useProxy === true, { gateV1: true, prepareHeaders: mmPrepareHeaders, prepareBody: mmPrepareBody }],
     or: ["OpenRouter", () => cfg.or?.useProxy === true, { openai: true }],
   }[provider];
   if (!meta) return null;
@@ -5580,8 +5704,12 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
       // 注意：必须在 body 收完（本回调内）再应答——req.on("data") 已经在收集，
       // 提前 return 而不 res.end() 会让 socket 一直挂着。
       // 只门 openai 桥：bAI/SenseNova 是原样透传中转，非 /v1/ 路径交给上游自己答，保持原行为。
+      // ⚠ gateV1（v1.0.89 · mm）：MiniMax 会员通道的上游是 **Anthropic 原生协议**
+      //   （不走 openai 桥），但它同样只该承接 POST /v1/*，且 count_tokens 与 /v1/models
+      //   也该由本机应答（桌面版靠这两个端点判定「模型可用」）。所以把准入门**拆成两半**：
+      //   门（路径/方法/本机应答）与桥（OpenAI 协议翻译）分开，mm 只要前者。
       const urlPath = String(req.url || "").split("?")[0];
-      if (opts.openai) {
+      if (opts.openai || opts.gateV1) {
         // 端点匹配用：容忍结尾多余的 "/"（路径归一化只影响识别，判 404 的文案仍用原样 urlPath）
         const epPath = urlPath.length > 1 ? urlPath.replace(/\/+$/, "") : urlPath;
         setErrProvider(relayLabel(p), p);
@@ -5682,8 +5810,49 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
 // 一次尝试：把请求送到本渠道的上游并把响应写进 res（可能是影子 res）。
 // 从 makeRelay 里原样抽出，只把闭合的 p/S/useProxy/opts 换成 fo.*。
 async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
-        const headers = {};
+        let headers = {};
         for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
+        /* 渠道专属的**整份**请求头（v1.0.89 · mm）。
+         *
+         * mm 的上游同时校验 Bearer 令牌 / 完整浏览器 UA / Origin / Referer，
+         * 客户端送来的同名头**一律作废**——所以这里不是「补几个头」而是整份换掉：
+         * prepareHeaders 返回的就是最终发出去的那份头。
+         *
+         * 钩子里顺带做**令牌续期**（快到期时换新的）。续期失败要变成一个
+         * **说得清原因**的 401（"请在 MiniMax Code 里重新登录"），
+         * 而不是 500 或一句天书——失败消息里**不含**令牌值。
+         *
+         * 其它渠道没有这个钩子 → headers 仍是从 PASS_HEADERS 抄来的原样，行为一字未变。 */
+        if (typeof fo.opts.prepareHeaders === "function") {
+          let prepared = null;
+          try {
+            prepared = await fo.opts.prepareHeaders({ req, cfg, headers, isProbe, provider: fo.provider });
+          } catch (e) {
+            const why = String((e && e.message) || e);
+            setErrProvider(relayLabel(fo.provider), fo.provider);
+            noteRelayError(fo.provider, "auth", why);
+            if (!res.headersSent) return wbAnthroError(res, 401, why);
+            try { res.end(); } catch { }
+            return;
+          }
+          if (prepared && typeof prepared === "object") headers = prepared;
+        }
+        /* 渠道专属的**请求体**改写（v1.0.89 · mm）。
+         *
+         * ⚠ mm 的上游虽然讲 Anthropic 协议，但**工具定义要的是扁平形状**
+         *   （{type, name, description, input_schema}），而 Claude Code 发的是
+         *   Anthropic 的**嵌套**形状（{type, function:{name, …}}）。
+         *   原样透传 → 上游回 400 "invalid params, function name is empty (2013)"，
+         *   而**没有工具的请求一切正常**（上游没东西可挑）——于是「能聊天、一用工具就断」，
+         *   极难自查。详见 mm-auth.mjs 的 mmNormalizeTools 注释。
+         *
+         * 响应方向**不用**转：上游回的 tool_use 本来就是标准 Anthropic 形状。
+         *
+         * 其它渠道没有这个钩子 → body 原样，行为一字未变。 */
+        if (typeof fo.opts.prepareBody === "function") {
+          try { body = fo.opts.prepareBody({ req, cfg, body, rewritten, isProbe, provider: fo.provider }) || body; }
+          catch { /* 改写失败就按原样发：让上游自己报错，比我们猜着改更安全 */ }
+        }
         // isProbe 由入口算好后传入（同时决定中转观察与超时档位），这里不再重算。
         // v1.0.85：响应头预算同样按体量分档（与 openaiExchange 的 doCall 用同一个纯函数）。
         // 这条透传路径（bai/sn）的 body 是 Buffer，字节数直接就是 body.length，
@@ -5778,6 +5947,10 @@ const wbaiRelay = makeRelay("wbai", recentCallsWbai, (cfg) => ({ upstream: cfg.w
 const zenRelay = makeRelay("zen", recentCallsZen, (cfg) => ({ upstream: cfg.zen.upstream, mapping: cfg.zen.mapping, defaultModel: cfg.zen.defaultModel, availableModels: cfg.zen.availableModels }), (cfg) => cfg.zen.useProxy === true, { openai: true });
 // Qoder：OpenAI 协议，复用同一套桥。认证是轮换的 jt- jobToken（每次请求现读令牌文件），无静态密钥
 const qdRelay = makeRelay("qd", recentCallsQd, (cfg) => ({ upstream: cfg.qd.upstream, mapping: cfg.qd.mapping, defaultModel: cfg.qd.defaultModel, availableModels: cfg.qd.availableModels }), (cfg) => cfg.qd.useProxy === true, { openai: true });
+// MiniMax 会员托管通道（mm）：上游是 **Anthropic 原生协议**，所以**不走 openai 桥**；
+// 但请求头要整份换掉（Bearer + 浏览器 UA + Origin + Referer，缺一个就是 401），
+// 由 opts.prepareHeaders 完成；准入门（只承接 POST /v1/*）由 opts.gateV1 完成。
+const mmRelay = makeRelay("mm", recentCallsMm, (cfg) => ({ upstream: cfg.mm.upstream, mapping: cfg.mm.mapping, defaultModel: cfg.mm.defaultModel, availableModels: cfg.mm.availableModels }), (cfg) => cfg.mm.useProxy === true, { gateV1: true, prepareHeaders: mmPrepareHeaders, prepareBody: mmPrepareBody });
 // OpenRouter（第 6 家）：OpenAI 协议 + 通用桥；凭据是 keys[] 轮换区，由 openaiExchange 内的
 // orPick/orAdvance 每请求现选（这里传的 slice 只提供 upstream/mapping/availableModels）。
 const orRelay = makeRelay("or", recentCallsOr, (cfg) => ({ upstream: cfg.or.upstream, mapping: cfg.or.mapping, defaultModel: cfg.or.defaultModel, availableModels: cfg.or.availableModels }), (cfg) => cfg.or.useProxy === true, { openai: true });
@@ -5856,6 +6029,30 @@ function sliceOf(cfg, p) {
       relayPort: w.relayPort || DEFAULTS.wbai.relayPort, defaultModel: w.defaultModel || DEFAULTS.wbai.defaultModel,
       availableModels: w.availableModels || [...DEFAULTS.wbai.availableModels], mapping: w.mapping || { ...DEFAULTS.wbai.mapping },
       useProxy: w.useProxy === true,
+    };
+  }
+  if (p === "mm") {
+    const m = cfg.mm || {};
+    /* 模型 id 一律归一成上游的**官方写法**（大小写敏感，见 mmCanonicalModel 的注释）。
+     * 面板保存映射时会把目标转成小写——那对六家全是小写 id 的渠道是等价的，
+     * 对 MiniMax 就等于把发出去的名字改掉了。这里归一一次，
+     * 下拉里显示的、存进 config.json 的、发给上游的，三处永远一致。 */
+    const models = (m.availableModels || [...DEFAULTS.mm.availableModels]).map(mmCanonicalModel);
+    const rawMap = m.mapping || { ...DEFAULTS.mm.mapping };
+    const map = {};
+    for (const k of Object.keys(rawMap)) {
+      map[k] = { ...rawMap[k], target: mmCanonicalModel(rawMap[k] && rawMap[k].target) };
+    }
+    return {
+      /* MiniMax 会员通道：**没有** sk- 密钥这一说——鉴权用的是会员登录态换来的
+         Bearer 访问令牌，它只存在内存里（mm-auth.mjs），中转每次请求现取。
+         key 给一个稳定占位符，供「接线比对 / 指纹展示」用；
+         本渠道是否就绪由 /api/status 的 mm.token 汇报（providerConfigured 认它，
+         **不**认这个占位符）。 */
+      p: "mm", zh: "MiniMax 会员", key: "mm-local", upstream: m.upstream || DEFAULTS.mm.upstream,
+      relayPort: m.relayPort || DEFAULTS.mm.relayPort, defaultModel: mmCanonicalModel(m.defaultModel || DEFAULTS.mm.defaultModel),
+      availableModels: models, mapping: map,
+      useProxy: m.useProxy === true,
     };
   }
   if (p === "or") {
@@ -5967,6 +6164,7 @@ function channelCredentials(c) {
     wbai: c.wbai?.accessToken,
     zen: c.zen?.apiKey,
     qd: c.qd?.token || "qd-local",
+    mm: "mm-local",
     or: orActiveKey(c),
   };
 }
@@ -5974,9 +6172,11 @@ function channelCredentials(c) {
 /* CLI/桌面版里"走本地协议桥"的渠道。applyToCli 用同一个判据决定
    ANTHROPIC_BASE_URL 写 127.0.0.1 还是上游本体——**必须是同一个函数**，
    否则会出现"直连上游却写占位符"（上游收不到真凭据，整个渠道 401）。
-   这个名单是**静态的**：zen 不在其中，它默认直连上游本体，与 qd/wb/wbai/or 不同；
-   zen 什么时候才进桥，见 cliViaRelay。 */
-const isBridgeChannel = (p) => p === "wb" || p === "wbai" || p === "qd" || p === "or";
+   这个名单是**静态的**：zen 不在其中，它默认直连上游本体，与 qd/wb/wbai/mm/or 不同；
+   zen 什么时候才进桥，见 cliViaRelay。
+   ⚠ mm 也在名单里：MiniMax 会员通道的鉴权头（Bearer + 浏览器 UA + Origin/Referer）
+     **只有中转自己知道**，Claude Code 直连上游发不出这套头 → 必须过本地中转。 */
+const isBridgeChannel = (p) => p === "wb" || p === "wbai" || p === "qd" || p === "mm" || p === "or";
 
 /* ★ v1.0.78：CLI 侧"走本地协议桥"的**完整**名单（静态名单 + zen 的动态那一种）。
  *
@@ -6042,6 +6242,8 @@ function cliMode(cfg, creds) {
     if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
     // Qoder 同理走本地协议桥；令牌会轮换，故只按端口判据，不做 key 匹配
     if (u.includes(`:${c.qd?.relayPort || DEFAULTS.qd.relayPort}`)) return { mode: "qd", ...r };
+    // MiniMax 会员通道走本地中转（上游要的那套鉴权/指纹头只有中转发得出来）
+    if (u.includes(`:${c.mm?.relayPort || DEFAULTS.mm.relayPort}`)) return { mode: "mm", ...r };
     // OpenRouter 同理走本地协议桥（OpenAI 协议 → 桥翻译）
     if (u.includes(`:${c.or?.relayPort || DEFAULTS.or.relayPort}`)) return { mode: "or", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
@@ -6169,6 +6371,8 @@ function desktopMode(cfg, creds) {
     if (u.includes(`:${c.zen?.relayPort || DEFAULTS.zen.relayPort}`)) return { mode: "zen", ...r };
     // Qoder 同理走本地协议桥；令牌会轮换，故只按端口判据，不做 key 匹配
     if (u.includes(`:${c.qd?.relayPort || DEFAULTS.qd.relayPort}`)) return { mode: "qd", ...r };
+    // MiniMax 会员通道走本地中转（上游要的那套鉴权/指纹头只有中转发得出来）
+    if (u.includes(`:${c.mm?.relayPort || DEFAULTS.mm.relayPort}`)) return { mode: "mm", ...r };
     if (u.includes(`:${c.or?.relayPort || DEFAULTS.or.relayPort}`)) return { mode: "or", ...r };
     if (u.includes(":15721")) return { mode: "ccswitch", ...r };
     return { mode: "other", ...r };
@@ -6481,6 +6685,15 @@ async function statusPayload() {
   const zenCapNow = zenCapFields(cfg);
   // 传输开关的只读事实（v1.0.75）：当前档位 + 前置条件在本机满足没有（三态分清）。
   const zenTransportNow = ocTransportFields(cfg);
+  // MiniMax 会员通道（mm）：令牌快照 + 一句话提示。
+  // 🔴 快照来自 mmTokens.snapshot()，里面**只有长度/有效期/是否有效**，没有令牌值。
+  const mmStatus = providerStatus(cfg, "mm", recentCallsMm);
+  const mmTokenSnapshot = mmTokens.snapshot();
+  const mmTokenHint = mmTokenSnapshot.invalid
+    ? MM_LOGIN_INVALID_MSG
+    : mmTokenSnapshot.configured
+      ? "会员令牌只在内存里，到期自动续期；重启路由台要重新读（在 MiniMax Code 里登录即可恢复）"
+      : "没读到本机 MiniMax 登录态——请先在 MiniMax Code 里登录，再点「重新读取登录态」";
   return {
     now: new Date().toISOString(),
     /* 自报身份：版本 + 实际跑的是哪个文件。
@@ -6610,6 +6823,19 @@ async function statusPayload() {
       pool: wbPoolFields(cfg, "wbai", Date.now()),
       paidHint: wbPaidHintFields("wbai"),
     },
+    // MiniMax 会员托管通道（mm）：令牌**只在内存**，所以这一块的 token 快照
+    // 是唯一的事实来源。快照里**没有任何令牌值**（只有长度/有效期/是否有效）——
+    // 它会原样进 /api/status 交给面板，所以它必须先经过 mm-auth.mjs 的审查。
+    mm: {
+      relay: mmStatus.relay, relayLast: mmStatus.relayLast, upstream: mmStatus.upstream,
+      recent: mmStatus.recent, modelFallback: mmStatus.modelFallback,
+      useProxy: cfg.mm?.useProxy === true,
+      token: mmTokenSnapshot,
+      // 给凭据行/卡片的一句话提示（服务端说了算，渲染层不认识渠道名）。
+      tokenHint: mmTokenHint,
+      // 这一格是**会员额度**通道，不是开放平台按量计费——两回事，面板上必须分开说。
+      memberQuota: true,
+    },
     // OpenRouter（第 6 家）：三盏灯 + 两层轮换状态 + 额度真相（「免费流水区」卡读这里）
     or: {
       relay: orm.relay, relayLast: orm.relayLast, upstream: orm.upstream, recent: orm.recent, modelFallback: orm.modelFallback,
@@ -6683,6 +6909,7 @@ async function runTierProbe(cfg, P, all) {
     : P === "wbai" ? recentCallsWbai
     : P === "zen" ? recentCallsZen
     : P === "qd" ? recentCallsQd
+    : P === "mm" ? recentCallsMm
     : recentCallsOr;
   const active = all ? null : activeTier(store);
   const targets = active ? [active] : TIERS.map((t) => t.key);
@@ -6824,18 +7051,20 @@ const panel = http.createServer(async (req, res) => {
       "/workbuddy-ai": "/wbai", "/wbai.html": "/wbai",
       "/opencode": "/zen", "/zen.html": "/zen",
       "/qoder": "/qd", "/qd.html": "/qd",
+      "/minimax": "/mm", "/mm.html": "/mm",
       "/openrouter": "/or", "/or.html": "/or",
     };
     if (req.method === "GET" && PROVIDER_ALIAS[u.pathname]) {
       res.writeHead(302, { location: PROVIDER_ALIAS[u.pathname], "cache-control": "no-store" });
       return res.end();
     }
-    // 只认六个规范路径。这里写成显式比较而非数组 includes，是为了让
+    // 只认规范路径。这里写成显式比较而非数组 includes，是为了让
     // scripts/check-manifest.cjs 的 C1（清单 path 必须在服务端有对应分支）与
     // C10（渲染模板的路径必须有清单 path 匹配）能用字面量 grep 判断。
     if (req.method === "GET" && (
       u.pathname === "/" || u.pathname === "/bai" || u.pathname === "/sn" || u.pathname === "/wb" ||
-      u.pathname === "/wbai" || u.pathname === "/zen" || u.pathname === "/qd" || u.pathname === "/or"
+      u.pathname === "/wbai" || u.pathname === "/zen" || u.pathname === "/qd" || u.pathname === "/mm" ||
+      u.pathname === "/or"
     )) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "provider.html")));
@@ -6889,6 +7118,28 @@ const panel = http.createServer(async (req, res) => {
     if (req.method === "GET" && u.pathname === "/api/qd/patch/status") {
       try { return json(res, 200, { ok: true, ...qpStatus() }); }
       catch (e) { return json(res, 200, { ok: false, error: String((e && e.message) || e) }); }
+    }
+    /* POST /api/mm/reread —— 重新读一遍本机的 MiniMax 登录态，灌进内存。
+     *
+     * 用户在 MiniMax Code 里重新登录之后点这个：登录态文件里的刷新令牌换了新的，
+     * 中转得把它捡回来（令牌只在内存，磁盘那份不归我们管）。
+     *
+     * 🔴 这里的响应**只有状态快照**（长度/有效期/是否有效），**没有令牌值**；
+     *    也不写任何文件——凭据只在进程内存里。 */
+    if (req.method === "POST" && u.pathname === "/api/mm/reread") {
+      try {
+        const r = mmTokens.readAuthFile({ force: true });
+        if (!r.ok) {
+          return json(res, 400, {
+            error: r.reason || "本机没读到 MiniMax 登录态",
+            remedy: "请先在 MiniMax Code 里登录，然后回到本页再点一次「重新读取登录态」",
+            token: mmTokens.snapshot(),
+          });
+        }
+        return json(res, 200, { ok: true, token: mmTokens.snapshot() });
+      } catch (e) {
+        return json(res, 500, { error: String((e && e.message) || e) });
+      }
     }
     if (req.method === "POST" && u.pathname === "/api/qd/patch/apply") {
       try {
@@ -7048,7 +7299,8 @@ const panel = http.createServer(async (req, res) => {
         // 这一趟是整批写入，宁可少写一家也不能因为一家的脏数据把其余五家一起拖下水
         if (!Array.isArray(ids)) { skipped.push(k); continue; }
         // 归一化与 POST /api/config 完全一致：去空白 → 转小写 → 去空 → 去重
-        const arr = ids.map((x) => String(x == null ? "" : x).trim().toLowerCase()).filter(Boolean);
+        // （mm 例外：它的模型 id 大小写敏感，保留官方写法，见 POST /api/config 里那段注释）
+        const arr = ids.map((x) => k === "mm" ? mmCanonicalModel(x) : String(x == null ? "" : x).trim().toLowerCase()).filter(Boolean);
         // **空数组保持原列表不动**（沿用 /api/config 的既有语义）：宁可留着旧列表，
         // 也不能让一次误操作把某家的模型列表整个清空
         if (!arr.length) { skipped.push(k); continue; }
@@ -7361,7 +7613,13 @@ const panel = http.createServer(async (req, res) => {
         for (const t of TIERS) {
           const m = b.mapping[t.key];
           if (!m) continue;
-          const target = String(m.target || "").trim().toLowerCase();
+          /* 目标模型名的写法：
+           *   既有行为是**转小写**——对六家全是小写 id 的渠道等价；
+           *   但 mm 这一格的上游 id 是**大小写敏感**的（官方写法 MiniMax-M3.1-Flash），
+           *   转小写等于把发出去的名字改了（上游会 400，或更糟：悄悄按别的模型扣额度）。
+           *   故 mm 走 mmCanonicalModel 还原成官方写法。 */
+          const rawTarget = String(m.target || "").trim();
+          const target = P === "mm" ? mmCanonicalModel(rawTarget) : rawTarget.toLowerCase();
           const label = String(m.label || "").trim() || t.zh;
           if (!target) return json(res, 400, { error: `${t.key} 的目标模型不能为空` });
           dst[t.key] = { target, label };
@@ -7404,7 +7662,8 @@ async function unknownMappingTargets(p, mapping, cfg) {
 
 // —— 可选模型列表 ——
       if (Array.isArray(b.availableModels)) {
-        const arr = b.availableModels.map((x) => String(x).trim().toLowerCase()).filter(Boolean);
+        /* 同样：mm 的模型 id 大小写敏感，存的时候要保留官方写法（见上面那段注释）。 */
+        const arr = b.availableModels.map((x) => P === "mm" ? mmCanonicalModel(x) : String(x).trim().toLowerCase()).filter(Boolean);
         if (arr.length) sub.availableModels = [...new Set(arr)];
       }
       // —— 上游地址（中转每请求实时读，无需重启）——
@@ -7425,7 +7684,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
         if (n !== sub.relayPort) { sub.relayPort = n; needRestart = true; }
       }
       if (typeof b.defaultModel === "string" && b.defaultModel.trim()) {
-        sub.defaultModel = b.defaultModel.trim().toLowerCase();
+        sub.defaultModel = P === "mm" ? mmCanonicalModel(b.defaultModel) : b.defaultModel.trim().toLowerCase();
       }
       /* 一个字段都没写进去 → 报错，并**不要** saveCfg（省掉一次无谓的整文件落盘）。
        *
@@ -7527,6 +7786,18 @@ async function unknownMappingTargets(p, mapping, cfg) {
           return json(res, 400, { error: "未读到 Qoder 令牌——请先启动 Qoder 桌面端（补丁会把令牌写到 %TEMP%/qoder-token.json），无需手动填写" });
         }
       }
+      /* mm（MiniMax 会员）：凭据不在配置里（只在内存），所以「配没配好」只能问令牌仓库。
+       * 这里**不**强制重读登录态——用户点「一键接入」是接线动作，不是「我刚登录了」；
+       * 刚登录完请点凭据行上的「重新读取登录态」（那才是会重读磁盘的动作）。 */
+      if (P === "mm") {
+        const snap = mmTokens.snapshot();
+        if (snap.invalid) {
+          return json(res, 400, { error: MM_LOGIN_INVALID_MSG + "——请在 MiniMax Code 里重新登录，然后回到本页点「重新读取登录态」" });
+        }
+        if (!snap.configured) {
+          return json(res, 400, { error: "本机没读到 MiniMax 登录态——请先在 MiniMax Code 里登录，然后回到本页点「重新读取登录态」，再接入" });
+        }
+      }
       const doCli = b.cli !== false;
       const doDesk = b.desktop !== false;
       const warns = [];
@@ -7546,6 +7817,10 @@ async function unknownMappingTargets(p, mapping, cfg) {
         + "③「OpenCode 客户端中转 + 免费档」能用，需本机已装 OpenCode（npm i -g opencode-ai），免费模型不需要订阅。"
         + "改传输方式请在 Zen 页切换；改档位请改上游地址，然后点「刷新模型列表」换成该档自己的目录");
       if (P === "qd") warns.push("Qoder 走账号的 Free 套餐额度；令牌每次 Qoder 启动会轮换，中转会自动跟随——但 Qoder 客户端必须保持运行，否则中转读不到令牌");
+      if (P === "mm") warns.push("MiniMax 会员通道走的是**会员额度**（MiniMax Code 登录的那个账号自带的额度），"
+        + "**不是**开放平台按量计费的 API Key——两回事，别混。令牌只存在内存里：重启路由台要重新读，"
+        + "在 MiniMax Code 里登录即可恢复。上游会按 system prompt 的内容做客户端指纹校验，"
+        + "中转转发时已带上正确的 UA/Origin/Referer，实测能过。");
       if (P === "or") warns.push("OpenRouter 免费区：免费模型 50 次/天/把 key，用尽自动换模型、再换 key（最多 3 把）；重置时间看 X-RateLimit-Reset，面板显示倒计时与剩余次数");
       log(`一键切到 ${name}: cli=${doCli} desktop=${doDesk}`);
       return json(res, 200, { ok: true, provider: P, warnings: warns, snapshot: "已自动快照切换前的配置（可用于一键恢复）" });
@@ -7747,7 +8022,7 @@ function listenWithRetry(srv, port, name) {
     if (e.code !== "EADDRINUSE") { log(`${name} 端口错误: ${e.message}`); process.exit(1); }
     if (attempts === 1) log(`${name} 端口 :${port} 暂被占用（多为重启交接），每 600ms 重试，最多 15 秒`);
     let peerHealthy = false;
-    if (!relay.listening && !snRelay.listening && !wbRelay.listening && !zenRelay.listening && !qdRelay.listening && !orRelay.listening && !panel.listening) {
+    if (!relay.listening && !snRelay.listening && !wbRelay.listening && !zenRelay.listening && !qdRelay.listening && !mmRelay.listening && !orRelay.listening && !panel.listening) {
       try {
         const pr = await fetch(`http://127.0.0.1:${cfg0.panelPort}/api/ping`, { signal: AbortSignal.timeout(1200) });
         peerHealthy = pr.ok;
@@ -7785,6 +8060,7 @@ listenWithRetry(wbRelay, cfg0.wb.relayPort, "WorkBuddy中转");
 listenWithRetry(wbaiRelay, cfg0.wbai.relayPort, "WorkBuddyAI中转");
 listenWithRetry(zenRelay, cfg0.zen.relayPort, "OpenCodeZen中转");
 listenWithRetry(qdRelay, cfg0.qd.relayPort, "Qoder中转");
+listenWithRetry(mmRelay, cfg0.mm.relayPort, "MiniMax会员中转");
 listenWithRetry(orRelay, cfg0.or.relayPort, "OpenRouter中转");
 listenWithRetry(panel, cfg0.panelPort, "面板");
 // 成功绑定中转端口 = 本实例成为唯一的活跃服务者，此时才允许合并配置/跑周期探测
