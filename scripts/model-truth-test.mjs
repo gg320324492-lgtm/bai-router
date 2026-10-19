@@ -18,6 +18,10 @@
  *     日志、面板渲染与改动前**逐字一致**，且没有任何回落记录
  *   ★ ④ **回落不是静默成功**：诊断抽屉里那一条要一眼看出「你发的 A / 实际跑的是 B」
  *   ★ ⑤ **换模后 served 必须跟着改**（否则面板会拿一个假的名字说「实际服务的是它」）
+ *   ★ ⑥ **不是回落的两条新分支**（2026-10-20 实测加的）：客户端送**小写**（上游 id
+ *     大小写敏感，如 mm 的 MiniMax-M3.1-Flash）或送**带日期后缀**的规范 id
+ *     （claude-haiku-4-5-20251001）时，都必须命中映射表/可用清单，**不许**被记成回落。
+ *     回落留痕是「以为在用 A 其实在用 B」的唯一防线，它自己天天误报就等于没有。
  *
  * ## 怎么测的
  *
@@ -80,6 +84,10 @@ const TOK_WB = "dummy-wb-token-not-a-real-credential-y8";
 const SN_DEFAULT = "test-sn-default-model";       // sn 的出厂 defaultModel（回落落点）
 const SN_LISTED = "test-sn-listed-model";         // 在 availableModels 里（第二条分支）
 const SN_MAPPED = "test-sn-mapped-sonnet";        // 映射表里 claude-sonnet-5 的目标（第一条分支）
+/* ★ 清单里一个**大小写混合**的名字：模拟 mm 的官方写法 MiniMax-M3.1-Flash。
+   上游 id 大小写敏感，客户端却常常送小写 —— 逐字比就永远比不中。 */
+const SN_MIXED = "test-sn-MixedCase";
+const SN_MIXED_LOWER = "test-sn-mixedcase";
 /** ★ 用户实测报的那个名字：Zen 的模型名打到 WorkBuddy/别家的中转口上就是它。
  *  夹具里它在**任何**一家的映射与清单里都不存在 —— 这正是回落的前提。 */
 const FOREIGN = "space-bunny-free";
@@ -232,6 +240,11 @@ function patchSn(cfg) {
     "claude-sonnet-5": { target: SN_MAPPED, label: "档·Sonnet" },
     "claude-haiku-4-5": { target: SN_LISTED, label: "档·Haiku" },
   };
+}
+/* 再加一条**大小写混合**的清单项，用来测「客户端送小写」这一路。 */
+function patchSnMixed(cfg) {
+  patchSn(cfg);
+  cfg.sn.availableModels = [SN_LISTED, SN_DEFAULT, SN_MIXED];
 }
 /* WorkBuddy：入口档必然 429，换模挑中目录里那一档付费的。 */
 function patchWb(cfg) {
@@ -412,6 +425,77 @@ describe("T9 ★③ 活体：模型名在映射里时与改动前逐字一致", 
     assert.equal(R.target, SN_LISTED,
       `★ target 必须重算成「我们打算路由到哪」= 客户端要的那个模型，而不是出厂默认档。实际 ${JSON.stringify(R)}`);
     assert.equal(R.mismatch, false, `★ 正常流量绝不许被报成不一致。实际 ${JSON.stringify(R)}`);
+  }, { timeout: 90000 });
+});
+
+/* ====================================================================== *
+ * ★⑥ 活体：两条**新**的查找分支 —— 大小写 与 日期后缀
+ * ====================================================================== *
+ *
+ * 为什么要这两条（2026-10-20 实测出来的）：
+ *   · **大小写**：normalizeModel 会把模型名转小写，而 mm 的上游 id 大小写敏感
+ *     （官方写法 MiniMax-M3.1-Flash）。逐字比永远比不中 → 客户端明明送的就是
+ *     清单里那个名字，却被记成一次「模型回落」。**这条留痕是「以为在用 A 其实在用 B」
+ *     的唯一防线**，它自己天天误报，用户就会学会无视它 —— 那比静默回落更坏。
+ *   · **日期后缀**：Claude Code 发来的是 claude-haiku-4-5-20251001 这种带日期的
+ *     规范 id，而映射表的 key 是 claude-haiku-4-5。查不到 → 静默落到 defaultModel；
+ *     只要「某档映射到的模型」与「本渠道默认模型」不同，用户点的档位就被悄悄换掉。
+ */
+describe("T9 ★⑥ 活体：大小写不敏感 + 日期后缀，都不许被当成回落", () => {
+  let server, upstream, dataDir, P;
+  const hits = [];
+
+  before(async () => {
+    const ports = await portsInRange(9);
+    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
+    dataDir = path.join(TMPROOT, "data-case");
+    upstream = await startFakeUpstream(hits);
+    server = await startServer(dataDir, P, upstream.address().port, patchSnMixed);
+  }, { timeout: 90000 });
+
+  after(() => { try { upstream && upstream.close(); } catch { } killAll(); });
+
+  test("★⑥ 大小写：客户端送小写 → 上游收到清单里的官方写法，且**不记回落**", async () => {
+    hits.length = 0;
+    const r = await askRelay(P.sn, SN_MIXED_LOWER, 1024);
+    assert.equal(r.status, 200, `应当成功。实际 ${r.status}：${r.text.slice(0, 160)}`);
+    const chat = hits.filter((h) => h.url.indexOf("/v1/messages") >= 0);
+    assert.equal(chat[0].model, SN_MIXED,
+      `★ 上游必须收到清单里的**原样写法**（上游 id 大小写敏感，发小写会 400）。实际 ${JSON.stringify(chat.map((h) => h.model))}`);
+    assert.equal(r.text, ANTHRO_OK, `响应正文应原样透传。实际 ${r.text.slice(0, 200)}`);
+    const st = await askStatus(P);
+    assert.deepEqual(st.sn.modelFallback, [],
+      `★ 这不是回落，不许留下回落记录（天天误报的告警比静默回落更坏）。实际 ${JSON.stringify(st.sn.modelFallback)}`);
+    assert.equal(/模型回落/.test(server.stdout()), false,
+      `★ 正常路径不许打回落日志。实际日志尾：\n${server.stdout().slice(-600)}`);
+  }, { timeout: 90000 });
+
+  test("★⑥ 日期后缀：claude-sonnet-5-20260101 → 命中映射表里 claude-sonnet-5 那一档", async () => {
+    hits.length = 0;
+    const r = await askRelay(P.sn, "claude-sonnet-5-20260101", 1024);
+    assert.equal(r.status, 200, `应当成功。实际 ${r.status}：${r.text.slice(0, 160)}`);
+    const chat = hits.filter((h) => h.url.indexOf("/v1/messages") >= 0);
+    assert.equal(chat[0].model, SN_MAPPED,
+      `★ 带日期后缀的档位名必须落到映射表里那一档的目标，而不是静默落到默认模型。实际 ${JSON.stringify(chat.map((h) => h.model))}`);
+    const st = await askStatus(P);
+    assert.deepEqual(st.sn.modelFallback, [], `★ 不许记成回落。实际 ${JSON.stringify(st.sn.modelFallback)}`);
+    const R = st.sn.recent;
+    assert.equal(R.target, SN_MAPPED, `★ target 也要按同一套规则重算（两处解析不许分叉）。实际 ${JSON.stringify(R)}`);
+    assert.equal(R.served, SN_MAPPED, `实际 ${JSON.stringify(R)}`);
+    assert.equal(R.mismatch, false, `★ 不许报不一致。实际 ${JSON.stringify(R)}`);
+  }, { timeout: 90000 });
+
+  test("★⑥ 对照组：真的查不到的名字**仍然**要回落、仍然要留痕（新分支不许把告警一起关掉）", async () => {
+    hits.length = 0;
+    const r = await askRelay(P.sn, FOREIGN, 1024);
+    assert.equal(r.status, 200, `应当成功。实际 ${r.status}：${r.text.slice(0, 160)}`);
+    const chat = hits.filter((h) => h.url.indexOf("/v1/messages") >= 0);
+    assert.equal(chat[0].model, SN_DEFAULT, `查不到就该落到默认模型。实际 ${JSON.stringify(chat.map((h) => h.model))}`);
+    const st = await askStatus(P);
+    assert.equal(st.sn.modelFallback.length, 1,
+      `★ 回落必须仍然留痕（否则这两条新分支就是把唯一的防线关掉了）。实际 ${JSON.stringify(st.sn.modelFallback)}`);
+    assert.equal(st.sn.modelFallback[0].requested, FOREIGN, `实际 ${JSON.stringify(st.sn.modelFallback)}`);
+    assert.equal(st.sn.modelFallback[0].landed, SN_DEFAULT, `实际 ${JSON.stringify(st.sn.modelFallback)}`);
   }, { timeout: 90000 });
 });
 
@@ -602,11 +686,34 @@ describe("T9 ★④ 源码判据：面板必须一眼看出「以为在用 A 其
     const stripNote = (s) => s.split("\n").filter((l) => !/noteModelFallback/.test(l)).join("\n");
     assert.equal(stripNote(loud), quiet,
       `★ 两个解析函数除留痕那一句外必须逐字一致。\nquiet:\n${quiet}\nloud:\n${loud}`);
-    assert.match(quiet, /if \(m && m\.target\) return m\.target;/, "第一条分支（命中映射）");
-    assert.match(quiet, /if \(\(cfg\.availableModels \|\| \[\]\)\.includes\(base\)\) return base;/, "第二条分支（命中清单）");
+    assert.match(quiet, /const hit = resolveModelTarget\(base, cfg\);/, "查找规则必须走共享的 resolveModelTarget（两处各写各的迟早分叉）");
+    assert.match(quiet, /if \(hit\) return hit;/, "命中就返回模型名");
     assert.match(quiet, /return cfg\.defaultModel;/, "第三条分支（回落）必须原样保留");
     assert.equal(/noteModelFallback/.test(quiet), false, "重算那条路**不许**留痕（否则每刷新一次面板就多一条回落记录）");
     assert.match(loud, /noteModelFallback\(ch, base, cfg\.defaultModel\);/, "留痕必须落在回落那条上");
+  });
+
+  test("★ 结构判据：共享的查找函数必须同时具备「大小写不敏感」与「剥掉日期后缀」", () => {
+    /* 这两条是 2026-10-20 实测加上的：mm 的上游 id 大小写敏感（MiniMax-M3.1-Flash），
+       而 Claude Code 发的是带日期的规范 id（claude-haiku-4-5-20251001）。
+       少任何一条，正常流量都会被记成「模型回落」——那条留痕是「以为在用 A 其实在用 B」
+       的唯一防线，它自己误报就等于没有。 */
+    const fn = sliceBetween(SRC, "function resolveModelTarget(base, cfg) {", "\n}");
+    assert.match(fn, /tierKeyOf\(base\)/, "必须先算出去掉日期后缀的档位 key");
+    assert.match(fn, /cfg\.mapping\?\.\[base\]/, "映射表必须先查原名");
+    assert.match(fn, /cfg\.mapping\?\.\[key\]/, "映射表必须再查档位 key（带日期后缀的那种请求靠这条命中）");
+    assert.match(fn, /listedModelOf\(base, cfg\.availableModels\)/, "清单必须查原名");
+    assert.match(fn, /listedModelOf\(key, cfg\.availableModels\)/, "清单必须再查档位 key");
+
+    /* 大小写不敏感这件事必须真的在 listedModelOf 里，不能只在调用处做——
+       调用处拿到的 base 早就被 normalizeModel 转小写了。 */
+    const lf = sliceBetween(SRC, "function listedModelOf(base, list) {", "\n}");
+    assert.match(lf, /toLowerCase\(\) === base/, "★ 清单匹配必须大小写不敏感（逐字比就是 mm 天天误报的根因）");
+    assert.equal(/includes\(base\)/.test(lf), false, "逐字比必须去掉");
+
+    /* 日期后缀必须真的被剥掉，且只剥 8 位数字那一段（别把模型名里的其他数字吃掉）。 */
+    const tk = sliceBetween(SRC, "function tierKeyOf(base) {", "\n}");
+    assert.match(tk, /-\\d\{8\}\$/, "必须剥掉 8 位日期后缀");
   });
 
   test("★ 结构判据：resolveModel 的第三条分支必须**有**留痕调用（前两条不许有）", () => {
@@ -615,8 +722,8 @@ describe("T9 ★④ 源码判据：面板必须一眼看出「以为在用 A 其
     const fn = sliceBetween(SRC, "function resolveModel(name, cfg, ch) {", "// ---------- 桌面版可用性探测的两个端点");
     assert.equal((fn.match(/noteModelFallback/g) || []).length, 1,
       `★ resolveModel 里必须恰好有一处 noteModelFallback 调用。实际片段：\n${fn}`);
-    assert.match(fn, /if \(m && m\.target\) return m\.target;/, "第一条分支（命中映射）必须原样保留");
-    assert.match(fn, /if \(\(cfg\.availableModels \|\| \[\]\)\.includes\(base\)\) return base;/, "第二条分支（命中清单）必须原样保留");
+    assert.match(fn, /const hit = resolveModelTarget\(base, cfg\);/, "查找规则必须走共享的 resolveModelTarget");
+    assert.match(fn, /if \(hit\) return hit;/, "命中就返回模型名");
     /* 留痕必须在 return defaultModel **之前**（反了就等于先回落再记，记的还是对的，
        但顺序一旦倒过来就看不出"因为什么才回落"）。 */
     assert.ok(fn.indexOf("noteModelFallback") < fn.indexOf("return cfg.defaultModel;"),
@@ -661,20 +768,35 @@ const SABOTAGE = [
     where: "resolveModelQuiet —— 事后重算那条路不许留痕",
     from: `function resolveModelQuiet(name, cfg) {
   const base = normalizeModel(name);
-  const m = cfg.mapping?.[base];
-  if (m && m.target) return m.target;
-  if ((cfg.availableModels || []).includes(base)) return base;
+  const hit = resolveModelTarget(base, cfg);
+  if (hit) return hit;
   return cfg.defaultModel;
 }`,
     to: `function resolveModelQuiet(name, cfg) {
   const base = normalizeModel(name);
-  const m = cfg.mapping?.[base];
-  if (m && m.target) return m.target;
-  if ((cfg.availableModels || []).includes(base)) return base;
+  const hit = resolveModelTarget(base, cfg);
+  if (hit) return hit;
   noteModelFallback(cfg.p, base, cfg.defaultModel);
   return cfg.defaultModel;
 }`,
     reds: "★③ 面板每刷新一次就把回落计数再加一次（重算不是一次新的解析）",
+  },
+  {
+    name: "catalog-case-sensitive-again",
+    file: "src/server/server.mjs",
+    where: "listedModelOf —— 清单匹配必须大小写不敏感",
+    from: `  const hit = arr.find((x) => String(x).toLowerCase() === base);`,
+    to: `  const hit = arr.find((x) => String(x) === base);`,
+    reds: "★⑥ 客户端送小写就查不到清单里那个名字 → 记成回落（mm 天天误报的根因）",
+  },
+  {
+    name: "drop-dated-tier-key",
+    file: "src/server/server.mjs",
+    where: "resolveModelTarget —— 映射表必须再查一次去掉日期后缀的档位 key",
+    from: `  const m1 = cfg.mapping?.[key];
+  if (m1 && m1.target) return m1.target;`,
+    to: ``,
+    reds: "★⑥ Claude Code 发的 claude-haiku-4-5-20251001 查不到映射 → 静默落到默认模型",
   },
   {
     name: "no-mismatch-flag",

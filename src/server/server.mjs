@@ -1093,6 +1093,59 @@ function normalizeModel(name) {
   // 去掉 [..] 后缀并小写，否则查不到映射会静默落到默认模型
   return String(name).replace(/\s*\[[^\]]*\]\s*$/, "").trim().toLowerCase();
 }
+/**
+ * 档位 key：Claude Code 有时发来的是**带日期后缀的规范 id**
+ * （claude-haiku-4-5-20251001），而映射表的 key 是**不带日期的档位名**
+ * （claude-haiku-4-5）。
+ *
+ * 少了这一步，这个请求查不到映射 → 静默落到 defaultModel。**只要「某个档位映射到的模型」
+ * 与「本渠道默认模型」不是同一个，用户点的档位就被悄悄换掉了**——
+ * 正是「以为在用 A 其实在用 B」那一类，而且面板连回落记录都不会有。
+ * （实测：2026-10-20 真收到过 claude-haiku-4-5-20251001。）
+ */
+function tierKeyOf(base) {
+  const m = /^(.+)-\d{8}$/.exec(String(base));
+  return m ? m[1] : String(base);
+}
+/**
+ * 可用清单里的匹配：**大小写不敏感**，命中时返回**清单里的原样写法**。
+ *
+ * 为什么必须大小写不敏感：normalizeModel 会把模型名**转小写**，而 mm 的上游 id
+ * 是**大小写敏感**的（官方写法 MiniMax-M3.1-Flash）。逐字比永远比不中，
+ * 于是客户端明明送的就是清单里那个名字，却被记成一次「模型回落」——
+ * 而这条留痕是「以为在用 A 其实在用 B」的**唯一防线**。它自己天天误报，
+ * 用户就会学会无视它（那比静默回落更坏，代码注释里自己写了这句）。
+ *
+ * ⚠ 返回的是**清单里的写法**（不是小写版）——上游 id 大小写敏感，发错了会 400。
+ */
+function listedModelOf(base, list) {
+  const arr = Array.isArray(list) ? list : [];
+  const hit = arr.find((x) => String(x).toLowerCase() === base);
+  return hit == null ? null : String(hit);
+}
+/**
+ * 档位名 → 真正的模型名。**命中就返回模型名，没命中返回 null**（要不要回落交给调用方）。
+ *
+ * 查找顺序（顺序即优先级，与改动前一致）：
+ *   ① 映射表：先查原名，再查去掉日期后缀的档位名
+ *   ② 可用清单：先查原名，再查去掉日期后缀的档位名；大小写不敏感
+ *
+ * ⚠ resolveModel 与 resolveModelQuiet **共用这一个函数**——它们俩一旦分叉，
+ *   providerStatus 重算出来的「意图」就会与实际执行的解析慢慢对不上，
+ *   而对不上的时候面板报的是**两个方向都可能错**的差异，用户无从判断该信哪个。
+ */
+function resolveModelTarget(base, cfg) {
+  const key = tierKeyOf(base);
+  const m0 = cfg.mapping?.[base];
+  if (m0 && m0.target) return m0.target;
+  const m1 = cfg.mapping?.[key];
+  if (m1 && m1.target) return m1.target;
+  const l0 = listedModelOf(base, cfg.availableModels);
+  if (l0) return l0;
+  const l1 = listedModelOf(key, cfg.availableModels);
+  if (l1) return l1;
+  return null;
+}
 /* ---------- 模型回落留痕（v1.0.78 T9） ----------
  *
  * resolveModel 的第三条分支是**静默**的：客户端送来一个「映射表里没有、可用清单里也没有」
@@ -1145,29 +1198,29 @@ function modelFallbackFields(p) {
       firstAt: new Date(x.firstAt).toISOString(), lastAt: new Date(x.lastAt).toISOString(),
     }));
 }
-/** 档位名 → 真正的模型名。**三条分支与 resolveModel 逐字相同，唯一区别是第三条不留痕**。
+/** 档位名 → 真正的模型名。**与 resolveModel 逐字相同，唯一区别是回落那条不留痕**。
  *
  *  它存在的理由是 providerStatus 要**事后重算**「那次请求本来打算路由到哪」：
  * 重算不是一次新的解析，不该再记一次回落（否则面板每刷新一次就多一条回落记录）。
  * ⚠ 两条分支不许各写各的：它们必须永远一致，否则"重算出来的意图"与"实际执行的解析"
  * 会慢慢分叉，那比回落本身更难查。scripts/model-truth-test.mjs 有一条断言把这两个
- * 函数的前四行**逐字**比对，改了一边忘了另一边，测试当场红。 */
+ * 函数的主体**逐字**比对，改了一边忘了另一边，测试当场红。
+ * 它们现在**共用 resolveModelTarget**，查找规则只有一份，分叉在结构上就不可能发生。 */
 function resolveModelQuiet(name, cfg) {
   const base = normalizeModel(name);
-  const m = cfg.mapping?.[base];
-  if (m && m.target) return m.target;
-  if ((cfg.availableModels || []).includes(base)) return base;
+  const hit = resolveModelTarget(base, cfg);
+  if (hit) return hit;
   return cfg.defaultModel;
 }
 /**
  * 档位名 → 真正的模型名。`ch` 是渠道键，只用于回落留痕（不传就记成 "?"）。
- * 前两条分支是**照旧**的：不改解析结果、不改顺序、不改任何返回值。
+ * 查找规则全在 resolveModelTarget 里（与 resolveModelQuiet **共用**），
+ * 这里只多一件事：**真的没命中时留痕**。
  */
 function resolveModel(name, cfg, ch) {
   const base = normalizeModel(name);
-  const m = cfg.mapping?.[base];
-  if (m && m.target) return m.target;
-  if ((cfg.availableModels || []).includes(base)) return base;
+  const hit = resolveModelTarget(base, cfg);
+  if (hit) return hit;
   noteModelFallback(ch, base, cfg.defaultModel);
   return cfg.defaultModel;
 }
