@@ -44,6 +44,7 @@ import { selfStartTimeMs, verifyPidRecord, pidIdentityMessage, VERDICT_SAME } fr
 import {
   wbPoolOf, wbPickAccount, wbNoteFailure, wbNoteRefreshFailure, wbPoolStatus,
   wbPaidSameName, wbMappingRows, wbUnusableStatus, redact as redactWiring,
+  wbNoteSuccess,
 } from "./wb-pool-wiring.mjs";
 /* WorkBuddy 令牌的 JWT 声明解码（wb-token.mjs）：纯逻辑、零 IO。
  * 独立成文件是为了能**被测试直接 import**——server.mjs 一 import 就起服务，
@@ -108,8 +109,11 @@ import { makeUsageScanner } from "./usage-scan.mjs";
  * 就起服务（wb-token.mjs 顶部的教训）。本步**只做加法**：8 个旧端口一字未变，
  * 网关是新增的第 9 个端口；切默认、拆旧端口是后面的步骤。 */
 import {
-  GATEWAY_MODEL, GATEWAY_BODY, makeGatewayHandler,
+  GATEWAY_MODEL, GATEWAY_BODY, GATEWAY_TIER, makeGatewayHandler,
 } from "./gateway.mjs";
+/* 网关的故障转移（gateway-failover.mjs）：把「档位」从最终模型名反查回来，
+ * 转移时才能按**目标家**重解析（各家同一档位是不同模型）。 */
+import { tierOfModel } from "./gateway-failover.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -5008,7 +5012,7 @@ try {
   process.on("exit", () => { try { ocGateway.dispose(); } catch { } });
 } catch { /* 极老的环境没有 process.on("exit") */ }
 
-async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs, usageOut }) {
+async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs, usageOut, acctOut, sessionKey }) {
   const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : p === "or" ? "OpenRouter" : wkZh(p);
   setErrProvider(NAME, p);   // 渠道 key 一起传下去：wbPipe 里的 noteRelayError 要按真实渠道归因
   /* ---- OpenCode 传输：**在取令牌之前**提前分流（v1.0.75）----
@@ -5059,10 +5063,20 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs, usage
      * 拿它当 key 等于把所有探针粘到同一个号上，白占一条绑定还制造假命中。 */
     const mk0 = isProbe ? null : zenSessionId(j, false);
     try {
-      const sel = await wbEnsureTokenPooled(cfg, p, { model: ob && ob.model, sessionKey: mk0 });
+      const sel = await wbEnsureTokenPooled(cfg, p, {
+        model: ob && ob.model,
+        /* 新那套（持久化亲和）的 key：**原生会话头优先**，没有才用派生的。
+         * 老那套（内存 LRU）的 key 仍旧是派生的那个 —— 老行为逐字不变，
+         * 而且两套的 key 空间**相同**时新那套说了算（老那套让位）。 */
+        sessionKey: sessionKey || mk0,
+        stickyKey: mk0,
+      });
       token = sel.token;
       wbActiveAccountId = sel.accountId;
       wbActiveFp = wbAccountFp(sel.token);
+      /* 账号 id 往上传：会话亲和要记「这段对话落在哪个号上」，
+       * 而选号发生在池子内部（这里），中转那一层看不到。 */
+      if (acctOut && typeof acctOut === "object") acctOut.accountId = sel.accountId;
     } catch (e) {
       /* 池子说不可用 —— **原样报池子给的原因**，一个字都不反推。
        * 旧代码这里只会说「访问令牌未配置」，那正是 dsh-xdpool 1.7.7 事故的形态：
@@ -5630,6 +5644,9 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
      * 每次尝试**新的**一个：转交给下一家时，数字必须跟着换——上一家的数字
      * 记到这一家头上就是**错账**。 */
     target.usageOut = {};
+    /* 账号 id 的出口：选号发生在池子内部（桥那一层），中转这一层看不到。
+     * 会话亲和要记「这段对话落在哪个号上」，得靠它。 */
+    target.acctOut = {};
     /* 新增：模型级休息（magpie 的**两级休息**）——这家整体还活着，但**这个模型**
      * 在休息。本次请求跳过它，同号其它模型照常用。
      * 模型级休息不能整家踢掉：那正是「这个模型没额度」把整家拖下水的老毛病。 */
@@ -5673,6 +5690,22 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
          * 但那是「没统计到」，不是「真花了 0」——面板那侧按缺字段显示「—」）。 */
         ...(target.usageOut || {}),
       });
+      /* 会话亲和：这段对话落在哪个号上，要记下来（magpie 的 affinity）。
+       * 记了它，下一段对话就会优先落在同一个号上——供应商的 prompt cache 才读得到。
+       * ⚠ 缺**会话键**或**账号 id**就**不记**：宁可不记，也不要记错
+       *（记错 = 把后面的请求都粘到一个不相干的号上）。
+       * ⚠ 记亲和失败**不许**影响这次应答（它是旁路）。 */
+      try {
+        const acctId = (target.acctOut || {}).accountId || "";
+        const skey = fo.sessionKey || "";
+        if (skey && acctId) {
+          wbNoteSuccess(cfg, provider, {
+            sessionKey: skey, accountId: acctId,
+            usage: target.usageOut || null,
+            model: String((sub.rewritten || {}).model || ""),
+          });
+        }
+      } catch { /* 记亲和失败不该影响这次应答 */ }
       /* 静默换人留痕（v1.0.88）：把「实际服务的渠道 + 实际发出去的模型」一起记进有界结构，
          面板据此在故障转移视图顶部显式告诉用户「你选的是 A、回答你的是 B」。
          sub.rewritten.model 就是真正发出去的那个名字（每个目标渠道都按自己的映射重解析过），
@@ -6062,11 +6095,12 @@ function makeRelayHandler(p, store, getSlice, useProxy, opts = {}) {
              * 没有这个标记的请求（现有 8 个中转端口）走的是原来那条路，一字未变。 */
             if (req[GATEWAY_MODEL]) {
               j.model = req[GATEWAY_MODEL];
-              /* tier0 留 null：**没有档位可重解析**。故障转移的 bodyFor() 遇到
-               * tier0 为 null 会保持请求体不变——那正是这里要的：网关送来的模型名
-               * 就是最终模型名，不该被下一个渠道按「档位表」重新解释一遍。
-               * （按渠道重新解析是第二步的事。） */
-              tier0 = null;
+              /* tier0：**网关模式下档位是从模型名反查回来的**（req[GATEWAY_TIER]）。
+               * 有了它，故障转移的 bodyFor() 能按**目标家**重解析这一档
+               * （sn 的 opus 档是 glm-5.2、wb 的是 hy3 —— 不是同一个模型）。
+               * 查不到档位就留 null：bodyFor() 遇到 null 会保持请求体不变，
+               * 那正是我们要的——**宁可转移不了，也不要把原家的模型发给下一家**。 */
+              tier0 = req[GATEWAY_TIER] || null;
             } else {
               tier0 = tier; // 记下原始档位，转移时按新渠道的映射重解析
               j.model = resolveModel(j.model, sliceCfg, p);
@@ -6094,8 +6128,14 @@ function makeRelayHandler(p, store, getSlice, useProxy, opts = {}) {
       }
       // 探活级小请求（max_tokens≤8）：更短超时
       const isProbe = (() => { try { const j = JSON.parse(body.toString("utf8")); return typeof j.max_tokens === "number" && j.max_tokens <= 8; } catch { return false; } })();
+      /* 会话键：**原生会话头优先**（Claude Code 等会发 `x-claude-code-session-id`），
+       * 没有才用派生的（首条 user 消息的哈希）。
+       * 原生的更准（同一段对话就是同一个 id），派生的只是兜底。
+       * ⚠ 两个都拿不到就是空串 —— **不编造**（magpie 的铁律）。
+       * 探活请求不算会话（它没有真实对话）。 */
+      const sessKey = isProbe ? "" : (sessionOfReq(req) || zenSessionId(rewritten, false) || "");
       try {
-        await attemptWithFailover({ provider: p, S, useProxy, opts, obs }, req, res, cfg, body, rewritten, isProbe, tier0);
+        await attemptWithFailover({ provider: p, S, useProxy, opts, obs, sessionKey: sessKey }, req, res, cfg, body, rewritten, isProbe, tier0);
       } catch (e) {
         try { log('FODEBUG STACK: ' + String(e && e.stack)); } catch {}
         if (!res.headersSent) wbAnthroError(res, 502, String((e && e.message) || e));
@@ -6189,7 +6229,7 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
             return wbAnthroError(res, 400, `请求体无法解析为 Anthropic messages JSON：${why}｜Content-Type=${ctv}｜长度=${len} 字节｜前 80 字节=${raw}`);
           }
           try {
-            await openaiExchange(fo.provider, { cfg, S: fo.S, j: rewritten, isProbe, res, useProxy: fo.useProxy(cfg), obs: fo.obs, usageOut: fo.usageOut });
+            await openaiExchange(fo.provider, { cfg, S: fo.S, j: rewritten, isProbe, res, useProxy: fo.useProxy(cfg), obs: fo.obs, usageOut: fo.usageOut, acctOut: fo.acctOut, sessionKey: fo.sessionKey });
           } catch (e) {
             noteRelayError(fo.provider, "network", String((e && e.message) || e));
             if (!res.headersSent) wbAnthroError(res, 502, (e && e.message) || e);
@@ -6312,6 +6352,9 @@ const gatewayServer = http.createServer(makeGatewayHandler({
    * 而不是抄一份渠道名单——名单与处理器不同步时，网关会说「这家没接线」，
    * 而不是把请求丢给一个不存在的 handler。 */
   isProvider: (key) => Object.prototype.hasOwnProperty.call(gatewayHandlers, key),
+  /* 档位反查要现读配置（映射表会变），所以给的是函数不是快照。 */
+  getCfg: () => loadCfg(),
+  tierOf: tierOfModel,
 }));
 
 // ---------- 文件级操作 ----------
