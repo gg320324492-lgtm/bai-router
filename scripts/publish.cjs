@@ -4,7 +4,7 @@
 const { execSync, execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const { decideProxyUse, buildGhEnv, runDirectProbe } = require("./publish-proxy.cjs");
+const { decideProxyUse, buildGhEnv, runDirectProbe, PROXY_ENV_KEYS } = require("./publish-proxy.cjs");
 const { assertCleanSource, assertRemoteSource } = require("./publish-source.cjs");
 const { syncSeed } = require("./publish-seed.cjs");
 const { isPrereleaseVersion } = require("../src/update-channel.js");
@@ -34,8 +34,40 @@ const releaseRepository = `https://github.com/${owner}/${repo}.git`;
 const readGit = (args, env = process.env) => execFileSync("git", args, {
   cwd: ROOT, encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"], env,
 });
+
+/* 远端核对的执行器：依次试「带代理」与「不带代理」，哪条通用哪条。
+ *
+ * ⚠⚠ 为什么不能直接用上传那份 env（2026-10-22 实测踩到）：
+ *   上传走哪条路由由**探测**决定，而探测打的是 api.github.com；
+ *   核对打的是 **github.com** —— 实测直连 api.github.com 0.8 秒、
+ *   直连 github.com **16.7 秒**（同一个 IP 段，时延差一个数量级），
+ *   git 的连接预算撑不住那次握手：
+ *     fatal: unable to access '…': Failed to connect to github.com port 443 after 21108 ms
+ *   探测说「直连可用」→ 脚本把代理变量摘掉 → 恰好把**核对那条路**断掉。
+ *
+ *   也就是说：**探测量的是一条路，决定的却是另一条路**。两条路各走各的，
+ *   远端核对自己挑一条能通的就行 —— 与上传那条路**解耦**。
+ */
+const noProxyEnv = buildGhEnv(process.env, { useProxy: false });
+let ghEnv = null;   // 发布时再定（见下方 decideProxyUse）
+function netEnvVariants() {
+  const sig = (e) => PROXY_ENV_KEYS.map((k) => `${k}=${e[k] || ""}`).join("|");
+  const out = [];
+  for (const e of [process.env, ghEnv, noProxyEnv]) {
+    if (!e) continue;
+    if (!out.some((v) => sig(v) === sig(e))) out.push(e);
+  }
+  return out;
+}
+function readGitRemote(args) {
+  let last = null;
+  for (const env of netEnvVariants()) {
+    try { return readGit(args, env); } catch (e) { last = e; }
+  }
+  throw last;
+}
 const releaseHead = assertCleanSource(readGit);
-assertRemoteSource(readGit, { repository: releaseRepository, head: releaseHead, tag: `v${v}` });
+assertRemoteSource(readGitRemote, { repository: releaseRepository, head: releaseHead, tag: `v${v}` });
 
 // 更新日志来源（v1.0.51）：release-notes.md 是唯一权威来源。
 // 理由：该文件同时被 electron-builder（build.releaseInfo.releaseNotesFile）写进
@@ -180,13 +212,13 @@ if (isPre) {
  *   env 传给 gh，全程不写 process.env，所以构建阶段的网络设置原封不动。
  * ⚠ 只打印代理变量的**名**，不打印值：代理 URL 里可能嵌着 user:password。 */
 const proxyDecision = decideProxyUse(process.env, runDirectProbe);
-const ghEnv = buildGhEnv(process.env, proxyDecision);
+ghEnv = buildGhEnv(process.env, proxyDecision);
 console.log(`» 发版网络路径：${proxyDecision.useProxy ? "走代理上传（保留代理变量）" : "直连上传（本次已清掉代理变量）"}`);
 console.log(`  理由：${proxyDecision.reason}`);
 
 // 构建耗时数分钟；发布前再次检查本地来源、远端 main 和已存在的 tag。
 assertCleanSource(readGit, releaseHead);
-assertRemoteSource((args) => readGit(args, ghEnv), {
+assertRemoteSource(readGitRemote, {
   repository: releaseRepository, head: releaseHead, tag: `v${v}`,
 });
 
