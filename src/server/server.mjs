@@ -5218,23 +5218,25 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs }) {
           noteRelayError(p, "rate_limit", `${NAME} 触发上游限流`);
         }
       } else if (r.status === 403 && /FreeTierError|only be used from within/i.test(txt)) {
-        /* 免费档围栏。⚠ 文案更正（v1.0.75，2026-10-12）：这里原写「官方限定只能在
-         * OpenCode 客户端内使用 / 换模型无效」——**那个说法不完整，且会让人以为无解**。
-         * 实测证明判据是「**发给模型的请求里必须带工具**」：把工具从模型可见列表里摘掉
-         * （deny 权限就会这样）后，请求退化成「无工具推理」而被同一个 FreeTierError 拒掉；
-         * 保留工具（ask）则一切正常。而本程序直连中转时请求不带工具（执行权在 Claude Code
-         * 那边），所以**走直连这一档必然被拒**。换模型确实无效，但有解：改走 OpenCode
-         * 客户端中转（模型手上就有工具）。 */
-        why = " —— Zen 的免费档要求**发给模型的请求里必须带工具**（服务端返回 FreeTierError）。"
-          + "本程序当前是**直连**中转，请求里不带工具（执行权在 Claude Code 那边），所以这一档走直连必然被拒。"
-          + "换模型无效；解法是把传输方式切成「OpenCode 客户端中转」——那样模型手上就有工具，本机需先装 OpenCode（npm i -g opencode-ai）。"
-          + "另一条路是把上游地址改成 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，https://opencode.ai/auth）。";
-        /* kind 用**产品级标签** `free_tier_direct` 而不是笼统的 `upstream_403`（v1.0.78）：
-         * 这一条**不是渠道故障**，是「免费档 + 直连」这一组合的产品级预期拒绝。
+        /* 免费档围栏。⚠ 文案已大幅更新（2026-10-17 之后）：opencode.ai 服务端在这个时间点
+         * 之后**彻底封死**了免费档的外部调用，与调用方式无关——直连、经本机 OpenCode 客户端
+         * （1.19.3，带有效 OAuth 凭证）中转、带不带工具，一律被同一个 FreeTierError 拒掉。
+         * （实测：在全局数据目录<含有效凭证>下 spawn 1.19.3 端到端对话，仍 403；旧注释里
+         * 「改走 OpenCode 客户端中转就能过围栏」的说法已失效，会让人反复尝试无效路径。）
+         * 这一档**不再可用**，出路只有两条：① 把上游改成 Go 档并订阅（https://opencode.ai/zen/go/v1，
+         * $10/月，实测 oc_sk 在 Go 档是被识别的，只差订阅）；② 让它随故障转移自动落到 wb/wbai/or
+         * 等其它通道（这些不依赖 opencode.ai 免费档，可继续免费对话）。 */
+        why = " —— OpenCode Zen 的**免费档已被服务端彻底封死**（2026-10-17 起，所有外部调用一律"
+          + "FreeTierError，包括经本机 OpenCode 客户端中转），这一档已无法使用。"
+          + "两条出路：① 把上游地址改成 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，"
+          + "https://opencode.ai/auth），你的 oc_sk 在 Go 档是被识别的；② 保持现状，由故障转移自动"
+          + "改走 WorkBuddy / OpenRouter 等其它通道继续对话。";
+        /* kind 用**产品级标签** `free_tier_direct` 而不是笼统的 `upstream_403`：
+         * 这一条**不是渠道故障**，是「免费档 + 外部调用」这一组合的产品级预期拒绝。
          * 面板据此显示「预期内被拒」而不是红灯，文案直接把两条下一步指出来
-         * （①改走 OpenCode 客户端中转 ②切 Go 档），用户不用再猜。 */
+         * （①切 Go 档 ②走其它通道），用户不用再猜。 */
         noteRelayError(p, ZEN_FREE_TIER_DIRECT_KIND,
-          `${NAME} 免费档走直连被拒（预期内，非故障）：改用「OpenCode 客户端中转」，或把上游地址改成 Go 档 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go`);
+          `${NAME} 免费档已被服务端封死（预期内，非故障）：改上游到 Go 档并订阅，或让故障转移落到 wb/wbai/or 等其它通道`);
       } else if (r.status === 402 || /insufficient account funds/i.test(txt)) {
         why = " —— API Key 余额为 0，付费模型需要先充值；Go 档的付费额度同样走这把 Key 的余额。";
         noteRelayError(p, "upstream_402", `${NAME} 余额不足`);
@@ -7484,10 +7486,10 @@ async function unknownMappingTargets(p, mapping, cfg) {
       if (P === "wb") warns.push("WorkBuddy 国内版：0 积分模型由 WorkBuddy 客户端账号提供；令牌过期会自动用刷新令牌续期，无需重新接线。国际版请到「WorkBuddy AI」格单独接线");
       if (P === "wbai") warns.push("WorkBuddy AI 国际版：需要国际版客户端的令牌（与国内版不通用）；模型目录与倍率来自上游 /v3/config，未取到时用出厂兜底清单");
       if (P === "zen") warns.push("OpenCode Zen 有两档、还有两种传输方式，可用性完全不同："
-        + "①「直连 + 免费档」会被拒（FreeTierError）——上游要求发给模型的请求里必须带工具，而直连的请求不带（执行权在 Claude Code 那边）；"
-        + "②「直连 + Go 档」（上游含 /zen/go/）能用，但要账号已订阅 OpenCode Go（$10/月，https://opencode.ai/auth）；"
-        + "③「OpenCode 客户端中转 + 免费档」能用，需本机已装 OpenCode（npm i -g opencode-ai），免费模型不需要订阅。"
-        + "改传输方式请在 Zen 页切换；改档位请改上游地址，然后点「刷新模型列表」换成该档自己的目录");
+        + "①「免费档」已被服务端封死（2026-10-17 起，外部调用一律 403 FreeTierError，直连与经本机 OpenCode 客户端中转都过不去），这一档已无法使用、不是本机故障；"
+        + "②「Go 档」（上游含 /zen/go/）能用，但要账号已订阅 OpenCode Go（$10/月，https://opencode.ai/auth），你的 oc_sk 在 Go 档是被识别的。"
+        + "免费档若要继续对话：要么把上游地址改成 Go 档并订阅，要么让故障转移自动落到 WorkBuddy / OpenRouter 等其它通道；"
+        + "改档位请改上游地址，然后点「刷新模型列表」换成该档自己的目录");
       if (P === "qd") warns.push("Qoder 走账号的 Free 套餐额度；令牌每次 Qoder 启动会轮换，中转会自动跟随——但 Qoder 客户端必须保持运行，否则中转读不到令牌");
       if (P === "or") warns.push("OpenRouter 免费区：免费模型 50 次/天/把 key，用尽自动换模型、再换 key（最多 3 把）；重置时间看 X-RateLimit-Reset，面板显示倒计时与剩余次数");
       log(`一键切到 ${name}: cli=${doCli} desktop=${doDesk}`);
