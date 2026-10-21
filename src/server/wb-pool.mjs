@@ -44,11 +44,23 @@
  * 所以 {@link credentialFreshness} 的信任顺序是
  * **lastRefreshTime > capturedAt > （expiresAt 只当最后垫底，且单独标成不可信档）**。
  *
- * ## 会话粘性
+ * ## 会话粘性（两套并存，别混）
  *
- * key 由**调用方**算好传进来（推荐：对话**首条 user 消息**的 sha256）。
- * 理由与 xdpool 相同：Claude Code 每轮都带完整历史，首条 user 消息在整段对话里
- * 恒定，而会话 id 每轮都变。
+ *   ① **本模块的内存粘性**（`stickyBind`/`stickyLookup`，200 条 LRU）：老的那套。
+ *      key 由**调用方**算好传进来（推荐：对话**首条 user 消息**的 sha256）。
+ *      理由与 xdpool 相同：Claude Code 每轮都带完整历史，首条 user 消息在整段对话里
+ *      恒定，而会话 id 每轮都变。
+ *      语义：**无条件粘**（只要那个号还能用就一直用），且**进程退出就没了**。
+ *
+ *   ② **会话亲和层**（`session-store.mjs`，magpie affinity 的移植）：新的那套。
+ *      判据多一层——「缓存值不值得留」（读+写 ≥1024 token 且缓存没冷），
+ *      而且**跨进程重启**还在。接线层（wb-pool-wiring.mjs）持有它，
+ *      选号时把结论递进来（`acquire` 的 `opts.affinityTarget`），
+ *      判据本身在 {@link affinityDecision} 里。
+ *
+ * 两套的分工：**有原生会话头的请求走新那套，没有的走老那套**（接线层决定）。
+ * 新那套的判据「值不值得留」比老那套严，所以它一旦接管某个会话，
+ * 老那套对那条会话就让位（接线层负责让位，本模块不操心）。
  *
  * ## 边界：本模块**不做**什么（接线时才做的事）
  *
@@ -712,6 +724,126 @@ export function unavailableReason(pool, accountId, now, model) {
 }
 
 // ==========================================================================
+// ⑤' 会话亲和：这一轮粘不粘（magpie 的 affinity 判据落在这里）
+// ==========================================================================
+
+/**
+ * 亲和表里那条记录（按 key 找）。
+ *
+ * ⚠ 为什么不能直接用 `store.lookup(key)` 找这条记录：
+ * lookup 在「这条记录不值得留」时**也**返回 null（magpie 的 no-cache / cold
+ * 两条判据），而**「没有记录」与「有记录但不留」是两件事**：
+ *
+ *   · 没有记录 → 这一层**根本不参与**，老那套无条件粘性照旧接管；
+ *   · 有记录但不留 → 这一层**说了算**（换号，但绑定留着）。
+ *
+ * 分不开这两件事，就会把「缓存不值了」当成「从没粘过」——于是老那套被请回来，
+ * 新那套的判据形同虚设（本模块最怕的那种「默默失效」）。
+ *
+ * @param {object} store 亲和表（SessionStore 或任何有 entries() 的等价物）
+ * @param {string} key 会话 key
+ * @returns {{key:string,target:string,at:number,used:number,meta:object}|null}
+ */
+function affinityRecord(store, key) {
+  if (!store || typeof store.entries !== "function") return null;
+  const list = store.entries();
+  if (!Array.isArray(list)) return null;
+  for (const e of list) if (e && e.key === key) return e;
+  return null;
+}
+
+/**
+ * ★ 亲和决策：**这个会话现在归谁、这一轮该不该继续用它**。
+ *
+ * 判据的顺序（magpie `affine()` 的同款语义，但只用得上的那几段）：
+ *
+ *   ① **那个号现在还能不能用？** —— 问池子（{@link unavailableReason}），
+ *      **绝不**从「本次响应」反推（本章的老规矩：失败原因只问池子）。
+ *      · 凭据**真的死了**（dead）→ **永久解绑**（`forgetTarget`）。
+ *        「休息中」≠「死了」：休息的号等会儿还能用（绑定留着，缓过来还能接回去），
+ *        死了的号再粘着就是**死等**（凭据不会自己活过来）。
+ *      · 只是冷却 / 额度用尽 / 停用 → **绑定留着**，这一轮换号。
+ *   ② **值不值得留？** —— 问亲和层自己（`store.lookup`）：magpie 的
+ *      「读+写 ≥1024 token 且缓存没冷」。不值得留就换号（绑定仍留着，
+ *      下一轮重新判）。
+ *   ③ **「不知道缓存有多少」≠「缓存不值」**：调用方没报缓存量（全是 0）时，
+ *      按「留着」处理（安全侧）—— 否则每条会话都会被判成「不值」，
+ *      每轮重建一次 prompt 缓存，比不接亲和还糟。
+ *
+ * 「可用」由本函数判断（池子最懂 eligibility），「值不值得留」由亲和层判断
+ * （它知道缓存冷不冷）——两边都同意，这一轮才粘住那个号。
+ *
+ * @param {object} pool 池子（含 accounts）
+ * @param {object} store 亲和表；没有它 / 没有这条记录 → decision "none"
+ * @param {string|null} key 会话 key（调用方给的，本模块不造）
+ * @param {number} now 时间源，由调用方注入
+ * @param {string|null} [model] 问的是不是这个模型上的冷却
+ * @returns {{decision:"none"|"stick"|"switch", has:boolean, target:string|null,
+ *            reason:string|null, dead:boolean, cacheKnown:boolean}}
+ */
+export function affinityDecision(pool, store, key, now, model) {
+  const out = { decision: "none", has: false, target: null, reason: null, dead: false, cacheKnown: false };
+  if (!store || typeof store.lookup !== "function") return out;
+  const k = key == null ? "" : String(key);
+  if (!k) return out;
+
+  const rec = affinityRecord(store, k);
+  if (!rec) return out;                 // ① 这一层没有这条记录 → 不参与
+  out.has = true;
+
+  /* ② 那个号现在还能不能用？——问池子。 */
+  const st = unavailableReason(pool, rec.target, now, model);
+  if (!st.available && st.reason === "dead") {
+    /* 凭据真的死了 → 永久解绑。休息中的号不在这一支（它们走下面那支，绑定留着）。 */
+    out.dead = true;
+    out.decision = "switch";
+    out.reason = "dead";
+    try { store.forgetTarget(rec.target); } catch { /* 亲和表坏了不该让请求崩 */ }
+    return out;
+  }
+
+  /* ③ 还活着（哪怕在冷却）→ 问亲和层「这一轮还粘不粘」。
+     usable=false = 「它现在用不了」：这一轮换号，**绑定留着**。 */
+  let looked = null;
+  try { looked = store.lookup(k, { usable: st.available }); } catch { looked = null; }
+  if (looked && looked.target === rec.target) {
+    out.decision = "stick";
+    out.target = rec.target;
+    /* reason 给的是**池子自己的**原因（cooling / quota / …），
+       这样 strict 模式（粘住就绝不换）能把「那个号现在为什么用不了」如实报出去，
+       而不是自己编一个词。 */
+    out.reason = st.available ? "ok" : (st.reason || "cooling");
+    try { store.touch(k); } catch { /* 同上 */ }
+    return out;
+  }
+
+  /* ④ 不粘了 → 本该换号。**但先分清「缓存不值」与「不知道缓存有多少」**：
+   *
+   *   · 「不值」= 知道，而且读写加起来不到 1024 token（magpie 的 no-cache 判据）；
+   *   · 「不知道」= 调用方**没报**缓存量（全是 0）。
+   *
+   * 两者混为一谈的后果很具体：调用方忘了报 → 每一条会话都判成「不值」→
+   * 会话永远不粘 → **每一轮都在重建 prompt 缓存**（比不接亲和还糟得多）。
+   * 所以「不知道」按「留着」处理（安全侧），「知道且不值」才换。
+   * 这也是本仓库的老纪律：读失败当空是灾难，「读失败 = 未知，不是空」。 */
+  const meta = rec.meta && typeof rec.meta === "object" ? rec.meta : {};
+  const cacheKnown = (Number(meta.cacheRead) || 0) + (Number(meta.cacheWrite) || 0) > 0;
+  out.cacheKnown = cacheKnown;
+  if (!cacheKnown && st.available) {
+    out.decision = "stick";
+    out.target = rec.target;
+    out.reason = "unknown-cache";
+    try { store.touch(k); } catch { /* 同上 */ }
+    return out;
+  }
+
+  /* ⑤ 真的不粘了 → 换号。绑定**留着**（死掉的那一支已经解绑过了）。 */
+  out.decision = "switch";
+  out.reason = st.available ? "not-worth" : (st.reason || "unavailable");
+  return out;
+}
+
+// ==========================================================================
 // ⑥ 选号
 // ==========================================================================
 
@@ -729,6 +861,12 @@ function eligibility(pool, acct, model, now) {
  *   ② 粘性：这一段对话已经粘住的号，**只要它还能用就用它**。
  *      这一条是整个模块存在的理由 —— 换号 = 整段对话的 prompt 缓存作废。
  *      它不能用（冷却/停用/移出/判死）时才往下走，走了就会重新绑定。
+ *      ②a **会话亲和层**（新那套，持久化 + 「缓存值不值得留」的判据）：
+ *          调用方（接线层）已经问过 {@link affinityDecision}，把结论递进来
+ *          （`opts.affinityTarget`）。这里只做最后一道检查：**它此刻在不在
+ *          eligible 里**（不在 = 它在冷却/判死/停用 → 换号）。
+ *          它与手动指定、与老那套粘性**同级**：手动指定仍然压过它
+ *          （显式意图永远压过自动优化）。
  *   ③ 按模式选一个新的。
  *
  * 为什么手动指定排在粘性**前面**：粘性是系统为了省积分做的自动优化，
@@ -740,8 +878,10 @@ function eligibility(pool, acct, model, now) {
  *
  * @param {object} pool {version, mode, accounts[], sticky?}
  * @param {{version?:string, model?:string|null, sessionKey?:string|null, now:number,
- *          prefer?:string|null, stickyMap?:Map, rand?:() => number}} opts
- *        `now` 是**必填**的时间源；`rand` 注入随机源（balanced 模式，保证可测）
+ *          prefer?:string|null, stickyMap?:Map, rand?:() => number,
+ *          affinityTarget?:string|null}} opts
+ *        `now` 是**必填**的时间源；`rand` 注入随机源（balanced 模式，保证可测）；
+ *        `affinityTarget` 是**会话亲和层**给出的目标账号 id（见 ②a）
  * @returns {{ok:boolean, account?:object, bound?:boolean, preferred?:boolean,
  *            reason?:string, remedy?:string, how?:string, eligible?:number}}
  */
@@ -783,6 +923,16 @@ export function acquire(pool, opts = {}) {
     preferSkipped = true;
   }
   const extra = preferSkipped ? { preferSkipped: true } : {};
+
+  /* ②a 会话亲和层（新那套）：它说粘住就粘住 —— 但**只在这个号此刻真的可用时**。
+   *    不可用（冷却/额度/判死/停用）就落空，往下走老那套粘性或按模式重选。 */
+  if (opts.affinityTarget) {
+    const a = eligible.find((x) => x.id === opts.affinityTarget);
+    if (a) {
+      bindIfSticky(stickyMap, sessionKey, a.id, now);
+      return { ok: true, account: a, bound: true, eligible: eligible.length, how: "affinity", ...extra };
+    }
+  }
 
   /* ② 粘性优先 —— 保住 prompt 缓存的那一条。 */
   if (sessionKey != null && sessionKey !== "") {
