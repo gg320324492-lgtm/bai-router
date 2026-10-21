@@ -3,7 +3,7 @@
  * 由 provider.html 先加载，panel-common.js 再按 key 取用。
  *
  * v17 起清单的语义变了：**条目是「渠道」，不是「页面」**（契约 REFACTOR-CONTRACT-v17 第一节）。
- * 七个 URL 全部保留，但它们都渲染同一张单页；清单里多了一个不对应独立 URL 的
+ * 八个 URL 全部保留，但它们都渲染同一张单页；清单里多了一个不对应独立 URL 的
  * ccswitch 条目（矩阵上的「交还区」），原先的 home 条目已删除——根路径 / 现在只是
  * 「不预选中任何渠道」的默认视图，不再是清单实体。
  *
@@ -252,6 +252,10 @@ window.BAI_PROVIDERS = {
      * —— 两档的清单互不通用（免费档 83 个 / Go 档 38 个）。
      * 更好的做法是点「检测可用性」：它按真实请求逐个探测，并逐模型标出
      * 「可用 · 支持工具」/「可用 · 仅对话」/「探不通」。 */
+    /* 合并说明：本块取「免费档已被封死」这一版（2026-10-17 实测，外部调用一律 403），
+     * 而非 origin/main 那版「约四分之三请求随机挂起」（2026-10-15 实测）——
+     * 后者更早，且已被前者**包含**：现在 403 先到，根本轮不到挂起那个现象。
+     * 两版对「免费档唯一的干净解是订阅 Go 档」的判断一致。 */
     conclusion: "两档的可用性完全不同，看矩阵卡上的档位徽章："
       + "「免费档」已被服务端彻底封死（2026-10-17 起，外部调用一律 403 FreeTierError，直连与经本机 OpenCode 客户端中转都过不去），"
       + "这一档已无法使用、不是本机故障，换模型也无用；"
@@ -285,8 +289,15 @@ window.BAI_PROVIDERS = {
 
     letter: "WB",
     name: "WorkBuddy",
-    tagline: "腾讯 · 国内版 · 三款 0 积分模型",
-    badge: { text: "0 积分", kind: "cn" },
+    tagline: "腾讯 · 国内版 · 31 款里仅 2 款 0 积分",
+    /* ⚠ v1.0.88 改：原来写「0 积分」+「三款 0 积分模型」，**两处都不准**——
+     * 实测本机目录（2026-10-17，31 款）只有 **2 款** 是 credits=x0.00
+     * （hy3、step-5-preview），其余 **29 款全部收费**（hy4-preview x0.29、
+     * space-bunny x0.08、deepseek-v4.1-flash x0.11 …）。
+     * 一个「0 积分」的徽章会被读成「这家全免费」，于是用户在该家选个别的模型
+     * 就开始烧积分而毫无提示——这跟「静默换人被换到计费渠道」是同一类伤害。
+     * 徽章只说**有一款免费**这个事实，不概括整家。 */
+    badge: { text: "有免费款", kind: "cn" },
     chainable: true,
     /* 账号池卡（v1.0.77）：这一格可以挂多个账号，按「同一段对话粘一个号、
        那个号真用不了才换」的规矩自动轮换。老配置只有一个令牌时池子合成为
@@ -334,8 +345,10 @@ window.BAI_PROVIDERS = {
 
     letter: "WAI",
     name: "WorkBuddy AI",
-    tagline: "腾讯 · 国际版 · 出海",
-    badge: { text: "0 积分 · 海外", kind: "intl" },
+    tagline: "腾讯 · 国际版 · 出海 · 28 款里仅 3 款 0 积分",
+    /* ⚠ 同 wb：实测 28 款里只有 3 款 credits=x0.00（deepseek-v4.1-flash、hy3、
+     * step-5-preview），其余收费。写「0 积分」会被读成整家免费。 */
+    badge: { text: "有免费款 · 海外", kind: "intl" },
     chainable: true,
     /* 账号池卡（v1.0.77）：见 wb.accountPool。与 wb **分池不混** ——
        两版令牌互不通用，装进同一个池子必然有一半是死的。 */
@@ -363,6 +376,72 @@ window.BAI_PROVIDERS = {
     remedy: "先启动「国际版」客户端（国内版那个不行，两者令牌文件不同）再点「一键获取令牌」。没有刷新令牌，到期需重新捕获。模型清单以面板「刷新模型列表」从上游拉到的为准，本格出厂的三项只是兜底。真实对话若报上面那个 400，是上游新增指纹未覆盖，不是本机配置问题——国内外两版都一样，此时可先用 OpenCode Zen 等不挑客户端的渠道顶上。",
 
     settingsLabels: { relayPort: "WorkBuddy AI 中转端口" },
+  },
+
+  /* ================= MiniMax 会员（/mm）—— 转移链在 wbai 之后、or 之前 =================
+   * **会员额度**通道：凭据是 MiniMax Code 桌面端登录态里换来的 Bearer 令牌，
+   * 只存在内存（不落 config.json / 不进日志 / 面板上看不到明文）。
+   * 上游是 Anthropic Messages **原生协议**（不做协议翻译）。
+   * ⚠ 实测（2026-10-19，MiniMax Code 3.1.4）：上游真正硬要求的只有**两样**——
+   *   鉴权令牌（`authorization: Bearer`）与 `content-type: application/json`；
+   *   UA / Origin / Referer / system prompt **都不是校验对象**（去掉照样 200）。
+   *   真正被挑刺的是**工具定义的形状**（本中转已做转换）。
+   * ⚠ 与「开放平台 BYOK（按量计费）」是两回事，面板上必须分开说。 */
+  mm: {
+    key: "mm",
+    path: "/mm",
+    tab: "MiniMax 会员",
+    h1: "MiniMax 会员路由",
+    title: "MiniMax 会员路由 · B.AI 路由台",
+    shortName: "MiniMax 会员",
+
+    letter: "MM",
+    name: "MiniMax 会员",
+    tagline: "会员额度 · 令牌只存内存",
+    /* 徽章只说「会员额度」这个事实，**不写「免费」**：
+     * 会员额度里能用多少取决于用户自己的套餐，写成「免费」会被读成「这家全免费」，
+     * 于是用户随便发消息就开始烧额度而毫无提示——跟 wb 那次「0 积分」是同一类伤害。 */
+    badge: { text: "会员额度", kind: "cn" },
+    chainable: true,
+    /* 凭据**不由用户填写**：中转从本机的 MiniMax Code 登录态自取。
+     * kind 用 jobToken —— 枚举里唯一表示「令牌由中转自取、不落配置」的那一档
+     * （qd 的 jobToken 也是这个性质：轮换的、每次现读）。 */
+    credential: {
+      kind: "jobToken",
+      label: "会员登录态",
+      hint: "从本机 MiniMax Code 的登录态读取，只存内存",
+    },
+    /* 凭据自取型：这一行画成**只读**（没有输入框），只给一个「重新读取登录态」的动作。
+     * 渲染层据此分派，不认渠道名（C11）；endpoint 与文案都在清单里给。 */
+    credentialReadonly: { api: "/api/mm/reread", label: "重新读取登录态" },
+    /* 会员额度通道卡（cards/mm-member.js）：只画清单声明了 memberQuota 的那一格。 */
+    memberQuota: true,
+
+    models: ["MiniMax-M3.1-Flash"],
+    brands: { minimax: "MiniMax" },
+    defaultModels: ["MiniMax-M3.1-Flash"],
+    mappingDefaults: {
+      "claude-fable-5": "MiniMax-M3.1-Flash",
+      "claude-sonnet-5": "MiniMax-M3.1-Flash",
+      "claude-opus-5": "MiniMax-M3.1-Flash",
+      "claude-haiku-4-5": "MiniMax-M3.1-Flash",
+    },
+
+    conclusion: "本机读到了 MiniMax Code 的登录态就算就绪（会员令牌在内存里，快到期会自动续期）。"
+      + "这一格走的是**会员额度**——MiniMax Code 登录的那个账号自带的免费/会员额度，"
+      + "**不是**开放平台按量计费的 API Key：能用多少取决于你自己的套餐，两回事，别混。",
+    caveat: "会员额度通道 · 令牌只存路由台内存 · 上游只认鉴权令牌与工具定义的形状",
+    remedy: "先在 **MiniMax Code 里登录**（凭据从它的登录态拿），再回本页点「重新读取登录态」。"
+      + "令牌**只存在路由台的内存里**：不写进 config.json、不写进日志、面板上也看不到明文；"
+      + "唯一例外是**续期之后**——新令牌会写回 MiniMax Code 自己的登录态文件（它令牌本来就在那儿）。"
+      + "不写回不行：刷新令牌是一次性的，路由台一续期就会把 MiniMax Code 那把作废，两边都掉线。"
+      + "因此**重启路由台不用重新读**。"
+      + "⚠ 上游真正挑刺的只有两处：**鉴权令牌**与**工具定义的形状**"
+      + "（本中转已把嵌套形状转成上游要的扁平形状，能正常对话与调工具）；"
+      + "请求头与 system prompt 都不是校验对象——换句话说，这一格出问题时"
+      + "先看这两处，而不是去调 UA。",
+
+    settingsLabels: { relayPort: "MiniMax 会员中转端口" },
   },
 
   /* ================= OpenRouter（/or）—— 转移链第 6 位（兜底） =================
@@ -467,7 +546,7 @@ window.BAI_PROVIDERS = {
  * ========================================================================== */
 window.BAI_VIEWS = [
   { id: "console", nav: "控制台", dom: "viewConsole", hint: "渠道矩阵 · 映射编辑 · 诊断抽屉", cards: ["model-sync", "oc-transport"] },
-  { id: "cred", nav: "凭据", dom: "viewCred", hint: "每家渠道各自要的东西", cards: ["token-capture", "model-catalog", "or-rotation", "wb-pool"] },
+  { id: "cred", nav: "凭据", dom: "viewCred", hint: "每家渠道各自要的东西", cards: ["token-capture", "model-catalog", "or-rotation", "wb-pool", "mm-member"] },
   { id: "fo", nav: "故障转移", dom: "viewFo", hint: "开关 · 顺序 · 冷却", cards: ["failover"] },
   { id: "settings", nav: "设置", dom: "viewSettings", hint: "代理 · 端口 · 更新 · 数据目录", cards: [] },
 ];

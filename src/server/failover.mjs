@@ -72,6 +72,163 @@ export function failoverSnapshot() {
   return out;
 }
 
+/* ====================================================================== *
+ * 静默换人留痕（v1.0.88）——「我选的是 A，实际回答我的是 B」必须能被看见。
+ *
+ * 背景是一桩真实事故：用户在另一台机器上把 OpenCode Zen 配成入口，链序里紧跟着
+ * WorkBuddy。Zen 免费档约 75% 的请求会挂起（上游不吐首 token），中转在**还没发出
+ * 响应头**时判定失败、自动改投 WorkBuddy —— WorkBuddy 正常应答，于是每一次对话
+ * 都在 WorkBuddy 上真实计费（实测每发约 $0.049），而面板上一切正常。
+ * 跳转早就被 noteFailoverEvent 记进日志，只是那只是 `log()`，谁都不会去看。
+ *
+ * 🔴 本模块只**记录**，不碰任何判定：哪些错误该转移、转移到谁，一个字都没改。
+ *
+ * —— 内存为什么是有界的（这是长期运行的服务，必须说清楚）——
+ *   ① 明细环 silentJumpLog：定长 SILENT_JUMP_LOG 条，unshift + 溢出 pop。
+ *   ② 组合表 silentJumpPairs：**按渠道对**（from|to）开条目，不是按流量开条目。
+ *      渠道集合是封闭的（providers.js 清单，可进链的渠道有 8 家：
+ *      bai/sn/wb/wbai/zen/qd/mm/or），所以条目数上界是 8×8=64，与跑了多久、
+ *      多少条请求无关。再加一道 SILENT_JUMP_MAX_PAIRS 兜底，
+ *      万一将来传入的 from/to 变成不可枚举的动态值，也不会失控。
+ *      ⚠ 上界必须**严格大于** 渠道对数：v1.0.89 加第 8 家（mm）时 64 正好等于
+ *      8×8，于是淘汰逻辑会在"没超界"的情况下触发，面板会静悄悄少报一种换人组合。
+ *   ③ 每条里的 minutes 是定长 SILENT_JUMP_WINDOW_MIN 的分钟桶环；minutes 本身也只
+ *      增不删地按分钟数滚动，不是无限增长。
+ *   三层都是"按固定上界"而不是"按时间清理"，所以最坏占用是个常数，跟运行时长无关。
+ */
+export const SILENT_JUMP_LOG = 50;          // 保留的最近明细条数
+export const SILENT_JUMP_WINDOW_MIN = 60;  // 面板「最近 1 小时」的窗口 = 60 个分钟桶
+export const SILENT_JUMP_MAX_PAIRS = 96;   // 组合表硬上界（可进链 8 家 ⇒ 渠道对 64，留裕度）
+
+const silentJumpLog = [];    // 最近若干条 {at, from, to, model}，最新的在 [0]
+const silentJumpPairs = new Map(); // "from|to" -> {from,to,total,lastAt,model,minutes:[{m,c}]}
+let silentJumpFirstAt = null;      // 本次服务运行以来第一次换人的时刻
+
+/** "from|to" —— 用 | 而不是 :，渠道键里不含分隔符，键不会被歧义解析。 */
+const pairKey = (from, to) => `${from}|${to}`;
+
+/**
+ * 记一次「入口渠道 → 实际服务的渠道」的换人。
+ *
+ * @param from  用户/客户端连的那个渠道（入口）
+ * @param tries attemptWithFailover 的尝试表：{provider, ok} / {provider, skipped}
+ * @param model 实际发出去的那个模型名（可空）。面板靠它说清「钱花到哪个模型上了」。
+ * @param now   测试可注入假时刻；产品代码不传（不传就是 Date.now()）。
+ * @returns 记下了就返回 {from,to}，没换人就返回 null。
+ */
+export function noteSilentJump(from, tries, model, costs, now) {
+  if (!from || !Array.isArray(tries)) return null;
+  /* 「实际服务的」= tries 里第一个 ok 且**不是入口本身**的那家。
+     · 全部 ok:false（最后那句 502）⇒ 没有人服务过，不记 —— 记下来会变成
+       「实际回答你的是 X」而事实上没人回答，是编造。
+     · ok 的就是入口 ⇒ 没换人，不记。
+     · 入口被跳过（额度冷却中）、下一家接上 ⇒ from≠to，如实记，这正是用户体感到的。 */
+  const served = tries.find((t) => t && t.ok === true && t.provider && t.provider !== from);
+  if (!served) return null;
+
+  const at = typeof now === "number" ? now : Date.now();
+  const m = Math.floor(at / 60000);
+  const key = pairKey(from, served.provider);
+  let rec = silentJumpPairs.get(key);
+  if (!rec) {
+    /* 兜底上界：真到这一格说明 from/to 超出了渠道集合，宁可淘汰最久没动静的一条，
+       也不能让 Map 随流量长大。 */
+    if (silentJumpPairs.size >= SILENT_JUMP_MAX_PAIRS) {
+      let oldestKey = null, oldestAt = Infinity;
+      for (const [k, v] of silentJumpPairs) {
+        if (v.lastAt < oldestAt) { oldestAt = v.lastAt; oldestKey = k; }
+      }
+      if (oldestKey != null) silentJumpPairs.delete(oldestKey);
+    }
+    rec = { from, to: served.provider, total: 0, lastAt: at, model: model || null, minutes: [], costs: costs ?? null };
+    silentJumpPairs.set(key, rec);
+  }
+  rec.total++;
+  rec.lastAt = at;
+  if (model) rec.model = model;
+  /* costs 由调用方按**那个模型自己的 credits** 算好（true=计费 / false=免费 / null=查不到）。
+     查不到就保持 null，面板据此**不下结论**——把「不知道」说成「在扣你钱」是误报，
+     比不提示更坏。 */
+  if (costs != null) rec.costs = costs;
+  /* 分钟桶：同一分钟内只加计数；跨分钟则头插一条并把超窗的丢掉。 */
+  const head = rec.minutes[0];
+  if (head && head.m === m) head.c++;
+  else { rec.minutes.unshift({ m, c: 1 }); if (rec.minutes.length > SILENT_JUMP_WINDOW_MIN) rec.minutes.length = SILENT_JUMP_WINDOW_MIN; }
+
+  /* 明细里的 at 存成 ISO 字符串，与 active[].lastAt 同一个形状 —— 面板只认一种，
+     混着放的话那个 Date.parse(x.at) 在真跑起来时会静悄悄变 NaN，渲染成「NaN 分钟前」。 */
+  silentJumpLog.unshift({ at: new Date(at).toISOString(), from, to: served.provider, model: model || null });
+  if (silentJumpLog.length > SILENT_JUMP_LOG) silentJumpLog.length = SILENT_JUMP_LOG;
+  if (silentJumpFirstAt == null) silentJumpFirstAt = at;
+  return { from, to: served.provider };
+}
+
+/** 最近 N 分钟内这一对渠道换了几次（桶环上求和；超窗的桶顺手丢掉，保持结构定长）。 */
+function countInWindow(rec, windowMin, nowMin) {
+  let n = 0;
+  const keep = [];
+  for (const b of rec.minutes) {
+    if (b.m > nowMin - windowMin) { n += b.c; keep.push(b); }
+  }
+  if (keep.length !== rec.minutes.length) rec.minutes = keep;
+  return n;
+}
+
+/**
+ * 给 /api/status 用的快照。面板只读这三个字段：
+ *   total  本次服务运行以来累计换了几次（null 表示一次都没有）
+ *   active [{from,to,count,total,lastAt,model}] —— 只含「入口 ≠ 实际服务」的组合
+ *   recent [{at,from,to,model}] —— 最近几条时间线
+ *
+ * @param now 测试可注入假时刻；产品代码不传。
+ */
+export function silentJumpSnapshot(now) {
+  const at = typeof now === "number" ? now : Date.now();
+  const nowMin = Math.floor(at / 60000);
+  if (!silentJumpLog.length && silentJumpPairs.size === 0) {
+    return { total: 0, firstAt: null, lastAt: null, active: [], recent: [], kept: 0, windowMin: SILENT_JUMP_WINDOW_MIN };
+  }
+  const active = [];
+  for (const rec of silentJumpPairs.values()) {
+    const count = countInWindow(rec, SILENT_JUMP_WINDOW_MIN, nowMin);
+    /* 这一对的最后一次已经超出整段窗口 ⇒ 不再出现在「当前」面板里（它是历史，
+       不是现状）。条目本身不删：留着才不会因为翻一次窗口就丢历史计数。 */
+    if (rec.lastAt <= nowMin * 60000 - SILENT_JUMP_WINDOW_MIN * 60000) continue;
+    active.push({
+      from: rec.from, to: rec.to,
+      count,                                   // 最近 windowMin 分钟
+      total: rec.total,                         // 累计
+      lastAt: new Date(rec.lastAt).toISOString(),
+      model: rec.model || null,
+      /* true=那个模型计费 / false=免费 / null=查不到（面板据此不说扣钱）。 */
+      costs: rec.costs === true ? true : rec.costs === false ? false : null,
+    });
+  }
+  /* 排在前面的先看：窗口内次数多的，其次是最近发生的。 */
+  active.sort((a, b) => (b.count - a.count) || (Date.parse(b.lastAt) - Date.parse(a.lastAt)));
+  return {
+    /* total 是「各组合累计之和」，不是明细环的长度 —— 明细环会淘汰老条目，
+       拿它的长度当累计，用户看到的数字会莫名其妙地掉回去。 */
+    total: [...silentJumpPairs.values()].reduce((n, r) => n + r.total, 0),
+    firstAt: silentJumpFirstAt ? new Date(silentJumpFirstAt).toISOString() : null,
+    lastAt: silentJumpLog.length ? silentJumpLog[0].at : null,
+    active,
+    recent: silentJumpLog.slice(0, 8),
+    /* kept = 明细环里**此刻**还留着的条数（不是 recent 那个上限 8）。
+       给「有界」这件事一个可观测的口：面板排查时能一眼看出缓冲区有没有在涨，
+       测试也才能真的验到「淘汰生效」而不是只验到「展示时被截断了」。 */
+    kept: silentJumpLog.length,
+    windowMin: SILENT_JUMP_WINDOW_MIN,
+  };
+}
+
+/** 只给测试用：把留痕清空。产品代码没有理由调用它。 */
+export function _resetSilentJumpForTest() {
+  silentJumpLog.length = 0;
+  silentJumpPairs.clear();
+  silentJumpFirstAt = null;
+}
+
 // 影子 res：一次尝试先把响应收在内存里，由调用方决定丢弃还是落盘。
 //
 // 两种模式：

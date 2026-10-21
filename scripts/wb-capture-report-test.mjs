@@ -747,8 +747,8 @@ describe("★ ⑤ 结果与本次捕获对得上", () => {
 describe("真 server.mjs 的状态接口契约", () => {
   let child, P, dataDir, killed = false;
   before(async () => {
-    const ports = await portsInRange(8);
-    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7] };
+    const ports = await portsInRange(9);
+    P = { bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3], zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], mm: ports[8] };
     dataDir = fs.mkdtempSync(path.join(TMPROOT, "real-"));
     const cfg = JSON.parse(readFileSync(DEFAULTS_JSON, "utf8"));
     cfg.failover.enabled = false;
@@ -756,7 +756,7 @@ describe("真 server.mjs 的状态接口契约", () => {
      * ② 同时把代理环境变量从子进程环境里摘掉。两件事缺一不可。 */
     cfg.proxy = "http://127.0.0.1:7897";
     cfg.relayPort = P.bai; cfg.panelPort = P.panel;
-    for (const k of ["sn", "wb", "wbai", "zen", "qd", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
+    for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
     fs.writeFileSync(path.join(dataDir, "config.json"), JSON.stringify(cfg, null, 2));
     const env = { ...process.env, BAI_DATA_DIR: dataDir, BAI_ENV_FIXED: "1", BAI_NO_PROXY_AUTODETECT: "1" };
     for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]) delete env[k];

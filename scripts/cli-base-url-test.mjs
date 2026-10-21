@@ -150,10 +150,10 @@ function snapshotHead(dir) {
  * ------------------------------------------------------------------ */
 
 async function bootServer(treeDir, tag, mutate) {
-  const ports = await freePorts(10);
+  const ports = await freePorts(11);
   const P = {
     bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3],
-    zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], fake: ports[8],
+    zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], fake: ports[8], mm: ports[9],
   };
   const root = path.join(TMPROOT, tag);
   const dataDir = path.join(root, "data");
@@ -176,7 +176,7 @@ async function bootServer(treeDir, tag, mutate) {
   /* 端口**最后**统一改写：mutate 若整块替换了某个渠道子对象，会把出厂端口（157xx，真实
    * 装机正在用的）带回来 —— 那绝不能去抢。 */
   cfg.relayPort = P.bai; cfg.panelPort = P.panel;
-  for (const k of ["sn", "wb", "wbai", "zen", "qd", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
+  for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
   writeFileSync(path.join(dataDir, "config.json"), JSON.stringify(cfg, null, 2));
   /* 可选：先在临时 HOME 里放一份「已经接到 zen 中转上」的 settings.json，让 cliMode 认得
    * 当前接的是 zen（面板保存配置后的自动重应用走的就是这条「curCli === P」判据）。 */

@@ -309,8 +309,8 @@ describe("e2e：/api/test 真跑一遍，工具确实发到了上游", () => {
   let upstreamReply = null;    // 每个用例自己设
 
   before(async () => {
-    const [bai, zen, qd, panel, upstream] = await freePorts(5);
-    P = { bai, zen, qd, panel, upstream };
+    const [bai, zen, qd, panel, upstream, mm] = await freePorts(6);
+    P = { bai, zen, qd, panel, upstream, mm };
     dataDir = mkdtempSync(path.join(TMPROOT, "boot-"));
 
     const cfg = JSON.parse(readFileSync(path.join(REPO, "src", "server", "config.defaults.json"), "utf8"));
@@ -318,7 +318,8 @@ describe("e2e：/api/test 真跑一遍，工具确实发到了上游", () => {
     Object.assign(cfg, {
       sn: { ...cfg.sn, relayPort: 15881 }, wb: { ...cfg.wb, relayPort: 15882 },
       wbai: { ...cfg.wbai, relayPort: 15883 }, zen: { ...cfg.zen, relayPort: zen },
-      qd: { ...cfg.qd, relayPort: qd }, or: { ...cfg.or, relayPort: 15884 },
+      qd: { ...cfg.qd, relayPort: qd }, mm: { ...cfg.mm, relayPort: mm },
+      or: { ...cfg.or, relayPort: 15884 },
     });
     cfg.failover.enabled = false;   // 只测 zen 自己的链路，别让别的渠道搅进来
     /* ⚠ 必须预置 cfg.proxy：否则启动后跑一次代理探测，探到本机 7897 就 applyProxy()

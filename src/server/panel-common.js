@@ -612,6 +612,12 @@
     const S = stOf(key);
     const t = S.token || {};
     if (typeof t.configured === "boolean") {
+      /* 凭据已作废（上游说登录态失效）：**报红并说清该做什么**。
+       * 这不是「未配置」——东西曾经是好的，是被上游作废了；处置也不同
+       * （要重新登录，不是第一次去配）。 */
+      if (t.invalid === true) {
+        return { s: "err", txt: "凭据已失效", detail: t.error || "登录态已失效，请到对应客户端重新登录" };
+      }
       if (!t.configured) return { s: "idle", txt: "未配置", detail: (P.credential || {}).label || "凭据未就绪" };
       /* 轮换型令牌（jobToken）：令牌文件还在 ≠ 还在用。客户端没找到 = 上一次运行
          留下的陈旧文件，中转读到它只会 401 —— 这种要说"需留意"而不是"已就绪"。 */
@@ -621,6 +627,12 @@
       }
       if (p && p.tokenFresh === false) {
         return { s: "warn", txt: "令牌未刷新", detail: "客户端没开或没发过带鉴权的请求" };
+      }
+      /* 自动续期型凭据（会员托管那一类）：到期**不是**问题——它会自己续。
+       * 报成黄色的「剩 0 天」会让人以为要手工处理；真正要处理的是续不上，
+       * 那由上面的 invalid 分支报红。 */
+      if (t.autoRenew === true) {
+        return { s: "ok", txt: "已就绪", detail: S.tokenHint || "令牌到期自动续期" };
       }
       const days = t.expiresInDays;
       if (keyCount(t) > 1) {
@@ -1125,7 +1137,20 @@
       const act = q('[data-role="act"]', row);
       clsx(row, key === selected, "sel");
 
-      if (kind === "apiKey") {
+      /* 凭据**不由用户填写**（自取型）：中转从本机的客户端登录态自取令牌。
+       * 画成**只读**：没有输入框、没有「保存」——让用户去填一个用不上的密钥，
+       * 只会让人以为还差一步，实际那一步在客户端里（登录）。
+       * 唯一的动作是「重新读取登录态」：用户在客户端登录完，点它把新凭据捡回来。
+       * 端点与按钮文案都由清单给（credentialReadonly.api / .label），渲染层不认识渠道名。
+       *
+       * ⚠ 这一支**排在 kind 分派之前**：自取型的性质盖过 kind 说它是哪一类
+       * （kind 只决定"凭据视图给不给输入框"），顺序放错就会出现"声明了自取型却仍画输入框"。 */
+      if (P.credentialReadonly && typeof P.credentialReadonly === "object") {
+        const ro = P.credentialReadonly;
+        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
+          + (st.detail ? `<span class="fp zh">${esc(st.detail)}</span>` : "");
+        act.innerHTML = `<button class="btn sm" type="button" data-act="reread">${esc(ro.label || "重新读取登录态")}</button>`;
+      } else if (kind === "apiKey") {
         const C = cfgOf(key);
         const shown = C.apiKey ? esc(fp(C.apiKey)) : "";
         stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
@@ -1246,6 +1271,25 @@
           poll();
         }, $("applyResult"));
         showResult($("applyResult"), `✔ ${nameOf(key)} 的密钥已保存（明文只落在本机 config.json，页面不回显）。`, true);
+      } else if (act === "reread") {
+        /* 自取型凭据的「重新读取」：让中转再去本机的客户端登录态里读一遍。
+         * 端点在清单里给（credentialReadonly.api）——渲染层不认识渠道名（C11）。
+         * 服务端只会回**状态快照**（长度/有效期/是否有效），不会回令牌明文。 */
+        const ro = P.credentialReadonly || {};
+        const url = ro.api || "";
+        if (!url) {
+          showResult($("applyResult"), "这一行没有配置「重新读取」的接口（清单里缺 credentialReadonly.api）。", false);
+          return;
+        }
+        await withBusy(btn, async () => {
+          const r = await postJSON(url, {});
+          if (r && r.error) throw new Error(r.error);
+        }, $("applyResult"));
+        await refreshConfig();
+        poll();
+        showResult($("applyResult"),
+          `✔ ${nameOf(key)}：已重新读取本机登录态。`
+          + "（令牌只存在内存里，页面与日志都不会显示它的明文。）", true);
       } else if (act === "capture") {
         const h = captureHandlers[key];
         if (typeof h === "function") { await h(btn); return; }   // 卡片接管（token-capture）
@@ -1560,6 +1604,51 @@
               + lines.join("\n"),
           });
         }
+      }
+    }
+
+    /* ④c 静默换人（v1.0.88）。
+     *
+     * 「你选的是 A，实际回答你的是 B」这条必须有两个落点：故障转移视图顶部（大块、
+     * 不折叠），以及**这里**——诊断抽屉是用户不进故障转移视图时的默认去处，
+     * 只做一个落点就等于默认看不见。
+     *
+     * 语气分两档，判据只有一条：实际服务的那家是不是**计费**渠道（badge.kind 为
+     * paid/cn），而入口那家是免费的（free/intl）。是 → err（扣钱，红）；否 → warn。
+     * 数据一律来自 /api/status 的 failover.silentJump，服务端只记事实、不定价，
+     * 所以这里报的是「换了谁」而不是替上游报价。 */
+    {
+      const sj = (status && status.failover && status.failover.silentJump) || null;
+      const act = sj && Array.isArray(sj.active) ? sj.active.filter((e) => e && e.from && e.to && e.from !== e.to) : [];
+      if (act.length) {
+        const kindOf = (k) => (((MANIFEST[k] || {}).badge) || {}).kind || "";
+        const money = act.some((e) => ["paid", "cn"].includes(kindOf(e.to)) && ["free", "intl"].includes(kindOf(e.from)));
+        const wmin = sj.windowMin > 1 ? Math.round(sj.windowMin / 60) : 1;
+        const whenAg = (iso) => {
+          const m = (Date.now() - Date.parse(iso || "")) / 60000;
+          if (!isFinite(m)) return "时间未知";
+          if (m < 1) return "刚刚";
+          if (m < 60) return `${Math.round(m)} 分钟前`;
+          if (m < 1440) return `${Math.round(m / 60)} 小时前`;
+          return `${Math.round(m / 1440)} 天前`;
+        };
+        const lines = act.slice(0, 4).map((e) => {
+          const n = `${nameOf(e.from)} → ${nameOf(e.to)}`;
+          const cnt = e.count > 0 ? `最近 ${wmin} 小时 ${e.count} 次` : "最近 1 小时内没有";
+          return `${whenAg(e.lastAt)}　${n}　${cnt}（累计 ${e.total} 次）${e.model ? `　模型 ${e.model}` : ""}`;
+        });
+        const top = act[0];
+        items.push({
+          s: money ? "err" : "warn",
+          t: money
+            ? `你选的渠道没有回答你，${nameOf(top.to)} 在替你回答（并且要计费）`
+            : `你选的渠道没有回答你，${nameOf(top.to)} 正在替它回答`,
+          m: `自动故障转移开着的时候，${nameOf(top.from)} 一失败就由下一家接手，请求照样成功——`
+            + "所以界面看不出任何异常，但回答你的已经不是你选的那家了。\n"
+            + (money ? "注意：接手的那家是计费渠道，上面这些对话记在它的账上。\n" : "")
+            + lines.join("\n")
+            + `\n要停掉：进「故障转移」视图，把后面那几家从顺序里删掉，或关掉自动故障转移。`,
+        });
       }
     }
 

@@ -653,6 +653,29 @@ input.custom { width: 100%; margin-top: 4px; }
 /* ============================================================================
    12. 故障转移视图
    ========================================================================== */
+/* 静默换人告警（v1.0.88）—— 画在整个故障转移视图的最顶上，开关之前，不折叠。
+ *
+ * 视觉等级刻意比上面那个「自动故障转移」开关更高：这条不是状态提示，是
+ * 「你以为在用的那家没有回答你」。同色系里靠 --err / --warn 加左侧色条 + 图标徽章
+ * 拉出来，不靠字号堆砌，免得在小窗口里把下面的顺序区挤没。 */
+.jumpalarm {
+  margin: 12px 16px 4px; padding: 12px 14px; border-radius: 12px;
+  border: 1px solid var(--err-line, var(--line2)); border-left-width: 4px;
+  background: var(--err-soft); display: flex; flex-direction: column; gap: 7px;
+}
+.jumpalarm[hidden] { display: none; }
+.jumpalarm.warn { border-color: var(--warn); background: var(--warn-soft); }
+.jumpalarm .jhead { display: flex; align-items: center; gap: 9px; }
+.jumpalarm .jhead b { font-size: 13.5px; font-weight: 750; color: var(--bad-text, var(--ink)); line-height: 1.5; }
+.jumpalarm .jico {
+  flex: none; width: 19px; height: 19px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--err); color: #fff; font-size: 12.5px; font-weight: 800; line-height: 1;
+}
+.jumpalarm.warn .jico { background: var(--warn); color: var(--brand-ink, #0A0C11); }
+.jumpalarm .jlines { font-size: 11.5px; color: var(--ink2); line-height: 1.75; }
+.jumpalarm .jadvice { font-size: 11.5px; color: var(--ink); line-height: 1.7; }
+
 .fohead { display: flex; align-items: center; gap: 12px; padding: 14px 16px 10px; flex-wrap: wrap; }
 .foheadtxt b { font-size: 13px; font-weight: 700; display: block; }
 .foheadtxt span { font-size: 11.5px; color: var(--dim); }

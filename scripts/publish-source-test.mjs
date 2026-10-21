@@ -114,6 +114,11 @@ function simulatePublish(options = {}) {
       if (name === "fs") return fsFake;
       if (name === "path") return path;
       if (name === "./publish-source.cjs") return { assertCleanSource, assertRemoteSource };
+      /* publish-seed.cjs 是**纯函数模块**（不碰文件、不联网、不读环境变量），
+       * 所以这里直接用**真的**那份——替身只会让「快照同步」这段测不到真逻辑。
+       * ⚠ 它的存在本身就是那 8 个用例的依赖：publish.cjs 一 require 它，
+       *   替身没这一条就会抛 "unexpected dependency"，全部用例一起红。 */
+      if (name === "./publish-seed.cjs") return require("./publish-seed.cjs");
       if (name === "./publish-proxy.cjs") return { decideProxyUse: () => ({ useProxy: false, reason: "fake probe" }), buildGhEnv: (env) => ({ ...env }), runDirectProbe: () => ({ ok: true }) };
       throw new Error("unexpected dependency");
     },
