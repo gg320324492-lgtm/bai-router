@@ -210,16 +210,23 @@ describe("applyToCli —— 接线写 ~/.claude/settings.json", () => {
     assert.equal(api.writes.length, before, "第二次接线不该写盘");
   });
 
-  test("④ 网关模式：BASE_URL 指向统一网关，模型 id 带 provider 前缀", async () => {
+  test("④ 网关模式：BASE_URL 指向统一网关，模型 id 带 provider 前缀**且是档位**", async () => {
     const file = tmpSettings(USER_FILE);
     const api = makeApplyToCli(file, { gateway: true });
     await api.applyToCli(S);
     const env = parseJsonc(fs.readFileSync(file, "utf8")).value.env;
     assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:15799", "网关模式的 BASE_URL 要指向统一网关");
     /* 网关**不猜**走哪一家：它拆模型 id 的第一个 "/"。不带前缀 → 400，说清原因。 */
-    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "bai/hy3", "模型 id 要带 provider 前缀（网关靠它分流）");
-    assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "bai/mimo-v2.5");
-    assert.equal(env.ANTHROPIC_MODEL, "bai/mimo-v2.5");
+    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "bai/claude-opus-5",
+      "模型 id 要带 provider 前缀（网关靠它分流）");
+    /* ⚠ 后半段是**档位**（claude-opus-5），不是最终模型名（hy3）。
+     * 档位是 provider 无关的抽象，最终模型名是 provider 相关的具体值；
+     * 写具体值就等于在链路上丢掉了「这一档」——多档同模型时（zen 的四档都指向
+     * space-bunny-free）具体值反推不出档位，转移就会用错档位的模型。 */
+    assert.notEqual(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "bai/hy3",
+      "后半段必须是档位，不是最终模型名——否则转移时档位不可知");
+    assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "bai/claude-haiku-4-5");
+    assert.equal(env.ANTHROPIC_MODEL, "bai/claude-haiku-4-5");
     /* 显示名**不带**前缀——那是给人看的标签，不是模型 id。 */
     const name = env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME;
     if (name != null) assert.ok(!String(name).includes("/"), "显示名不该带 provider 前缀");

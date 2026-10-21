@@ -150,10 +150,11 @@ function snapshotHead(dir) {
  * ------------------------------------------------------------------ */
 
 async function bootServer(treeDir, tag, mutate) {
-  const ports = await freePorts(11);
+  const ports = await freePorts(12);
   const P = {
     bai: ports[0], sn: ports[1], wb: ports[2], wbai: ports[3],
     zen: ports[4], qd: ports[5], or: ports[6], panel: ports[7], fake: ports[8], mm: ports[9],
+    gateway: ports[10],
   };
   const root = path.join(TMPROOT, tag);
   const dataDir = path.join(root, "data");
@@ -172,11 +173,19 @@ async function bootServer(treeDir, tag, mutate) {
   cfg.wbai = { ...cfg.wbai, accessToken: DUMMY.wbai };
   cfg.qd = { ...cfg.qd, token: DUMMY.qd };        // 手动令牌：/api/apply 不用再去读令牌文件
   cfg.or = { ...cfg.or, keys: [DUMMY.or] };
+  /* 本文件这一组用例验的是**老路**（各家自己的中转端口/直连上游）——
+   * 那是统一网关出问题时的**回退路径**，必须继续被守住。
+   * 出厂默认已改成走网关（v1.0.94-beta.1 起），所以这里**显式关掉**：
+   * 「默认」与「回退路径」是两件事，不能混着测。
+   * 走网关的那一组在文件末尾单独测（mutate.gatewayMode = "on"）。 */
+  cfg.gatewayMode = (mutate && mutate.gatewayMode) || "off";
   if (mutate) mutate(cfg, P);
   /* 端口**最后**统一改写：mutate 若整块替换了某个渠道子对象，会把出厂端口（157xx，真实
    * 装机正在用的）带回来 —— 那绝不能去抢。 */
   cfg.relayPort = P.bai; cfg.panelPort = P.panel;
   for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], relayPort: P[k] };
+  /* 统一网关也要占一个号（否则会去抢真实装机上的 15799）。 */
+  cfg.gatewayPort = P.gateway;
   writeFileSync(path.join(dataDir, "config.json"), JSON.stringify(cfg, null, 2));
   /* 可选：先在临时 HOME 里放一份「已经接到 zen 中转上」的 settings.json，让 cliMode 认得
    * 当前接的是 zen（面板保存配置后的自动重应用走的就是这条「curCli === P」判据）。 */
@@ -538,6 +547,199 @@ if (process.argv.includes("--sabotage")) {
   console.log(JSON.stringify({ file: "src/server/server.mjs", ...s }, null, 2));
   process.exit(0);
 }
+
+/* ------------------------------------------------------------------ *
+ * ⑦ 统一网关模式（v1.0.94-beta.1 起默认走这条）
+ *
+ * 上面那几组验的是**老路**（各家自己的中转端口 / 直连上游）—— 那是统一网关
+ * 出问题时的**回退路径**，必须继续被守住。
+ * 这一组验**新路**：请求先到统一网关，网关按模型 id 的 `provider/模型` 前缀
+ * 分流到那一家。
+ * ------------------------------------------------------------------ */
+describe("⑦ 统一网关模式：接线指向网关，请求按 provider 前缀分流", () => {
+  let srv, fake, seen;
+  const mutate = (cfg, P) => {
+    /* 每家的上游都指到同一个假上游：网关分流后打到的上游就是它，
+     * 录下来的东西就是「网关真的转对了」的证据。 */
+    for (const k of ["bai", "sn", "wb", "wbai", "zen", "qd", "mm", "or"]) {
+      cfg[k] = { ...cfg[k], upstream: `http://127.0.0.1:${P.fake}` };
+    }
+  };
+  mutate.gatewayMode = "on";
+  before(async () => {
+    srv = await bootServer(TREES.after, "gateway", mutate);
+    seen = [];
+    fake = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => { body += d; });
+      req.on("end", () => {
+        seen.push({ url: req.url, body });
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(SSE_BODY("网关标记"));
+      });
+    });
+    await new Promise((r) => fake.listen(srv.P.fake, "127.0.0.1", r));
+  }, { timeout: 180000 });
+  after(async () => {
+    try { srv && srv.kill(); } catch { }
+    try { fake && fake.closeAllConnections && fake.closeAllConnections(); } catch { }
+    try { fake && await new Promise((r) => fake.close(r)); } catch { }
+  });
+
+  test("① 接线：BASE_URL 指向统一网关，模型 id 带 provider 前缀", async () => {
+    const env = await applyProvider(srv, "sn");
+    assert.equal(env.ANTHROPIC_BASE_URL, `http://127.0.0.1:${srv.P.gateway}`,
+      "接线没指向统一网关");
+    assert.ok(String(env.ANTHROPIC_DEFAULT_OPUS_MODEL || "").startsWith("sn/"),
+      "模型 id 没带 provider 前缀，网关分流不了");
+  });
+
+  test("② 请求经网关打到上游，上游收到的是**最终模型名**（前缀已剥掉）", async () => {
+    const r = await fetch(`http://127.0.0.1:${srv.P.gateway}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "sn/glm-5.2", max_tokens: 32, messages: [{ role: "user", content: "网关自检" }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await r.text();
+    assert.equal(r.status, 200, `期望 200，实际 ${r.status}：${text.slice(0, 200)}`);
+    assert.equal(seen.length, 1, `应当只向上游发一次，实际 ${seen.length} 次：${JSON.stringify(seen.map((s) => s.url))}`);
+    const got = JSON.parse(seen[0].body);
+    assert.equal(got.model, "glm-5.2", "上游看到的应是剥掉前缀后的最终模型名");
+    assert.match(text, /网关标记/, "回包应当来自上游");
+  });
+
+  test("②b 模型 id 写 provider/档位 → 上游收到的是**该家映射出来的最终模型名**", async () => {
+    /* 档位（claude-opus-5）是 provider 无关的抽象，最终模型名（glm-5.2）是具体值。
+     * 网关模式下模型 id 带的是**档位**——它无歧义，转移时才知道该按目标家重解析哪一档。 */
+    const before = seen.length;
+    const r = await fetch(`http://127.0.0.1:${srv.P.gateway}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "sn/claude-opus-5", max_tokens: 32, messages: [{ role: "user", content: "档位分流" }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await r.text();
+    assert.equal(r.status, 200, `期望 200，实际 ${r.status}：${text.slice(0, 200)}`);
+    assert.equal(seen.length, before + 1, "应当只向上游发一次");
+    const got = JSON.parse(seen[before].body);
+    assert.equal(got.model, "glm-5.2",
+      "档位必须被按 **sn 自己的映射** 解析成最终模型名（sn 的 opus 档是 glm-5.2）");
+    assert.notEqual(got.model, "claude-opus-5", "档位名不是上游模型名，不能原样发出去");
+  });
+
+  test("②c 模型 id 写 provider/最终模型（旧写法）→ 原样发出去，不被再解析", async () => {
+    /* 旧写法（用户手写、或升级前遗留的接线）里模型段是最终模型名。
+     * 这时**绝不能**再解析它——解析一个模型名只会静默回落到本渠道默认模型，
+     * 用户点了 A 却跑了 B，面板还记成一次「模型回落」。 */
+    const before = seen.length;
+    const r = await fetch(`http://127.0.0.1:${srv.P.gateway}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "sn/kimi-k3", max_tokens: 32, messages: [{ role: "user", content: "字面模型" }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await r.text();
+    assert.equal(r.status, 200, `期望 200，实际 ${r.status}：${text.slice(0, 200)}`);
+    assert.equal(seen.length, before + 1, "应当只向上游发一次");
+    const got = JSON.parse(seen[before].body);
+    assert.equal(got.model, "kimi-k3", "字面模型要原样送到上游");
+    assert.notEqual(got.model, "sensenova-6.8-flash-lite",
+      "字面模型被回落成本渠道默认模型了 —— 那是「用户点 A 跑了 B」");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * ⑧ 网关模式下的**故障转移**：档位随目标家重解析
+ *
+ * 这是整轮改造里最容易「看起来对、其实错」的一环：
+ * 转移时如果不知道用户点的是哪一档，就会拿**入口家的模型**去请求下一家
+ * （下一家多半不服务它 → 400，而且失败原因会被记成「下一家坏了」，排查方向被带偏）。
+ * ------------------------------------------------------------------ */
+describe("⑧ 网关模式下的故障转移：档位按目标家重解析", () => {
+  let srv, failFake, okFake, okSeen;
+  let failPort = 0, okPort = 0;
+  const mutate = (cfg) => {
+    /* ⚠ 刻意把 sn 的 fable-5 也指向 glm-5.2（与 opus-5 同一个模型）——
+     * 这样「按最终模型名反查档位」就**必然歧义**，任何依赖反查的实现都会在这里露馅。 */
+    cfg.sn = {
+      ...cfg.sn,
+      upstream: `http://127.0.0.1:${failPort}`,
+      mapping: { ...cfg.sn.mapping, "claude-fable-5": { target: "glm-5.2" } },
+    };
+    /* bai 的上游是**扁平**字段（cfg.upstream），不是 cfg.bai.upstream。 */
+    cfg.upstream = `http://127.0.0.1:${okPort}`;
+    /* 转移链：入口 sn 挂掉 → 转 bai。 */
+    cfg.failover = { ...(cfg.failover || {}), enabled: true, chain: ["bai"] };
+  };
+  mutate.gatewayMode = "on";
+
+  before(async () => {
+    const extra = await freePorts(2);
+    failPort = extra[0]; okPort = extra[1];
+    srv = await bootServer(TREES.after, "gwfail", mutate);
+    okSeen = [];
+    failFake = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => { body += d; });
+      req.on("end", () => {
+        /* 入口家一律 500 → 触发转移。 */
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "api_error", message: "upstream boom" } }));
+      });
+    });
+    okFake = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => { body += d; });
+      req.on("end", () => {
+        okSeen.push({ url: req.url, body });
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(SSE_BODY("转移成功"));
+      });
+    });
+    await new Promise((r) => failFake.listen(failPort, "127.0.0.1", r));
+    await new Promise((r) => okFake.listen(okPort, "127.0.0.1", r));
+  }, { timeout: 180000 });
+  after(async () => {
+    try { srv && srv.kill(); } catch { }
+    for (const f of [failFake, okFake]) {
+      try { f && f.closeAllConnections && f.closeAllConnections(); } catch { }
+      try { f && await new Promise((r) => f.close(r)); } catch { }
+    }
+  });
+
+  test("① 档位形式：入口 sn 挂掉后，bai 收到的是**bai 自己那一档**的模型", async () => {
+    const r = await fetch(`http://127.0.0.1:${srv.P.gateway}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "sn/claude-opus-5", max_tokens: 32, messages: [{ role: "user", content: "转移" }] }),
+      signal: AbortSignal.timeout(40000),
+    });
+    const text = await r.text();
+    assert.equal(r.status, 200, `期望 200，实际 ${r.status}：${text.slice(0, 200)}`);
+    assert.equal(okSeen.length, 1, `应当正好转到 bai 一次，实际 ${okSeen.length} 次`);
+    const got = JSON.parse(okSeen[0].body);
+    assert.equal(got.model, "hy3",
+      "转移后必须用 **bai 自己** claude-opus-5 档的模型（hy3），而不是入口家 sn 的 glm-5.2");
+    assert.notEqual(got.model, "glm-5.2",
+      "把入口家的模型硬发给下一家 → 下一家不服务它 → 400，且失败原因会被记成「bai 坏了」");
+  });
+
+  test("② 字面模型形式（档位不可知）：下一家收到的是**它自己的默认模型**", async () => {
+    /* 模型段是最终模型名 glm-5.2，而 sn 的 fable-5 与 opus-5 都指向它 →
+     * 档位**不可知**（反查必然歧义）。这时绝不能把 glm-5.2 硬发给 bai。 */
+    const before = okSeen.length;
+    const r = await fetch(`http://127.0.0.1:${srv.P.gateway}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "sn/glm-5.2", max_tokens: 32, messages: [{ role: "user", content: "歧义" }] }),
+      signal: AbortSignal.timeout(40000),
+    });
+    const text = await r.text();
+    assert.equal(r.status, 200, `期望 200，实际 ${r.status}：${text.slice(0, 200)}`);
+    assert.equal(okSeen.length, before + 1, `应当正好转到 bai 一次，实际 ${okSeen.length - before} 次`);
+    const got = JSON.parse(okSeen[before].body);
+    assert.equal(got.model, "qwen3.8-flash",
+      "档位不可知时用**目标家自己的**默认模型（bai 的 qwen3.8-flash）");
+    assert.notEqual(got.model, "glm-5.2",
+      "把入口家的模型硬发给下一家 —— 档位不可知时也不能这么干");
+  });
+});
 
 /* ------------------------------------------------------------------ *
  * 树快照在 import 之后立刻生成（模块顶层）：所有 describe 共用同一份

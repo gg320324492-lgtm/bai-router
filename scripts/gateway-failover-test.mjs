@@ -1,19 +1,29 @@
-/* 统一网关的故障转移计划 —— 档位反查 / 目标家重解析 / 候选链顺序。
+/* 统一网关的档位识别 —— 档位反查 / 档位识别 / 目标家重解析 / 候选链顺序。
  *
  * ## 这份测试在守什么
  *
  * 网关模式下故障转移链断掉的根因是：**模型 id 里没有档位了**。
- * 网关收到的 `provider/模型` 里的模型段**已经是最终模型名**，转移时不知道该用哪一档，
+ * 网关收到的 `provider/...` 里的模型段若是**最终模型名**，转移时不知道该用哪一档，
  * 只能把原模型硬发给下一家 → 下一家多半不服务这个模型 → 400。
  *
- * 本模块的解法是**反查**：从 (provider, 模型) 反查出档位，转移时才对目标家
- * 按**它自己的**映射重新解析。这份测试盯住三件事：
+ * 两个方向：
+ *   · `tierKeyFor` —— 模型 id 写 `provider/档位`（**正规写法**）→ 档位就在 id 里，
+ *     无损、无歧义。这份测试盯住它认得准。
+ *   · `tierOfModel` —— 模型 id 写 `provider/最终模型`（旧写法 / 用户手写）→ 只能反查。
  *
- *   ① 反查**不许猜**——查不到就 null（猜错档位 = 转移后用错模型 = 请求失败）。
- *   ② 回落语义必须与 `server.mjs` 现有的 `resolveModel` **一字不差**（逐条对拍）。
- *   ③ 顺序语义与 magpie 一致：**用户手选的就是首选**，入口永远第一。
+ * ⚠⚠ **反查命中多个 = 歧义 = 必须返回 null。**
+ * 这条曾经写反过（旧实现「取第一个」），代价是：zen 的四档都指向 space-bunny-free，
+ * 反查必然命中四个 → 取到 fable → 转移到 wb 时用了 wb 的 **fable** 档模型
+ * （deepseek-v4.1-flash），而用户点的是 **opus** 档（应是 hy3）。
+ * **用户点的档位被悄悄换掉，面板上什么都看不出来。**
  *
- * 末尾两条**反向对照**把源码改坏（反查一律返回 null / 回落用入口家的默认模型），
+ * 这份测试盯住四件事：
+ *   ① 反查**不许猜**——查不到**或**命中多个都 null。
+ *   ② 档位识别（tierKeyFor）认得准，且不把模型名误认成档位。
+ *   ③ 回落语义必须与 `server.mjs` 现有的 `resolveModel` **一字不差**（逐条对拍）。
+ *   ④ 顺序语义与 magpie 一致：**用户手选的就是首选**，入口永远第一。
+ *
+ * 末尾两条**反向对照**把源码改坏（歧义时返回第一个 / 回落用入口家的默认模型），
  * 证明对应断言**真的会红**——恒真的测试比没有测试更坏。
  */
 import { test, describe } from "node:test";
@@ -99,21 +109,43 @@ describe("档位反查", () => {
     assert.equal(GF.tierOfModel("不认识这家", "hy3", cfg), null);
     /* 空模型名不许命中任何东西 */
     assert.equal(GF.tierOfModel("sn", "", cfg), null);
-    /* ⚠ 猜错档位 = 转移后用错模型 = 请求失败，所以这里只能是 null */
-    assert.equal(GF.tierOfModel("sn", "sn-shared", cfg) === null, false,
-      "反查得到就必须给出档位，不许含糊");
   });
 
-  test("③ 两档映射到同一个模型 → 取第一个，且转移后模型仍正确", () => {
+  test("③ 两档映射到同一个模型 → **歧义，返回 null**（不许挑一个）", () => {
     const cfg = makeCfg();
-    /* sn 的 fable-5 与 opus-5 都指向 sn-shared：取第一个（键序＝优先级） */
-    assert.equal(GF.tierOfModel("sn", "sn-shared", cfg), "claude-fable-5");
-    /* 取哪个都不影响转移结果——wb 的这两档都指向 wb-shared */
+    /* sn 的 fable-5 与 opus-5 都指向 sn-shared —— 反查命中两个，档位**不可知**。
+     * 挑一个（哪怕挑对了一个）也是**瞎猜**：挑错就是「用户点 opus 跑了 fable 的模型」。 */
+    assert.equal(GF.tierOfModel("sn", "sn-shared", cfg), null,
+      "命中多个 = 歧义 = 档位不可知，必须返回 null");
+    /* 歧义时转移**绝不能**把入口家的模型硬发给下一家 —— 只能用目标家自己的默认模型 */
     const plan = GF.planGatewayChain("sn/sn-shared", cfg);
     assert.equal(plan[0].provider, "sn");
+    assert.equal(plan[0].tier, null, "档位不可知就不许填一个");
     assert.equal(plan[1].provider, "wb");
-    assert.equal(plan[1].model, "wb-shared",
-      "歧义档位转移后拿到的模型必须仍然正确（两档在目标家指向同一个模型）");
+    assert.equal(plan[1].model, "wb-default",
+      "档位不可知时用目标家自己的默认模型");
+    assert.notEqual(plan[1].model, "sn-shared",
+      "把入口家的模型硬发给下一家 → 下一家不服务它 → 400，且失败原因会被记成「下一家坏了」");
+  });
+
+  test("③b 档位识别（tierKeyFor）：模型 id 写 provider/档位 时认得准", () => {
+    const cfg = makeCfg();
+    /* 档位名 → 档位本身 */
+    assert.equal(GF.tierKeyFor("sn", "claude-opus-5", cfg), "claude-opus-5");
+    assert.equal(GF.tierKeyFor("sn", "claude-sonnet-5", cfg), "claude-sonnet-5");
+    /* 带日期后缀的规范 id 也要认（claude-haiku-4-5-20251001） */
+    assert.equal(GF.tierKeyFor("sn", "claude-haiku-4-5-20251001", cfg), "claude-haiku-4-5");
+    /* 最终模型名**不是**档位 */
+    assert.equal(GF.tierKeyFor("sn", "glm-5.2", cfg), null, "模型名不是档位");
+    assert.equal(GF.tierKeyFor("sn", "sn-shared", cfg), null);
+    assert.equal(GF.tierKeyFor("wb", "hy3", cfg), null);
+    /* 渠道不认识 */
+    assert.equal(GF.tierKeyFor("不认识这家", "claude-opus-5", cfg), null);
+    /* 这一家没配这一档，但它是系统认得的档位 → 仍按档位处理（交给中转按本家回落） */
+    assert.equal(GF.tierKeyFor("wb", "claude-haiku-4-5", cfg, { tiers: ["claude-haiku-4-5"] }),
+      "claude-haiku-4-5", "认得系统的档位清单");
+    assert.equal(GF.tierKeyFor("wb", "claude-haiku-4-5", cfg), null,
+      "没给 tiers 清单时只认这一家映射表里有的");
   });
 });
 
@@ -243,10 +275,15 @@ function contractChecks(mod) {
   const cfg = makeCfg();
   assert.equal(mod.tierOfModel("sn", "glm-5.2", cfg), "claude-sonnet-5", "① 反查");
   assert.equal(mod.tierOfModel("sn", "hy3", cfg), null, "② 反查不到");
-  assert.equal(mod.tierOfModel("sn", "sn-shared", cfg), "claude-fable-5", "③ 歧义取第一个");
+  assert.equal(mod.tierOfModel("sn", "sn-shared", cfg), null, "③ 歧义 → null（不许挑一个）");
 
   const amb = mod.planGatewayChain("sn/sn-shared", cfg);
-  assert.equal(amb[1].model, "wb-shared", "③ 转移后模型仍正确");
+  assert.equal(amb[1].model, "wb-default", "③ 歧义时用目标家自己的默认模型");
+  assert.notEqual(amb[1].model, "sn-shared", "③ 绝不把入口家的模型硬发给下一家");
+
+  /* 档位识别（新写法走这条） */
+  assert.equal(mod.tierKeyFor("sn", "claude-opus-5", cfg), "claude-opus-5", "③b 档位识别");
+  assert.equal(mod.tierKeyFor("sn", "glm-5.2", cfg), null, "③b 模型名不是档位");
 
   const plan = mod.planGatewayChain("sn/glm-5.2", cfg);
   assert.equal(plan[1].provider, "wb", "④ 第二项是 wb");
@@ -280,11 +317,30 @@ describe("反向对照（改坏源码，断言必须红）", () => {
     contractChecks(GF);
   });
 
-  test("⑭ 把「档位反查」改坏（一律返回 null）→ 必须打红", async () => {
+  test("⑭ 把「歧义时返回第一个」改坏 → 必须打红", async () => {
+    /* 这正是旧实现（「取第一个命中的档位」）——它会让「用户点 opus、转移后跑 fable 的
+     * 模型」这种错**重新回来**，而面板上看不出来。 */
+    const bad = await mutantModule(
+      "ambiguous-first",
+      "    if (found !== null) return null;                    // 命中第二个 → 歧义 → 不猜",
+      "    if (found !== null) return found;                  // SABOTAGE：歧义时取第一个",
+    );
+    assert.throws(() => contractChecks(bad),
+      "歧义改成取第一个之后断言竟然还绿 —— 那这条断言是恒真的");
+    const cfg = makeCfg();
+    assert.equal(bad.tierOfModel("sn", "sn-shared", cfg), "claude-fable-5",
+      "改坏之后确实挑了一个档位");
+    const plan = bad.planGatewayChain("sn/sn-shared", cfg);
+    assert.equal(plan[1].model, "wb-shared",
+      "挑中的档位决定了转移后跑哪个模型 —— 这就是「用户点 opus 跑了 fable 的模型」");
+    assert.notEqual(plan[1].model, "wb-default");
+  });
+
+  test("⑭b 把「档位反查」改坏（一律返回 null）→ 必须打红", async () => {
     const bad = await mutantModule(
       "tier-null",
-      "    if (String(entry.target) === want) return tier;    // 命中即返回（键序 = 优先级）",
-      "    if (String(entry.target) === want) return null;    // SABOTAGE：反查一律返回 null",
+      "    found = tier;\n  }\n  return found;",
+      "    found = null;   // SABOTAGE：反查一律返回 null\n  }\n  return found;",
     );
     assert.throws(() => contractChecks(bad),
       "反查改成返回 null 之后断言竟然还绿 —— 那这条断言是恒真的");

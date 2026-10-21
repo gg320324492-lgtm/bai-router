@@ -146,10 +146,15 @@ window.BAI_CARDS["gateway-switch"] = {
       }
       const rows = keys.map((k) => {
         const gw = gproviders.find((p) => p && p.key === k) || null;
+        /* 模型 id 现在写的是 `provider/档位`，所以这里列**档位**（= 模型 id 的后半段）。
+         * 档位后面顺带标上它当前的模型，用户才知道「这一档现在跑的是什么」。 */
+        const slots = gw && Array.isArray(gw.slots) ? gw.slots.filter((s) => s && s.tier) : [];
         const models = gw && Array.isArray(gw.models) ? gw.models.filter(Boolean) : [];
-        const mtxt = models.length
-          ? models.join(" · ")
-          : (gw ? "（这一家还没有可分流的模型）" : "（网关没有接管这一家）");
+        const mtxt = slots.length
+          ? slots.map((s) => s.model ? `${s.tier}→${s.model}` : s.tier).join(" · ")
+          : (models.length
+            ? models.join(" · ")
+            : (gw ? "（这一家还没有可分流的档位）" : "（网关没有接管这一家）"));
         return `<div class="fpline">
             <span class="v zh" style="flex:none;min-width:88px;font-weight:650;color:var(--ink)">${esc(nameOfKey(k))}</span>
             <span class="v" style="flex:none;color:var(--dim)">${esc(k)}/</span>

@@ -45,14 +45,15 @@ export const GATEWAY_MODEL = Symbol("bai.gateway.model");
 
 /** req[GATEWAY_TIER]：这个请求对应的**档位**（如 "claude-opus-5"）。
  *
- * 为什么需要它：网关模式下模型 id 是 `provider/模型`（已经是最终模型名），
- * **档位信息丢了**。而 bai-router 的转移必须按**目标家**重解析档位
+ * 为什么需要它：转移必须按**目标家**重解析档位
  * （同一家同一档位是不同模型：sn 的 opus 档是 glm-5.2，wb 的是 hy3）。
  * 档位没了，转移就会把**原家的模型**发给下一家 → 下一家多半不服务它 → 400。
  *
- * 所以网关用**反查**把档位找回来（model → 哪一档的 target 等于它），挂在这里。
- * 查不到就不挂 —— 中转那边 tier0 留 null，转移时保持原 body 不变，
- * **宁可转移不了也不要转错模型**。 */
+ * 档位从哪来：
+ *   · 模型 id 写 `provider/档位` → 档位**就在 id 里**，直接取（无损、不会歧义）。
+ *   · 模型 id 写 `provider/最终模型` → 只能反查，而**多档同模型时反查必然歧义**
+ *     （zen 的四档都指向 space-bunny-free）→ 那种情况 tier 留 null，
+ *     转移时用**目标家自己的默认模型**，而不是把这一家的模型硬发过去。 */
 export const GATEWAY_TIER = Symbol("bai.gateway.tier");
 
 /** req[GATEWAY_BODY]：网关读完并改写过的请求体（模型段已从 `provider/模型` 里剥出来）。
@@ -101,9 +102,15 @@ export function parseGatewayModel(model, isProvider = defaultIsProvider) {
  * @param {object} o
  * @param {Record<string, (req:any,res:any)=>void>} o.handlers provider 键 → 中转 handler
  * @param {(key:string)=>boolean} [o.isProvider] 「这个 provider 键认识吗」的判据
+ * @param {() => object} [o.getCfg] 取当前配置（用于识别档位）
+ * @param {(provider:string, name:string, cfg:object) => string|null} [o.tierKeyFor]
+ *   「这个名字本身是该家的一个**档位**吗？」（模型 id 写 `provider/档位` 时用）
+ * @param {(provider:string, model:string, cfg:object) => string|null} [o.tierOf]
+ *   「**哪个**档位指向这个模型？」（模型 id 写 `provider/最终模型` 时用；
+ *   命中多个 = 歧义 = 返回 null，不猜）
  * @returns {(req:any,res:any)=>void}
  */
-export function makeGatewayHandler({ handlers, isProvider = defaultIsProvider, getCfg = null, tierOf = null } = {}) {
+export function makeGatewayHandler({ handlers, isProvider = defaultIsProvider, getCfg = null, tierKeyFor = null, tierOf = null } = {}) {
   const map = handlers && typeof handlers === "object" ? handlers : {};
   return (req, res) => {
     const chunks = [];
@@ -154,26 +161,42 @@ export function makeGatewayHandler({ handlers, isProvider = defaultIsProvider, g
         return gatewayError(res, 404,
           `provider「${parsed.provider}」在本实例没有中转处理器（已知渠道：${KNOWN_PROVIDERS.join("、")}）`);
       }
-      /* 把模型段写回请求体：上游要看到的是**最终模型名**，不是 provider/模型。
-       * 键序不变（JSON.parse 保序），所以写回后的字节与中转自己解析再拼出来的完全一致。 */
+      /* 把模型段写回请求体。键序不变（JSON.parse 保序），所以写回后的字节
+       * 与中转自己解析再拼出来的完全一致。 */
       j.model = parsed.model;
       raw = Buffer.from(JSON.stringify(j));
-      /* 交棒：模型名标成「已定稿」，body 交出去（provider 的 handler 直接用它，
-       * 不用再等已经 end 掉的流）。 */
-      req[GATEWAY_MODEL] = parsed.model;
+      /* 交棒：body 交出去（provider 的 handler 直接用它，不用再等已经 end 掉的流）。 */
       req[GATEWAY_BODY] = raw;
-      /* 档位：从模型名**反查**回来（哪一档的 target 等于这个模型）。
-       * 网关模式下模型 id 里没有档位，而转移时必须按目标家重解析档位——
-       * 同一家同一档位是不同模型（sn 的 opus 档是 glm-5.2，wb 的是 hy3）。
-       * 查不到就不挂：中转那边 tier0 留 null，转移时保持原 body 不变，
-       * **宁可转移不了，也不要把原家的模型发给下一家**。 */
+      /* ── 模型段是「档位」还是「最终模型名」？两种都要认，语义不同 ──────────
+       *
+       * **档位**（`provider/档位`，网关模式下的正规写法）：
+       *   档位是 provider 无关的抽象，最终模型名是 provider 相关的具体值。
+       *   档位就在 id 里 → **不标「已定稿」**，让中转按本家映射解析（与老路径
+       *   同一套逻辑，一个字都不用改）→ 档位无损，转移时按目标家重解析也就自动正确。
+       *
+       * **最终模型名**（`provider/最终模型`，旧写法 / 用户手写）：
+       *   标「已定稿」——中转**绝不能**再解析它（解析一个模型名只会静默回落到
+       *   本渠道默认模型：用户点了 A 却跑了 B，面板还记成一次「模型回落」）。
+       *   档位只能反查，而**多档同模型时反查必然歧义** → 那时 tier 留 null，
+       *   转移时用**目标家自己的默认模型**（而不是把这一家的模型硬发过去）。
+       */
+      let tier = null;
+      let literal = true;
       try {
         const cfg = typeof getCfg === "function" ? getCfg() : null;
-        if (cfg && typeof tierOf === "function") {
-          const t = tierOf(parsed.provider, parsed.model, cfg);
-          if (t) req[GATEWAY_TIER] = t;
+        if (cfg) {
+          if (typeof tierKeyFor === "function") {
+            const k = tierKeyFor(parsed.provider, parsed.model, cfg);
+            if (k) { tier = k; literal = false; }
+          }
+          if (!tier && typeof tierOf === "function") {
+            /* 反查：**命中多个就是歧义**，tierOfModel 会返回 null —— 不猜。 */
+            tier = tierOf(parsed.provider, parsed.model, cfg) || null;
+          }
         }
-      } catch { /* 反查失败不该挡住请求 */ }
+      } catch { /* 档位识别失败不该挡住请求 */ }
+      if (literal) req[GATEWAY_MODEL] = parsed.model;
+      if (tier) req[GATEWAY_TIER] = tier;
       try {
         handler(req, res);
       } catch (e) {

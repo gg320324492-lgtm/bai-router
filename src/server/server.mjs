@@ -113,7 +113,7 @@ import {
 } from "./gateway.mjs";
 /* 网关的故障转移（gateway-failover.mjs）：把「档位」从最终模型名反查回来，
  * 转移时才能按**目标家**重解析（各家同一档位是不同模型）。 */
-import { tierOfModel } from "./gateway-failover.mjs";
+import { tierOfModel, tierKeyFor } from "./gateway-failover.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -144,6 +144,8 @@ const TIERS = [
   { key: "claude-opus-5", envKey: "ANTHROPIC_DEFAULT_OPUS_MODEL", zh: "Opus" },
   { key: "claude-haiku-4-5", envKey: "ANTHROPIC_DEFAULT_HAIKU_MODEL", zh: "Haiku" },
 ];
+/** 档位 key 清单（从 TIERS 推导，不另写一份 —— 两份名单迟早会漂移）。 */
+const TIER_KEYS = TIERS.map((t) => t.key);
 /* ---------- 渠道清单（数据驱动，契约 v18 里程碑 1a）----------
  *
  * **唯一的渠道集合来源**。此前的六家（bai/sn/wb/zen/qd/or）散落在至少 8 处硬编码
@@ -222,11 +224,16 @@ const DEFAULTS = {
    * 不与任何现有端口（15721~15792）也不与面板 15723 撞。
    * ⚠ 这是**新增入口**，不是替换：8 个旧中转端口一个都没动。 */
   gatewayPort: 15799,
-  /* 网关模式：关（默认）= 请求走各家自己的中转端口；开 = 请求先到统一网关，
-   * 网关按模型 id 的 `provider/模型` 前缀分流到那一家。
+  /* 网关模式：**开** = 请求先到统一网关（15799），网关按模型 id 的 `provider/模型`
+   * 前缀分流到那一家；关 = 请求走各家自己的中转端口（老路）。
+   *
    * 两种模式**用户可见行为一致**（同一家的同一批模型、同样的请求体与错误文案），
-   * 区别只在「请求先到哪个端口」——以及网关能同时看到所有家，那才是 T3 账号级路由的前提。 */
-  gatewayMode: "off",
+   * 区别只在「请求先到哪个端口」——以及网关能同时看到所有家，那才是账号级路由的前提。
+   *
+   * 默认**开**：统一网关是 magpie 形态的正解（一个端口），而 8 个旧中转端口**仍然在跑**，
+   * 面板上一关开关就回到老路 —— 等于内置了回退路径，不用等发版。
+   * ⚠ 老机器的 config.json 里没有这个字段，合并时取默认值 → 也会切到网关。 */
+  gatewayMode: "on",
   defaultModel: "qwen3.8-flash",
   availableModels: ["qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash"],
   mapping: defaultMapping("qwen3.8-flash", "Qwen3.8-Flash"),
@@ -5620,11 +5627,20 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
   // 每个目标渠道都要按**它自己的**路由表重新把档位解析成模型名：主渠道的映射在别的
   // 渠道往往不存在（Qoder 的 lite / WorkBuddy 的 deepseek-* / Zen 的 space-bunny-free
   // 互不相通）。不重解析的话转移过去必然 400 "Model is unavailable"。
-  const bodyFor = (target) => {
-    if (!tier0 || !rewritten) return { body, rewritten };
-    const m = resolveModel(tier0, {
+  //
+  // ⚠⚠ **档位缺失时绝不能把入口家的模型原样发给下一家**：
+  //   入口是 zen/space-bunny-free，转给 wb 之后 wb 收到的是 "space-bunny-free"——
+  //   wb 压根不服务这个模型（400），而且失败原因会被记成「wb 坏了」，排查方向直接被带偏。
+  //   正确做法：档位不知道就用**这一家自己的**默认模型（它至少服务得了这个模型）。
+  //   （档位已知时 resolveModel 内部也是这么回落的 —— 目标家没有这一档就落到它的默认模型。）
+  const bodyFor = (target, isEntry) => {
+    if (isEntry) return { body, rewritten };            // 入口：body 就是它自己的
+    if (!rewritten) return { body, rewritten };
+    const slice = {
       mapping: target.S.mapping, availableModels: target.S.availableModels, defaultModel: target.S.defaultModel,
-    }, target.S.p || target.provider);
+    };
+    const m = tier0 ? resolveModel(tier0, slice, target.S.p || target.provider) : slice.defaultModel;
+    if (!m) return null;                                  // 这一家连默认模型都没有 → 跳过它
     return { body: Buffer.from(JSON.stringify({ ...rewritten, model: m })), rewritten: { ...rewritten, model: m } };
   };
   for (const provider of chain) {
@@ -5639,7 +5655,9 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     const target = provider === fo.provider ? fo : relaySpec(provider, cfg);
     if (!target) { tries.push({ provider, skipped: "未知渠道" }); continue; }
     const cap = new CaptureRes(res);
-    const sub = bodyFor(target);
+    const sub = bodyFor(target, isEntry);
+    /* 这一家连默认模型都没有 → 没法构造给它的请求，跳过（别硬发一个它不认的模型名）。 */
+    if (!sub) { tries.push({ provider, skipped: "没有可用模型" }); continue; }
     /* 这次尝试的用量出口。上游报出来的 token 数会写进来，账本据此记账。
      * 每次尝试**新的**一个：转交给下一家时，数字必须跟着换——上一家的数字
      * 记到这一家头上就是**错账**。 */
@@ -5751,7 +5769,13 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
      * 模型级失败（只有这个模型不行）若也记整号冷却，就把「这个模型没额度」
      * 变成「整家停 90 秒」——那正是两级休息要消除的老毛病。 */
     if (fcls.scope !== "model") {
-      failoverCooldown(provider, lastErr); // 若刚才那次是额度用尽，这里不会把它降级成 90 秒（failover.mjs 有闸）
+      /* 额度/欠费是「等也没用」的失败（magpie 的 creditRest / quotaRest）：
+       * 入口也该让位，下条请求直接换一家，而不是每次先白撞一次已知没额度的渠道。
+       * 限流/网络抖只是「等一会儿就好」—— 入口仍排第一（手动选的就是首选，
+       * 90 秒的抖动不该改变用户的选择）。 */
+      const quotaish = fcls.kind === "quota" || fcls.kind === "credit";
+      // 若刚才那次是额度用尽，这里不会把它降级成 90 秒（failover.mjs 有闸）
+      failoverCooldown(provider, lastErr, quotaish ? { quota: true } : {});
     }
     /* 用量：这次尝试**失败但已把活交出去了**（handed_on）——它计费了什么、为什么失败，
      * 都要留痕；但它**不计入失败数**（magpie 的口径：转交出去的 try 照样写记录）。 */
@@ -6352,8 +6376,13 @@ const gatewayServer = http.createServer(makeGatewayHandler({
    * 而不是抄一份渠道名单——名单与处理器不同步时，网关会说「这家没接线」，
    * 而不是把请求丢给一个不存在的 handler。 */
   isProvider: (key) => Object.prototype.hasOwnProperty.call(gatewayHandlers, key),
-  /* 档位反查要现读配置（映射表会变），所以给的是函数不是快照。 */
+  /* 档位识别要现读配置（映射表会变），所以给的是函数不是快照。 */
   getCfg: () => loadCfg(),
+  /* 「模型段本身就是该家的一个档位吗」——模型 id 写 `provider/档位` 时走这条。
+   * 档位在 id 里 → 无损、无歧义，中转照老路径解析即可。 */
+  tierKeyFor: (provider, name, cfg) => tierKeyFor(provider, name, cfg, { tiers: TIER_KEYS }),
+  /* 「哪个档位指向这个模型」——模型 id 写 `provider/最终模型` 时走这条。
+   * ⚠ 命中多个 = 歧义 = 返回 null（tierOfModel 的语义），不猜。 */
   tierOf: tierOfModel,
 }));
 
@@ -7012,7 +7041,24 @@ async function applyToCli(S) {
    * 客户端送来的那个 token 对网关没有意义（真写上去反而在用户主目录留了一份明文副本）。
    */
   const gw = gatewayOn();
-  const modelId = (target) => (gw ? `${S.p}/${target}` : String(target));
+  /* 网关模式：模型 id 写 `provider/档位`（如 `sn/claude-opus-5`），**不是** `provider/最终模型`。
+   *
+   * ⚠⚠ 为什么是档位而不是最终模型名 —— 这一条曾经写反过，代价是「用户点 opus，
+   * 转移后跑的是 fable 的模型」（档位被悄悄换掉，面板上看不出来）。
+   *
+   *   · **档位**（claude-opus-5）是 provider 无关的抽象；**最终模型名**（hy3）是
+   *     provider 相关的具体值。网关模式下写最终模型名 = 在链路上**丢掉了 provider
+   *     无关的那一半**，只留具体值 —— 而具体值在 provider 内部**反推不出档位**
+   *     （zen/qd/or/mm 的四档全指向同一个模型，反查必然命中四个，歧义）。
+   *   · 写档位则：网关只做前缀剥离，档位原样透传给中转 → 中转沿用老路径那套
+   *     「档位 → 本家模型」解析（一个字都不用改）→ 转移时按**目标家**重解析也就自动正确。
+   *
+   * 这正是 magpie 的模型 id 语义：id 里带的是槽位，每家自己的表把槽位翻成真实模型名。
+   *
+   * 老路（不走网关）保持原样：写最终模型名 —— 那一路客户端送来的就是模型名，
+   * 中转按「模型名 → 可用清单」认它，不需要档位。
+   */
+  const modelId = (tier, target) => (gw ? `${S.p}/${tier}` : String(target));
   const edits = [];
   const setEnv = (k, v) => edits.push({ path: "env." + k, value: v });
   const delEnv = (k) => edits.push({ path: "env." + k, delete: true });
@@ -7022,7 +7068,7 @@ async function applyToCli(S) {
    * authorization 头**透传给上游**——写成占位符就等于把假令牌发给上游了。
    * 协议桥渠道（wb/qd/or/zen/mm）自己用凭据，不看客户端送来的 token，照旧写占位符。 */
   setEnv("ANTHROPIC_AUTH_TOKEN", viaLocalRelay ? PROXY_MANAGED_TOKEN : (S.key || "wb-local"));
-  setEnv("ANTHROPIC_MODEL", modelId(S.mapping["claude-haiku-4-5"]?.target || S.defaultModel));
+  setEnv("ANTHROPIC_MODEL", modelId("claude-haiku-4-5", S.mapping["claude-haiku-4-5"]?.target || S.defaultModel));
   /* 显示名：只写用户手填的 label，不掺倍率（v1.0.65 撤掉）。
    *
    * 仍然不 `delete`：以前是 `delete e[t.envKey + "_NAME"]` —— 我们自己把 Claude Code
@@ -7036,7 +7082,7 @@ async function applyToCli(S) {
   for (const t of TIERS) {
     const m = S.mapping[t.key] || {};
     const target = m.target || S.defaultModel;
-    setEnv(t.envKey, modelId(target));
+    setEnv(t.envKey, modelId(t.key, target));
     // 用户没填 label 就不写这条（留空反而会让 Claude Code 回退显示模型 id，与旧行为一致）
     if (m.label) setEnv(t.envKey + "_NAME", m.label);
   }
@@ -7068,16 +7114,16 @@ async function applyToCli(S) {
 function applyToDesktop(S) {
   const f = desktopConfigFile();
   if (!f) throw new Error("找不到桌面版配置文件（configLibrary/_meta.json）");
-  /* 网关模式：桌面版也指向统一网关，且模型名要带 `provider/模型` 前缀——
+  /* 网关模式：桌面版也指向统一网关，且模型名要带 `provider/档位` 前缀——
    * 桌面版把 inferenceModels[].name 原样当模型发出去，网关靠这个前缀分流。
+   *
+   * ⚠ 写**档位**而不是最终模型名：档位是 provider 无关的抽象，写它才不丢信息
+   *   （多档同模型时，最终模型名反推不出档位 —— 详见 applyToCli 里那段注释）。
+   *   老路（不走网关）桌面版本来就写档位（`t.key`），两路一致。
    * ⚠ 令牌**不改**：桌面版送来的 authorization 会被 bai/sn 的 handler 透传给上游，
    * 换成占位符就等于把假令牌发给上游了。 */
   const gw = gatewayOn();
-  const modelName = (t) => {
-    const m = S.mapping[t.key] || {};
-    const target = m.target || S.defaultModel;
-    return gw ? `${S.p}/${target}` : t.key;
-  };
+  const modelName = (t) => (gw ? `${S.p}/${t.key}` : t.key);
   writeAtomic(
     f,
     JSON.stringify(
@@ -8386,8 +8432,16 @@ async function unknownMappingTargets(p, mapping, cfg) {
         port: cfg.gatewayPort || DEFAULTS.gatewayPort,
         providers: CHANNELS.map((k) => {
           const S = sliceOf(cfg, k);
-          const models = Object.values(S.mapping || {}).map((m) => m && m.target).filter(Boolean);
-          return { key: k, name: PROVIDERS[k] || k, models: Array.from(new Set(models)) };
+          /* 模型 id 现在写的是 `provider/档位`，所以「这一家能分到哪些」要看**档位**。
+           * 每个档位顺带报上它当前的模型（面板上看得见「这一档现在指向什么」）。 */
+          const slots = TIER_KEYS.map((tier) => ({
+            tier,
+            model: String((S.mapping && S.mapping[tier] && S.mapping[tier].target) || S.defaultModel || ""),
+          })).filter((x) => x.model);
+          return {
+            key: k, name: PROVIDERS[k] || k, slots,
+            models: Array.from(new Set(slots.map((x) => x.model))),
+          };
         }),
       });
     }

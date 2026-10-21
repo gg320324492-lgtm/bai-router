@@ -1,44 +1,34 @@
 /**
- * gateway-failover.mjs —— 统一网关（magpie 形态的那个「一个端口」）的**故障转移计划**。
+ * gateway-failover.mjs —— 统一网关（magpie 形态的那个「一个端口」）的**档位识别**。
  *
  * ## 它补的是哪个洞
  *
  * bai-router 一直有故障转移：`server.mjs` 的 `attemptWithFailover` 按 `cfg.failover.chain`
  * 挨家试，每家**按自己的映射表**把档位重新解析成模型。
  *
- * 但**网关模式下这条链断了**：
- *   · 网关（`gateway.mjs`）拆模型 id 的 `provider/模型` 前缀，把请求交给**那一家**的
- *     relay handler；handler 直接打上游，**没有转移**。
- *   · 而网关收到的模型 id 是 `provider/模型`（**已经是最终模型名**），**没有档位信息**。
- *     转移时不知道该用哪一档 → 只能把原模型发给下一家 → 下一家多半不服务这个模型 → 400。
+ * 而**档位（tier）在网关模式下会丢**：
+ *   · 网关（`gateway.mjs`）拆模型 id 的 `provider/...` 前缀，把请求交给**那一家**的
+ *     relay handler。
+ *   · 若模型 id 写的是 `provider/最终模型`（如 `sn/glm-5.2`），**档位信息就没了**。
+ *     转移时不知道该用哪一档 → 要么把原模型发给下一家（多半 400），
+ *     要么靠反查把档位猜回来（多档同模型时**必然猜错**）。
  *
- * ## 本模块怎么补
+ * ## 正确形态：`provider/档位`
  *
- * **把「档位」从模型 id 里反查回来**。bai-router 的映射是
- * `cfg[provider].mapping[tierKey].target = 模型名`，所以给定 (provider, 模型)，
- * 可以反查：**哪一档的 target 等于这个模型**。拿到档位之后，转移时就能对**目标家**
- * 用**它自己的**映射重解析：`目标家的 mapping[档位].target`（没有就回落到目标家的
- * `defaultModel`）。
+ * **档位是 provider 无关的抽象，「最终模型名」是 provider 相关的具体值。**
+ * magpie 的模型 id 就是这个语义：id 里带的是「档位/槽位」，每家自己的表把槽位
+ * 翻成它的真实模型名。我们这边的 `mapping[档位].target` 正是那张表。
  *
- * ## 与 magpie 路由组语义的对应
+ * 所以网关模式下模型 id 应当写成 `provider/档位`（如 `sn/claude-opus-5`）：
+ *   · 网关只做**前缀剥离**，档位原样透传给中转 → **档位不丢**；
+ *   · 中转沿用老路径那套「档位 → 本家模型」解析，**一个字都不用改**；
+ *   · 故障转移时 `bodyFor(档位)` 按**目标家**重解析，也就自动正确了。
  *
- * magpie 那边靠**组**：模型 id → `GroupFor` 找出一个「服务同一个模型的多家成员」的组，
- * 然后在组成员之间路由与转移。它的模型 id 本身就是最终模型（magpie 只往 agent 的配置里
- * 写 `provider/model` 的**模型段**），所以「这一档在别家叫什么」这件事 magpie 是靠
- * **每家各自的模型表**回答的——组里存的是**模型**，不是档位。
+ * ## 本模块提供两个方向
  *
- * 我们这边是反过来的：客户端（Claude Code）送来的**档位名**（claude-opus-5），
- * 每家的映射表把档位翻成**自己的**模型名。网关模式下我们收到的是「provider + 最终模型」，
- * 档位丢了——于是要**从模型名反推回档位**，才能在别家重新翻一次。
- *
- * 差别就一句：**magpie 靠组把「同一个模型」聚在一起；我们靠反查把「档位」找回来。**
- * 我们这样更省事的地方是：不需要额外维护一张「组」的结构——档位 ↔ 模型的对应关系
- * **本来就在每家的 mapping 里**，反查只是把它倒过来读一遍。magpie 那边多出来的那张组表
- * 是在给「同一个模型多家都能服务」这件事找个落点；我们这边同一件事由
- * `mapping[档位].target` 天然表达了。
- *
- * ⚠ 反查**只能反查，不能猜**。猜错档位 = 转移后用错模型 = 请求失败（多半 400）。
- * 反查不到就老实说 null（`tierOfModel` 的返回值），由调用方决定怎么办。
+ *   · `tierKeyFor` —— 「这个名字**本身就是**该家的一个档位吗？」（新写法走这条）
+ *   · `tierOfModel` —— 「**哪个**档位指向这个模型？」（旧写法/用户手写走这条；
+ *     **命中多个就是歧义，返回 null，不猜**）
  *
  * ## 边界
  *
@@ -118,17 +108,21 @@ export function sliceOfProvider(provider, cfg) {
 /**
  * **档位反查**：给定 (provider, 模型)，找出**哪一档的 target 等于这个模型**。
  *
- * 为什么必须反查：网关收到的模型 id 是 `provider/模型`，**模型段已经是最终模型名**，
- * 档位信息没了。转移时只有先知道档位，才能对目标家重新翻一次映射
- * （`目标家 mapping[档位].target`），否则只能把原模型硬发给下一家 → 下一家多半不服务
- * 这个模型 → 400。
+ * ⚠⚠ **命中多个 = 歧义 = 返回 null，不猜。**
  *
- * 歧义怎么办：**取第一个命中的档位**（映射表的键序即优先级）。
- * 为什么无害：两档映射到**同一个模型**时，转移后拿到的模型**一样**——
- * 选哪一档都不改变结果。这也正是出厂默认的样子（`defaultMapping` 把几档都指向同一个模型）。
+ * 这条曾经写错过，代价很大。原文是「取第一个命中的档位……为什么无害：两档映射到
+ * 同一个模型时，转移后拿到的模型一样」。**那是错的**：转移后拿到的模型由**目标家**
+ * 按档位决定，而目标家的各档**指向不同的模型**。出厂默认里 zen/qd/or/mm 的四档
+ * 全指向同一个模型，于是反查必然命中四个：
+ *   · 反查 zen/space-bunny-free → 命中 fable（第一个）
+ *   · 转移到 wb → wb 的 fable 档是 deepseek-v4.1-flash
+ *   · 而用户点的是 opus 档，在 wb 上应该是 hy3
+ * 也就是说：**用户点 opus，转移后跑的是 fable 的模型**——计费档位被悄悄换掉了，
+ * 而面板上什么异常都看不到。
  *
- * ⚠ **不许猜**：反查不到就返回 null。猜错档位 = 转移后用错模型 = 请求失败，
- * 而那种失败**看起来像上游抽风**，排查方向会被带偏。
+ * 歧义不是可以「挑一个」的技术细节：**档位是从模型名反推出来的，而模型名在
+ * provider 内部不再能区分档位**（多档同模型时），信息在链路上就丢了。
+ * 唯一正确的做法是别丢——见 `tierKeyFor` 与网关的档位透传。
  *
  * ⚠ 比较用**逐字相等**（不做大小写归一）：上游模型 id 是**大小写敏感**的
  * （MiniMax 的 `MiniMax-M3.1-Flash` 就是），大小写不敏感地匹配有命中**另一个**档位
@@ -137,17 +131,60 @@ export function sliceOfProvider(provider, cfg) {
  * @param {string} provider 渠道键（sn / wb / …）
  * @param {string} model 该渠道下的模型名（最终模型名）
  * @param {object} cfg 全量配置
- * @returns {string|null} 档位 key；反查不到返回 null
+ * @returns {string|null} 档位 key；反查不到**或命中多个**都返回 null
  */
 export function tierOfModel(provider, model, cfg) {
   if (!provider || model == null) return null;
   const want = String(model);
   if (!want) return null;
   const slice = sliceOfProvider(provider, cfg);
+  let found = null;
   for (const [tier, entry] of Object.entries(slice.mapping)) {
     if (!entry || !entry.target) continue;              // 空 target 不该命中任何东西
-    if (String(entry.target) === want) return tier;    // 命中即返回（键序 = 优先级）
+    if (String(entry.target) !== want) continue;
+    if (found !== null) return null;                    // 命中第二个 → 歧义 → 不猜
+    found = tier;
   }
+  return found;
+}
+
+/**
+ * **档位识别**：给定 (provider, 名字)，这个名字**是不是该家的一个档位**？
+ *
+ * 与 `tierOfModel` 是**反向**的一问一答：
+ *   · `tierKeyFor`  —— 「这个名字本身就是个档位吗？」（模型 id 写 `provider/档位` 时用）
+ *   · `tierOfModel` —— 「哪个档位指向这个模型？」（模型 id 写 `provider/最终模型` 时用）
+ *
+ * 为什么两个都要：模型 id 有两种写法，两种都得认。
+ *   · `provider/档位`（**新写法，网关模式下的正规写法**）→ 档位**直接就在 id 里**，
+ *     不用反查，也不会有歧义（档位名本身就是唯一的）。中转按本家映射解析即可。
+ *   · `provider/最终模型`（旧写法 / 用户手写）→ 只能反查，多档同模型时必然歧义 →
+ *     返回 null（宁可不知道，也不要用错档位）。
+ *
+ * 归一化与 `server.mjs` 的 `normalizeModel` / `tierKeyOf` 逐字一致：
+ * 去 `[..]` 后缀、转小写、去日期后缀（claude-haiku-4-5-20251001 → claude-haiku-4-5）。
+ *
+ * @param {string} provider 渠道键
+ * @param {string} name 模型 id 的模型段
+ * @param {object} cfg 全量配置
+ * @param {object} [opts]
+ * @param {string[]} [opts.tiers] 已知档位 key 清单（server.mjs 的 TIERS）。
+ *   传了就多认一层：**这一家没配这个档位，但它是系统认得的档位** → 仍按档位处理，
+ *   让中转按「本家映射 → 回落本家默认模型」走，并留下一条回落留痕。
+ *   不传就只认「这一家映射表里有的」（够用的常态：出厂默认四家各四档齐全）。
+ * @returns {string|null} 是档位就返回**档位 key**，不是就返回 null
+ */
+export function tierKeyFor(provider, name, cfg, opts = {}) {
+  if (!provider || name == null) return null;
+  const base = normalizeModel(name);
+  if (!base) return null;
+  const key = tierKeyOf(base);
+  const mapping = sliceOfProvider(provider, cfg).mapping;
+  if (Object.prototype.hasOwnProperty.call(mapping, base)) return base;
+  if (Object.prototype.hasOwnProperty.call(mapping, key)) return key;
+  const known = Array.isArray(opts.tiers) ? opts.tiers : [];
+  if (known.includes(base)) return base;
+  if (known.includes(key)) return key;
   return null;
 }
 
