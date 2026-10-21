@@ -1055,8 +1055,18 @@ describe("mm 工具定义形状转换", () => {
 
     const mk = SERVER_SRC.match(/makeRelay\(\s*"mm"[\s\S]*?\);/);
     assert.ok(mk, "必须有 makeRelay(\"mm\", …) 这一次调用");
-    assert.match(mk[0], /prepareBody:\s*mmPrepareBody/,
-      "makeRelay(\"mm\", …) 的 opts 里必须挂 prepareBody");
+    /* 第二处注册点：mm 中转**真的被造出来时**用的是带 prepareBody 的那套 opts。
+     *
+     * 参数被搬进 RELAY_PARAMS 之后，这里要**跟着接线走**，不能跟着旧写法走：
+     * 接线本身没丢（prepareBody 仍挂在 mm 的 opts 上），只是位置变了。
+     * ⚠ 仍然要**两处分别断言**——渠道表一处、实际接线一处，缺一不可：
+     *   只断言一处的话，删掉另一处测试照样绿（那正是这条注释要防的事）。 */
+    const params = SERVER_SRC.match(/^\s*mm:\s*\{[^\n]*recentCallsMm[^\n]*$/m);
+    assert.ok(params, "参数表里必须有 mm 那一项（认 recentCallsMm 那一行，别认错同名的 mm）");
+    assert.match(params[0], /prepareBody:\s*mmPrepareBody/,
+      "参数表里 mm 那一项的 opts 必须挂 prepareBody");
+    assert.match(mk[0], /RELAY_PARAMS\.mm\.opts/,
+      "makeRelay(\"mm\", …) 必须用参数表里 mm 那一项的 opts —— 用错了就等于没挂 prepareBody");
 
     assert.match(SERVER_SRC, /function mmPrepareBody\(/,
       "必须有 mmPrepareBody 这个函数");

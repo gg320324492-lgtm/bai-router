@@ -15,7 +15,7 @@
  *   ① /api/test 的探测请求**带上了最小工具**，且 `max_tokens` **仍是 8**（isProbe 的判据）
  *   ② 免费档+直连的 403 归到「预期内被拒」，**不算故障**；**其它渠道的 403 照旧算故障**
  *   ③ **非 Zen 渠道的探测请求体与改动前逐字一致**（不给别的渠道凭空加字段）
- *   ④ 面板文案能看出**下一步该做什么**（改走 OpenCode 客户端中转 / 切 Go 档）
+ *   ④ 面板文案能看出**下一步该做什么**（切 Go 档 / 让故障转移落到其它通道）
  *   ⑤ 反向对照：把 tools 从探测体里去掉，① 必须变红（见文件末尾 SABOTAGE）
  *
  * ## 两类测试
@@ -255,10 +255,14 @@ describe("④ 面板：预期内被拒 ≠ 红色故障，且文案给出下一�
 
   test("★ 文案能看出下一步该做什么（两条路都点出来）", () => {
     const s = channelStateFor({ upstream: { tested: false, expected: true, expectedWhy: WHY, expectedTiers: [] } });
-    assert.match(s.detail, /OpenCode 客户端中转/, "必须点出「改走 OpenCode 客户端中转」这条");
     assert.match(s.detail, /Go 档/, "必须点出「切 Go 档」这条");
     assert.match(s.detail, /opencode\.ai\/zen\/go\/v1/, "切 Go 档要给出确切的上游地址，否则用户不知道填哪");
-    assert.match(s.detail, /opencode-ai/, "客户端中转要给出安装线索");
+    assert.match(s.detail, /opencode\.ai\/auth/, "切 Go 档要给出订阅入口，否则用户不知道去哪订阅");
+    assert.match(s.detail, /故障转移/, "必须点出「让故障转移落到其它通道」这条");
+    assert.match(s.detail, /wb\/wbai\/or/, "要指名可落到的通道，否则用户不知道还能用谁");
+    /* 免费档已被服务端封死，**不能再把用户往「改走客户端中转」那条路上引**——
+     * 那条路实测也已过不去，照旧引导会让人反复尝试一条无效的路径。 */
+    assert.doesNotMatch(s.detail, /改走 OpenCode 客户端中转/, "不该再推荐已失效的客户端中转这条出路");
   });
 
   test("★ 真故障仍然是红色故障（不能被上面两条带跑）", () => {
@@ -442,7 +446,8 @@ describe("e2e：/api/test 真跑一遍，工具确实发到了上游", () => {
     for (const t of r.tiers) {
       assert.equal(t.expected, true, `每档都应标成预期内：${JSON.stringify(t)}`);
       assert.equal(t.expectedKind, ZEN_FREE_TIER_DIRECT_KIND, "kind 必须是产品级标签");
-      assert.match(t.expectedWhy, /OpenCode 客户端中转/, "文案要给出下一步");
+      assert.match(t.expectedWhy, /Go 档/, "文案要给出下一步");
+      assert.match(t.expectedWhy, /故障转移/, "文案要给出下一步：另一条是让故障转移落到其它通道");
     }
     const st = await status();
     assert.equal(st.zen.upstream.expected, true, "/api/status 必须把这个状态透给面板");
@@ -474,8 +479,8 @@ describe("e2e：/api/test 真跑一遍，工具确实发到了上游", () => {
     const st = await status();
     const rl = st.zen.relayLast || {};
     assert.equal(rl.kind, ZEN_FREE_TIER_DIRECT_KIND, `relayLast.kind 应当是产品级标签，实际 ${rl.kind}（消息：${rl.message}）`);
-    assert.match(rl.message, /OpenCode 客户端中转/, "relayLast 的文案要给出下一步");
     assert.match(rl.message, /Go 档/, "relayLast 的文案要点出 Go 档");
+    assert.match(rl.message, /故障转移/, "relayLast 的文案要点出另一条：让故障转移落到其它通道");
     assert.doesNotMatch(rl.message, /^\s*转移走（HTTP 403）：\{/, "不能被覆盖成笼统的「转移走 + JSON 原文」（那正是本次要修的现象）");
   }, { timeout: 60000 });
 });

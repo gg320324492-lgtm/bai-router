@@ -71,6 +71,25 @@ import {
   createMmTokenStore, mmBuildHeaders, mmCanonicalModel, mmNormalizeTools, mmNormalizeBodyTools,
   MM_INFER_BASE, MM_MODEL, MM_LOGIN_INVALID_MSG,
 } from "./mm-auth.mjs";
+/* 保格式 JSON/JSONC 编辑器（edit-json.mjs）：读原文、按字节区间做最小改动、
+ * 原样保住注释/键顺序/缩进/换行/BOM。移植自 magpie 的 internal/edit/json.go。
+ *
+ * 为什么必须有它：旧写法是 `JSON.parse` 读 + `JSON.stringify` 整份写回，
+ * 有两个后果——① 读失败被当成空对象再写回，用户其余配置当场蒸发；
+ * ② 每次切模型都整份重写，注释/键顺序/缩进被抹平，文件 mtime 一直在变，
+ * 面板那套「这次是谁改的」归因也跟着失真。
+ *
+ * ⚠ 铁律：**读失败 = 不知道，绝不是空**。文件在但读不懂 → 中止接线、不写盘；
+ * 文件不在 → 从空开始建，那是合法状态。两件事必须分开。 */
+import { parseJsonc, applyEdits } from "./edit-json.mjs";
+/* 统一网关入口（gateway.mjs）：**一个端口**，模型 id 写成 provider/模型，
+ * 网关拆前缀决定走哪一家（magpie 形态）。
+ * 纯逻辑、零 IO、零网络，所以独立成文件才能被测试直接 import——server.mjs 一 import
+ * 就起服务（wb-token.mjs 顶部的教训）。本步**只做加法**：8 个旧端口一字未变，
+ * 网关是新增的第 9 个端口；切默认、拆旧端口是后面的步骤。 */
+import {
+  GATEWAY_MODEL, GATEWAY_BODY, makeGatewayHandler,
+} from "./gateway.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -175,6 +194,10 @@ const DEFAULTS = {
   proxy: "http://127.0.0.1:7890",
   relayPort: 15722,
   panelPort: 15723,
+  /* 统一网关端口（magpie 形态的那个「一个端口」）。15799 是新号：
+   * 不与任何现有端口（15721~15792）也不与面板 15723 撞。
+   * ⚠ 这是**新增入口**，不是替换：8 个旧中转端口一个都没动。 */
+  gatewayPort: 15799,
   defaultModel: "qwen3.8-flash",
   availableModels: ["qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash"],
   mapping: defaultMapping("qwen3.8-flash", "Qwen3.8-Flash"),
@@ -5347,23 +5370,25 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs }) {
           noteRelayError(p, "rate_limit", `${NAME} 触发上游限流`);
         }
       } else if (r.status === 403 && /FreeTierError|only be used from within/i.test(txt)) {
-        /* 免费档围栏。⚠ 文案更正（v1.0.75，2026-10-12）：这里原写「官方限定只能在
-         * OpenCode 客户端内使用 / 换模型无效」——**那个说法不完整，且会让人以为无解**。
-         * 实测证明判据是「**发给模型的请求里必须带工具**」：把工具从模型可见列表里摘掉
-         * （deny 权限就会这样）后，请求退化成「无工具推理」而被同一个 FreeTierError 拒掉；
-         * 保留工具（ask）则一切正常。而本程序直连中转时请求不带工具（执行权在 Claude Code
-         * 那边），所以**走直连这一档必然被拒**。换模型确实无效，但有解：改走 OpenCode
-         * 客户端中转（模型手上就有工具）。 */
-        why = " —— Zen 的免费档要求**发给模型的请求里必须带工具**（服务端返回 FreeTierError）。"
-          + "本程序当前是**直连**中转，请求里不带工具（执行权在 Claude Code 那边），所以这一档走直连必然被拒。"
-          + "换模型无效；解法是把传输方式切成「OpenCode 客户端中转」——那样模型手上就有工具，本机需先装 OpenCode（npm i -g opencode-ai）。"
-          + "另一条路是把上游地址改成 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，https://opencode.ai/auth）。";
-        /* kind 用**产品级标签** `free_tier_direct` 而不是笼统的 `upstream_403`（v1.0.78）：
-         * 这一条**不是渠道故障**，是「免费档 + 直连」这一组合的产品级预期拒绝。
+        /* 免费档围栏。⚠ 文案已大幅更新（2026-10-17 之后）：opencode.ai 服务端在这个时间点
+         * 之后**彻底封死**了免费档的外部调用，与调用方式无关——直连、经本机 OpenCode 客户端
+         * （1.19.3，带有效 OAuth 凭证）中转、带不带工具，一律被同一个 FreeTierError 拒掉。
+         * （实测：在全局数据目录<含有效凭证>下 spawn 1.19.3 端到端对话，仍 403；旧注释里
+         * 「改走 OpenCode 客户端中转就能过围栏」的说法已失效，会让人反复尝试无效路径。）
+         * 这一档**不再可用**，出路只有两条：① 把上游改成 Go 档并订阅（https://opencode.ai/zen/go/v1，
+         * $10/月，实测 oc_sk 在 Go 档是被识别的，只差订阅）；② 让它随故障转移自动落到 wb/wbai/or
+         * 等其它通道（这些不依赖 opencode.ai 免费档，可继续免费对话）。 */
+        why = " —— OpenCode Zen 的**免费档已被服务端彻底封死**（2026-10-17 起，所有外部调用一律"
+          + "FreeTierError，包括经本机 OpenCode 客户端中转），这一档已无法使用。"
+          + "两条出路：① 把上游地址改成 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，"
+          + "https://opencode.ai/auth），你的 oc_sk 在 Go 档是被识别的；② 保持现状，由故障转移自动"
+          + "改走 WorkBuddy / OpenRouter 等其它通道继续对话。";
+        /* kind 用**产品级标签** `free_tier_direct` 而不是笼统的 `upstream_403`：
+         * 这一条**不是渠道故障**，是「免费档 + 外部调用」这一组合的产品级预期拒绝。
          * 面板据此显示「预期内被拒」而不是红灯，文案直接把两条下一步指出来
-         * （①改走 OpenCode 客户端中转 ②切 Go 档），用户不用再猜。 */
+         * （①切 Go 档 ②走其它通道），用户不用再猜。 */
         noteRelayError(p, ZEN_FREE_TIER_DIRECT_KIND,
-          `${NAME} 免费档走直连被拒（预期内，非故障）：改用「OpenCode 客户端中转」，或把上游地址改成 Go 档 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go`);
+          `${NAME} 免费档已被服务端封死（预期内，非故障）：改上游到 Go 档并订阅，或让故障转移落到 wb/wbai/or 等其它通道`);
       } else if (r.status === 402 || /insufficient account funds/i.test(txt)) {
         why = " —— API Key 余额为 0，付费模型需要先充值；Go 档的付费额度同样走这把 Key 的余额。";
         noteRelayError(p, "upstream_402", `${NAME} 余额不足`);
@@ -5552,8 +5577,10 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     // 影子判定为失败：换一个
     const status = cap.status || 0;
     tries.push({ provider, ok: false, status, err: String(describeError(cap) || "").slice(0, 110) });
-    if (!shouldFailover(status)) {
+    if (!shouldFailover(status, capBodyText(cap))) {
       // 不该转移（多半是 400 请求本身有问题）——把这次的真实错误原样还给客户端
+      // ⚠ 但正文明说了「这家不接」（request illegal / unapproved channel /
+      //   模型不被服务）时，shouldFailover 会放行转移——那种 400 换个供应商能通。
       // 注意：这里是**没有发生转移**的分支（换渠道也没用，直接原样返回）。
       // 措辞必须与行为一致，否则排查时会被"故障转移"字样误导成渠道切换过。
       noteChannelAttempt(fo.provider, tries);
@@ -5600,6 +5627,19 @@ function describeError(cap) {
     if (m) return m[1];
     const m2 = txt.match(/"error"\s*:\s*"([^"]{1,200})"/);
     return m2 ? m2[1] : txt.slice(0, 160);
+  } catch { return ""; }
+}
+
+/* 这次尝试的**原始响应体**（出错时缓冲在影子 res 里）。
+ *
+ * 为什么要单独取全文：故障转移的判据不能只看状态码。400/404/422 有时是
+ * 「**这家不接这类请求**」而不是「请求本身有问题」——正文里明说了拒绝理由时，
+ * 换一家有用。正文含糊时仍然不转移（宁可少转，也不要白耗别家的额度）。
+ * 判据在 failover.mjs 的 shouldFailover(status, body)。 */
+function capBodyText(cap) {
+  try {
+    if (!cap || !cap.buf || !cap.buf.length) return "";
+    return Buffer.concat(cap.buf).toString("utf8");
   } catch { return ""; }
 }
 
@@ -5766,11 +5806,25 @@ function relaySpec(provider, cfg) {
   return { provider, label: meta[0], useProxy: meta[1], opts: meta[2], S: sliceOf(cfg, provider) };
 }
 
-function makeRelay(p, store, getSlice, useProxy, opts = {}) {
-  return http.createServer((req, res) => {
+/* 中转的**两层**：
+ *   · makeRelayHandler(...) → handler（收到请求后干什么）
+ *   · makeRelay(...)      → http.createServer(handler)（在哪个端口上听）
+ * 为什么要拆：统一网关（magpie 形态的那个「一个端口」）要的是**handler**——
+ * 它按模型 id 的 provider 前缀挑一家接手；8 个旧中转端口要的是**端口**。
+ * 拆开之后两边可以共用同一批 handler 逻辑，不会出现「端口是一套、网关是另一套」。
+ * ⚠ handler 本身对请求是无状态的（唯一跨请求的状态是外面传进来的观察表），
+ *   所以「端口一个实例、网关一个实例」行为完全一致。 */
+function makeRelayHandler(p, store, getSlice, useProxy, opts = {}) {
+  return (req, res) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", async () => {
+    /* 「body 的接力」：统一网关已经**读完**了这个请求体（它要靠 body 里的 model 字段
+     * 决定走哪一家），请求流因此早就 end 了。此时再挂 'data'/'end' 监听器，
+     * 'end' 永远不会再来 → 请求挂死、客户端干等超时。
+     * 所以网关把读好的 body 挂在 req[GATEWAY_BODY] 上，这里**优先用它**、不再等流。
+     * 没有这个标记的请求（现有 8 个中转端口）走的还是原来那条「挂监听器等流」的路，
+     * 一字未变。 */
+    const preBody = req[GATEWAY_BODY];
+    const onEnd = async () => {
       // 准入门（Bug B）：openai 桥（wb/zen/qd）只承接「POST + /v1/*」的模型调用。
       // 以前这里对任何 path/method 都往下走模型调用逻辑：GET 没有 body → rewritten 为 null
       // → handleUpstream 里那句 400「请求体必须是 Anthropic messages JSON」把 /api/ping
@@ -5845,8 +5899,23 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
           if (typeof j.max_tokens === "number" && j.max_tokens < 3) j.max_tokens = 3; // 桌面版健康探测兼容
           if (typeof j.model === "string") {
             const tier = normalizeModel(j.model);
-            tier0 = tier; // 记下原始档位，转移时按新渠道的映射重解析
-            j.model = resolveModel(j.model, sliceCfg, p);
+            /* 统一网关入口（magpie 形态）：模型名**已经定稿**——网关把
+             * `provider/模型` 拆开，模型段已写回请求体（req[GATEWAY_MODEL]）。
+             * 这里**绝不能再解析**：resolveModel 查的是「档位名 → 模型名」的映射，
+             * 而模型名本身多半查不到（它不是档位）→ 静默回落到本渠道 defaultModel，
+             * 用户点了 A 却跑了 B，而且面板会把它记成一次「模型回落」。
+             * 没有这个标记的请求（现有 8 个中转端口）走的是原来那条路，一字未变。 */
+            if (req[GATEWAY_MODEL]) {
+              j.model = req[GATEWAY_MODEL];
+              /* tier0 留 null：**没有档位可重解析**。故障转移的 bodyFor() 遇到
+               * tier0 为 null 会保持请求体不变——那正是这里要的：网关送来的模型名
+               * 就是最终模型名，不该被下一个渠道按「档位表」重新解释一遍。
+               * （按渠道重新解析是第二步的事。） */
+              tier0 = null;
+            } else {
+              tier0 = tier; // 记下原始档位，转移时按新渠道的映射重解析
+              j.model = resolveModel(j.model, sliceCfg, p);
+            }
             // 只观察"真实会话"流量：max_tokens≥512 的对话请求。
             // 桌面版后台小请求(健康探测/起标题/摘要, max_tokens 通常 ≤128)不算"用户正在用的档位"
             if (req.method === "POST" && req.url.startsWith("/v1/messages") && typeof j.max_tokens === "number" && j.max_tokens >= 512) {
@@ -5877,8 +5946,23 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
         if (!res.headersSent) wbAnthroError(res, 502, String((e && e.message) || e));
         else try { res.end(); } catch { }
       }
-    });
-  });
+    };
+    if (preBody !== undefined && preBody !== null) {
+      /* 网关入口：body 已被网关读完并改写好 → 直接用，**不再等流**。
+       * （请求流早就 end 了，再等 'end' 就是挂死。） */
+      chunks.push(preBody);
+      void onEnd();
+    } else {
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", onEnd);
+    }
+  };
+}
+
+/** 中转端口 = handler 挂在一个端口上。**行为与拆层之前逐字相同**：
+ *  同样的 handler、同样的一句 http.createServer。 */
+function makeRelay(p, store, getSlice, useProxy, opts = {}) {
+  return http.createServer(makeRelayHandler(p, store, getSlice, useProxy, opts));
 }
 
 // 一次尝试：把请求送到本渠道的上游并把响应写进 res（可能是影子 res）。
@@ -6010,24 +6094,67 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
         }
 }
 
+/* ---------- 8 家中转：参数一处定义，端口与统一网关共用 ----------
+ *
+ * 原来这 8 家的参数（slice 读取器 / useProxy / opts）是**内联**在各自的
+ * makeRelay(...) 调用里的。现在统一网关也要用**同一批参数**造自己的落点
+ * （网关按模型 id 的 provider 前缀挑一家接手），所以抽成一张表：
+ *   · 一处定义 → 端口与网关不可能漂移（「改了一处忘了另一处」正是这类重复最常见的病）
+ *   · 表里每一项都**逐字**取自改动前那 8 行调用，行为一字未变
+ * store（观察表）也放进表里：那是跨请求的唯一可变状态，两边共用同一份数组，
+ * 于是「从网关走 sn」与「直连 sn 端口」在面板上看到的调用记录是同一条。 */
+const RELAY_PARAMS = {
+  bai: { store: recentCallsBai, slice: (cfg) => ({ upstream: cfg.upstream, mapping: cfg.mapping, defaultModel: cfg.defaultModel, availableModels: cfg.availableModels }), useProxy: () => true, opts: {} },
+  sn: { store: recentCallsSn, slice: (cfg) => ({ upstream: cfg.sn.upstream, mapping: cfg.sn.mapping, defaultModel: cfg.sn.defaultModel, availableModels: cfg.sn.availableModels }), useProxy: (cfg) => cfg.sn.useProxy === true, opts: {} },
+  wb: { store: recentCallsWb, slice: (cfg) => ({ upstream: cfg.wb.upstream, mapping: cfg.wb.mapping, defaultModel: cfg.wb.defaultModel, availableModels: cfg.wb.availableModels }), useProxy: (cfg) => cfg.wb.useProxy === true, opts: { openai: true } },
+  wbai: { store: recentCallsWbai, slice: (cfg) => ({ upstream: cfg.wbai.upstream, mapping: cfg.wbai.mapping, defaultModel: cfg.wbai.defaultModel, availableModels: cfg.wbai.availableModels }), useProxy: (cfg) => cfg.wbai.useProxy === true, opts: { openai: true } },
+  zen: { store: recentCallsZen, slice: (cfg) => ({ upstream: cfg.zen.upstream, mapping: cfg.zen.mapping, defaultModel: cfg.zen.defaultModel, availableModels: cfg.zen.availableModels }), useProxy: (cfg) => cfg.zen.useProxy === true, opts: { openai: true } },
+  qd: { store: recentCallsQd, slice: (cfg) => ({ upstream: cfg.qd.upstream, mapping: cfg.qd.mapping, defaultModel: cfg.qd.defaultModel, availableModels: cfg.qd.availableModels }), useProxy: (cfg) => cfg.qd.useProxy === true, opts: { openai: true } },
+  mm: { store: recentCallsMm, slice: (cfg) => ({ upstream: cfg.mm.upstream, mapping: cfg.mm.mapping, defaultModel: cfg.mm.defaultModel, availableModels: cfg.mm.availableModels }), useProxy: (cfg) => cfg.mm.useProxy === true, opts: { gateV1: true, prepareHeaders: mmPrepareHeaders, prepareBody: mmPrepareBody } },
+  or: { store: recentCallsOr, slice: (cfg) => ({ upstream: cfg.or.upstream, mapping: cfg.or.mapping, defaultModel: cfg.or.defaultModel, availableModels: cfg.or.availableModels }), useProxy: (cfg) => cfg.or.useProxy === true, opts: { openai: true } },
+};
+
 // 三个中转：B.AI 走代理（出海）、SenseNova 走直连（境内，可被 sn.useProxy 覆盖）、
 // WorkBuddy 走直连（www.workbuddy.ai 直连可达，可被 wb.useProxy 覆盖；协议桥见 opts.openai）
-const relay = makeRelay("bai", recentCallsBai, (cfg) => ({ upstream: cfg.upstream, mapping: cfg.mapping, defaultModel: cfg.defaultModel, availableModels: cfg.availableModels }), () => true);
-const snRelay = makeRelay("sn", recentCallsSn, (cfg) => ({ upstream: cfg.sn.upstream, mapping: cfg.sn.mapping, defaultModel: cfg.sn.defaultModel, availableModels: cfg.sn.availableModels }), (cfg) => cfg.sn.useProxy === true);
-const wbRelay = makeRelay("wb", recentCallsWb, (cfg) => ({ upstream: cfg.wb.upstream, mapping: cfg.wb.mapping, defaultModel: cfg.wb.defaultModel, availableModels: cfg.wb.availableModels }), (cfg) => cfg.wb.useProxy === true, { openai: true });
+const relay = makeRelay("bai", RELAY_PARAMS.bai.store, RELAY_PARAMS.bai.slice, RELAY_PARAMS.bai.useProxy, RELAY_PARAMS.bai.opts);
+const snRelay = makeRelay("sn", RELAY_PARAMS.sn.store, RELAY_PARAMS.sn.slice, RELAY_PARAMS.sn.useProxy, RELAY_PARAMS.sn.opts);
+const wbRelay = makeRelay("wb", RELAY_PARAMS.wb.store, RELAY_PARAMS.wb.slice, RELAY_PARAMS.wb.useProxy, RELAY_PARAMS.wb.opts);
 // WorkBuddy 国际版：同一个协议桥、同一套请求头构造，只换上游/端口/令牌三样（里程碑 1b）
-const wbaiRelay = makeRelay("wbai", recentCallsWbai, (cfg) => ({ upstream: cfg.wbai.upstream, mapping: cfg.wbai.mapping, defaultModel: cfg.wbai.defaultModel, availableModels: cfg.wbai.availableModels }), (cfg) => cfg.wbai.useProxy === true, { openai: true });
+const wbaiRelay = makeRelay("wbai", RELAY_PARAMS.wbai.store, RELAY_PARAMS.wbai.slice, RELAY_PARAMS.wbai.useProxy, RELAY_PARAMS.wbai.opts);
 // OpenCode Zen：OpenAI 协议，复用同一套桥（apiKey 认证，无令牌续期）
-const zenRelay = makeRelay("zen", recentCallsZen, (cfg) => ({ upstream: cfg.zen.upstream, mapping: cfg.zen.mapping, defaultModel: cfg.zen.defaultModel, availableModels: cfg.zen.availableModels }), (cfg) => cfg.zen.useProxy === true, { openai: true });
+const zenRelay = makeRelay("zen", RELAY_PARAMS.zen.store, RELAY_PARAMS.zen.slice, RELAY_PARAMS.zen.useProxy, RELAY_PARAMS.zen.opts);
 // Qoder：OpenAI 协议，复用同一套桥。认证是轮换的 jt- jobToken（每次请求现读令牌文件），无静态密钥
-const qdRelay = makeRelay("qd", recentCallsQd, (cfg) => ({ upstream: cfg.qd.upstream, mapping: cfg.qd.mapping, defaultModel: cfg.qd.defaultModel, availableModels: cfg.qd.availableModels }), (cfg) => cfg.qd.useProxy === true, { openai: true });
+const qdRelay = makeRelay("qd", RELAY_PARAMS.qd.store, RELAY_PARAMS.qd.slice, RELAY_PARAMS.qd.useProxy, RELAY_PARAMS.qd.opts);
 // MiniMax 会员托管通道（mm）：上游是 **Anthropic 原生协议**，所以**不走 openai 桥**；
 // 但请求头要整份换掉（Bearer + 浏览器 UA + Origin + Referer，缺一个就是 401），
 // 由 opts.prepareHeaders 完成；准入门（只承接 POST /v1/*）由 opts.gateV1 完成。
-const mmRelay = makeRelay("mm", recentCallsMm, (cfg) => ({ upstream: cfg.mm.upstream, mapping: cfg.mm.mapping, defaultModel: cfg.mm.defaultModel, availableModels: cfg.mm.availableModels }), (cfg) => cfg.mm.useProxy === true, { gateV1: true, prepareHeaders: mmPrepareHeaders, prepareBody: mmPrepareBody });
+const mmRelay = makeRelay("mm", RELAY_PARAMS.mm.store, RELAY_PARAMS.mm.slice, RELAY_PARAMS.mm.useProxy, RELAY_PARAMS.mm.opts);
 // OpenRouter（第 6 家）：OpenAI 协议 + 通用桥；凭据是 keys[] 轮换区，由 openaiExchange 内的
 // orPick/orAdvance 每请求现选（这里传的 slice 只提供 upstream/mapping/availableModels）。
-const orRelay = makeRelay("or", recentCallsOr, (cfg) => ({ upstream: cfg.or.upstream, mapping: cfg.or.mapping, defaultModel: cfg.or.defaultModel, availableModels: cfg.or.availableModels }), (cfg) => cfg.or.useProxy === true, { openai: true });
+const orRelay = makeRelay("or", RELAY_PARAMS.or.store, RELAY_PARAMS.or.slice, RELAY_PARAMS.or.useProxy, RELAY_PARAMS.or.opts);
+
+/* ---------- 统一网关（magpie 形态：一个端口，模型 id 写成 provider/模型） ----------
+ *
+ * 本步**只做加法**：这是新增的第 9 个端口，8 个旧端口与它们的行为一字未变。
+ * 切默认、拆旧端口是后面的步骤。
+ *
+ * 网关的落点表与上面 8 个端口**共用同一批参数**（RELAY_PARAMS）——网关不是
+ * 「另一套中转逻辑」，它就是把同一个中转 handler 挂在另一个端口上，
+ * 于是「网关走 sn」与「直连 sn 端口」必然是同一套行为。 */
+for (const p of CHANNELS) {
+  if (!RELAY_PARAMS[p]) throw new Error(`统一网关落点表缺渠道 ${p}（RELAY_PARAMS 与 CHANNELS 必须一一对应）`);
+}
+const gatewayHandlers = Object.fromEntries(CHANNELS.map((p) => {
+  const q = RELAY_PARAMS[p];
+  return [p, makeRelayHandler(p, q.store, q.slice, q.useProxy, q.opts)];
+}));
+const gatewayServer = http.createServer(makeGatewayHandler({
+  handlers: gatewayHandlers,
+  /* 「这个 provider 键认识吗」：以**本实例真有中转处理器**为准，
+   * 而不是抄一份渠道名单——名单与处理器不同步时，网关会说「这家没接线」，
+   * 而不是把请求丢给一个不存在的 handler。 */
+  isProvider: (key) => Object.prototype.hasOwnProperty.call(gatewayHandlers, key),
+}));
 
 // ---------- 文件级操作 ----------
 function readJson(file) {
@@ -6481,12 +6608,87 @@ function snapshotExternal() {
 // 桌面版那边早就这么写了，这里只是让 CLI 侧对齐。
 const PROXY_MANAGED_TOKEN = "PROXY_MANAGED";
 
+/* 读不懂 ~/.claude/settings.json 时的处置。
+ *
+ * 两种「读不出来」必须分开：
+ *   · **文件不在** —— 合法状态，从空开始建。
+ *   · **文件在但读不懂** —— 不知道，不是空。此时**绝不能**拿一份空对象覆盖它：
+ *     用户其余配置会当场蒸发（旧代码正是这么干的：`catch { s = {} }` 然后写回）。
+ *
+ * 这里选的路子是「**另存一份 + 中止接线 + 一个字都不改**」：
+ * 备份让用户有退路（照着改回来），中止保证不猜、不覆盖。
+ * 另一条路是「备份后用最小配置重建」—— 技术上更省事，但会让用户在不知情的情况下
+ * 丢掉原配置里那些**我们不接管**的部分（权限、钩子、MCP…），所以不默认这么做。 */
+function unreadableSettingsAction(file, detail) {
+  let saved = null;
+  try {
+    saved = file + ".unreadable-" + Date.now();
+    copyFileSync(file, saved);
+  } catch { saved = null; }
+  const guide = unreadableSettingsGuidance(saved, detail);
+  const err = new Error(guide.message);
+  err.repair = { backup: saved, offerRestore: guide.offerRestore };
+  return err;
+}
+
+/* 用户看得见的引导：读不懂 settings.json 时，除了报错还要告诉他能怎么办。
+ *
+ * 返回 { message, offerRestore }：
+ *   message       —— 面板上显示的那段话
+ *   offerRestore  —— 要不要给一个「用备份恢复并重新接线」的一键入口
+ *
+ * TODO(human): 这段的措辞与 offerRestore 取 true/false，是一个产品判断：
+ *   · 用户的 settings.json 读不懂，多数是手滑多一个逗号，或别的工具写了注释。
+ *   · 备份一定在（unreadableSettingsAction 已经另存好了），所以「一键用备份恢复」
+ *     技术上随时能做 —— 但恢复等于**用备份覆盖用户当前文件**，若用户后来手工改好过，
+ *     覆盖会把那次修改也抹掉。所以 offerRestore 该默认关掉还是开，由你定。
+ *   · 下面这版是**保守默认**：说清下一步，不提供一键覆盖。
+ */
+function unreadableSettingsGuidance(bak, detail) {
+  // TODO(human): 按你的判断实现这个函数（下面这版是保守默认，可以直接改成你的方案）
+  return {
+    message: detail
+      + "\n原文件未被改动"
+      + (bak ? "，已另存为：" + bak : "（另存备份失败，请立刻自己复制一份）")
+      + "\n请打开该文件修好 JSON 语法（常见原因：多一个逗号、注释没删、字符串没转义）后重新接线。"
+      + "本程序不会覆盖读不懂的配置。",
+    offerRestore: false,
+  };
+}
+
 // 通用：把一个提供方的映射写进 CLI settings.json
 async function applyToCli(S) {
-  let s = {};
-  try { s = readJson(SETTINGS); } catch { s = {}; }
-  s.env = s.env || {};
-  const e = s.env;
+  /* ★ 读原文，不反序列化（v1.0.93 起）。
+   *
+   * 旧写法：`try { s = readJson(SETTINGS); } catch { s = {} }` + `JSON.stringify(s, null, 2)` 整份写回。
+   * 两个后果：
+   *   ① **读失败被当成空** —— 用户 settings.json 里只要有一处解析不过（手滑多一个逗号、
+   *      别的工具写了注释），下一条接线就把整个文件改写成只剩 env 的样子，用户其余配置
+   *      当场蒸发。这正是 magpie 明令禁止的「failed read means unknown, never empty」。
+   *   ② **全量重写** —— 注释、键顺序、缩进风格全被抹平；每次切模型都重写一遍，
+   *      文件 mtime 一直在变，面板那套「这次是谁改的」归因也跟着失真。
+   *
+   * 现在：读原文 → 保格式编辑器做**最小改动** → 只在真的变了时才写盘。 */
+  let text = "";
+  let existed = false;
+  try {
+    text = readFileSync(SETTINGS, "utf8");
+    existed = true;
+  } catch { /* 文件不存在：从空开始建，这是合法状态 */ }
+
+  let env = {};
+  if (existed && text.trim() !== "") {
+    const parsed = parseJsonc(text);
+    const root = parsed.ok ? parsed.value : null;
+    /* 根不是对象（数组/标量）同样算「读不懂」——Claude Code 那边也不认，
+     * 而我们若照旧往下写就会产出一个更糟的文件。 */
+    if (!parsed.ok || !root || typeof root !== "object" || Array.isArray(root)) {
+      const detail = "无法解析 " + SETTINGS
+        + (parsed.ok ? "（根不是 JSON 对象）" : `（第 ${parsed.line} 行第 ${parsed.column} 列：${parsed.error}）`);
+      throw unreadableSettingsAction(SETTINGS, detail);
+    }
+    env = (root.env && typeof root.env === "object" && !Array.isArray(root.env)) ? root.env : {};
+  }
   /* 里程碑 4b：**走本地中转的渠道**写占位符，不写真实凭据。
    *
    * 以前这里把真实 JWT 明文写进 ~/.claude/settings.json —— 那把令牌与
@@ -6503,9 +6705,13 @@ async function applyToCli(S) {
    * 与桌面版既有做法一致（applyToDesktop 之外的 FALLBACK_CC 里就写着 PROXY_MANAGED）。
    */
   const viaLocalRelay = cliViaRelay(S);
-  e.ANTHROPIC_BASE_URL = cliBaseUrlFor(S);
-  e.ANTHROPIC_AUTH_TOKEN = viaLocalRelay ? PROXY_MANAGED_TOKEN : (S.key || "wb-local");
-  e.ANTHROPIC_MODEL = S.mapping["claude-haiku-4-5"]?.target || S.defaultModel;
+  const edits = [];
+  const setEnv = (k, v) => edits.push({ path: "env." + k, value: v });
+  const delEnv = (k) => edits.push({ path: "env." + k, delete: true });
+
+  setEnv("ANTHROPIC_BASE_URL", cliBaseUrlFor(S));
+  setEnv("ANTHROPIC_AUTH_TOKEN", viaLocalRelay ? PROXY_MANAGED_TOKEN : (S.key || "wb-local"));
+  setEnv("ANTHROPIC_MODEL", S.mapping["claude-haiku-4-5"]?.target || S.defaultModel);
   /* 显示名：只写用户手填的 label，不掺倍率（v1.0.65 撤掉）。
    *
    * 仍然不 `delete`：以前是 `delete e[t.envKey + "_NAME"]` —— 我们自己把 Claude Code
@@ -6519,24 +6725,32 @@ async function applyToCli(S) {
   for (const t of TIERS) {
     const m = S.mapping[t.key] || {};
     const target = m.target || S.defaultModel;
-    e[t.envKey] = target;
+    setEnv(t.envKey, target);
     // 用户没填 label 就不写这条（留空反而会让 Claude Code 回退显示模型 id，与旧行为一致）
-    if (m.label) e[t.envKey + "_NAME"] = m.label;
+    if (m.label) setEnv(t.envKey + "_NAME", m.label);
   }
-  e.API_TIMEOUT_MS = e.API_TIMEOUT_MS || "3000000";
-  e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-  e.NODE_USE_ENV_PROXY = "1";
+  /* 用户自己设过 API_TIMEOUT_MS 就留着（旧写法 `e.API_TIMEOUT_MS = e.API_TIMEOUT_MS || "3000000"`）。 */
+  if (!env.API_TIMEOUT_MS) setEnv("API_TIMEOUT_MS", "3000000");
+  setEnv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+  setEnv("NODE_USE_ENV_PROXY", "1");
   if (S.p === "bai" || S.p === "or") {
     // 出海渠道（B.AI / OpenRouter）：CLI 直连上游时靠 proxy env 出海。
     // OpenRouter 走的是本地桥（127.0.0.1），但桥自己出海仍要代理——env 留着没坏处。
-    e.HTTPS_PROXY = loadCfg().proxy;
-    e.HTTP_PROXY = loadCfg().proxy;
+    const px = loadCfg().proxy;
+    setEnv("HTTPS_PROXY", px);
+    setEnv("HTTP_PROXY", px);
   } else {
     // 境内提供方（SenseNova/WorkBuddy）直连、清空代理（WorkBuddy 桥在本机，NO_PROXY 已覆盖）
-    delete e.HTTPS_PROXY; delete e.HTTP_PROXY;
+    delEnv("HTTPS_PROXY"); delEnv("HTTP_PROXY");
   }
-  e.NO_PROXY = "127.0.0.1,localhost";
-  writeAtomic(SETTINGS, JSON.stringify(s, null, 2) + "\n");
+  setEnv("NO_PROXY", "127.0.0.1,localhost");
+
+  const out = applyEdits(text, edits);
+  if (!out.ok) throw new Error("改写 " + SETTINGS + " 失败：" + out.error);
+  /* **只在真的变了才写盘**：不改就不动文件，mtime 不变——
+   * 面板那套「这次是谁改的」归因（按 mtime 窗口比对 CC Switch 的状态文件）
+   * 才不会被我们自己反复重写给污染。 */
+  if (out.changed) writeAtomic(SETTINGS, out.text);
   recordCliApply(S.p);   // 留指纹：之后能分辨这份配置还是不是我们写的
 }
 // 通用：把一个提供方写进桌面版 configLibrary（都经由本地中转，桌面版不感知上游差异）
@@ -7882,8 +8096,37 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const warns = [];
       if (doCli) { const w = snapshotExternal(); warns.push(...w.filter((x) => x.startsWith("桌面"))); }
       if (doDesk) { const w = snapshotExternal(); warns.push(...w.filter((x) => x.startsWith("CLI"))); }
-      if (doCli) await applyToCli(S);
-      if (doDesk) applyToDesktop(S);
+      /* 快照一次，把两边的警告按**这次要动哪一边**分派。
+       *
+       * ⚠ 旧写法是两个分支各调一次 snapshotExternal，然后**互相挑错了对方的警告**：
+       *   doCli 分支挑的是「桌面版没有可恢复的快照」，doDesk 分支挑的是「CLI 没有…」——
+       *   正好反了。于是只接 CLI 时，CLI 没快照的警告被藏起来，桌面版的警告却冒出来；
+       *   只接桌面版时同理。现在挑对了。 */
+      {
+        const w = snapshotExternal();
+        if (doCli) warns.push(...w.filter((x) => x.startsWith("CLI")));
+        if (doDesk) warns.push(...w.filter((x) => x.startsWith("桌面")));
+      }
+      /* 接线失败**必须如实告诉用户**：多半是 ~/.claude/settings.json 读不懂
+       * （手滑多一个逗号、别的工具写了注释）。这时我们**一个字都没改**，
+       * 面板该说的是「你的文件读不懂、修好再来」，而不是一个笼统的 500。
+       * 旧写法里 applyToCli 从不抛错——因为它把读失败当成空对象然后照写，
+       * 于是「读不懂」变成「静默清空用户配置」。现在读不懂会抛，这里接住它。 */
+      const applied = [];
+      try {
+        if (doCli) { await applyToCli(S); applied.push("cli"); }
+        if (doDesk) { applyToDesktop(S); applied.push("desktop"); }
+      } catch (e) {
+        const repair = (e && e.repair) || null;
+        log(`接线到 ${name} 失败：`, (e && e.message) || e);
+        return json(res, 400, {
+          error: String((e && e.message) || e).slice(0, 500),
+          repair,
+          applied,
+          /* 一个字都没改 —— 面板可以据此说清「你的配置没被动过」。 */
+          untouched: applied.length === 0,
+        });
+      }
       const ccRunning = await checkCcSwitch();
       if (ccRunning) warns.push("CC Switch 正在运行，它可能随时把配置改回去；切换前建议先退出它");
       warns.push("桌面版需完全退出并重开 Claude 才生效；CLI 新开终端生效");
@@ -7891,10 +8134,10 @@ async function unknownMappingTargets(p, mapping, cfg) {
       if (P === "wb") warns.push("WorkBuddy 国内版：0 积分模型由 WorkBuddy 客户端账号提供；令牌过期会自动用刷新令牌续期，无需重新接线。国际版请到「WorkBuddy AI」格单独接线");
       if (P === "wbai") warns.push("WorkBuddy AI 国际版：需要国际版客户端的令牌（与国内版不通用）；模型目录与倍率来自上游 /v3/config，未取到时用出厂兜底清单");
       if (P === "zen") warns.push("OpenCode Zen 有两档、还有两种传输方式，可用性完全不同："
-        + "①「直连 + 免费档」会被拒（FreeTierError）——上游要求发给模型的请求里必须带工具，而直连的请求不带（执行权在 Claude Code 那边）；"
-        + "②「直连 + Go 档」（上游含 /zen/go/）能用，但要账号已订阅 OpenCode Go（$10/月，https://opencode.ai/auth）；"
-        + "③「OpenCode 客户端中转 + 免费档」能用，需本机已装 OpenCode（npm i -g opencode-ai），免费模型不需要订阅。"
-        + "改传输方式请在 Zen 页切换；改档位请改上游地址，然后点「刷新模型列表」换成该档自己的目录");
+        + "①「免费档」已被服务端封死（2026-10-17 起，外部调用一律 403 FreeTierError，直连与经本机 OpenCode 客户端中转都过不去），这一档已无法使用、不是本机故障；"
+        + "②「Go 档」（上游含 /zen/go/）能用，但要账号已订阅 OpenCode Go（$10/月，https://opencode.ai/auth），你的 oc_sk 在 Go 档是被识别的。"
+        + "免费档若要继续对话：要么把上游地址改成 Go 档并订阅，要么让故障转移自动落到 WorkBuddy / OpenRouter 等其它通道；"
+        + "改档位请改上游地址，然后点「刷新模型列表」换成该档自己的目录");
       if (P === "qd") warns.push("Qoder 走账号的 Free 套餐额度；令牌每次 Qoder 启动会轮换，中转会自动跟随——但 Qoder 客户端必须保持运行，否则中转读不到令牌");
       if (P === "mm") warns.push("MiniMax 会员通道走的是**会员额度**（MiniMax Code 登录的那个账号自带的额度），"
         + "**不是**开放平台按量计费的 API Key——两回事，别混。令牌只存在内存里：重启路由台要重新读，"
@@ -8142,5 +8385,26 @@ listenWithRetry(qdRelay, cfg0.qd.relayPort, "Qoder中转");
 listenWithRetry(mmRelay, cfg0.mm.relayPort, "MiniMax会员中转");
 listenWithRetry(orRelay, cfg0.or.relayPort, "OpenRouter中转");
 listenWithRetry(panel, cfg0.panelPort, "面板");
+/* 统一网关的监听：**绑不上也不许拖垮现有中转**。
+ *
+ * 8 个中转端口是本软件的命脉，统一网关只是**新增**的一个入口 ——
+ * 它的端口被占（多半是另一个实例占着）时只记一行日志继续跑，
+ * 绝不能像 listenWithRetry 那样 exit(2) 把整个服务带走。
+ * 那条「端口被占就退出重试」的规矩是为**中转端口**定的：
+ * 中转端口被占 = 服务干不了活，重启交接是唯一合理的动作；
+ * 网关端口被占 = 少一个可选入口而已，8 个中转端口照常服务。 */
+function listenGateway(srv, port, name) {
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    log(`${name}未启用（端口配置无效：${JSON.stringify(port)}）——现有中转端口不受影响`);
+    return;
+  }
+  srv.on("error", (e) => {
+    log(`${name} 端口 :${port} 监听失败（${e && e.message}）——现有中转端口不受影响，统一网关入口本次不可用`);
+  });
+  srv.listen(port, "127.0.0.1", () => {
+    log(`${name}就绪 http://127.0.0.1:${port}（模型名写成 provider/模型，例如 sn/glm-5.2）`);
+  });
+}
+listenGateway(gatewayServer, cfg0.gatewayPort, "统一网关");
 // 成功绑定中转端口 = 本实例成为唯一的活跃服务者，此时才允许合并配置/跑周期探测
 relay.once("listening", () => setTimeout(onActivated, 300));

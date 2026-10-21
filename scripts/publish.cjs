@@ -1,17 +1,32 @@
 // 一键发布新版本：先改 package.json 的 version，然后运行  node scripts/publish.cjs "更新说明"
-// 流程：electron-builder 构建 → gh release create v<version> (exe + latest.yml)
+// 流程：electron-builder 构建 → gh release create v<version> (exe + latest.yml 或 beta.yml)
+//   稳定版 → latest.yml；预发布版（1.0.93-beta.1）→ beta.yml，且在 GitHub 上标 prerelease。
 const { execSync, execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { decideProxyUse, buildGhEnv, runDirectProbe } = require("./publish-proxy.cjs");
 const { assertCleanSource, assertRemoteSource } = require("./publish-source.cjs");
 const { syncSeed } = require("./publish-seed.cjs");
+const { isPrereleaseVersion } = require("../src/update-channel.js");
 
 const ROOT = path.resolve(__dirname, "..");
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
 const v = pkg.version;
 const owner = pkg.build.publish[0].owner, repo = pkg.build.publish[0].repo;
 const exe = `BARRouter-Setup-${v}.exe`;
+
+/* ★ 更新通道：预发布版本走**自己那条** feed。
+ *
+ * electron-builder 自己会按版本号推导通道（appInfo.channel 取 semver 的
+ * prerelease 标签）：版本是 `1.0.93-beta.1` → 通道 "beta" → 产出 `beta.yml`；
+ * 版本是 `1.0.93` → 通道 "latest" → 产出 `latest.yml`。
+ * 所以**构建命令一个字都不用改**，只有「上传哪份 yml」要跟着变。
+ *
+ * ⚠ 关键：**预发布版本绝不能上传 latest.yml**。latest.yml 是稳定版用户
+ * 唯一读的那份，上传了就等于把测试版推给了所有稳定版用户——
+ * 那就不是「选择性升级」了。 */
+const isPre = isPrereleaseVersion(v);
+const ymlName = isPre ? "beta.yml" : "latest.yml";
 
 // 2026-10-13：历史发版只上传安装包，未推源码，gh 默认在旧 main 上打了新版 tag。
 // 构建前固定来源；直接查发布仓库，不能把本地 origin/main 缓存当作远端实况。
@@ -113,6 +128,11 @@ runCheckManifest("post-build");
 if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {
   fs.copyFileSync(path.join(ROOT, "scripts", "upgrade.ps1"), path.join(ROOT, "dist", "upgrade.ps1"));
 }
+// rollback.ps1：一键回退脚本（装回旧版），同样作为 release 资产发布。
+// 有了它，「选择性升级」才真正闭环——升上去容易，退回来也得是一条命令。
+if (!fs.existsSync(path.join(ROOT, "dist", "rollback.ps1"))) {
+  fs.copyFileSync(path.join(ROOT, "scripts", "rollback.ps1"), path.join(ROOT, "dist", "rollback.ps1"));
+}
 /* 用 execFileSync + 参数数组，而不是把内容拼进 shell 字符串。
    原因：notes 现在是 release-notes.md 的全文（多行 markdown，含反引号）。拼进
    `gh ... --notes "…"` 后，双引号内的反引号会被 bash 当**命令替换**执行——
@@ -159,8 +179,12 @@ try {
   gh([
     "release", "create", `v${v}`, "-R", `${owner}/${repo}`,
     "--target", releaseHead,
-    `dist/${exe}`, `dist/${exe}.blockmap`, "dist/upgrade.ps1", "dist/latest.yml",
+    `dist/${exe}`, `dist/${exe}.blockmap`, "dist/upgrade.ps1", "dist/rollback.ps1", `dist/${ymlName}`,
     "--title", `v${v}`, "--notes", notes,
+    /* 预发布版在 GitHub 上标成 prerelease，**不会**占住 Latest。
+     * 这一步很要紧：Latest 是人从 releases 页面点下载时的默认落点，
+     * 测试版占了它，就等于把测试版塞给了所有人 —— 那不叫「选择性升级」。 */
+    ...(isPre ? ["--prerelease"] : []),
   ]);
 } catch (e) {
   console.error([
@@ -176,7 +200,7 @@ try {
     `  ↺ 重试（重跑全部闸门后重发）：  node scripts/publish.cjs`,
     `  ↺ 或手工重发上传：`,
     `      gh release create v${v} -R ${owner}/${repo} \\`,
-    `        "dist/${exe}" "dist/${exe}.blockmap" dist/upgrade.ps1 dist/latest.yml \\`,
+    `        "dist/${exe}" "dist/${exe}.blockmap" dist/upgrade.ps1 dist/rollback.ps1 dist/${ymlName} \\`,
     `        --target ${releaseHead} --title v${v} --notes-file release-notes.md`,
     ``,
   ].join("\n"));

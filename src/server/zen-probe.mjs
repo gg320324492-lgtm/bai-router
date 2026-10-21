@@ -187,17 +187,17 @@ export function zenProbeClassify(status, txt) {
   if (/An active OpenCode Go subscription is required/i.test(t))
     return { cls: "auth", reachable: true, why: "需要 OpenCode Go 订阅（上游原文 An active OpenCode Go subscription is required to use Go models.）。Key 已被上游正常解析，缺的是订阅本身。" };
   if (/FreeTierError|only be used from within/i.test(t))
-    /* ⚠ 文案更正（v1.0.75，2026-10-12）：这里原先写「免费档被官方封死在 OpenCode 客户端内、
-     * 换模型无效」——**那个说法是错的**，而且是我自己一次配错的实验造成的（探针会话用了全 deny
-     * 权限）。实测证明判据是「发给模型的请求里必须带工具」：deny 会把工具从模型可见列表里
-     * 整个摘掉，于是请求退化成「无工具推理」而被拒。`ask` 保留工具则一切正常。
-     * 而本程序直连中转时请求里没有工具（执行权在 Claude Code 那边），所以走直连必然被拒。
-     * 换模型确实无效，但「被封死」的说法会让人以为无解——它有解，见下。 */
+    /* ⚠ 文案已大幅更新（2026-10-17 之后）：opencode.ai 服务端在这个时间点之后
+     * **彻底封死**了免费档的外部调用，与调用方式无关——直连、经本机 OpenCode 客户端中转、
+     * 带不带工具，一律被同一个 FreeTierError 拒掉。所以这里不再给「改走客户端中转」
+     * 这条路（旧文案会让人反复尝试一条已经无效的路径），只给两条真能走的。 */
     return {
       cls: "auth", reachable: true,
-      why: "上游要求「发给模型的请求里必须带工具」（FreeTierError）。本程序直连中转时请求不带工具"
-        + "——执行权在 Claude Code 那边，工具由它执行——所以走直连这一档必然被拒。"
-        + "换模型无效；解法是改走 OpenCode 客户端中转（这样模型手上就有工具），或切到 Go 档。",
+      why: "OpenCode Zen 免费档已被服务端彻底封死（2026-10-17 起，外部调用一律 FreeTierError，"
+        + "实测连经本机 OpenCode 客户端中转也过不去），这一档已无法使用，不是渠道故障。"
+        + "下一步二选一：①把上游地址改成 Go 档 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go"
+        + "（$10/月，https://opencode.ai/auth），你的 oc_sk 在 Go 档是被识别的；"
+        + "②保持现状，由故障转移自动落到 wb/wbai/or 等其它通道继续对话。",
     };
   if (/Model access is disabled/i.test(t))
     return { cls: "auth", reachable: true, why: "该模型未对这把 Key 开放（上游 Model access is disabled）。" };
@@ -289,11 +289,11 @@ export function zenExpectedRejection(status, txt, {
     kind: ZEN_FREE_TIER_DIRECT_KIND,
     // cls 复用同一套分类，不重写：这里如实记成 auth（Key 没问题，是这一档在直连下被围栏拒）。
     cls: zenProbeClassify(status, t).cls || "auth",
-    why: "这一档在直连下本来就会被拒，不是渠道故障。"
-      + "OpenCode Zen 免费档要求「发给模型的请求里必须带工具」；"
-      + "本程序直连中转时执行权在 Claude Code 那边，请求不带工具，于是被同一个 FreeTierError 403 拒掉。"
-      + "下一步二选一：①把传输方式切成「OpenCode 客户端中转」（需本机已装 OpenCode，npm i -g opencode-ai）；"
-      + "②把上游地址改成 Go 档 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go（$10/月，https://opencode.ai/auth），再点「刷新模型列表」。",
+    why: "OpenCode Zen 免费档已被服务端彻底封死（2026-10-17 起，所有外部调用一律 FreeTierError，"
+      + "实测连经本机 OpenCode 客户端中转也过不去），这一档已无法使用，不是渠道故障。"
+      + "下一步二选一：①把上游地址改成 Go 档 https://opencode.ai/zen/go/v1 并订阅 OpenCode Go"
+      + "（$10/月，https://opencode.ai/auth），你的 oc_sk 在 Go 档是被识别的；"
+      + "②保持现状，由故障转移自动落到 wb/wbai/or 等其它通道继续对话。",
   };
 }
 

@@ -3,6 +3,10 @@ const { spawn, execFile } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const instCheck = require("./install-consistency");
+/* 更新通道（稳定版 / 测试版）——纯逻辑，无 Electron 依赖，测试直接 import 它。
+ * 放在 CommonJS 里是因为 main.js 是 CommonJS：Electron 里 require() 一个 ESM
+ * 并不可靠，两边格式一致最省事。 */
+const { CHANNELS, readChannel, updaterChannel } = require("./update-channel");
 
 // ---------- 兼容性：老机器/核显/远程桌面下 Electron 窗口黑屏的根治开关 ----------
 // 路由台界面极轻，软件渲染没有任何可感知性能损失
@@ -478,6 +482,45 @@ function readCfgSafe() {
   try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, "config.json"), "utf8")); } catch { return {}; }
 }
 
+/* 写 config.json（原子：临时文件 + rename）。
+ *
+ * ⚠ 为什么不能直接 writeFileSync：**server.mjs 也在写同一个文件**（面板改设置时）。
+ * 直接写会被写坏——写到一半进程被杀，文件就截断了，用户配置当场蒸发。
+ * 临时文件 + rename 在 POSIX 与 Windows 上都保证「要么是旧的完整内容、
+ * 要么是新的完整内容」。
+ *
+ * rename 覆盖一个「正被别的句柄占住」的文件在 Windows 上会抛 EPERM/EACCES/EBUSY
+ * （杀毒实时扫描、同步客户端、编辑器打开着），所以重试几次——
+ * 那通常只是几百毫秒的锁，不是真失败。 */
+const CFG_SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+function sleepSyncMs(ms) { if (ms > 0) Atomics.wait(CFG_SLEEP_BUF, 0, 0, ms); }
+function writeCfgSafe(patch) {
+  const f = path.join(DATA_DIR, "config.json");
+  const next = { ...readCfgSafe(), ...(patch || {}) };
+  const tmp = f + ".tmp-" + process.pid;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", "utf8");
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { }
+    logMain("写 config.json 失败: " + (e && e.message));
+    return false;
+  }
+  for (let i = 0; i < 5; i++) {
+    try {
+      fs.renameSync(tmp, f);
+      return true;
+    } catch (e) {
+      if (i === 4) {
+        try { fs.unlinkSync(tmp); } catch { }
+        logMain("写 config.json 失败(rename): " + (e && e.message));
+        return false;
+      }
+      sleepSyncMs(120 * (i + 1));
+    }
+  }
+  return false;
+}
+
 async function restartServer() {
   quitting = true;
   try { if (child) await killTree(child.pid); } catch { }
@@ -569,19 +612,73 @@ function showWindow(diagMode) {
 }
 
 // ---------- 托盘 ----------
-function createTray() {
-  const img = nativeImage.createFromPath(iconPath);
-  tray = new Tray(img.isEmpty() ? nativeImage.createEmpty() : img);
-  tray.setToolTip("B.AI 路由台");
-  const menu = Menu.buildFromTemplate([
+/* 托盘菜单单独抽成一个函数：更新通道是**可切换的**，radio 的勾选态在建菜单
+ * 那一刻就定死了，所以切完通道必须重建菜单。 */
+function buildTrayMenu() {
+  const cur = readChannel(readCfgSafe());
+  return Menu.buildFromTemplate([
     { label: "显示主界面", click: () => showWindow() },
     { label: "检查更新", click: () => manualCheckUpdate() },
+    {
+      /* 更新通道：稳定版 / 测试版。两条通道各读各的 release 清单
+       * （latest.yml / beta.yml），互不干扰——这就是「选择性升级」的落地：
+       * 留在稳定版的用户不会被测试版影响，测试版出了问题切回去即可。 */
+      label: "更新通道",
+      submenu: [
+        { label: "稳定版", type: "radio", checked: cur === CHANNELS.stable, click: () => setUpdateChannel(CHANNELS.stable) },
+        { label: "测试版（beta）", type: "radio", checked: cur === CHANNELS.beta, click: () => setUpdateChannel(CHANNELS.beta) },
+      ],
+    },
     { label: "重启服务", click: async (item) => { item.enabled = false; await restartServer(); item.enabled = true; } },
     { type: "separator" },
     { label: "部署到本机（快捷方式/自启）…", click: () => deployLocal() },
     { type: "separator" },
     { label: "退出", click: () => { quitting = true; app.quit(); } },
   ]);
+}
+/** 通道切了之后菜单要重建——radio 的勾选态不会自己变。 */
+function refreshTrayMenu() {
+  if (!tray) return;
+  const menu = buildTrayMenu();
+  tray.setContextMenu(menu);
+  trayMenuRef = menu;
+  syncTray();
+}
+
+/**
+ * 切更新通道。
+ *
+ * 切完**立刻重新检查一次**：换了通道就是换了一条 feed，之前查到的结果作废。
+ * manualCheckAt 要在这里打——用户是主动点的，该走「手动检查」那条路
+ * （把结果报给用户看），而不是后台静默下载。
+ */
+async function setUpdateChannel(ch) {
+  const want = ch === CHANNELS.beta ? CHANNELS.beta : CHANNELS.stable;
+  if (!writeCfgSafe({ updateChannel: want })) {
+    notifyWindow("app-event", { kind: "check", text: "保存更新通道失败，通道没改成" });
+    refreshTrayMenu();
+    return;
+  }
+  if (autoUpdater) {
+    try {
+      autoUpdater.allowPrerelease = true;
+      autoUpdater.channel = updaterChannel(want);
+    } catch (e) { logMain("切更新通道失败: " + (e && e.message)); }
+  }
+  refreshTrayMenu();
+  notifyWindow("app-event", {
+    kind: "check",
+    text: want === CHANNELS.beta ? "已切到测试版通道，正在检查更新" : "已切回稳定版通道，正在检查更新",
+  });
+  manualCheckAt = Date.now();
+  try { if (autoUpdater) await autoUpdater.checkForUpdates(); } catch { }
+}
+
+function createTray() {
+  const img = nativeImage.createFromPath(iconPath);
+  tray = new Tray(img.isEmpty() ? nativeImage.createEmpty() : img);
+  tray.setToolTip("B.AI 路由台");
+  const menu = buildTrayMenu();
   tray.on("double-click", () => showWindow());
   tray.setContextMenu(menu);
   trayMenuRef = menu;
@@ -698,6 +795,21 @@ function setupUpdater() {
     //   自动 → 立刻 downloadUpdate()，后台静默下载，用户无感（保持原有体验）
     au.autoDownload = false;
     au.autoInstallOnAppQuit = true;
+    /* ★ 更新通道（稳定版 / 测试版）。
+     *
+     * `allowPrerelease = true` 是**两条通道都要的**：不带它，1.0.93-beta.1 这种
+     * 版本在 semver 比较里根本不算「比当前版本新」，用户永远看不到测试版。
+     *
+     * `channel` 决定读 release 里的哪份清单：latest 读 `latest.yml`，
+     * beta 读 `beta.yml`。⚠ 稳定版映射到 **latest** 而不是 stable ——
+     * electron-updater 认的是 yml 的文件名，写成 "stable" 它会去找 stable.yml，
+     * 那个文件不存在，于是永远「检查不到更新」。 */
+    try {
+      au.allowPrerelease = true;
+      au.channel = updaterChannel(readChannel(readCfgSafe()));
+    } catch (e) {
+      logMain("设置更新通道失败: " + (e && e.message));
+    }
     au.on("checking-for-update", () => { updateState = { phase: "checking" }; syncTray(); });
     au.on("update-available", (info) => {
       const manual = isManualCheck();
