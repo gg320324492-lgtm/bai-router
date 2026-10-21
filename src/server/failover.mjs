@@ -1,4 +1,7 @@
 import { Writable } from "node:stream";
+// 通用候选层：失败分类 / 两级休息 / 冷却时长（纯逻辑，零 IO，零时钟）。
+// ★ 本模块只**用**它，不改它；它的口径见 src/server/candidates.mjs 的文件头。
+import { classifyFailure, cooldownFor, scopeOfKind, RestTable } from "./candidates.mjs";
 // 自动故障转移（v1.0.43）
 //
 // 目标：Claude Code 只接一次线（指向当前提供方那个端口），之后由中转自己决定用谁。
@@ -70,6 +73,122 @@ export function failoverSnapshot() {
     if (s.until > Date.now()) out[p] = { cooldownLeftSec: Math.ceil((s.until - Date.now()) / 1000), lastErr: s.lastErr, quota: !!s.quota };
   }
   return out;
+}
+
+/* ====================================================================== *
+ * 账号级冷却（新增层）—— 上面那套 provider 级的一字未动，这里是**加**的
+ *
+ * 为什么要再加一层：
+ *   上面那套（failoverState）是 **provider 级**的：一次失败冷却整家 90 秒
+ *   （额度用尽 30 分钟）。但真实世界里有两件它表达不了的事：
+ *
+ *   ① **粒度**：同一家 provider 可能有多个账号/密钥。一个账号额度耗尽，
+ *      不该把同家其它账号一起拖下水 —— magpie 的候选粒度是账号/密钥级。
+ *   ② **两级**：一个账号的**某个模型**额度耗尽，更不该把同账号的其它模型
+ *      一起拖下水 —— magpie 的 restKey（整号）/ restID（模型）。
+ *
+ *   这一层就是把那套语义搬进来：失败分类看响应体（不只看状态码）、
+ *   休息键分两级、冷却时长照抄 magpie 的表、连续失败退避。
+ *
+ *   ⚠ 与上面那套**并存**，不替换：上面那套是「这家现在整体能不能用」，
+ *      这一层是「这个账号/这个模型现在能不能用」。两者的键空间不同
+ *      （provider vs provider@user / provider@user/model），不会互相覆盖。
+ * ====================================================================== */
+
+/** 全进程共享的休息表（账号级）。 */
+const sharedRestTable = new RestTable();
+
+/**
+ * 共享的账号级休息表。
+ *
+ * 为什么要共享：休息状态是**跨请求**的事实（这个号刚才失败了），
+ * 放模块级单例才有一致性；每个调用方自己 new 一张表就等于没有。
+ */
+export function restTable() {
+  return sharedRestTable;
+}
+
+/**
+ * 按账号/模型粒度记一次失败并冷却。
+ *
+ * 与旧的 {@link failoverCooldown} 的分工：
+ *   · 旧的：provider 级，两档（90s / 30min），只看状态码 —— **一字未动**；
+ *   · 这个：账号级/模型级，看响应体分类，时长照抄 magpie 的表 + 退避。
+ *
+ * 写在哪一层由 scope 决定（scopeOfKind / 调用方从 classifyFailure 拿到的）：
+ *   · "account" → 写 restKey ⇒ **整号休息**，这一号的所有模型都停；
+ *   · "model"   → 写 restID  ⇒ **只休息那个模型**，同账号其它模型照常用；
+ *   · "none"    → 谁也不写（请求本身有问题，换谁都一样）。
+ *
+ * ⚠ **正确用法**（scope 必须来自 classifyFailure，不能只传 kind）：
+ *     const f = classifyFailure(status, body);
+ *     failoverCooldownFor(c.restKey, c.restId, f.kind, {
+ *       scope: f.scope, retryAfterMs: f.retryAfterMs, resetAtMs: f.resetAtMs, why: f.why,
+ *     });
+ *   只传 kind 时用的是 {@link scopeOfKind} 的**默认值**：auth 当成凭据判死
+ *   （整号休息）。但「供应商拒的是客户端」那一种 auth 的 scope 是 "none"
+ *   （谁也不休息）—— 漏传 scope 就把它错当成凭据失效、把整个账号停了。
+ *
+ * @param {string} restKey 整号休息键（"provider@user" 或 "provider"）
+ * @param {string} restId  模型休息键（restKey + "/" + model）
+ * @param {string} kind    失败类别（candidates.KINDS 之一）
+ * @param {{now?:number, scope?:string, failures?:number, retryAfterMs?:number|null,
+ *          resetAtMs?:number|null, why?:string, model?:string|null}} [opts]
+ * @returns {{rested:boolean, id:string|null, kind:string, scope:string,
+ *            durationMs:number, untilMs:number, failures:number}}
+ */
+export function failoverCooldownFor(restKey, restId, kind, opts = {}) {
+  // 时间由参数传入（opts.now）；不注入假时刻时沿用本文件既有的时钟口径。
+  const now = typeof opts.now === "number" ? opts.now : Date.now();
+  const table = sharedRestTable;
+  const scope = opts.scope || scopeOfKind(kind);
+
+  // scope "none"：请求本身有问题 —— 谁也不休息（换几家都一样失败，
+  // 只会白耗别家的额度，还把真实报错埋掉）。
+  if (scope === "none" || !restKey) {
+    return { rested: false, id: null, kind, scope, durationMs: 0, untilMs: now, failures: 0 };
+  }
+
+  const id = scope === "model" ? (restId || restKey) : String(restKey);
+  if (!id) {
+    return { rested: false, id: null, kind, scope, durationMs: 0, untilMs: now, failures: 0 };
+  }
+
+  // 连续失败计数（magpie 的 routed.failures）：退避要用它。
+  // 候选成功应答时调用方要 table.forget(id) 清零 —— 否则不是「连续」。
+  let failures;
+  if (Number.isFinite(opts.failures)) {
+    failures = opts.failures;
+  } else {
+    // magpie 的 rateForget：太久没失败的那一次算「新的」，重新从 1 分钟起算。
+    // 不这样的话，一个偶发失败的账号会一路退避到 10 分钟再也下不来。
+    const prev = table.entry(id);
+    if (prev && now - prev.until > 30 * 60 * 1000) table.forget(id);
+    failures = table.bump(id);
+  }
+
+  const durationMs = cooldownFor(kind, {
+    now,
+    failures,
+    retryAfterMs: opts.retryAfterMs,
+    resetAtMs: opts.resetAtMs,
+  });
+  const untilMs = now + durationMs;
+
+  // ⚠ **只延长，不缩短**（wb-pool.mjs 的 applyFailure 口径）：
+  // 一次额度失败的长冷却不能被后来的限流降级成短冷却 —— 那等于立刻放行，
+  // 下条请求又去撞一个已知没额度的账号。
+  const prev = table.entry(id);
+  if (!prev || untilMs > prev.until) {
+    table.rest(id, untilMs, {
+      kind,
+      scope,
+      why: opts.why || "",
+      model: opts.model == null ? null : String(opts.model),
+    });
+  }
+
+  return { rested: true, id, kind, scope, durationMs, untilMs, failures };
 }
 
 /* ====================================================================== *
@@ -339,7 +458,27 @@ export function providerRefusal(body) {
 // ⚠ 例外：**看响应体**。400/404/422 有时不是「请求本身有问题」，而是
 // 「**这家不接这类请求**」——同一个请求换一家完全能通。
 // 判据是正文，不是状态码（magpie 的 `failure(status, body)` 就是同时看两者）。
+//
+// ★ 现在有响应体时，判据是**候选层那个分类器**（candidates.mjs 的
+//   classifyFailure，magpie 的 failure(status, body) 口径）：它同时看状态码
+//   与正文，把失败分成 credit/quota/rate/auth/content/unserved/other，
+//   只有 content（请求本身有问题）才不转移。
+//
+// ⚠ **没有响应体时走的是下面那个 shouldFailoverByStatus —— 与改动前逐字一致**。
+//   这是硬要求：不能因为「引入了分类器」就把老调用方的行为改了。
+//   （调用方多的是只传 status 的场景，那些结论必须原样。）
 export function shouldFailover(status, body) {
+  if (!body) return shouldFailoverByStatus(status, body);
+  return classifyFailure(status, body).failover;
+}
+
+/**
+ * 旧的、**只看状态码**的判据。
+ *
+ * ⚠ 这段代码是刻意**冻结**的：它就是 v1.0.93 之前的行为，一字未改。
+ *    没有响应体时 {@link shouldFailover} 直接用它，保证老调用方看到的老结论。
+ */
+function shouldFailoverByStatus(status, body) {
   if (status === 400 || status === 404 || status === 422) {
     if (providerRefusal(body)) return true;
   }
