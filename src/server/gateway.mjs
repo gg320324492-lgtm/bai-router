@@ -107,15 +107,20 @@ export function makeGatewayHandler({ handlers, isProvider = defaultIsProvider } 
       }
       let raw = Buffer.concat(chunks);
       let j = null;
-      try { j = JSON.parse(raw.toString("utf8")); } catch { j = null; }
-      if (!j || typeof j !== "object" || Array.isArray(j)) {
+      let parsedJson = false;
+      try { j = JSON.parse(raw.toString("utf8")); parsedJson = true; } catch { j = null; }
+      if (!parsedJson) {
         return gatewayError(res, 400,
           `统一网关的请求体必须是带 model 字段的 Anthropic messages JSON（${describeBody(raw)}）`);
+      }
+      if (!j || typeof j !== "object" || Array.isArray(j)) {
+        return gatewayError(res, 400,
+          `统一网关的请求体必须是一个 JSON 对象（收到的是 ${Array.isArray(j) ? "数组" : typeof j}）——它得带 model 字段（${describeBody(raw)}）`);
       }
       const modelName = typeof j.model === "string" ? j.model : "";
       if (!modelName.trim()) {
         return gatewayError(res, 400,
-          "统一网关的请求体里没有 model 字段——模型名必须写成 provider/模型 的形式（例如 sn/glm-5.2）");
+          "统一网关的请求体里没有可用的 model 字段——模型名必须写成 provider/模型 的形式（例如 sn/glm-5.2）");
       }
       const parsed = parseGatewayModel(modelName, isProvider);
       if (!parsed) {
