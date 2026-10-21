@@ -4,6 +4,7 @@
   "proxy": "",
   "relayPort": 15722,
   "panelPort": 15723,
+  "gatewayPort": 15799,
   "defaultModel": "qwen3.8-flash",
   "availableModels": [
     "claude-fable-5",
