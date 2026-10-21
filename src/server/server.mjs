@@ -94,6 +94,9 @@ import { makeUsageWriter } from "./usage-writer.mjs";
 /* 会话身份（session-id.mjs）：magpie 的 sessionHeaders 移植版。
  * ⚠ 它只**认**客户端头与各 agent 的原生头；都没有就返回 null —— 从不编造 id。 */
 import { sessionOf } from "./session-id.mjs";
+/* 用量扫描器（usage-scan.mjs）：从流过的 SSE 字节里顺手捡出 token 数。
+ * 透传那条路（bai/sn）上游响应是原样管道过去的，不扫就拿不到用量。 */
+import { makeUsageScanner } from "./usage-scan.mjs";
 /* 统一网关入口（gateway.mjs）：**一个端口**，模型 id 写成 provider/模型，
  * 网关拆前缀决定走哪一家（magpie 形态）。
  * 纯逻辑、零 IO、零网络，所以独立成文件才能被测试直接 import——server.mjs 一 import
@@ -4083,7 +4086,7 @@ function wbUnknownPassthroughText(unknown) {
 }
 
 // OpenAI SSE → Anthropic SSE（clientStream=false 时聚合成单条 Anthropic JSON 响应）
-async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
+async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs, usageOut }) {
   const inTok = Math.max(1, Math.ceil(JSON.stringify(inputJson || {}).length / 4));
   const msgId = "msg_wb_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   /* ── ★ v1.0.78：非 2xx **不进 SSE 解析器** ──
@@ -4310,6 +4313,24 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs }) {
   const stopReason = finish === "length" ? "max_tokens" : (finish === "tool_calls" || toolParts.length) ? "tool_use" : "end_turn";
   const outTok = (usage && usage.completion_tokens) || Math.max(1, Math.ceil(outChars / 4));
   const inFinal = (usage && usage.prompt_tokens) || inTok;
+  /* 用量往上传（账本要记这次花了多少 token）。
+   *
+   * ⚠ **只填上游真报出来的数**，不填估算值（上面那个 ÷4 的 outTok 是估算，
+   * 当成「上游报的」写进账本就是**误报**）。
+   * ⚠ OpenAI 与 Anthropic 给的字段名不一样（prompt_tokens / input_tokens），
+   *   两套都认 —— 上游是什么形状就用什么形状的。 */
+  if (usageOut && typeof usageOut === "object" && usage && typeof usage === "object") {
+    const pin = Number.isFinite(usage.prompt_tokens) ? usage.prompt_tokens
+      : (Number.isFinite(usage.input_tokens) ? usage.input_tokens : null);
+    const pout = Number.isFinite(usage.completion_tokens) ? usage.completion_tokens
+      : (Number.isFinite(usage.output_tokens) ? usage.output_tokens : null);
+    if (pin !== null) usageOut.in = pin;
+    if (pout !== null) usageOut.out = pout;
+    const cached = usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens;
+    if (Number.isFinite(cached)) usageOut.cacheRead = cached;
+    const cr = usage.cache_read_input_tokens;
+    if (Number.isFinite(cr)) usageOut.cacheRead = cr;
+  }
   if (clientStream) {
     emit("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: inFinal, output_tokens: outTok } });
     emit("message_stop", { type: "message_stop" });
@@ -4982,7 +5003,7 @@ try {
   process.on("exit", () => { try { ocGateway.dispose(); } catch { } });
 } catch { /* 极老的环境没有 process.on("exit") */ }
 
-async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs }) {
+async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs, usageOut }) {
   const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : p === "or" ? "OpenRouter" : wkZh(p);
   setErrProvider(NAME, p);   // 渠道 key 一起传下去：wbPipe 里的 noteRelayError 要按真实渠道归因
   /* ---- OpenCode 传输：**在取令牌之前**提前分流（v1.0.75）----
@@ -5528,6 +5549,7 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs }) {
     model: j.model, clientStream: j.stream === true, inputJson: j,
     timeoutMs: isProbe ? Math.max(60000, ZEN_PROBE_TIMEOUT_MS * 3)
       : upstreamFirstEventBudgetMs(upstreamBodyBytes(bodyStr)),
+    usageOut,
   }); // Anthropic 默认非流式
 }
 
@@ -5570,6 +5592,10 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     if (!target) { tries.push({ provider, skipped: "未知渠道" }); continue; }
     const cap = new CaptureRes(res);
     const sub = bodyFor(target);
+    /* 这次尝试的用量出口。上游报出来的 token 数会写进来，账本据此记账。
+     * 每次尝试**新的**一个：转交给下一家时，数字必须跟着换——上一家的数字
+     * 记到这一家头上就是**错账**。 */
+    target.usageOut = {};
     /* 新增：模型级休息（magpie 的**两级休息**）——这家整体还活着，但**这个模型**
      * 在休息。本次请求跳过它，同号其它模型照常用。
      * 模型级休息不能整家踢掉：那正是「这个模型没额度」把整家拖下水的老毛病。 */
@@ -5609,6 +5635,9 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
         status: 200,
         tries: tries.length,
         sessionProvider: sessionOfReq(req),
+        /* token 数只在上游**真报出来**时才有；没报就留着空（账本会填 0，
+         * 但那是「没统计到」，不是「真花了 0」——面板那侧按缺字段显示「—」）。 */
+        ...(target.usageOut || {}),
       });
       /* 静默换人留痕（v1.0.88）：把「实际服务的渠道 + 实际发出去的模型」一起记进有界结构，
          面板据此在故障转移视图顶部显式告诉用户「你选的是 A、回答你的是 B」。
@@ -6126,7 +6155,7 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
             return wbAnthroError(res, 400, `请求体无法解析为 Anthropic messages JSON：${why}｜Content-Type=${ctv}｜长度=${len} 字节｜前 80 字节=${raw}`);
           }
           try {
-            await openaiExchange(fo.provider, { cfg, S: fo.S, j: rewritten, isProbe, res, useProxy: fo.useProxy(cfg), obs: fo.obs });
+            await openaiExchange(fo.provider, { cfg, S: fo.S, j: rewritten, isProbe, res, useProxy: fo.useProxy(cfg), obs: fo.obs, usageOut: fo.usageOut });
           } catch (e) {
             noteRelayError(fo.provider, "network", String((e && e.message) || e));
             if (!res.headersSent) wbAnthroError(res, 502, (e && e.message) || e);
@@ -6169,7 +6198,10 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
           res.writeHead(r.status, h);
           if (r.body) {
             const stream = r._nodeStream ? r.body : Readable.fromWeb(r.body);
-            stream.pipe(res);
+            /* 顺手扫一遍用量：透传这条路中转**没看内容**（原样管道过去），
+             * 不扫就拿不到 token 数，账本的 token 列会一直是 0。
+             * 扫描器是 Transform：字节原样透传，不缓冲、不改时序。 */
+            stream.pipe(makeUsageScanner(fo.usageOut)).pipe(res);
             stream.on("error", () => res.end());
           } else res.end();
         } catch (e) {
