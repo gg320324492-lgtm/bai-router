@@ -19,12 +19,12 @@ magpie 是 10.3 万行 Go、5661 个文件。它自己的历史是首周每天 2
 | --- | --- | --- | --- |
 | T0 | 差距分析与复刻清单（研究） | ✅ 完成 | — |
 | T1 | **地基三件套**：保格式 JSON 编辑器 / 路由策略内核 / 统一协议 IR | ✅ 完成 | `internal/edit/`、`internal/routes/`、`internal/gateway/ir.go` |
-| T2 | **单网关化**：8 个中转端口 → 1 个 | ⬜ 未开始 | `internal/gateway/gateway.go` |
-| T3 | **候选层泛化**：provider 级 → 账号/密钥级 | ⬜ 下一步 | `internal/gateway/fallback.go` |
-| T4 | **路由策略上板**：7 种策略 + 配额感知排序 | ⬜ 未开始 | `internal/provider/routing.go` |
-| T5 | **协议矩阵补全**：Responses / Gemini + 桥换 IR | ⬜ 未开始 | `internal/gateway/{responses,gemini}.go` |
-| T6 | **会话身份与亲和**（通用层） | ⬜ 未开始 | `internal/gateway/sessionHeaders` |
-| T7 | **用量账本** `usage.jsonl` + 面板 | ⬜ 未开始 | `internal/usage/` |
+| T2 | **单网关化**：8 个中转端口 → 1 个 | 🟡 已落地（beta 默认开，旧端口留作回退） | `internal/gateway/gateway.go` |
+| T3 | **候选层泛化**：provider 级 → 账号/密钥级 | ✅ 完成（`candidates.mjs` + 两级休息 + 归因冷却） | `internal/gateway/fallback.go` |
+| T4 | **路由策略上板**：7 种策略 + 配额感知排序 | ✅ 完成（`routes.mjs` + 面板接线） | `internal/provider/routing.go` |
+| T5 | **协议矩阵补全**：Responses / Gemini + 桥换 IR | 🟡 IR 底座已就位，编解码未做 | `internal/gateway/{responses,gemini}.go` |
+| T6 | **会话身份与亲和**（通用层） | ✅ 完成（`session-id.mjs` + `session-store.mjs`，持久化） | `internal/gateway/sessionHeaders` |
+| T7 | **用量账本** `usage.jsonl` + 面板 | ✅ 完成（`usage-ledger.mjs` + `usage-writer.mjs` + token 扫描） | `internal/usage/` |
 | T8 | **账号发现改读登录态**（替代 hook 注入） | ⬜ 未开始 | `internal/provider/account.go` |
 | T9 | **配额探测与配额感知路由** | ⬜ 未开始 | `internal/provider/quotas.go` |
 | T10 | **脱敏与审计台账** | ⬜ 未开始 | `internal/redact/`、`internal/maskrec/` |
@@ -100,10 +100,39 @@ provider 跳。模型寻址靠本地四档映射表（`TIERS` + `resolveModelTar
 
 **动点**：
 - `makeRelay` / `relaySpec` / 每 provider 的 `createServer` → 收敛成单一 handler
-- `ANTHROPIC_BASE_URL` 恒指向那一个端口；模型 id 改写 `provider/model`
+- `ANTHROPIC_BASE_URL` 恒指向那一个端口；模型 id 改写 `provider/档位`
 - `attemptWithFailover` 的「provider 链」概念整体作废（它就是 magpie 的候选循环）
 - `noProxyList` 两处同步的老坑随端口收敛一并消失
 - 面板的「每家一个端口」字段要改
+
+**⚠ 模型 id 的后半段写什么 —— 这一条踩过坑，值得单独记**
+（2026-10-22 实现时的发现，与复审 agent 的独立复审对上）
+
+一开始写的是 `provider/最终模型`（如 `sn/glm-5.2`，即最终模型名），
+靠**反查**（哪个档位的 target 等于这个模型）把档位找回来。这条路**在数学上不可逆**：
+
+- **档位**（claude-opus-5）是 provider 无关的抽象；**最终模型名**（glm-5.2）是
+  provider 相关的具体值。写具体值 = 在链路上丢掉了 provider 无关的那一半。
+- 出厂默认里 zen/qd/or/mm 的**四档全指向同一个模型** → 反查必然命中四个 →
+  挑哪个都是瞎猜。挑错的后果是「用户点 opus，转移后跑的是 fable 的模型」——
+  **计费档位被悄悄换掉，面板上什么都看不出来**。
+- 目标家按**档位**解析出的模型是不同的（sn 的 opus 档是 glm-5.2，wb 的是 hy3），
+  所以「两档映射到同一模型时选哪档都一样」这个假设从根上就是错的。
+
+**正确形态是 `provider/档位`**（magpie 同款语义：id 里带的是槽位，每家自己的表
+把槽位翻成真实模型名）。这样：
+
+- 网关只做**前缀剥离**，档位原样透传给中转 → **档位无损、无歧义**；
+- 中转沿用老路径那套「档位 → 本家模型」解析，**一个字都不用改**；
+- 故障转移时按**目标家**重解析这一档，也就自动正确了。
+
+旧写法（`provider/最终模型`，用户手写或升级前的遗留接线）仍然认，但那时档位
+只能反查、**多档同模型时必然歧义 → 返回 null**，转移时用**目标家自己的默认模型**，
+绝不再把入口家的模型硬发给下一家。
+
+对应实现：`src/server/gateway.mjs`（前缀剥离 + 档位识别）、
+`src/server/gateway-failover.mjs`（`tierKeyFor` / `tierOfModel`）、
+`src/server/server.mjs` 的 `applyToCli` / `applyToDesktop`（写 `provider/档位`）。
 
 **风险**：这是请求主路径。必须分小步：先加新入口（模型 id 带前缀时走新逻辑），与旧路径并存，
 用端到端用例证明等价，再切默认，最后拆旧的。

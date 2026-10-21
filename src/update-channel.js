@@ -16,8 +16,10 @@
  * ⚠ 口径说明（别自己改）：
  * · 「稳定版」= electron-updater 的 `latest` 通道，读 release 里的 `latest.yml`
  * · 「测试版」= electron-updater 的 `beta` 通道，读 release 里的 `beta.yml`
- * · 两条通道都要 `allowPrerelease = true`，否则带 prerelease 后缀的版本
- *   （1.0.93-beta.1）在 semver 比较里根本不算「更新」，用户永远看不到。
+ * · `allowPrerelease` **两条通道不一样**（stable=false / beta=true）——
+ *   四种组合里只有两种是对的，详见 {@link allowPrereleaseFor} 的那张表。
+ *   写成「两条都要 true」会让稳定版用户要么看到「检查更新失败」，
+ *   要么**意外拿到测试版**——那就不是「选择性升级」了。
  */
 
 /** 两个通道。值是 config.json 里 `updateChannel` 字段的取值。 */
@@ -50,9 +52,34 @@ function readChannel(cfg) {
  * ⚠ 「稳定版」映射到 **latest** 而不是 stable —— electron-updater 认的是
  * release 资产里的 yml 文件名：`latest.yml` / `beta.yml` / `alpha.yml`。
  * 写成 "stable" 它会去找 stable.yml，那个文件不存在，于是永远「检查不到更新」。
+ * （setter 也不许空串：`Channel must be not an empty string`。）
  */
 function updaterChannel(channel) {
   return channel === CHANNELS.beta ? "beta" : "latest";
+}
+
+/**
+ * 这一条通道**允不允许预发布版本**。
+ *
+ * ⚠⚠ 这是整套通道机制里最容易搞错的一处。读 electron-updater 的
+ * `GitHubProvider` 源码，四种组合里**只有两种是对的**：
+ *
+ *   | allowPrerelease | channel  | 结果 |
+ *   |---|---|---|
+ *   | false | "latest" | ✅ 走 API 的 /releases/latest（**排除预发布**）→ 读 latest.yml |
+ *   | true  | "beta"   | ✅ 走 Atom feed，挑 prerelease 标签为 beta 的那条 → 读 beta.yml |
+ *   | true  | 不设      | ❌ 取 feed 的**第一个**条目（可能就是预发布）→ 稳定版用户会拿到 beta |
+ *   | true  | "latest" | ❌ 循环里一个都匹配不上 → 报「No published versions on GitHub」 |
+ *
+ * 也就是说：**稳定版必须 allowPrerelease=false**，哪怕 channel 名叫 "latest"。
+ * 两个都设成「开」是最容易踩的第四种 —— 稳定版用户会看到「检查更新失败」。
+ *
+ * 另注：AppUpdater 构造时会**自己**按当前版本号有没有 prerelease 段来推导
+ * allowPrerelease（`hasPrereleaseComponents(currentVersion)`）—— 我们显式设它，
+ * 正是为了**盖掉**那个推导：跑着 beta 版的用户切回稳定通道时，得立刻不再看 beta。
+ */
+function allowPrereleaseFor(channel) {
+  return channel === CHANNELS.beta;
 }
 
 /**
@@ -87,6 +114,7 @@ module.exports = {
   DEFAULT_CHANNEL,
   readChannel,
   updaterChannel,
+  allowPrereleaseFor,
   isPrereleaseVersion,
   channelForVersion,
 };

@@ -12,7 +12,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import {
-  CHANNELS, DEFAULT_CHANNEL, readChannel, updaterChannel,
+  CHANNELS, DEFAULT_CHANNEL, readChannel, updaterChannel, allowPrereleaseFor,
   isPrereleaseVersion, channelForVersion,
 } from "../src/update-channel.js";
 
@@ -40,6 +40,25 @@ describe("更新通道判据", () => {
 
   test("③ 两条通道必须读不同的清单（否则等于没分通道）", () => {
     assert.notEqual(updaterChannel(CHANNELS.stable), updaterChannel(CHANNELS.beta));
+  });
+
+  test("③b ★ allowPrerelease 必须按通道分开（读 electron-updater 源码得到的结论）", () => {
+    /* 四种组合里只有两种是对的：
+     *   稳定版：allowPrerelease=false + channel="latest" → 走 /releases/latest（排除预发布）
+     *   测试版：allowPrerelease=true  + channel="beta"   → 走 Atom feed 挑 beta
+     * 另两种都错：true+不设 → 稳定版会拿到 beta；true+"latest" → 报「No published versions」。 */
+    assert.equal(allowPrereleaseFor(CHANNELS.stable), false,
+      "稳定版必须 allowPrerelease=false —— 设成 true 且 channel 为 latest 会让检查更新直接失败");
+    assert.equal(allowPrereleaseFor(CHANNELS.beta), true,
+      "测试版必须 allowPrerelease=true —— 否则预发布版本在版本比较里根本不算「更新」");
+    assert.equal(allowPrereleaseFor("stable"), false, "不认识的通道按稳定版处理");
+    assert.equal(allowPrereleaseFor(undefined), false, "缺省按稳定版处理");
+    /* 两条通道的组合必须各不相同 —— 相同就等于没分通道 */
+    const stable = [updaterChannel(CHANNELS.stable), allowPrereleaseFor(CHANNELS.stable)];
+    const beta = [updaterChannel(CHANNELS.beta), allowPrereleaseFor(CHANNELS.beta)];
+    assert.notDeepEqual(stable, beta, "两条通道的 (channel, allowPrerelease) 组合必须不同");
+    assert.deepEqual(stable, ["latest", false]);
+    assert.deepEqual(beta, ["beta", true]);
   });
 
   test("④ 版本号带 prerelease 后缀才算预发布", () => {

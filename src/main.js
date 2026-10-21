@@ -6,7 +6,7 @@ const instCheck = require("./install-consistency");
 /* 更新通道（稳定版 / 测试版）——纯逻辑，无 Electron 依赖，测试直接 import 它。
  * 放在 CommonJS 里是因为 main.js 是 CommonJS：Electron 里 require() 一个 ESM
  * 并不可靠，两边格式一致最省事。 */
-const { CHANNELS, readChannel, updaterChannel } = require("./update-channel");
+const { CHANNELS, readChannel, updaterChannel, allowPrereleaseFor } = require("./update-channel");
 
 // ---------- 兼容性：老机器/核显/远程桌面下 Electron 窗口黑屏的根治开关 ----------
 // 路由台界面极轻，软件渲染没有任何可感知性能损失
@@ -661,7 +661,9 @@ async function setUpdateChannel(ch) {
   }
   if (autoUpdater) {
     try {
-      autoUpdater.allowPrerelease = true;
+      /* 两个一起改：allowPrerelease 决定「看不看预发布」，channel 决定「读哪份清单」。
+       * 只改一个就会落到那两种错误组合之一（详见 setupUpdater 里的四种组合表）。 */
+      autoUpdater.allowPrerelease = allowPrereleaseFor(want);
       autoUpdater.channel = updaterChannel(want);
     } catch (e) { logMain("切更新通道失败: " + (e && e.message)); }
   }
@@ -797,16 +799,25 @@ function setupUpdater() {
     au.autoInstallOnAppQuit = true;
     /* ★ 更新通道（稳定版 / 测试版）。
      *
-     * `allowPrerelease = true` 是**两条通道都要的**：不带它，1.0.93-beta.1 这种
-     * 版本在 semver 比较里根本不算「比当前版本新」，用户永远看不到测试版。
+     * ⚠⚠ **两条通道的 allowPrerelease 必须不一样**（读 electron-updater 的
+     * GitHubProvider 源码得到的结论，四种组合里只有两种是对的）：
+     *   · 稳定版：allowPrerelease=**false** + channel="latest"
+     *     → 走 API 的 /releases/latest（**排除预发布**）→ 读 latest.yml
+     *   · 测试版：allowPrerelease=**true** + channel="beta"
+     *     → 走 Atom feed，挑 prerelease 标签为 beta 的那条 → 读 beta.yml
+     * 另两种都是错的：
+     *   · allowPrerelease=true 且 channel 不设 → 取 feed 的**第一个**条目
+     *     （可能就是预发布）→ **稳定版用户会拿到 beta**
+     *   · allowPrerelease=true 且 channel="latest" → 循环里一个都匹配不上
+     *     → 报「No published versions on GitHub」，稳定版用户看到「检查更新失败」
      *
-     * `channel` 决定读 release 里的哪份清单：latest 读 `latest.yml`，
-     * beta 读 `beta.yml`。⚠ 稳定版映射到 **latest** 而不是 stable ——
-     * electron-updater 认的是 yml 的文件名，写成 "stable" 它会去找 stable.yml，
-     * 那个文件不存在，于是永远「检查不到更新」。 */
+     * 显式设 allowPrerelease 还能**盖掉** AppUpdater 自己的推导（它按当前版本号
+     * 有没有 prerelease 段来推）——跑着 beta 的用户切回稳定通道时，得立刻不再看 beta。
+     */
     try {
-      au.allowPrerelease = true;
-      au.channel = updaterChannel(readChannel(readCfgSafe()));
+      const ch = readChannel(readCfgSafe());
+      au.allowPrerelease = allowPrereleaseFor(ch);
+      au.channel = updaterChannel(ch);
     } catch (e) {
       logMain("设置更新通道失败: " + (e && e.message));
     }
