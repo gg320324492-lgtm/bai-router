@@ -71,6 +71,17 @@ import {
   createMmTokenStore, mmBuildHeaders, mmCanonicalModel, mmNormalizeTools, mmNormalizeBodyTools,
   MM_INFER_BASE, MM_MODEL, MM_LOGIN_INVALID_MSG,
 } from "./mm-auth.mjs";
+/* 保格式 JSON/JSONC 编辑器（edit-json.mjs）：读原文、按字节区间做最小改动、
+ * 原样保住注释/键顺序/缩进/换行/BOM。移植自 magpie 的 internal/edit/json.go。
+ *
+ * 为什么必须有它：旧写法是 `JSON.parse` 读 + `JSON.stringify` 整份写回，
+ * 有两个后果——① 读失败被当成空对象再写回，用户其余配置当场蒸发；
+ * ② 每次切模型都整份重写，注释/键顺序/缩进被抹平，文件 mtime 一直在变，
+ * 面板那套「这次是谁改的」归因也跟着失真。
+ *
+ * ⚠ 铁律：**读失败 = 不知道，绝不是空**。文件在但读不懂 → 中止接线、不写盘；
+ * 文件不在 → 从空开始建，那是合法状态。两件事必须分开。 */
+import { parseJsonc, applyEdits } from "./edit-json.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -6483,12 +6494,87 @@ function snapshotExternal() {
 // 桌面版那边早就这么写了，这里只是让 CLI 侧对齐。
 const PROXY_MANAGED_TOKEN = "PROXY_MANAGED";
 
+/* 读不懂 ~/.claude/settings.json 时的处置。
+ *
+ * 两种「读不出来」必须分开：
+ *   · **文件不在** —— 合法状态，从空开始建。
+ *   · **文件在但读不懂** —— 不知道，不是空。此时**绝不能**拿一份空对象覆盖它：
+ *     用户其余配置会当场蒸发（旧代码正是这么干的：`catch { s = {} }` 然后写回）。
+ *
+ * 这里选的路子是「**另存一份 + 中止接线 + 一个字都不改**」：
+ * 备份让用户有退路（照着改回来），中止保证不猜、不覆盖。
+ * 另一条路是「备份后用最小配置重建」—— 技术上更省事，但会让用户在不知情的情况下
+ * 丢掉原配置里那些**我们不接管**的部分（权限、钩子、MCP…），所以不默认这么做。 */
+function unreadableSettingsAction(file, detail) {
+  let saved = null;
+  try {
+    saved = file + ".unreadable-" + Date.now();
+    copyFileSync(file, saved);
+  } catch { saved = null; }
+  const guide = unreadableSettingsGuidance(saved, detail);
+  const err = new Error(guide.message);
+  err.repair = { backup: saved, offerRestore: guide.offerRestore };
+  return err;
+}
+
+/* 用户看得见的引导：读不懂 settings.json 时，除了报错还要告诉他能怎么办。
+ *
+ * 返回 { message, offerRestore }：
+ *   message       —— 面板上显示的那段话
+ *   offerRestore  —— 要不要给一个「用备份恢复并重新接线」的一键入口
+ *
+ * TODO(human): 这段的措辞与 offerRestore 取 true/false，是一个产品判断：
+ *   · 用户的 settings.json 读不懂，多数是手滑多一个逗号，或别的工具写了注释。
+ *   · 备份一定在（unreadableSettingsAction 已经另存好了），所以「一键用备份恢复」
+ *     技术上随时能做 —— 但恢复等于**用备份覆盖用户当前文件**，若用户后来手工改好过，
+ *     覆盖会把那次修改也抹掉。所以 offerRestore 该默认关掉还是开，由你定。
+ *   · 下面这版是**保守默认**：说清下一步，不提供一键覆盖。
+ */
+function unreadableSettingsGuidance(bak, detail) {
+  // TODO(human): 按你的判断实现这个函数（下面这版是保守默认，可以直接改成你的方案）
+  return {
+    message: detail
+      + "\n原文件未被改动"
+      + (bak ? "，已另存为：" + bak : "（另存备份失败，请立刻自己复制一份）")
+      + "\n请打开该文件修好 JSON 语法（常见原因：多一个逗号、注释没删、字符串没转义）后重新接线。"
+      + "本程序不会覆盖读不懂的配置。",
+    offerRestore: false,
+  };
+}
+
 // 通用：把一个提供方的映射写进 CLI settings.json
 async function applyToCli(S) {
-  let s = {};
-  try { s = readJson(SETTINGS); } catch { s = {}; }
-  s.env = s.env || {};
-  const e = s.env;
+  /* ★ 读原文，不反序列化（v1.0.93 起）。
+   *
+   * 旧写法：`try { s = readJson(SETTINGS); } catch { s = {} }` + `JSON.stringify(s, null, 2)` 整份写回。
+   * 两个后果：
+   *   ① **读失败被当成空** —— 用户 settings.json 里只要有一处解析不过（手滑多一个逗号、
+   *      别的工具写了注释），下一条接线就把整个文件改写成只剩 env 的样子，用户其余配置
+   *      当场蒸发。这正是 magpie 明令禁止的「failed read means unknown, never empty」。
+   *   ② **全量重写** —— 注释、键顺序、缩进风格全被抹平；每次切模型都重写一遍，
+   *      文件 mtime 一直在变，面板那套「这次是谁改的」归因也跟着失真。
+   *
+   * 现在：读原文 → 保格式编辑器做**最小改动** → 只在真的变了时才写盘。 */
+  let text = "";
+  let existed = false;
+  try {
+    text = readFileSync(SETTINGS, "utf8");
+    existed = true;
+  } catch { /* 文件不存在：从空开始建，这是合法状态 */ }
+
+  let env = {};
+  if (existed && text.trim() !== "") {
+    const parsed = parseJsonc(text);
+    const root = parsed.ok ? parsed.value : null;
+    /* 根不是对象（数组/标量）同样算「读不懂」——Claude Code 那边也不认，
+     * 而我们若照旧往下写就会产出一个更糟的文件。 */
+    if (!parsed.ok || !root || typeof root !== "object" || Array.isArray(root)) {
+      const detail = "无法解析 " + SETTINGS
+        + (parsed.ok ? "（根不是 JSON 对象）" : `（第 ${parsed.line} 行第 ${parsed.column} 列：${parsed.error}）`);
+      throw unreadableSettingsAction(SETTINGS, detail);
+    }
+    env = (root.env && typeof root.env === "object" && !Array.isArray(root.env)) ? root.env : {};
+  }
   /* 里程碑 4b：**走本地中转的渠道**写占位符，不写真实凭据。
    *
    * 以前这里把真实 JWT 明文写进 ~/.claude/settings.json —— 那把令牌与
@@ -6505,9 +6591,13 @@ async function applyToCli(S) {
    * 与桌面版既有做法一致（applyToDesktop 之外的 FALLBACK_CC 里就写着 PROXY_MANAGED）。
    */
   const viaLocalRelay = cliViaRelay(S);
-  e.ANTHROPIC_BASE_URL = cliBaseUrlFor(S);
-  e.ANTHROPIC_AUTH_TOKEN = viaLocalRelay ? PROXY_MANAGED_TOKEN : (S.key || "wb-local");
-  e.ANTHROPIC_MODEL = S.mapping["claude-haiku-4-5"]?.target || S.defaultModel;
+  const edits = [];
+  const setEnv = (k, v) => edits.push({ path: "env." + k, value: v });
+  const delEnv = (k) => edits.push({ path: "env." + k, delete: true });
+
+  setEnv("ANTHROPIC_BASE_URL", cliBaseUrlFor(S));
+  setEnv("ANTHROPIC_AUTH_TOKEN", viaLocalRelay ? PROXY_MANAGED_TOKEN : (S.key || "wb-local"));
+  setEnv("ANTHROPIC_MODEL", S.mapping["claude-haiku-4-5"]?.target || S.defaultModel);
   /* 显示名：只写用户手填的 label，不掺倍率（v1.0.65 撤掉）。
    *
    * 仍然不 `delete`：以前是 `delete e[t.envKey + "_NAME"]` —— 我们自己把 Claude Code
@@ -6521,24 +6611,32 @@ async function applyToCli(S) {
   for (const t of TIERS) {
     const m = S.mapping[t.key] || {};
     const target = m.target || S.defaultModel;
-    e[t.envKey] = target;
+    setEnv(t.envKey, target);
     // 用户没填 label 就不写这条（留空反而会让 Claude Code 回退显示模型 id，与旧行为一致）
-    if (m.label) e[t.envKey + "_NAME"] = m.label;
+    if (m.label) setEnv(t.envKey + "_NAME", m.label);
   }
-  e.API_TIMEOUT_MS = e.API_TIMEOUT_MS || "3000000";
-  e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-  e.NODE_USE_ENV_PROXY = "1";
+  /* 用户自己设过 API_TIMEOUT_MS 就留着（旧写法 `e.API_TIMEOUT_MS = e.API_TIMEOUT_MS || "3000000"`）。 */
+  if (!env.API_TIMEOUT_MS) setEnv("API_TIMEOUT_MS", "3000000");
+  setEnv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+  setEnv("NODE_USE_ENV_PROXY", "1");
   if (S.p === "bai" || S.p === "or") {
     // 出海渠道（B.AI / OpenRouter）：CLI 直连上游时靠 proxy env 出海。
     // OpenRouter 走的是本地桥（127.0.0.1），但桥自己出海仍要代理——env 留着没坏处。
-    e.HTTPS_PROXY = loadCfg().proxy;
-    e.HTTP_PROXY = loadCfg().proxy;
+    const px = loadCfg().proxy;
+    setEnv("HTTPS_PROXY", px);
+    setEnv("HTTP_PROXY", px);
   } else {
     // 境内提供方（SenseNova/WorkBuddy）直连、清空代理（WorkBuddy 桥在本机，NO_PROXY 已覆盖）
-    delete e.HTTPS_PROXY; delete e.HTTP_PROXY;
+    delEnv("HTTPS_PROXY"); delEnv("HTTP_PROXY");
   }
-  e.NO_PROXY = "127.0.0.1,localhost";
-  writeAtomic(SETTINGS, JSON.stringify(s, null, 2) + "\n");
+  setEnv("NO_PROXY", "127.0.0.1,localhost");
+
+  const out = applyEdits(text, edits);
+  if (!out.ok) throw new Error("改写 " + SETTINGS + " 失败：" + out.error);
+  /* **只在真的变了才写盘**：不改就不动文件，mtime 不变——
+   * 面板那套「这次是谁改的」归因（按 mtime 窗口比对 CC Switch 的状态文件）
+   * 才不会被我们自己反复重写给污染。 */
+  if (out.changed) writeAtomic(SETTINGS, out.text);
   recordCliApply(S.p);   // 留指纹：之后能分辨这份配置还是不是我们写的
 }
 // 通用：把一个提供方写进桌面版 configLibrary（都经由本地中转，桌面版不感知上游差异）
@@ -7884,8 +7982,37 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const warns = [];
       if (doCli) { const w = snapshotExternal(); warns.push(...w.filter((x) => x.startsWith("桌面"))); }
       if (doDesk) { const w = snapshotExternal(); warns.push(...w.filter((x) => x.startsWith("CLI"))); }
-      if (doCli) await applyToCli(S);
-      if (doDesk) applyToDesktop(S);
+      /* 快照一次，把两边的警告按**这次要动哪一边**分派。
+       *
+       * ⚠ 旧写法是两个分支各调一次 snapshotExternal，然后**互相挑错了对方的警告**：
+       *   doCli 分支挑的是「桌面版没有可恢复的快照」，doDesk 分支挑的是「CLI 没有…」——
+       *   正好反了。于是只接 CLI 时，CLI 没快照的警告被藏起来，桌面版的警告却冒出来；
+       *   只接桌面版时同理。现在挑对了。 */
+      {
+        const w = snapshotExternal();
+        if (doCli) warns.push(...w.filter((x) => x.startsWith("CLI")));
+        if (doDesk) warns.push(...w.filter((x) => x.startsWith("桌面")));
+      }
+      /* 接线失败**必须如实告诉用户**：多半是 ~/.claude/settings.json 读不懂
+       * （手滑多一个逗号、别的工具写了注释）。这时我们**一个字都没改**，
+       * 面板该说的是「你的文件读不懂、修好再来」，而不是一个笼统的 500。
+       * 旧写法里 applyToCli 从不抛错——因为它把读失败当成空对象然后照写，
+       * 于是「读不懂」变成「静默清空用户配置」。现在读不懂会抛，这里接住它。 */
+      const applied = [];
+      try {
+        if (doCli) { await applyToCli(S); applied.push("cli"); }
+        if (doDesk) { applyToDesktop(S); applied.push("desktop"); }
+      } catch (e) {
+        const repair = (e && e.repair) || null;
+        log(`接线到 ${name} 失败：`, (e && e.message) || e);
+        return json(res, 400, {
+          error: String((e && e.message) || e).slice(0, 500),
+          repair,
+          applied,
+          /* 一个字都没改 —— 面板可以据此说清「你的配置没被动过」。 */
+          untouched: applied.length === 0,
+        });
+      }
       const ccRunning = await checkCcSwitch();
       if (ccRunning) warns.push("CC Switch 正在运行，它可能随时把配置改回去；切换前建议先退出它");
       warns.push("桌面版需完全退出并重开 Claude 才生效；CLI 新开终端生效");
