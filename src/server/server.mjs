@@ -5565,8 +5565,10 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     // 影子判定为失败：换一个
     const status = cap.status || 0;
     tries.push({ provider, ok: false, status, err: String(describeError(cap) || "").slice(0, 110) });
-    if (!shouldFailover(status)) {
+    if (!shouldFailover(status, capBodyText(cap))) {
       // 不该转移（多半是 400 请求本身有问题）——把这次的真实错误原样还给客户端
+      // ⚠ 但正文明说了「这家不接」（request illegal / unapproved channel /
+      //   模型不被服务）时，shouldFailover 会放行转移——那种 400 换个供应商能通。
       // 注意：这里是**没有发生转移**的分支（换渠道也没用，直接原样返回）。
       // 措辞必须与行为一致，否则排查时会被"故障转移"字样误导成渠道切换过。
       noteChannelAttempt(fo.provider, tries);
@@ -5613,6 +5615,19 @@ function describeError(cap) {
     if (m) return m[1];
     const m2 = txt.match(/"error"\s*:\s*"([^"]{1,200})"/);
     return m2 ? m2[1] : txt.slice(0, 160);
+  } catch { return ""; }
+}
+
+/* 这次尝试的**原始响应体**（出错时缓冲在影子 res 里）。
+ *
+ * 为什么要单独取全文：故障转移的判据不能只看状态码。400/404/422 有时是
+ * 「**这家不接这类请求**」而不是「请求本身有问题」——正文里明说了拒绝理由时，
+ * 换一家有用。正文含糊时仍然不转移（宁可少转，也不要白耗别家的额度）。
+ * 判据在 failover.mjs 的 shouldFailover(status, body)。 */
+function capBodyText(cap) {
+  try {
+    if (!cap || !cap.buf || !cap.buf.length) return "";
+    return Buffer.concat(cap.buf).toString("utf8");
   } catch { return ""; }
 }
 

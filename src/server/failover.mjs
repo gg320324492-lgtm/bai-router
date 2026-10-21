@@ -300,10 +300,49 @@ export class CaptureRes extends Writable {
   discard() { this.buf = []; this.status = 0; this.headers = null; }
 }
 
+/* 「这家不接这个」的措辞 —— **供应商侧的拒绝**，不是「请求本身有问题」。
+ *
+ * 两类都要**换一家才有用**：
+ *   ① 模型不被这家服务（magpie 的 unservedWords 口径，见 internal/gateway/fallback.go）
+ *   ② 这家不认这个客户端（bai-router 特有：协议桥剥的是已知指纹，
+ *      上游新增指纹 / 新增校验规则时就撞在这里）
+ *
+ * ⚠ 口径必须**窄**。普通参数错（少个字段、类型不对）也回 400，那种情况换几家
+ * 一样失败，转移只会白耗别家的额度、还把真实报错埋掉。所以只有正文**明说**了
+ * 拒绝理由才转移；正文含糊的 400 一律不转移。
+ *
+ * 「request illegal」是实测里最常撞到的那句（WorkBuddy AI / MiniMax 会员都回它，
+ * 2026-10-21 实测：它出现在倒数第二个渠道上，却因为「400 不转移」直接终结了整条链，
+ * 最后一个渠道根本没被试）。 */
+const PROVIDER_REFUSAL_RE = new RegExp([
+  "request illegal",
+  "illegal api invocation",
+  "unapproved channel",
+  "model.{0,80}(not (supported|accessible|available|found|enabled|allowed)|unsupported|does ?n[o']t exist|unknown|invalid)",
+  "(no such|unknown|invalid|unsupported) model",
+  "model_not_found",
+  "模型.{0,12}(不存在|不支持|无权|未开通)",
+].join("|"), "i");
+
+/** 正文说的是「这家不接」而不是「请求本身有问题」吗。 */
+export function providerRefusal(body) {
+  const b = String(body || "");
+  if (!b) return false;
+  return PROVIDER_REFUSAL_RE.test(b);
+}
+
 // 判定某次失败是否值得换一个渠道重试。
+//
 // 400 不转移：那是请求本身有问题（参数错、上下文超长），换几家都一样失败，
 // 反而把真实报错埋掉。429/5xx/超时/网络错才转移。
-export function shouldFailover(status) {
+//
+// ⚠ 例外：**看响应体**。400/404/422 有时不是「请求本身有问题」，而是
+// 「**这家不接这类请求**」——同一个请求换一家完全能通。
+// 判据是正文，不是状态码（magpie 的 `failure(status, body)` 就是同时看两者）。
+export function shouldFailover(status, body) {
+  if (status === 400 || status === 404 || status === 422) {
+    if (providerRefusal(body)) return true;
+  }
   if (status >= 400 && status < 500 && status !== 429 && status !== 401 && status !== 403) return false;
   if (status === 0) return true;                        // 网络错 / 超时（尚未拿到状态码）
   return status === 429 || status === 401 || status === 403 || status >= 500;
