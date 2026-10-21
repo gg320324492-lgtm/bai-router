@@ -1,4 +1,4 @@
-# B.AI 路由台 —— 一键升级/重装（不依赖应用内置更新器）
+﻿# B.AI 路由台 —— 一键升级/重装（不依赖应用内置更新器）
 # 用法（在目标电脑任意 PowerShell 窗口）：
 #   powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://github.com/gg320324492-lgtm/bai-router/releases/latest/download/upgrade.ps1 -UseBasicParsing | iex"
 $ErrorActionPreference = "Stop"
@@ -16,7 +16,7 @@ Invoke-WebRequest $asset.browser_download_url -OutFile $tmp -UseBasicParsing
 $ProgressPreference = $prevProgress
 $want = (Invoke-RestMethod "https://github.com/$repo/releases/latest/download/latest.yml" -UseBasicParsing).Content | Select-String -Pattern 'sha512:\s*(.+)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
 if ($want) {
-  $got = [Convert]::ToBase64String([System.Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($tmp))))
+  $got = [Convert]::ToBase64String([System.Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($tmp)))
   if ($got -ne $want.Trim()) { throw "sha512 校验失败，已中止" }
   Write-Host "sha512 校验通过"
 }

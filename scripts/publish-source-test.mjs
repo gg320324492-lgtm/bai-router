@@ -73,7 +73,7 @@ function simulatePublish(options = {}) {
       return true;
     },
     readFileSync(file) {
-      if (String(file).endsWith("package.json")) return JSON.stringify({ version: "1.0.82", build: { publish: [{ owner: "example", repo: "router" }] } });
+      if (String(file).endsWith("package.json")) return JSON.stringify({ version: options.version || "1.0.82", build: { publish: [{ owner: "example", repo: "router" }] } });
       if (String(file).endsWith("release-notes.md")) return "v1.0.82 test notes";
       return JSON.stringify({ availableModels: [] });
     },
@@ -119,6 +119,9 @@ function simulatePublish(options = {}) {
        * ⚠ 它的存在本身就是那 8 个用例的依赖：publish.cjs 一 require 它，
        *   替身没这一条就会抛 "unexpected dependency"，全部用例一起红。 */
       if (name === "./publish-seed.cjs") return require("./publish-seed.cjs");
+      /* src/update-channel.js 同样是**纯函数模块**（不碰文件、不联网、不读环境变量），
+       * 它只管「版本号算通道」这一个判据，所以直接用真的那份。 */
+      if (name === "../src/update-channel.js") return require("../src/update-channel.js");
       if (name === "./publish-proxy.cjs") return { decideProxyUse: () => ({ useProxy: false, reason: "fake probe" }), buildGhEnv: (env) => ({ ...env }), runDirectProbe: () => ({ ok: true }) };
       throw new Error("unexpected dependency");
     },
@@ -137,6 +140,27 @@ test("真实发布入口在干净且同步时构建，并用 --target 绑定完�
   assert.equal(args[args.indexOf("--target") + 1], HEAD);
   assert.equal(state.queries.filter((args) => args[0] === "status").length, 3);
   assert.equal(state.queries.filter((args) => args[0] === "ls-remote").length, 2);
+});
+
+test("稳定版上传 latest.yml，不标 prerelease", () => {
+  const state = simulatePublish({ version: "1.0.93" });
+  assert.equal(state.error, undefined);
+  const args = state.releases[0];
+  assert.ok(args.includes("dist/latest.yml"), "稳定版必须上传 latest.yml");
+  assert.ok(!args.includes("dist/beta.yml"), "稳定版不该上传 beta.yml");
+  assert.ok(!args.includes("--prerelease"), "稳定版不该标 prerelease");
+  assert.ok(args.includes("dist/rollback.ps1"), "回退脚本要随每个版本发布");
+});
+
+test("预发布版只上传 beta.yml 并标 prerelease——绝不能碰 latest.yml", () => {
+  const state = simulatePublish({ version: "1.0.93-beta.1" });
+  assert.equal(state.error, undefined);
+  const args = state.releases[0];
+  assert.ok(args.includes("dist/beta.yml"), "预发布版要上传 beta.yml");
+  /* ⚠ 这条最要紧：latest.yml 是**稳定版用户唯一读的那份**。预发布版要是也上传了
+   * latest.yml，就等于把测试版推给了所有稳定版用户——那不叫「选择性升级」。 */
+  assert.ok(!args.includes("dist/latest.yml"), "预发布版绝不能上传 latest.yml");
+  assert.ok(args.includes("--prerelease"), "预发布版要在 GitHub 上标 prerelease，免得占住 Latest");
 });
 
 for (const [name, options, expectedError, built] of [

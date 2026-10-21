@@ -14,6 +14,40 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://github.com/g
 
 跨版本升级均原地覆盖安装，`%APPDATA%\bai-router` 里的配置/映射/备份自动保留。
 
+## 更新通道：稳定版 / 测试版（v1.0.93+）
+
+托盘菜单 →「更新通道」可切：
+
+| 通道 | 读哪份清单 | 谁会拿到 |
+| --- | --- | --- |
+| 稳定版（默认） | `latest.yml` | 所有人 |
+| 测试版（beta） | `beta.yml` | 主动切过去的人 |
+
+- 切到测试版后**只**会收到 beta 版本，稳定版用户完全不受影响——这就是「选择性升级」。
+- 预发布版本在 GitHub 上标成 prerelease，**不会**占住 Latest（Latest 是人从
+  releases 页面点下载时的默认落点，测试版占了它就等于推给了所有人）。
+- 通道选择存在 `%APPDATA%\bai-router\config.json` 的 `updateChannel` 字段。
+- 两条通道都开着 `allowPrerelease`：否则 `1.0.93-beta.1` 这种版本在版本比较里
+  根本不算「更新」，用户永远看不到。
+
+## 回退：装回旧版本
+
+一行命令（列出可用版本让你选）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://github.com/gg320324492-lgtm/bai-router/releases/latest/download/rollback.ps1 -UseBasicParsing | iex"
+```
+
+流程是：下载 → 校验 sha512 与数字签名 → 关程序 → 静默装旧版 → 重新启动。
+**任何一步失败都不会动当前安装**——下载与校验都排在关程序之前。
+
+直接指定版本：
+
+```powershell
+iwr https://github.com/gg320324492-lgtm/bai-router/releases/latest/download/rollback.ps1 -UseBasicParsing -OutFile "$env:TEMP\rollback.ps1"
+& "$env:TEMP\rollback.ps1" 1.0.92
+```
+
 ## 三提供方路由（v1.0.31+）
 
 面板顶部三个页签，各自独立的映射/密钥/中转端口，互不干扰，随时一键切换、一键接回 CC Switch：
