@@ -94,6 +94,11 @@ import { makeUsageWriter } from "./usage-writer.mjs";
 /* 会话身份（session-id.mjs）：magpie 的 sessionHeaders 移植版。
  * ⚠ 它只**认**客户端头与各 agent 的原生头；都没有就返回 null —— 从不编造 id。 */
 import { sessionOf } from "./session-id.mjs";
+/* 路由策略内核（routes.mjs）+ 坐席构建器（seat-builder.mjs）：magpie 的
+ * internal/routes 与 internal/gateway/routing.go 的 weighRouted。
+ * ⚠ apply 改名成 applyRouteStrategy —— server.mjs 里还有别的 apply 语义。 */
+import { apply as applyRouteStrategy, Builtin } from "./routes.mjs";
+import { seatOf } from "./seat-builder.mjs";
 /* 用量扫描器（usage-scan.mjs）：从流过的 SSE 字节里顺手捡出 token 数。
  * 透传那条路（bai/sn）上游响应是原样管道过去的，不扫就拿不到用量。 */
 import { makeUsageScanner } from "./usage-scan.mjs";
@@ -5557,6 +5562,34 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs, usage
 // 取哪份配置(slice)、是否走代理(useProxy)、把流量记到哪个 recentCalls(store) 不同。
 // 按"故障转移链"依次尝试。fo 形如 {provider:"qd", slice, useProxy, opts}。
 // 每家一次尝试都先写进影子 res：首个响应是错误就丢弃换下一家，是 200 才落盘。
+/* 转移链的顺序（magpie 的路由组语义）。
+ *
+ * **入口不在这里排** —— 入口永远第一（手动选的就是首选，不该被策略顶掉）。
+ * 这里排的是**其余的备选**：magpie 的 Smart 口径是「额度用尽的排后面、续期早的排前面、
+ * 会自报剩余的排最前」。
+ *
+ * ⚠ 今天的**信号还很少**：bai-router 的供应商大多不暴露配额接口（magpie 靠 OAuth
+ * 登录态去查，bai-router 没有那个前提），所以多数座位的额度是「未知」——
+ * 而「不知道」在策略里既不当成用尽、也不当成没用过，于是排序**保持配置里的顺序**。
+ * 机制先在这儿立住，等配额探测（T9）接上，它自己就会开始按额度重排，不必再动这里。
+ *
+ * ⚠ 排序坏了**不许**让转移链崩 —— 排序只决定「先试谁」，排不出来就按原顺序试。
+ */
+function orderChain(providers, now) {
+  const list = (providers || []).filter(Boolean);
+  if (list.length < 2) return list;
+  try {
+    const seats = list.map((p) => seatOf(makeCandidate({
+      provider: p, model: "", resting: !failoverAvailable(p),
+    }), { now, restTable: restTable() }));
+    const idx = applyRouteStrategy(Builtin.smart, "chain", seats, now);
+    const out = [];
+    for (const i of idx) { const p = list[i]; if (p && !out.includes(p)) out.push(p); }
+    for (const p of list) if (!out.includes(p)) out.push(p);
+    return out;
+  } catch { return list; }
+}
+
 async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, tier0) {
   const foCfg = cfg.failover || {};
   if (!foCfg.enabled) {
@@ -5565,8 +5598,9 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
   }
   const order = (Array.isArray(foCfg.chain) && foCfg.chain.length ? foCfg.chain : [fo.provider])
     .filter(Boolean);
-  // 当前提供方永远排第一——手动选的就是首选，不该被配置里的顺序顶掉
-  const chain = [fo.provider, ...order.filter((x) => x !== fo.provider)];
+  // 当前提供方永远排第一——手动选的就是首选，不该被配置里的顺序顶掉。
+  // 其余备选按路由策略排（magpie 的路由组语义，见 orderChain）。
+  const chain = [fo.provider, ...orderChain(order.filter((x) => x !== fo.provider), Date.now())];
   const tries = [];
   let lastErr = "";
   // 每个目标渠道都要按**它自己的**路由表重新把档位解析成模型名：主渠道的映射在别的
