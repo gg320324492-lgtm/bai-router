@@ -6654,6 +6654,24 @@ function cliMode(cfg, creds) {
         (bridged && key === PROXY_MANAGED_TOKEN) ? true : key === v;
     }
     const bh = hostOf(c.upstream || DEFAULTS.upstream), sh = hostOf(c.sn?.upstream || DEFAULTS.sn.upstream);
+    /* ★ 网关模式：所有请求都走**同一个端口**，URL 不再能标识是哪一家。
+     * 这时认**模型 id 的 provider 前缀**——网关本来就是靠它分流的。
+     *
+     * ⚠ 认不出就老实说「other」，**宁可说不知道**：
+     *   wb 与 wbai 两版端口相邻、极易认错，而认错的后果是「把请求发到另一家去」
+     *   （国际版与国内版是**两套东西**，凭据/目录/端口全独立）。
+     *   说「other」只是面板显示成「不是本软件接的」，用户一看就知道不对；
+     *   认错则是把请求送去别家 —— 那比显示错严重得多。 */
+    const gwPort = c.gatewayPort || DEFAULTS.gatewayPort;
+    if (gwPort && u.includes(`:${gwPort}`)) {
+      const mid = String(s?.env?.ANTHROPIC_DEFAULT_OPUS_MODEL || s?.env?.ANTHROPIC_MODEL || "");
+      const at = mid.indexOf("/");
+      if (at > 0) {
+        const p = mid.slice(0, at).trim().toLowerCase();
+        if (CHANNELS.includes(p)) return { mode: p, ...r };
+      }
+      return { mode: "other", ...r };
+    }
     if (bh && u.includes(bh)) return { mode: "bai", ...r };
     if (sh && u.includes(sh)) return { mode: "sn", ...r };
     // WorkBuddy 的 CLI 直接指向本地协议桥（CLI 讲 Anthropic，上游讲 OpenAI，必须过桥）
@@ -6784,6 +6802,22 @@ function desktopMode(cfg, creds) {
       const bridged = isBridgeChannel(ch);
       r["keyMatch" + ch.charAt(0).toUpperCase() + ch.slice(1)] =
         (bridged && key === PROXY_MANAGED_TOKEN) ? true : key === v;
+    }
+    /* 网关模式：桌面版的 URL 也指向同一个端口，供应商要从**模型 id 的前缀**认
+     * （网关模式下 applyToDesktop 把 inferenceModels[].name 写成 provider/模型）。
+     * 认不出就说「other」——理由同 cliMode：宁可说不知道，也不要认错成另一家。 */
+    const gwPort = c.gatewayPort || DEFAULTS.gatewayPort;
+    if (gwPort && u.includes(`:${gwPort}`)) {
+      const names = Array.isArray(d?.inferenceModels) ? d.inferenceModels : [];
+      for (const mi of names) {
+        const n = String((mi && mi.name) || "");
+        const at = n.indexOf("/");
+        if (at > 0) {
+          const p = n.slice(0, at).trim().toLowerCase();
+          if (CHANNELS.includes(p)) return { mode: p, ...r };
+        }
+      }
+      return { mode: "other", ...r };
     }
     if (u.includes(`:${c.relayPort || DEFAULTS.relayPort}`)) return { mode: "bai", ...r };
     if (u.includes(`:${c.sn?.relayPort || DEFAULTS.sn.relayPort}`)) return { mode: "sn", ...r };
