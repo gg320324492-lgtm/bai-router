@@ -3,7 +3,36 @@
 > 研究对象：[`yetone/magpie`](https://github.com/yetone/magpie)（Go，18.7k stars，103k 行，约 80 个 internal 包）
 > 克隆位置：`G:\tmp\magpie-study`（浅克隆，只读研究用）
 > 研究日期：2026-10-21
-> 对照对象：`G:\bai-router`（Electron + Node，v1.0.87）
+> 对照对象：`G:\bai-router`（Electron + Node）
+
+## ⚠ 基线说明（必读）
+
+本文对 bai-router 侧的**行号与规模描述，取自本地 checkout 的 v1.0.87**（commit `1ba94db`）。
+写作时本地落后 `origin/main` 14 个提交（上游已到 v1.0.92），其中包含一个新增渠道
+（MiniMax 会员通道）与故障转移面板的改动。已就以下几条**对着 origin/main v1.0.92 复核过**，
+结论不变：
+
+| 缺口 | v1.0.87（本文行号） | v1.0.92 复核 |
+| --- | --- | --- |
+| **A** 读 `settings.json` 失败被当空 → 写回 | `server.mjs:6159-6160` | **仍在**（`server.mjs:6487` 附近） |
+| **B** `JSON.stringify` 全量重写 `settings.json` | `server.mjs:6212` | **仍在**（`server.mjs:6539`） |
+| **C** 通用故障转移只看状态码 | `failover.mjs:149-153` | **仍在**（`shouldFailover(status)` 未变） |
+| **D** 通用冷却只有 2 档、无退避 | `failover.mjs:19,27` | **仍在**（`FAILOVER_COOLDOWN_MS`/`FAILOVER_QUOTA_COOLDOWN_MS` 未变） |
+| **E** 冷却粒度只到 provider | `failover.mjs:29` | **仍在**（`failoverState` 仍以 provider 为键） |
+| **M** 无会话身份概念 | — | **仍在**（全仓无 session 头处理） |
+| **N** 无用量账本 | `server.mjs:6353` 附近 | **仍在**（无 `usage.jsonl`） |
+
+**已随上游变化的**（本文相应描述按 v1.0.87 记）：
+
+- 渠道数：v1.0.87 是 7 家 + CC Switch；v1.0.92 是 **8 家**（新增 MiniMax 会员通道）+ CC Switch。
+- `failover.mjs` 行数：v1.0.87 是 152 行；v1.0.92 是 **309 行**——但涨上去的是「静默换人」的
+  面板显式化（`noteSilentJump` / `silentJumpSnapshot`），**冷却内核一行未动**，故缺口 C/D/E 照旧。
+- Zen 免费档的结论：v1.0.87 面板写的是「会话衰减」（2026-10-14 实测）；
+  v1.0.92 换成了「约四分之三请求随机挂起」（2026-10-15 实测）；
+  再往后（2026-10-17 起）实测为免费档**外部调用一律 403**，见本文 §3.2 与相关提交。
+
+**第 5 节「复刻清单」按上述缺口编号编制，结论对 v1.0.92 仍然成立**，
+只是动手前请以当时的 `origin/main` 为准重取行号。
 
 ---
 
@@ -20,7 +49,7 @@ magpie 和 bai-router 做的是同一件事（本地网关 + 桌面菜单栏 + �
 - bai-router 的 **WorkBuddy 账号池**（`wb-pool.mjs`）已经独立实现了 magpie 的失败分类器 ——
   五类失败（transient/quota/rate_limit/auth_dead/content）、account vs account_model 两种冷却粒度、
   Retry-After 解析、中文额度正则、会话粘性。**这块不用抄，已经有了。**
-- bai-router 的 **通用故障转移**（`failover.mjs` 152 行）却只有两档冷却、只看状态码、粒度只到 provider。
+- bai-router 的 **通用故障转移**（v1.0.87 的 `failover.mjs` 152 行）却只有两档冷却、只看状态码、粒度只到 provider。
 - bai-router 的**协议桥**是单向的 Anthropic→OpenAI Chat，magpie 是 4×4 协议矩阵。
 
 所以正确路线不是「照抄 magpie 的 Go 实现」，而是 **把 `wb-pool.mjs` 里已经写对的东西提到共享层**，
@@ -41,7 +70,7 @@ magpie 和 bai-router 做的是同一件事（本地网关 + 桌面菜单栏 + �
 
 | | bai-router | magpie |
 |---|---|---|
-| 网关端口 | **7 个**（15722/15732/15742/15752/15762/15772 + 面板 15723），一provider 一端口 | **1 个**（3425），模型 id 决定走哪 |
+| 网关端口 | **7 个**（15722/15732/15742/15752/15762/15772 + 面板 15723），一provider 一端口（v1.0.92 起 8 个渠道） | **1 个**（3425），模型 id 决定走哪 |
 | 模型寻址 | 本地四档映射表（fable/sonnet/opus/haiku → 各家 target） | `provider/model` 写进 agent 配置，网关自己解析 |
 | 客户端连接 | Claude Code 连某个 provider 的端口，故障转移在中转内部跨 provider 跳 | Claude Code 只连 3425，故障转移在网关内跨账号/模型跳 |
 | 供应商协议 | bai/sn 原样透传；wb/wbai/qd/or/zen 共用**一个** Anthropic→OpenAI 单向桥 | 4×4 全矩阵，双向，流式 + 非流式 |
@@ -220,7 +249,7 @@ verifyRest      = 30*time.Minute;   restrictedRest = 2*time.Hour
 | Retry-After 解析 | `wb-pool.mjs:253-269`（含 `X-RateLimit-Reset`、body 里的 `resetsIn` 等） | ✅ 已有 |
 | 模型级冷却 | `wb-pool.mjs:955` `acct.modelCooldowns[m]` | ✅ 已有 |
 | 会话粘性 | `wb-pool.mjs` 首条 user 消息 sha256 + 200 条 LRU | ✅ 已有 |
-| **通用故障转移** | `failover.mjs` 152 行 | ❌ 只 2 档冷却（90s/30min），`shouldFailover(status)` **只看状态码**，粒度只到 provider |
+| **通用故障转移** | `failover.mjs`（v1.0.87 152 行 / v1.0.92 309 行，涨的是「静默换人」面板） | ❌ 只 2 档冷却（90s/30min），`shouldFailover(status)` **只看状态码**，粒度只到 provider |
 | **路由策略** | 固定链序 `["qd","bai","sn","zen","wb","wbai","or"]` | ❌ 无策略概念 |
 | **并发/RPM 限流** | 无 | ❌ |
 | **亲和（网关级）** | 仅 WorkBuddy 池有 | ❌ 不通用 |
