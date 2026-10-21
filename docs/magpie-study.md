@@ -533,8 +533,8 @@ type message struct {
 
 | # | 缺口 | 位置 | 后果 |
 |---|---|---|---|
-| **A** | 读 `settings.json` 失败 → 当空 → 写回，**抹掉用户全部配置** | `server.mjs:6159-6160` + `:6212` | 数据丢失，且无备份 |
-| **B** | 每次切模型 `JSON.stringify` 全量重写 `settings.json` | `server.mjs:6212` | 注释/键序/缩进全丢 |
+| **A** | 读 `settings.json` 失败 → 当空 → 写回，**抹掉用户全部配置** | `server.mjs:6489`（旧） | ✅ **已修**：读不懂 → 另存备份 + 中止接线 + 一个字都不改 |
+| **B** | 每次切模型 `JSON.stringify` 全量重写 `settings.json` | `server.mjs:6541`（旧） | ✅ **已修**：保格式字节 splice，且只在真变了才写盘 |
 | **C** | 通用故障转移只看状态码，429 一律同一种 | `failover.mjs:149-153` `shouldFailover(status)` | 额度耗尽与瞬时限流混为一谈；且 403/401 无论原因都转移 |
 | **D** | 通用冷却只有 2 档（90s / 30min），无退避 | `failover.mjs:19,27` | 反复失败每次都只等 90s |
 | **E** | 冷却粒度只到 provider，不到账号/模型 | `failover.mjs:29` `Map<provider, ...>` | 一个模型额度用尽 → 整个渠道被踢出 |
