@@ -139,6 +139,24 @@ test("③ 祖先是标量时，换成嵌套对象", () => {
   assert.deepEqual(parseJsonc(r.text).value, { env: { BASE: "http://y" } });
 });
 
+test("★ ③ 单行 JSON 带尾逗号 → 加键后**仍是合法 JSON**", () => {
+  /* 插入点本来就有一个逗号（尾逗号）。无条件再加一个 → `{"a":1,,"b":2}`
+   * → 整个文件变非法 JSON。接线一失败，用户连原来那份配置都读不了了。 */
+  const r = setPath('{"a":1,}', "b", 2);
+  assert.equal(r.ok, true);
+  assert.doesNotMatch(r.text, /,,/, "产出了两个逗号 —— 整个文件变非法 JSON");
+  assert.deepEqual(parseJsonc(r.text).value, { a: 1, b: 2 });
+});
+
+test("★ ③ 同名键 → 改的是**生效**的那一个（与 JSON.parse 一致）", () => {
+  /* JSON 解析时同名键**后者胜**。改第一个的话，改动落在被遮住的那一个上 →
+   * 实际生效的值没变，而面板报「接线成功」—— 静默无效。 */
+  const src = '{\n  "env": { "A": 1 },\n  "env": { "A": 2 }\n}';
+  const r = setPath(src, "env.A", 9);
+  assert.equal(r.ok, true);
+  assert.equal(parseJsonc(r.text).value.env.A, 9, "改完必须真的生效");
+});
+
 test("★ ③ 幂等：同样的 setPath 调两次，第二次 changed=false 且文本逐字相同", () => {
   const once = setPath('{\n  "a": 1\n}', "a", 2);
   assert.equal(once.changed, true);
@@ -189,6 +207,15 @@ test("④ 删键时旁边的注释保留", () => {
   const r = delPath('{\n  "a": 1, // 留着\n  "b": 2\n}', "a");
   assert.match(r.text, /\/\/ 留着/);
   assert.equal(parseJsonc(r.text).ok, true);
+});
+
+test("★ ④ 同名键 → 删除要**全删**（只删一个的话前一个会复活）", () => {
+  /* JSON 解析时后者胜，所以删掉后一个 = 前一个顶替上来 = 「删了等于没删」。 */
+  const src = '{\n  "env": { "A": 1 },\n  "env": { "A": 2 }\n}';
+  const r = delPath(src, "env");
+  assert.equal(r.ok, true);
+  assert.equal(parseJsonc(r.text).value.env, undefined, "同名键必须真的删掉");
+  assert.equal(parseJsonc(r.text).ok, true, "删完还得是合法 JSON");
 });
 
 /* ══════════════════════════════════════════════════════════════

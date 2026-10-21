@@ -174,8 +174,16 @@ const PLANNED_WORDS = /quota|usage.?limit|hit your .*limit|limit.{0,24}resets|pe
  * ⚠ 必须与「额度」措辞互斥（magpie 的 modelRefused：`unserved && !quota`）——
  * 一条消息里同时说了「模型不支持」和「额度用完」，那是**额度**问题（整号），
  * 不是模型问题（只休息那个模型）。判错方向会把整个账号停掉。
+ *
+ * ⚠ 比 magpie 多了 `is unavailable`：**这是上游真回过的话**（zen 的
+ *   "Upstream request failed: Model is unavailable."）。
+ *   magpie 那张表里没有它，于是这句话落进「内容/其它」→ **判成不转移** →
+ *   整条链断在第一家。实测 zen 的 zen-probe 与 wb-pool 都单独认了这句话，
+ *   只有这里漏了 —— 三处口径必须一致。
+ *   只认 `is unavailable`（不认裸的 `unavailable`）："model is temporarily
+ *   unavailable" 是临时抖动，不是「这家不服务这个模型」，不该按模型级休息处理。
  */
-const UNSERVED_WORDS = /model.{0,80}(not (supported|accessible|available|found|enabled|allowed)|unsupported|does ?n[o']t exist|unknown|invalid)|(no such|unknown|invalid|unsupported) model|model_not_found|模型.{0,12}(不存在|不支持|无权|未开通)/i;
+const UNSERVED_WORDS = /model.{0,80}(not (supported|accessible|available|found|enabled|allowed)|unsupported|does ?n[o']t exist|unknown|invalid|is unavailable)|(no such|unknown|invalid|unsupported) model|model_not_found|模型.{0,12}(不存在|不支持|无权|未开通)/i;
 
 /**
  * 「说得确实像额度问题」——用**窄**口径的额度措辞。
@@ -870,6 +878,11 @@ function normalizeNote(note) {
  * 退避要用它，而且它**成功一次就清零**（magpie 的 served()），
  * 所以「连续失败 n 次」才是真的连续。
  */
+/** 休息表 / 失败计数的**条目数上限**。
+ *  正常运行时表里只有「几家渠道 × 几个档位」那么几十条；到上限说明有人在
+ *  用随机模型名刷（键含客户端可控内容）。500 条足够正常场景，溢出的都是垃圾。 */
+const REST_TABLE_MAX = 500;
+
 export class RestTable {
   constructor() {
     this._rests = new Map();     // id → { id, until, note }
@@ -890,6 +903,7 @@ export class RestTable {
     const k = String(id);
     const rec = { id: k, until: Number(until) || 0, note: normalizeNote(note) };
     this._rests.set(k, rec);
+    this._trim();
     return rec;
   }
 
@@ -922,7 +936,36 @@ export class RestTable {
     const k = String(id);
     const n = this.count(k) + 1;
     this._failures.set(k, n);
+    this._trim();
     return n;
+  }
+
+  /**
+   * 容量上限。
+   *
+   * ⚠ 为什么必须有：休息表与失败计数的键里含**客户端可控**的模型名
+   *   （网关模式下模型段就是客户端送来的字面模型）。不设上限的话，
+   *   发一堆随机模型名就能让这张表无限增长 —— 长期跑着的桌面端内存被吃光。
+   *
+   * 超了怎么办：先扫掉**已到期**的（那本来就是垃圾）；还不够就丢**最早到期**的
+   *   那几条（它们马上就要自己到期了，丢了几乎不损失信息）。
+   */
+  _trim() {
+    if (this._rests.size > REST_TABLE_MAX) {
+      this.sweep(Date.now());
+      while (this._rests.size > REST_TABLE_MAX) {
+        const first = this.entries()[0];
+        if (!first) break;
+        this._rests.delete(first.id);
+      }
+    }
+    if (this._failures.size > REST_TABLE_MAX) {
+      /* 失败计数没有到期时刻；Map 保持插入序，丢最早插入的那些。 */
+      for (const k of [...this._failures.keys()]) {
+        if (this._failures.size <= REST_TABLE_MAX) break;
+        this._failures.delete(k);
+      }
+    }
   }
 
   /** 清掉连续失败计数（候选成功应答时调它 —— magpie 的 served()）。 */

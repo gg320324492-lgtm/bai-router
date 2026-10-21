@@ -257,8 +257,12 @@ function findNode(root, parts) {
     if (!node || node.type !== "object") return null;
     const want = unescapeKey(part);
     let hit = null;
+    /* 同名键取**最后一个** —— 与 JSON.parse 的语义一致（后者胜）。
+     * 取第一个的话：文件里 `{"env":{...},"env":{...}}` 时，我们改的是**被遮住的那一个**，
+     * 而实际生效的是后一个 → 改动**静默无效**，用户看着「接线成功」而配置没变。
+     * （JSON.parse 本身也是后者胜：parseObject 里 `value[key] = v.value` 逐个覆盖。） */
     for (const m of node.members) {
-      if (m.key === want) { hit = m; break; }
+      if (m.key === want) hit = m;
     }
     if (!hit) return null;
     node = hit.node;
@@ -391,7 +395,10 @@ function insertKey(text, obj, key, value) {
   if (!pretty) {
     const v = JSON.stringify(value);
     if (ip.empty) return splice(text, ip.at, 0, k + ":" + v);
-    return splice(text, ip.at, 0, "," + k + ":" + v);
+    /* ⚠ 插入点**可能已经有逗号**（`{"a":1,}` 这种尾逗号写法）。
+     *   无条件再加一个逗号 → `{"a":1,,"b":2}` → 整个文件变非法 JSON。
+     *   已有的逗号直接当分隔符用。 */
+    return splice(text, ip.at, 0, (ip.hasComma ? "" : ",") + k + ":" + v);
   }
   const base = lineIndent(text, obj.start);
   const unit = indentUnit(text, obj.start, base);
@@ -480,11 +487,15 @@ function delIn(text, path) {
   const parent = findNode(tree.root, parts.slice(0, -1));
   if (!parent || parent.type !== "object") return { ok: true, text, changed: false };
   const lastKey = unescapeKey(parts[parts.length - 1]);
-  let hit = null;
-  for (const m of parent.members) if (m.key === lastKey) { hit = m; break; }
-  if (!hit) return { ok: true, text, changed: false };
-  let out = deleteMember(text, parent, hit);
-  if (parent.members.length === 1) out = collapseIfEmpty(out, parent.start);
+  /* 同名键**全部**删掉。
+   * 只删一个的话，前面的同名键会「复活」并顶替它（JSON 解析时后者胜）——
+   * 表现就是「删了等于没删」，而且面板上还看不出任何异常。 */
+  const hits = parent.members.filter((m) => m.key === lastKey);
+  if (!hits.length) return { ok: true, text, changed: false };
+  let out = text;
+  /* 从后往前删：后面的先删，前面的成员偏移才不会因为删除而失效。 */
+  for (let i = hits.length - 1; i >= 0; i--) out = deleteMember(out, parent, hits[i]);
+  if (hits.length === parent.members.length) out = collapseIfEmpty(out, parent.start);
   return { ok: true, text: out, changed: true };
 }
 

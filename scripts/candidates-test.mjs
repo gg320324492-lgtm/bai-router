@@ -130,6 +130,19 @@ describe("① 分类器 —— 状态码 + 响应体", () => {
     assert.equal(shouldFailover(404, "The model gpt-9 does not exist"), true);
   });
 
+  test("①i2 「Model is unavailable」⇒ unserved（zen 真回过这句话）", () => {
+    /* 实测 zen 的上游回 "Upstream request failed: Model is unavailable."。
+     * magpie 那张 unservedWords 表里没有它 → 落进「其它」→ 判成**不转移**
+     * → 整条链断在第一家。zen-probe 与 wb-pool 都单独认了这句话，只有这里漏了。 */
+    const a = classifyFailure(400, "Upstream request failed: Model is unavailable.");
+    assert.equal(a.kind, "unserved", "这句话说的是「这个模型不被服务」，必须转移");
+    assert.equal(a.scope, "model");
+    assert.equal(a.failover, true);
+    /* 但「临时不可用」不是「不服务这个模型」—— 不该按模型级休息处理 */
+    const b = classifyFailure(503, "model is temporarily unavailable, please retry");
+    assert.notEqual(b.kind, "unserved", "临时抖动不是「这家不服务这个模型」");
+  });
+
   test("①j 5xx 与网络错 ⇒ other（上游自己的问题）", () => {
     assert.equal(classifyFailure(500, "internal error").kind, "other");
     assert.equal(classifyFailure(500, "internal error").failover, true);
@@ -412,6 +425,18 @@ describe("⑧ 候选排序与挑选", () => {
     const badShape = { order: () => [0, 0] };
     assert.deepEqual(orderCandidates([a, b], null, badShape, NOW), [a, b]);
   });
+});
+
+test("⑩ 休息表有**容量上限**（键里含客户端可控的模型名）", () => {
+  /* 网关模式下模型段是客户端送来的字面模型 → 休息表的键含它。
+   * 不设上限的话，发一堆随机模型名就能让这张表无限增长。 */
+  const table = new RestTable();
+  for (let i = 0; i < 1200; i++) table.rest(`wb/随机模型-${i}`, NOW + 60000, { kind: "other" });
+  assert.ok(table.entries().length <= 500, `表里塞了 ${table.entries().length} 条，没有上限`);
+  assert.ok(table.entries().length > 0, "上限不该把表清空");
+  /* 失败计数那张表同样要封顶 */
+  for (let i = 0; i < 1200; i++) table.bump(`wb/随机模型-${i}`);
+  assert.ok(table.count(`wb/随机模型-1199`) <= 1, "计数不该无限增长");
 });
 
 /* ====================================================================== *
