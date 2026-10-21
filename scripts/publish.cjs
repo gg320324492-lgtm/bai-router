@@ -133,6 +133,32 @@ if (!fs.existsSync(path.join(ROOT, "dist", "upgrade.ps1"))) {
 if (!fs.existsSync(path.join(ROOT, "dist", "rollback.ps1"))) {
   fs.copyFileSync(path.join(ROOT, "scripts", "rollback.ps1"), path.join(ROOT, "dist", "rollback.ps1"));
 }
+/* 预发布版：把 latest.yml 改名成 beta.yml。
+ *
+ * electron-builder 的清单文件名跟的是 **publish.channel**，不是版本号
+ * （updateInfoBuilder.js 的 `computeChannelNames`：`publishConfig.channel || "latest"`；
+ *  GitHub provider 只产**一份**清单，所以配了 channel=beta 就只会产 beta.yml）。
+ *
+ * 那为什么不直接给 publish 配 channel？因为 `publish` 是一段**数组**
+ * （provider / owner / repo 都在里面），为了一个通道名就要把 owner/repo 在命令行上
+ * 再抄一遍——那种重复迟早会漂移（改了一处忘了另一处，发布到别人的仓库去）。
+ *
+ * 而**内容是逐字相同的**：yml 里只有 version / files / path / sha512 / releaseNotes /
+ * releaseDate，**没有任何通道标记**。通道只决定**文件名**。所以把 latest.yml 改名成
+ * beta.yml，与「让构建器直接产 beta.yml」完全等价。
+ *
+ * ⚠ 稳定版**绝不能**走这条路：latest.yml 是稳定版用户唯一读的那份。预发布版改名后
+ * **不上传** latest.yml，稳定版那份继续指着上一个稳定版——这就是「选择性升级」的隔离点。 */
+if (isPre) {
+  const built = path.join(ROOT, "dist", "latest.yml");
+  const want = path.join(ROOT, "dist", ymlName);
+  if (fs.existsSync(built)) {
+    fs.renameSync(built, want);
+    console.log(`» 预发布版：清单改名 latest.yml → ${ymlName}（内容不变，通道只由文件名决定）`);
+  } else if (!fs.existsSync(want)) {
+    throw new Error(`预发布版找不到可用的清单：dist/latest.yml 与 dist/${ymlName} 都不存在`);
+  }
+}
 /* 用 execFileSync + 参数数组，而不是把内容拼进 shell 字符串。
    原因：notes 现在是 release-notes.md 的全文（多行 markdown，含反引号）。拼进
    `gh ... --notes "…"` 后，双引号内的反引号会被 bash 当**命令替换**执行——

@@ -65,7 +65,7 @@ const scriptPath = fileURLToPath(new URL("./publish.cjs", import.meta.url));
 const script = readFileSync(scriptPath, "utf8");
 
 function simulatePublish(options = {}) {
-  const state = { built: false, dirty: Boolean(options.initialDirty), head: HEAD, remote: options.initialRemote || HEAD, writes: [], releases: [], queries: [] };
+  const state = { built: false, dirty: Boolean(options.initialDirty), head: HEAD, remote: options.initialRemote || HEAD, writes: [], releases: [], queries: [], renames: [] };
   const fsFake = {
     existsSync(file) {
       if (String(file).endsWith(path.join("bai-router", "config.json"))) return Boolean(options.seedChanges);
@@ -79,6 +79,9 @@ function simulatePublish(options = {}) {
     },
     writeFileSync(file) { state.writes.push(file); state.dirty = true; },
     copyFileSync() { throw new Error("unexpected copy"); },
+    /* 预发布版要把 dist/latest.yml 改名成 dist/beta.yml（清单内容不变，
+     * 通道只由文件名决定）。这里记下来，好断言「改名这一步真的发生了」。 */
+    renameSync(from, to) { state.renames.push([String(from), String(to)]); },
   };
   const childProcessFake = {
     execFileSync(command, args) {
@@ -161,6 +164,19 @@ test("预发布版只上传 beta.yml 并标 prerelease——绝不能碰 latest.
    * latest.yml，就等于把测试版推给了所有稳定版用户——那不叫「选择性升级」。 */
   assert.ok(!args.includes("dist/latest.yml"), "预发布版绝不能上传 latest.yml");
   assert.ok(args.includes("--prerelease"), "预发布版要在 GitHub 上标 prerelease，免得占住 Latest");
+  /* 改名这一步本身也要发生：electron-builder 产的是 latest.yml（文件名跟的是
+   * publish.channel，不是版本号），发布脚本得把它改名成 beta.yml 才上传得动。 */
+  const renamed = state.renames.find(([from, to]) => /latest\.yml$/.test(from) && /beta\.yml$/.test(to));
+  assert.ok(renamed, `预发布版必须把 dist/latest.yml 改名成 dist/beta.yml，实际改名记录：${JSON.stringify(state.renames)}`);
+});
+
+test("稳定版不改名，也不碰 beta.yml", () => {
+  const state = simulatePublish({ version: "1.0.93" });
+  assert.equal(state.error, undefined);
+  assert.equal(state.renames.length, 0, "稳定版不该改名——latest.yml 就是稳定版用户读的那份");
+  const args = state.releases[0];
+  assert.ok(args.includes("dist/latest.yml"), "稳定版必须上传 latest.yml");
+  assert.ok(!args.includes("dist/beta.yml"), "稳定版不该上传 beta.yml");
 });
 
 for (const [name, options, expectedError, built] of [

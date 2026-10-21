@@ -129,7 +129,7 @@ zen:冷却中；wb:冷却中；wbai:失败[st=400/[WorkBuddy AI] request illegal
 
 ### 验证
 
-- `npm test` —— **1102 全绿 / 0 失败**（比上一版多 185 条新测试）
+- `npm test` —— **1104 全绿 / 0 失败**
 - `node scripts/check-manifest.cjs` —— **0 error 0 warn**
 - `scripts/edit-json-sabotage-run.mjs` —— **反向对照 5/5 手法确认会把测试打红**（进出都逐字还原）
 - `scripts/gateway-test.mjs` —— **等价性对拍**：同一请求走「直连端口给档位名」与
