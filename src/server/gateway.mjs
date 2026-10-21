@@ -43,6 +43,18 @@ export const KNOWN_PROVIDERS = Object.freeze(["bai", "sn", "wb", "wbai", "zen", 
  *  用 Symbol 而不是普通字符串键：不会与客户端可能带来的任何 header/字段撞名。 */
 export const GATEWAY_MODEL = Symbol("bai.gateway.model");
 
+/** req[GATEWAY_TIER]：这个请求对应的**档位**（如 "claude-opus-5"）。
+ *
+ * 为什么需要它：网关模式下模型 id 是 `provider/模型`（已经是最终模型名），
+ * **档位信息丢了**。而 bai-router 的转移必须按**目标家**重解析档位
+ * （同一家同一档位是不同模型：sn 的 opus 档是 glm-5.2，wb 的是 hy3）。
+ * 档位没了，转移就会把**原家的模型**发给下一家 → 下一家多半不服务它 → 400。
+ *
+ * 所以网关用**反查**把档位找回来（model → 哪一档的 target 等于它），挂在这里。
+ * 查不到就不挂 —— 中转那边 tier0 留 null，转移时保持原 body 不变，
+ * **宁可转移不了也不要转错模型**。 */
+export const GATEWAY_TIER = Symbol("bai.gateway.tier");
+
 /** req[GATEWAY_BODY]：网关读完并改写过的请求体（模型段已从 `provider/模型` 里剥出来）。
  *  中转 handler 优先用它，别再等流 —— 原因见本文件顶部「body 的接力」。 */
 export const GATEWAY_BODY = Symbol("bai.gateway.body");
@@ -91,7 +103,7 @@ export function parseGatewayModel(model, isProvider = defaultIsProvider) {
  * @param {(key:string)=>boolean} [o.isProvider] 「这个 provider 键认识吗」的判据
  * @returns {(req:any,res:any)=>void}
  */
-export function makeGatewayHandler({ handlers, isProvider = defaultIsProvider } = {}) {
+export function makeGatewayHandler({ handlers, isProvider = defaultIsProvider, getCfg = null, tierOf = null } = {}) {
   const map = handlers && typeof handlers === "object" ? handlers : {};
   return (req, res) => {
     const chunks = [];
@@ -150,6 +162,18 @@ export function makeGatewayHandler({ handlers, isProvider = defaultIsProvider } 
        * 不用再等已经 end 掉的流）。 */
       req[GATEWAY_MODEL] = parsed.model;
       req[GATEWAY_BODY] = raw;
+      /* 档位：从模型名**反查**回来（哪一档的 target 等于这个模型）。
+       * 网关模式下模型 id 里没有档位，而转移时必须按目标家重解析档位——
+       * 同一家同一档位是不同模型（sn 的 opus 档是 glm-5.2，wb 的是 hy3）。
+       * 查不到就不挂：中转那边 tier0 留 null，转移时保持原 body 不变，
+       * **宁可转移不了，也不要把原家的模型发给下一家**。 */
+      try {
+        const cfg = typeof getCfg === "function" ? getCfg() : null;
+        if (cfg && typeof tierOf === "function") {
+          const t = tierOf(parsed.provider, parsed.model, cfg);
+          if (t) req[GATEWAY_TIER] = t;
+        }
+      } catch { /* 反查失败不该挡住请求 */ }
       try {
         handler(req, res);
       } catch (e) {
