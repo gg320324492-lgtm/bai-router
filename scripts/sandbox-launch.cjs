@@ -31,9 +31,13 @@ const desk = path.join(HOME, "AppData", "Local", "Claude-3p", "configLibrary", a
 if (!fs.existsSync(desk)) fs.writeFileSync(desk, JSON.stringify({ inferenceProvider: "gateway", inferenceGatewayBaseUrl: "http://127.0.0.1:15721/claude-desktop", inferenceGatewayApiKey: "ccs-x", inferenceModels: [] }, null, 2));
 /* 沙箱专用的监听口。号段与正式实例逐一对应（正式 15722/15732/… → 沙箱 16722/16732/…），
    一眼能对上是谁。bai 是平铺在顶层的（没有 BAI.bai 子对象），单独列。
-   wbai = WorkBuddy 国际版（契约 v18 里程碑 1b 新增渠道），对应正式的 15782。 */
-const PORTS = { bai: 16722, panel: 16723, sn: 16732, zen: 16742, wb: 16752, wbai: 16782, qd: 16762, or: 16772 };
-const CHANNELS = ["sn", "zen", "wb", "wbai", "qd", "or"];
+   wbai = WorkBuddy 国际版（契约 v18 里程碑 1b 新增渠道），对应正式的 15782。
+   mm = MiniMax 会员通道（v1.0.89 新增），对应正式的 15792。
+   gateway = 统一网关（magpie 形态的那个「一个端口」），对应正式的 15799。
+   ⚠ 这张表漏一个渠道，沙箱就会去绑**正式实例**的号：端口被占虽然只记一行日志
+   （不拖垮别的中转），但那一路等于**没起**，验它的那轮测试会莫名其妙全 404。 */
+const PORTS = { bai: 16722, panel: 16723, sn: 16732, wb: 16742, zen: 16752, qd: 16762, or: 16772, wbai: 16782, mm: 16792, gateway: 16799 };
+const CHANNELS = ["sn", "wb", "zen", "wbai", "qd", "or", "mm"];
 
 /* 种子配置**从 config.defaults.json 派生**，不再手写。
    手写那份只覆盖了 bai/sn 两家、模型清单还截断成 1~5 项；默认值里本来就有完整的
@@ -82,6 +86,10 @@ async function seedConfig() {
 
   cfg.relayPort = PORTS.bai;
   cfg.panelPort = PORTS.panel;
+  /* 统一网关（magpie 形态的那个「一个端口」）也要挪号：不挪的话沙箱的网关会去绑
+   * 正式实例的 15799 —— 端口被占虽然只记一行日志（不拖垮别的中转），但那等于
+   * 沙箱的网关**根本没起**，验网关的那轮测试会莫名其妙地全走 404。 */
+  cfg.gatewayPort = PORTS.gateway;
   /* 探测目标取与 probeVia 相同的真实上游 origin（未带 key，返回 401/403 即算通）。 */
   cfg.proxy = await reachableProxy(originOf(DEFAULTS.upstream) + "/v1/models");
   // 假 key：只为让接线判定与映射下拉有对象可读，不是任何真实凭据
@@ -109,8 +117,10 @@ async function seedConfig() {
    正式实例的号段从 config.defaults.json 现读，改端口时不会漏。 */
 function collidesWithProd(cfg) {
   if (!cfg) return true;
-  const prod = new Set([DEFAULTS.relayPort, DEFAULTS.panelPort, ...CHANNELS.map((k) => DEFAULTS[k] && DEFAULTS[k].relayPort)]);
-  const mine = [cfg.relayPort, cfg.panelPort, ...CHANNELS.map((k) => cfg[k] && cfg[k].relayPort)];
+  const prod = new Set([DEFAULTS.relayPort, DEFAULTS.panelPort, DEFAULTS.gatewayPort,
+    ...CHANNELS.map((k) => DEFAULTS[k] && DEFAULTS[k].relayPort)]);
+  const mine = [cfg.relayPort, cfg.panelPort, cfg.gatewayPort,
+    ...CHANNELS.map((k) => cfg[k] && cfg[k].relayPort)];
   return mine.some((p) => p != null && prod.has(p));
 }
 
