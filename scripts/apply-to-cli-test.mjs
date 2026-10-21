@@ -53,12 +53,13 @@ const SRC_APPLY = sliceFn(SRC, "async function applyToCli");
 const SRC_TIERS = sliceBetween(SRC, "const TIERS = [", "];") + "];";
 
 /** 组装一份可跑的 applyToCli：依赖全部从外面注进去。 */
-function makeApplyToCli(file) {
+function makeApplyToCli(file, opts = {}) {
   const writes = [];
   const recorded = [];
   const factory = new Function(
     "SETTINGS", "readFileSync", "writeAtomic", "copyFileSync", "recordCliApply",
     "cliViaRelay", "cliBaseUrlFor", "loadCfg", "parseJsonc", "applyEdits",
+    "gatewayOn", "gatewayBaseUrl",
     `${SRC_TIERS}\n${SRC_GUIDANCE}\n${SRC_ACTION}\n${SRC_APPLY}\n`
     + "return { applyToCli, unreadableSettingsAction, unreadableSettingsGuidance };",
   );
@@ -73,6 +74,11 @@ function makeApplyToCli(file) {
     () => ({ proxy: "http://127.0.0.1:7897" }),   // loadCfg
     parseJsonc,
     applyEdits,
+    /* 网关模式：默认关。测试要开时用 opts.gateway 把它打开。
+     * 注入的是**替身**而不是源码里那两个函数——它们要读 config.json，
+     * 而这个测试的沙箱里没有 config.json 这回事。 */
+    () => Boolean(opts.gateway),
+    () => "http://127.0.0.1:15799",
   );
   return { ...api, writes, recorded };
 }
@@ -202,5 +208,29 @@ describe("applyToCli —— 接线写 ~/.claude/settings.json", () => {
     const before = api.writes.length;
     await api.applyToCli(S);
     assert.equal(api.writes.length, before, "第二次接线不该写盘");
+  });
+
+  test("④ 网关模式：BASE_URL 指向统一网关，模型 id 带 provider 前缀", async () => {
+    const file = tmpSettings(USER_FILE);
+    const api = makeApplyToCli(file, { gateway: true });
+    await api.applyToCli(S);
+    const env = parseJsonc(fs.readFileSync(file, "utf8")).value.env;
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:15799", "网关模式的 BASE_URL 要指向统一网关");
+    /* 网关**不猜**走哪一家：它拆模型 id 的第一个 "/"。不带前缀 → 400，说清原因。 */
+    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "bai/hy3", "模型 id 要带 provider 前缀（网关靠它分流）");
+    assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "bai/mimo-v2.5");
+    assert.equal(env.ANTHROPIC_MODEL, "bai/mimo-v2.5");
+    /* 显示名**不带**前缀——那是给人看的标签，不是模型 id。 */
+    const name = env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME;
+    if (name != null) assert.ok(!String(name).includes("/"), "显示名不该带 provider 前缀");
+  });
+
+  test("④b 关掉网关模式：BASE_URL 与模型 id 回到旧写法（逐字不变）", async () => {
+    const file = tmpSettings(USER_FILE);
+    const api = makeApplyToCli(file, { gateway: false });
+    await api.applyToCli(S);
+    const env = parseJsonc(fs.readFileSync(file, "utf8")).value.env;
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:15722", "关着的时候走各家的中转端口");
+    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "hy3", "关着的时候模型 id 不带前缀");
   });
 });

@@ -15,6 +15,7 @@ import os from "node:os";
 import {
   CaptureRes, failoverCooldown, failoverClear, failoverAvailable, failoverSnapshot, failoverQuotaBlocked,
   shouldFailover, FAILOVER_COOLDOWN_MS, noteSilentJump, silentJumpSnapshot,
+  restTable, failoverCooldownFor,
 } from "./failover.mjs";
 import { qpApply, qpRevert, qpStatus } from "./qoder-patch.mjs";
 /* 逐模型能力探测（v1.0.74 · T3+T6）：只探免费模型、只在用户显式点「检测可用性」时跑。
@@ -82,6 +83,17 @@ import {
  * ⚠ 铁律：**读失败 = 不知道，绝不是空**。文件在但读不懂 → 中止接线、不写盘；
  * 文件不在 → 从空开始建，那是合法状态。两件事必须分开。 */
 import { parseJsonc, applyEdits } from "./edit-json.mjs";
+/* 用量账本（usage-ledger.mjs）：JSONL 追加日志。magpie 的 internal/usage 移植版。
+ * 读的时候坏行跳过（末尾半行是常态——别的进程正在写）。 */
+import { loadRecords } from "./usage-ledger.mjs";
+/* 通用候选层（candidates.mjs）：失败分类 / 两级休息 / 冷却时长。magpie 的
+ * internal/gateway/fallback.go 移植版。零依赖、零时钟。 */
+import { classifyFailure, isResting, makeCandidate } from "./candidates.mjs";
+/* 用量写入器（usage-writer.mjs）：把每次请求/每次尝试写进账本。 */
+import { makeUsageWriter } from "./usage-writer.mjs";
+/* 会话身份（session-id.mjs）：magpie 的 sessionHeaders 移植版。
+ * ⚠ 它只**认**客户端头与各 agent 的原生头；都没有就返回 null —— 从不编造 id。 */
+import { sessionOf } from "./session-id.mjs";
 /* 统一网关入口（gateway.mjs）：**一个端口**，模型 id 写成 provider/模型，
  * 网关拆前缀决定走哪一家（magpie 形态）。
  * 纯逻辑、零 IO、零网络，所以独立成文件才能被测试直接 import——server.mjs 一 import
@@ -198,6 +210,11 @@ const DEFAULTS = {
    * 不与任何现有端口（15721~15792）也不与面板 15723 撞。
    * ⚠ 这是**新增入口**，不是替换：8 个旧中转端口一个都没动。 */
   gatewayPort: 15799,
+  /* 网关模式：关（默认）= 请求走各家自己的中转端口；开 = 请求先到统一网关，
+   * 网关按模型 id 的 `provider/模型` 前缀分流到那一家。
+   * 两种模式**用户可见行为一致**（同一家的同一批模型、同样的请求体与错误文案），
+   * 区别只在「请求先到哪个端口」——以及网关能同时看到所有家，那才是 T3 账号级路由的前提。 */
+  gatewayMode: "off",
   defaultModel: "qwen3.8-flash",
   availableModels: ["qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash"],
   mapping: defaultMapping("qwen3.8-flash", "Qwen3.8-Flash"),
@@ -5553,6 +5570,12 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     if (!target) { tries.push({ provider, skipped: "未知渠道" }); continue; }
     const cap = new CaptureRes(res);
     const sub = bodyFor(target);
+    /* 新增：模型级休息（magpie 的**两级休息**）——这家整体还活着，但**这个模型**
+     * 在休息。本次请求跳过它，同号其它模型照常用。
+     * 模型级休息不能整家踢掉：那正是「这个模型没额度」把整家拖下水的老毛病。 */
+    if (!isEntry && !providerUsable(provider, (sub.rewritten || {}).model)) {
+      tries.push({ provider, skipped: "该模型冷却中" }); continue;
+    }
     try {
       await dispatchOne(target, req, cap, cfg, sub.body, sub.rewritten, isProbe);
     } catch (e) {
@@ -5565,7 +5588,28 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     }
     if (cap.ok()) {
       failoverClear(provider);
+      /* 成功 ⇒ 清掉这家/这个模型的休息与连续失败计数。
+       * 不清的话「连续失败」的退避会一直累加——一次偶发失败之后，那个号再也下不来
+       * （magpie 的 magpie 的 rateForget：太久没失败的那次算「新的」）。 */
+      try {
+        const t = restTable();
+        const m = String((sub.rewritten || {}).model || "");
+        t.rest(provider, 0, "");
+        if (m) t.rest(`${provider}/${m}`, 0, "");
+        t.forget(provider);
+      } catch { /* 休息表坏了不该影响这次应答 */ }
       tries.push({ provider, ok: true });
+      /* 用量：这次请求的**最终**结果（magpie 的口径：一个请求 = 一条记录，
+       * 按它怎么结束只数一次）。 */
+      usageWriter.record({
+        provider,
+        model: String((sub.rewritten || {}).model || (rewritten || {}).model || ""),
+        req: String(tier0 || ""),
+        served: String((sub.rewritten || {}).model || ""),
+        status: 200,
+        tries: tries.length,
+        sessionProvider: sessionOfReq(req),
+      });
       /* 静默换人留痕（v1.0.88）：把「实际服务的渠道 + 实际发出去的模型」一起记进有界结构，
          面板据此在故障转移视图顶部显式告诉用户「你选的是 A、回答你的是 B」。
          sub.rewritten.model 就是真正发出去的那个名字（每个目标渠道都按自己的映射重解析过），
@@ -5589,7 +5633,43 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
         `${target.label} 返回 ${status || "网络错误"}，此错误重试其他渠道也不会好转：${describeError(cap)}`);
     }
     lastErr = describeError(cap) || `HTTP ${status}`;
-    failoverCooldown(provider, lastErr); // 若刚才那次是额度用尽，这里不会把它降级成 90 秒（failover.mjs 有闸）
+    /* 归因 + 冷却（magpie 的 failure(status, body) 口径）。
+     *
+     * 分类**看响应体**而不只看状态码，所以能分出「额度用尽」（等多久都没好，15 分钟）
+     * 与「限流」（会自己好，退避 1→2→4…封顶 10 分钟）——旧逻辑两者都给 90 秒。
+     *
+     * 冷却**粒度**跟着归因走：账号级（整号停）或模型级（只停那个模型）。
+     * scope 必须来自 classifyFailure，不能只传 kind（见 failoverCooldownFor 的注释：
+     * 「供应商拒的是客户端」那种 auth 的 scope 是 none，漏传就会把整号停掉）。 */
+    const fbody = capBodyText(cap);
+    const fcls = classifyFailure(status, fbody, { provider });
+    const servedModel = String((sub.rewritten || {}).model || (rewritten || {}).model || "");
+    failoverCooldownFor(provider, `${provider}/${servedModel}`, fcls.kind, {
+      scope: fcls.scope,
+      retryAfterMs: fcls.retryAfterMs,
+      resetAtMs: fcls.resetAtMs,
+      why: lastErr,
+      model: servedModel,
+    });
+    /* 旧的 provider 级冷却**只在整号出事时**记。
+     * 模型级失败（只有这个模型不行）若也记整号冷却，就把「这个模型没额度」
+     * 变成「整家停 90 秒」——那正是两级休息要消除的老毛病。 */
+    if (fcls.scope !== "model") {
+      failoverCooldown(provider, lastErr); // 若刚才那次是额度用尽，这里不会把它降级成 90 秒（failover.mjs 有闸）
+    }
+    /* 用量：这次尝试**失败但已把活交出去了**（handed_on）——它计费了什么、为什么失败，
+     * 都要留痕；但它**不计入失败数**（magpie 的口径：转交出去的 try 照样写记录）。 */
+    usageWriter.recordAttempt({
+      provider,
+      model: servedModel,
+      req: String(tier0 || ""),
+      served: servedModel,
+      status,
+      error: lastErr.slice(0, 200),
+      tries: tries.length,
+      kind: fcls.kind,
+      sessionProvider: sessionOfReq(req),
+    });
     // 刚试过的渠道若已被标成「额度用尽」，转移日志也要带上这个标签——
     // 否则状态面板只剩一个笼统的 failover，分不出"额度没了"和"抖了一下"。
     const quotaNow = failoverQuotaBlocked(provider);
@@ -5615,6 +5695,18 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
   /* 全线失败：没有一家接过手，所以 noteSilentJump 自己会返回 null —— 不留痕。
      那条 502 已经把「最后是谁、为什么」如实回给客户端了，面板不必再重复一遍。 */
   noteFailoverEvent(fo.provider, tries, null, cfg);
+  /* 用量：全线失败也是**一条记录**（magpie 的口径：按请求怎么结束只数一次）。 */
+  usageWriter.record({
+    provider: fo.provider,
+    model: String((rewritten || {}).model || ""),
+    req: String(tier0 || ""),
+    served: "",
+    status: 502,
+    error: String(lastErr || "").slice(0, 200),
+    tries: tries.length,
+    kind: "failover_exhausted",
+    sessionProvider: sessionOfReq(req),
+  });
   return wbAnthroError(res, 502,
     `所有渠道都失败了。最后一次：${lastErr || "未知"}（链路：${tries.map((t) => t.provider + (t.ok ? "✓" : t.skipped ? "(" + t.skipped + ")" : "✗")).join(" → ")}）`);
 }
@@ -6407,6 +6499,68 @@ const cliBaseUrlFor = (S) => {
   return String(S.upstream || "").replace(/\/+$/, "").replace(/\/v1$/i, "");
 };
 
+/* ---------- 统一网关（magpie 形态的那个「一个端口」） ----------
+ *
+ * 关（默认）：请求走各家自己的中转端口（bai 15722 / sn 15732 / wb 15742 / …）。
+ * 开：请求先到统一网关（默认 15799），网关按模型 id 的 `provider/模型` 前缀分流到那一家。
+ *
+ * 两种模式**用户可见行为一致**——同一家的同一批模型、同样的请求体、同样的错误文案。
+ * 区别只在「请求先到哪个端口」；以及网关能同时看到所有家，那才是账号级路由的前提。
+ */
+function gatewayOn(cfg) {
+  const c = cfg || loadCfg();
+  return String(c.gatewayMode || "off").trim().toLowerCase() === "on";
+}
+function gatewayBaseUrl(cfg) {
+  const c = cfg || loadCfg();
+  return `http://127.0.0.1:${c.gatewayPort || DEFAULTS.gatewayPort}`;
+}
+
+/* 读用量账本。**读失败当空**：账本是缓存不是用户配置，丢了只是少几条历史；
+ * 反过来（用户配置读失败当空）会抹掉用户其它配置——那正是 magpie 反复警告的事故。 */
+function loadUsageRows() {
+  try {
+    const rows = loadRecords(DATA_DIR, 0);
+    return Array.isArray(rows) ? rows : [];
+  } catch { return []; }
+}
+
+/* 用量写入器。**写失败不抛**（magpie: accounting must never break a call）——
+ * 记账是旁路，它坏了不许把一次正常的模型调用带崩。 */
+const usageWriter = makeUsageWriter({
+  dir: DATA_DIR,
+  now: () => Date.now(),
+  logger: (m) => log("用量账本: " + m),
+});
+
+/* 这家供应商现在还能接这个模型吗？
+ *
+ * magpie 的**两级休息**：账号级（整号停）命中 ⇒ 这家所有模型都不可用；
+ * 只有模型级命中 ⇒ **只那个模型**不可用，同号其它模型照常。
+ * 旧逻辑只有 provider 级一个粒度，所以「这个模型没额度」会把整家踢掉。
+ */
+function providerUsable(provider, model) {
+  if (!failoverAvailable(provider)) return false;   // 旧的 provider 级冷却（面板读它）
+  const m = String(model || "");
+  if (!m) return true;
+  try {
+    const c = makeCandidate({ provider, model: m });
+    return !isResting(c, restTable(), Date.now());
+  } catch { return true; }
+}
+
+/* 这次请求的会话身份（magpie 的 sessionHeaders）。
+ *
+ * ⚠ **没有就返回空串，不编造**：magpie 的铁律——从不为没有 session id 的请求
+ * 造一个（提示词文本、调用方 key、网络地址都绝不用于猜会话归属）。
+ * 宁可账本里这一行没有会话，也不能把两个不相干的请求归到同一段对话上。 */
+function sessionOfReq(req) {
+  try {
+    const s = sessionOf((req && req.headers) || {});
+    return s && s.id ? String(s.id) : "";
+  } catch { return ""; }
+}
+
 function cliMode(cfg, creds) {
   try {
     const s = readJson(SETTINGS);
@@ -6705,13 +6859,27 @@ async function applyToCli(S) {
    * 与桌面版既有做法一致（applyToDesktop 之外的 FALLBACK_CC 里就写着 PROXY_MANAGED）。
    */
   const viaLocalRelay = cliViaRelay(S);
+  /* 网关模式：请求先到**统一网关**，网关按模型 id 的 `provider/模型` 前缀分流到那一家。
+   *
+   * ⚠ 模型 id 必须带 provider 前缀：网关**不猜**。它拆第一个 "/"，前缀不在已知渠道里
+   * 就 404（不静默走老路——静默走老路会让人以为网关生效了，实际请求压根没经过分流）。
+   * 模型名里本来就有斜杠的（OpenRouter 的 "openai/gpt-4o"）不受影响：网关只拆第一个。
+   *
+   * ⚠ 网关模式下**一律**写占位符令牌：请求先到网关，网关再用自己的凭据去调上游，
+   * 客户端送来的那个 token 对网关没有意义（真写上去反而在用户主目录留了一份明文副本）。
+   */
+  const gw = gatewayOn();
+  const modelId = (target) => (gw ? `${S.p}/${target}` : String(target));
   const edits = [];
   const setEnv = (k, v) => edits.push({ path: "env." + k, value: v });
   const delEnv = (k) => edits.push({ path: "env." + k, delete: true });
 
-  setEnv("ANTHROPIC_BASE_URL", cliBaseUrlFor(S));
+  setEnv("ANTHROPIC_BASE_URL", gw ? gatewayBaseUrl() : cliBaseUrlFor(S));
+  /* ⚠ 网关模式**不**改令牌：bai/sn 是直连渠道，它们的 handler 会把客户端带来的
+   * authorization 头**透传给上游**——写成占位符就等于把假令牌发给上游了。
+   * 协议桥渠道（wb/qd/or/zen/mm）自己用凭据，不看客户端送来的 token，照旧写占位符。 */
   setEnv("ANTHROPIC_AUTH_TOKEN", viaLocalRelay ? PROXY_MANAGED_TOKEN : (S.key || "wb-local"));
-  setEnv("ANTHROPIC_MODEL", S.mapping["claude-haiku-4-5"]?.target || S.defaultModel);
+  setEnv("ANTHROPIC_MODEL", modelId(S.mapping["claude-haiku-4-5"]?.target || S.defaultModel));
   /* 显示名：只写用户手填的 label，不掺倍率（v1.0.65 撤掉）。
    *
    * 仍然不 `delete`：以前是 `delete e[t.envKey + "_NAME"]` —— 我们自己把 Claude Code
@@ -6725,7 +6893,7 @@ async function applyToCli(S) {
   for (const t of TIERS) {
     const m = S.mapping[t.key] || {};
     const target = m.target || S.defaultModel;
-    setEnv(t.envKey, target);
+    setEnv(t.envKey, modelId(target));
     // 用户没填 label 就不写这条（留空反而会让 Claude Code 回退显示模型 id，与旧行为一致）
     if (m.label) setEnv(t.envKey + "_NAME", m.label);
   }
@@ -6757,6 +6925,16 @@ async function applyToCli(S) {
 function applyToDesktop(S) {
   const f = desktopConfigFile();
   if (!f) throw new Error("找不到桌面版配置文件（configLibrary/_meta.json）");
+  /* 网关模式：桌面版也指向统一网关，且模型名要带 `provider/模型` 前缀——
+   * 桌面版把 inferenceModels[].name 原样当模型发出去，网关靠这个前缀分流。
+   * ⚠ 令牌**不改**：桌面版送来的 authorization 会被 bai/sn 的 handler 透传给上游，
+   * 换成占位符就等于把假令牌发给上游了。 */
+  const gw = gatewayOn();
+  const modelName = (t) => {
+    const m = S.mapping[t.key] || {};
+    const target = m.target || S.defaultModel;
+    return gw ? `${S.p}/${target}` : t.key;
+  };
   writeAtomic(
     f,
     JSON.stringify(
@@ -6765,10 +6943,10 @@ function applyToDesktop(S) {
         disableDeploymentModeChooser: true,
         inferenceGatewayApiKey: S.key,
         inferenceGatewayAuthScheme: "bearer",
-        inferenceGatewayBaseUrl: `http://127.0.0.1:${S.relayPort}`,
+        inferenceGatewayBaseUrl: gw ? gatewayBaseUrl() : `http://127.0.0.1:${S.relayPort}`,
         inferenceModels: TIERS.map((t) => ({
           labelOverride: S.mapping[t.key]?.label || t.zh,
-          name: t.key,
+          name: modelName(t),
           supports1m: true,
         })),
         inferenceProvider: "gateway",
@@ -8051,6 +8229,95 @@ async function unknownMappingTargets(p, mapping, cfg) {
     }
 
     // v1.0.28: 一键接线按提供方分流；恢复（接回 CC Switch）在 /api/restore 里保持原样
+    /* ---------- 统一网关模式（magpie 形态的那个「一个端口」）----------
+     *
+     * GET  → 当前模式、网关端口、各家可选模型
+     * POST → 切模式并**重新接线**（不重接的话，用户�� Claude Code 还指着旧端口，
+     *       面板说「已切到网关」而实际请求还走老路——那比没这功能更坏）。
+     */
+    if (req.method === "GET" && u.pathname === "/api/gateway-mode") {
+      const cfg = loadCfg();
+      return json(res, 200, {
+        ok: true,
+        mode: gatewayOn(cfg) ? "on" : "off",
+        port: cfg.gatewayPort || DEFAULTS.gatewayPort,
+        providers: CHANNELS.map((k) => {
+          const S = sliceOf(cfg, k);
+          const models = Object.values(S.mapping || {}).map((m) => m && m.target).filter(Boolean);
+          return { key: k, name: PROVIDERS[k] || k, models: Array.from(new Set(models)) };
+        }),
+      });
+    }
+    if (req.method === "POST" && u.pathname === "/api/gateway-mode") {
+      const b = await readBody(req);
+      const want = String(b.mode || "").trim().toLowerCase();
+      if (want !== "on" && want !== "off") {
+        return json(res, 400, { error: "mode 只能是 on 或 off（收到：" + JSON.stringify(b.mode) + "）" });
+      }
+      const cfg = loadCfg();
+      cfg.gatewayMode = want;
+      saveCfg(cfg);
+      const warns = [];
+      try {
+        /* 只重接**当前接的那一家**——我们不知道用户想接哪家，不该替他决定。
+         * 当前接的是谁，从 settings.json 里的 BASE_URL 反查（cliMode 干的就是这事）。 */
+        const cur = cliMode(cfg).mode;
+        if (CHANNELS.includes(cur)) {
+          const S = sliceOf(cfg, cur);
+          warns.push(...snapshotExternal());
+          await applyToCli(S);
+          applyToDesktop(S);
+        } else {
+          warns.push("当前没有接任何一家；改动已保存，下次接线时生效");
+        }
+      } catch (e) {
+        return json(res, 400, {
+          error: "切换后重新接线失败：" + String((e && e.message) || e),
+          mode: want, warnings: warns,
+        });
+      }
+      return json(res, 200, { ok: true, mode: want, warnings: warns });
+    }
+    /* ---------- 用量账本（面板读）----------
+     * 账本是 JSONL 追加日志（usage-ledger.mjs）。读的时候**坏行跳过**——
+     * 末尾半行是常态（别的进程正在写），为一行坏掉而作废整份账本不划算。
+     */
+    if (req.method === "GET" && u.pathname === "/api/usage") {
+      const rows = loadUsageRows();
+      const totals = { requests: 0, failed: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0 };
+      const byProvider = new Map();
+      const byModel = new Map();
+      for (const r of rows) {
+        totals.requests++;
+        /* handed_on 的那些 try 写了记录但**不算失败数**（它们已经把活交出去了）。 */
+        if (!r.handed_on && Number(r.status) >= 400) totals.failed++;
+        totals.tokensIn += Number(r.in) || 0;
+        totals.tokensOut += Number(r.out) || 0;
+        totals.cacheRead += Number(r.cache_read) || 0;
+        totals.cacheWrite += Number(r.cache_write) || 0;
+        const pk = r.provider || "?";
+        const pm = byProvider.get(pk) || { key: pk, name: PROVIDERS[pk] || pk, requests: 0, tokens: 0 };
+        pm.requests++; pm.tokens += (Number(r.in) || 0) + (Number(r.out) || 0);
+        byProvider.set(pk, pm);
+        const mk = r.model || "?";
+        const mm2 = byModel.get(mk) || { key: mk, requests: 0, tokens: 0 };
+        mm2.requests++; mm2.tokens += (Number(r.in) || 0) + (Number(r.out) || 0);
+        byModel.set(mk, mm2);
+      }
+      const recent = rows.slice(-200).reverse().map((r) => ({
+        t: r.t, agent: r.agent, provider: r.provider, model: r.model,
+        req: r.req, served: r.served,
+        in: r.in, out: r.out, cacheRead: r.cache_read, cacheWrite: r.cache_write,
+        status: r.status, error: r.error, tries: r.tries, ms: r.ms, ttftMs: r.ttft_ms,
+        tierServed: r.tier_served, kind: r.kind, handedOn: r.handed_on,
+      }));
+      return json(res, 200, {
+        ok: true, totals,
+        rows: recent,
+        byProvider: Array.from(byProvider.values()).sort((a, b) => b.requests - a.requests),
+        byModel: Array.from(byModel.values()).sort((a, b) => b.requests - a.requests).slice(0, 30),
+      });
+    }
     if (req.method === "POST" && u.pathname === "/api/apply") {
       const b = await readBody(req);
       const P = resolveChannelKey(b.provider);
@@ -8333,13 +8600,20 @@ function listenWithRetry(srv, port, name) {
   const start = () => {
     attempts++;
     srv.once("error", onErr);
-    srv.listen(port, "127.0.0.1", () => {
+    srv.listen(port, "127.0.0.1");
+    srv.once("listening", () => {
       srv.removeListener("error", onErr);
       log(`${name}就绪 http://127.0.0.1:${port}` + (standby ? "（待命接管成功）" : attempts > 1 ? `（重试 ${attempts - 1} 次后绑定成功）` : ""));
       standby = false;
     });
   };
   const onErr = async (e) => {
+    /* ⚠ 重试前必须摘掉上一轮的 'listening' 监听器。
+     * listen 失败时那个监听器**永远不会触发**（只 bind 成功才触发），所以每轮重试
+     * 都多挂一个 —— 端口被占时（重启交接、老实例还在跑，这是常态）几十轮下来就超过
+     * 10 个，Node 开始刷 MaxListenersExceededWarning。
+     * 那是 v1.0.19 就有的老问题：每启一个第二实例都刷一串警告，淹掉真正的日志。 */
+    srv.removeAllListeners("listening");
     if (srv.listening) return;
     if (e.code !== "EADDRINUSE") { log(`${name} 端口错误: ${e.message}`); process.exit(1); }
     if (attempts === 1) log(`${name} 端口 :${port} 暂被占用（多为重启交接），每 600ms 重试，最多 15 秒`);
