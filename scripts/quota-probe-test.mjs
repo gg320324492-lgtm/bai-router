@@ -409,7 +409,11 @@ describe("⑤ 没有出处的那些 —— 候选端点与「就是探不到」"
   test("⑤e 候选端点真探到了 ⇒ 算数（判据是「读到了字段」，不是「端点回 200」）", async () => {
     // MiniMax Coding Plan 的应答形状（magpie readMiniMaxPlan）：插进去看会不会被读出来。
     const get = fakeGet([{
-      match: "/v1/token_plan/remains",
+      /* ⚠ 匹配的是**端点尾部**「/token_plan/remains」——
+       *   2026-10-23 之前 mm 的候选 URL 是 {origin}/v1/token_plan/remains，
+       *   现在是 {base}/token_plan/remains（base = .../mavis/api/v1/llm），
+       *   多出来的那一段是实测修的（见 ⑤g）。按尾部匹配，两种 URL 都认。 */
+      match: "/token_plan/remains",
       reply: json({
         base_resp: { status_code: 0, status_msg: "ok" },
         model_remains: [{
@@ -428,6 +432,19 @@ describe("⑤ 没有出处的那些 —— 候选端点与「就是探不到」"
     assert.equal(r.limit, 100);
     assert.equal(r.resetAtMs, 1760000000 * 1000, "end_time 是 epoch 秒");
     assert.match(r.source, /token_plan/);
+  });
+
+  test("⑤g mm 的候选 URL 必须用 {base}（用 {origin} 会丢掉 /mavis 这一段 ⇒ 404）", () => {
+    /* 2026-10-23 实测：
+     *   {origin}/v1/token_plan/remains            → 404（地址不对）
+     *   {base}/token_plan/remains（base 带 /mavis/api/v1/llm）→ 401（地址对，缺凭据）
+     * 差的就是「地址对不对」—— 404 的话再怎么接凭据也探不到。 */
+    const cand = (PROBE_SPECS.mm.candidates || []).find((c) => /token_plan/.test(String(c.url || "")));
+    assert.ok(cand, "mm 应当有 token_plan 的候选端点");
+    assert.match(String(cand.url), /\{base\}/,
+      `mm 的候选 URL 必须用 {base}（{origin} 会丢掉 /mavis/api/v1/llm 那一段）：${cand.url}`);
+    assert.equal(/\{origin\}/.test(String(cand.url)), false,
+      "mm 的候选 URL 不许用 {origin} —— 它只取协议+主机，实测拼出来的地址 404");
   });
 
   test("⑤f 默认候选表里，没出处的那些都标着「候选」", () => {

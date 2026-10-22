@@ -437,8 +437,15 @@ export const PROBE_SPECS = Object.freeze({
     candidates: [
       {
         id: "token-plan-remains",
-        url: "{origin}/v1/token_plan/remains",
-        source: "候选端点 GET /v1/token_plan/remains → model_remains[0].current_interval_usage_count / .current_interval_total_count",
+        /* ⚠ **用 {base} 不用 {origin}**（2026-10-23 实测）：
+         *   {origin} 只取「协议 + 主机」，于是拼出来是
+         *     https://agent.minimax.cn/v1/token_plan/remains  → **404**
+         *   而 base 是 https://agent.minimax.cn/mavis/api/v1/llm，拼出来是
+         *     https://agent.minimax.cn/mavis/api/v1/llm/token_plan/remains → **401**
+         *   404 = 地址不对；401 = 地址对、只是缺凭据（接上令牌就成了）。
+         *   mm 的中转上游本来就带着 /mavis/api/v1/llm 这一段，额度接口在它下面。 */
+        url: "{base}/token_plan/remains",
+        source: "候选端点 GET {base}/token_plan/remains → model_remains[0].current_interval_usage_count / .current_interval_total_count",
         unit: UNIT_REQUESTS,
         used: [{ path: "model_remains.0.current_interval_usage_count" }],
         limit: [{ path: "model_remains.0.current_interval_total_count" }],

@@ -5905,10 +5905,22 @@ async function probeQuotaOf(provider, cfg, now) {
   };
   let out = null;
   try {
+    /* ⚠⚠ **mm 的凭据在内存里**（MiniMax Code 的登录态），cfg 里取不到 ——
+     *   不注入的话 mm 永远是「探不到：没有可用的登录态」，而 mm 恰恰常常是
+     *   用户的**入口**渠道（探不到的那一家，正是最该看见的一家）。
+     *   ensure() 顺手续期；失败会抛（消息里没有令牌值）—— 探不到就探不到，
+     *   不该因此把整轮探测带崩。
+     *   ⚠ 令牌只进发往 MiniMax 自己的请求头，**不进日志、不进面板**。 */
+    let mmToken = "";
+    if (provider === "mm") {
+      try { mmToken = String((await mmTokens.ensure()) || ""); } catch { mmToken = ""; }
+    }
     out = await probeQuota(provider, {
       now,
       bases,
-      headers: (id) => probeHeadersOf(id, cfg),
+      headers: (id) => (id === "mm" && mmToken)
+        ? { authorization: "Bearer " + mmToken }
+        : probeHeadersOf(id, cfg),
       get,
     });
   } catch (e) {
