@@ -33,14 +33,21 @@ window.BAI_CARDS["channel-heatmap"] = {
         </div>`;
       const viewRoot = (slot.closest && slot.closest(".view")) || slot;
       viewRoot.appendChild(box);
-      /* 点格子 = 选中那家。事件挂在盒子上（事件委托）——
-         格子是共享组件拼出来的字符串，卡片不能给它逐个绑事件。
-         监听器只在建盒子时挂一次：同一个盒子被第二个视图复用时不会挂两遍。 */
+      /* 点格子 = 选中那家，**并跳到渠道页**。
+         事件挂在盒子上（事件委托）——格子是共享组件拼出来的字符串，
+         卡片不能给它逐个绑事件。监听器只在建盒子时挂一次：
+         同一个盒子被第二个视图复用时不会挂两遍。
+         ⚠ 为什么要点完就跳页：渠道页是主从布局（左列表 + 右详情），
+           「选中」这件事的**结果**在那屏才看得见。停在总览屏只改一个
+           看不见的选中态，等于点了没反应 —— 旧结构里点格子会就地展开，
+           看得见；现在不跳就断了。 */
       box.addEventListener("click", (ev) => {
         const cell = ev.target && ev.target.closest ? ev.target.closest("[data-channel]") : null;
         if (!cell) return;
         const key = cell.getAttribute("data-channel");
-        if (key && ctx.selectChannel) ctx.selectChannel(key);
+        if (!key) return;
+        if (ctx.selectChannel) ctx.selectChannel(key);
+        if (ctx.setView) ctx.setView("channels");
       });
     }
     const q = (sel) => box.querySelector(sel);
@@ -77,7 +84,12 @@ window.BAI_CARDS["channel-heatmap"] = {
       if (pending) return pending;
       pending = (async () => {
         try {
-          const r = await ctx.api("/api/channels/state");
+          /* 走渲染层的**共享读法**（ctx.loadChanStates）：同一个端点全屏只拉一份。
+             渠道页左栏、状态条卡、热力图卡读的是同一份数据——同屏显示的状态
+             才可能是同一时刻的。 */
+          const r = typeof ctx.loadChanStates === "function"
+            ? await ctx.loadChanStates()
+            : await ctx.api("/api/channels/state");
           if (r && r.ok === false) throw new Error(r.error || "读不到渠道状态");
           data = r || null;
           lasterr = "";

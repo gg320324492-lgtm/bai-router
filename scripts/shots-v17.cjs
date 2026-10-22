@@ -14,15 +14,17 @@ const fs = require("fs");
 
 /* 用 scripts/sandbox-launch.cjs 起的隔离沙箱（16xxx），不再另起一套实例。 */
 const BASE = "http://127.0.0.1:16723";
-const OUT = "C:/Users/pc/AppData/Local/Temp/opencode/ui-design/shots";
+const OUT = path.join(__dirname, "..", "docs", "evidence");
 
 /* wantDom：等就绪时要看到的视图容器，用来证明「当前是新文档」。
-   （hash 段 console/cred/fo/settings ↔ viewConsole/viewCred/viewFo/viewSettings） */
+   （hash 段 console/channels/fo/settings/quota ↔ viewConsole/viewChannels/viewFo/viewSettings/viewQuota） */
 const SHOTS = [
   { file: "v17-console-dark.png",  url: `${BASE}/#/console`,  theme: "dark",  wantDom: "viewConsole", w: 1440, h: 1000 },
   { file: "v17-console-light.png", url: `${BASE}/#/console`,  theme: "light", wantDom: "viewConsole", w: 1440, h: 1000 },
-  { file: "v17-cred-dark.png",     url: `${BASE}/#/cred`,     theme: "dark",  wantDom: "viewCred",    w: 1440, h: 1000 },
-  { file: "v17-cred-light.png",    url: `${BASE}/#/cred`,     theme: "light", wantDom: "viewCred",    w: 1440, h: 1000 },
+  { file: "v17-channels-dark.png",  url: `${BASE}/#/channels`, theme: "dark",  wantDom: "viewChannels", w: 1440, h: 1000 },
+  { file: "v17-channels-light.png", url: `${BASE}/#/channels`, theme: "light", wantDom: "viewChannels", w: 1440, h: 1000 },
+  /* narrow: the two master-detail columns no longer fit, so the rail turns into a horizontal strip */
+  { file: "v17-channels-narrow.png", url: `${BASE}/#/channels`, theme: "dark", wantDom: "viewChannels", w: 900, h: 1000 },
   { file: "v17-fo-dark.png",       url: `${BASE}/#/fo`,       theme: "dark",  wantDom: "viewFo",      w: 1440, h: 1000 },
   { file: "v17-fo-light.png",      url: `${BASE}/#/fo`,       theme: "light", wantDom: "viewFo",      w: 1440, h: 1000 },
   { file: "v17-settings-dark.png",   url: `${BASE}/#/settings`, theme: "dark",  wantDom: "viewSettings", w: 1440, h: 1000 },
@@ -64,7 +66,7 @@ async function waitReady(win, wantDom) {
     const ok = await win.webContents.executeJavaScript(`
       (() => {
         const on = document.querySelector(".view.on");
-        const cells = document.querySelectorAll("#matrixGrid .cell");
+        const cells = document.querySelectorAll("#matrixGrid .chan-row");
         const gauge = document.getElementById("txtRelay");
         const sentence = document.getElementById("statusSentence");
         const ready = document.readyState === "complete";
@@ -112,7 +114,7 @@ app.whenReady().then(async () => {
     const s = SHOTS[i];
     errs = [];
     win.setSize(s.w, s.h);
-    /* query 必须在 hash **之前**：拼在后面会变成 "#/cred&shot=1"，
+    /* query 必须在 hash **之前**：拼在后面会变成 "#/channels&shot=1"，
        hash 段匹配不上任何视图 id，页面会静默回落到控制台——
        这正是第一版截图八张全是控制台的原因。 */
     const [base, hash] = s.url.split("#");
@@ -144,11 +146,11 @@ app.whenReady().then(async () => {
     fs.writeFileSync(path.join(OUT, s.file), img.toPNG());
     const info = await win.webContents.executeJavaScript(`
       (() => {
-        const sel = document.querySelector("#matrixGrid .cell.sel");
+        const sel = document.querySelector("#matrixGrid .chan-row.sel");
         return {
           view: (document.querySelector(".view.on") || {}).id || null,
           theme: document.documentElement.getAttribute("data-theme"),
-          cells: document.querySelectorAll("#matrixGrid .cell").length,
+          cells: document.querySelectorAll("#matrixGrid .chan-row").length,
           selected: sel ? sel.dataset.k : null,
           selSelected: !!sel && sel.classList.contains("sel"),
           credRows: document.querySelectorAll("#credList .credrow").length,

@@ -345,114 +345,112 @@ body.no-frame .winCtrls { display: none; }
 .dim { color: var(--dim); }
 
 /* ============================================================================
-   7. 渠道矩阵（4×2 = 六家 + 交还区 + 转移链格）
+   7. 渠道页（主从布局：左栏渠道一览 · 右栏选中那家的全部内容）
+
+   为什么要分两栏：原先的 4×2 矩阵把「这家是谁」「能不能用」「映射到哪个模型」
+   「中转口是多少」挤在一张卡里，八家排下来要滚一屏半，而其中三样在选中之后
+   才有用。左栏只留「选谁」需要的三样（名字 + 状态药丸 + 用量小条），
+   其余全进右栏 —— 改一家不用滚。
    ========================================================================== */
-.matrix { display: grid; grid-template-columns: repeat(4, 1fr); gap: 13px; margin-bottom: 22px; }
 
-.cell {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 13px;
-  box-shadow: var(--sh); display: flex; flex-direction: column; overflow: hidden;
-  position: relative; transition: border-color .16s, box-shadow .16s;
-  cursor: pointer; min-width: 0;
+/* 两栏骨架。左栏固定宽度、右栏吃掉剩余宽度。 */
+.chan-split {
+  display: grid;
+  grid-template-columns: minmax(228px, 268px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
 }
-.cell:hover { border-color: var(--line2); transform: translateY(-2px); }
-.cell.sel { border-color: var(--brand-line); background: var(--panel2); }
-/* 当前选中：左侧一道品牌色竖条（与 toast 的左边条同一套语言） */
-.cell.sel::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--brand); }
-.cell.flash { animation: cellflash .9s ease-out; }
-@keyframes cellflash {
-  0% { box-shadow: 0 0 0 0 var(--brand-line); }
-  45% { box-shadow: 0 0 0 4px var(--brand-soft); }
-  100% { box-shadow: var(--sh); }
-}
-/* 不进链的两格（交还区 / 转移链格）用虚线 + 透明底，与渠道格区分 */
-.cell.chaincell, .cell[data-k="ccswitch"] { background: transparent; border-style: dashed; }
+.chan-rail { min-width: 0; position: sticky; top: 66px; }
+.chan-detail { min-width: 0; }
 
-.celltop { display: flex; align-items: center; gap: 9px; padding: 13px 14px 8px; }
-.letter {
-  width: 31px; height: 31px; border-radius: 9px; flex: none;
+/* 左栏列表：一行一家。 */
+.chan-list { display: flex; flex-direction: column; gap: 4px; }
+
+.chan-row {
+  display: grid;
+  /* 字母徽章 · 名字 · 用量条 · 状态药丸 —— 名字吃掉剩余宽度，其余按内容。 */
+  grid-template-columns: 26px minmax(0, 1fr) 44px auto;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color .14s, background .14s;
+}
+.chan-row:hover { border-color: var(--line2); background: var(--panel2); }
+.chan-row:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
+/* 当前选中：品牌色边框 + 淡底。与矩阵格的 .sel 同一套语言。 */
+.chan-row.sel { border-color: var(--brand-line); background: var(--brand-soft); }
+.chan-row.flash { animation: chanflash .9s ease-out; }
+@keyframes chanflash {
+  0% { border-color: var(--brand); }
+  100% { border-color: var(--brand-line); }
+}
+
+.chan-row .letter {
+  width: 26px; height: 26px; border-radius: 8px; flex: none;
   background: var(--panel3); border: 1px solid var(--line);
   display: grid; place-items: center;
-  font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--ink2);
-  letter-spacing: .5px;
+  font-family: var(--mono); font-size: 10px; font-weight: 700; color: var(--ink2);
 }
-.cell.sel .letter { background: var(--brand-soft); border-color: var(--brand-line); color: var(--brand); }
-/* 徽章只说明「这一家是免费/付费/境内/海外」，不参与状态语义 */
-.cbadge {
-  font-size: 9.5px; letter-spacing: .4px; border-radius: 5px; padding: 1.5px 6px;
-  white-space: nowrap; border: 1px solid var(--line); color: var(--dim); flex: none;
+.chan-row.sel .letter { background: var(--panel); border-color: var(--brand-line); color: var(--brand); }
+.chan-row .cr-name {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-weight: 650;
 }
-.cbadge.free, .cbadge.intl { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
-.cbadge.paid { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
-.cbadge.cn { color: var(--ink2); background: var(--panel2); }
-.cbadge.neutral { color: var(--dim); background: var(--idle-soft); border-color: transparent; }
 
-/* .cname 是 .cell（纵排 flex）的直接子元素，**不能**用 flex:1。
-   设计稿里它坐在横排的 .chead 内，flex:1 是为了在标题行里吃掉剩余宽度；
-   照抄到纵排容器里会变成"纵向抢剩余高度"，内容短的格子（交还区/转移链格）
-   会被撑出一道空档，副标题整块下沉。 */
-.cname { min-width: 0; flex: none; font-size: 13.5px; font-weight: 650; letter-spacing: .2px; }
-.cname .cpath { font-family: var(--mono); font-size: 10.5px; color: var(--dim); font-weight: 400; margin-left: 6px; }
-.ctag { font-size: 11.5px; color: var(--dim); padding: 0 14px 8px; line-height: 1.5; }
+/* 用量小条：一条极窄的横条，只表示「用了多少」，不表示好坏。
+   颜色仍走语义色（额度紧张偏黄/红），但**宽度**才是主信息。 */
+.chan-row .cr-meter { width: 44px; display: flex; justify-content: flex-end; }
+.cr-meter-bar {
+  display: block; width: 44px; height: 4px; border-radius: 99px;
+  background: var(--idle-soft); overflow: hidden;
+}
+.cr-meter-fill {
+  display: block; height: 100%; border-radius: 99px; background: var(--idle);
+}
+/* 探不到用量：显示「—」而不是一条空条（空条会被读成「用了 0%」）。 */
+.cr-meter-empty { font-size: 10.5px; color: var(--dim); font-family: var(--mono); }
 
-/* 档位徽章（v1.0.74 T4）。两档可用性完全不同（免费档被封死在客户端内 /
-   Go 档需订阅），所以它必须**显眼**：实心边框 + 语义色，不是行内小字。 */
-.ctier { padding: 0 14px 2px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.ctier:empty { display: none; }
-.ctier .tb {
+.chan-row .cr-state { display: flex; justify-content: flex-end; }
+/* 药丸在窄栏里要小一号，否则一行放不下（名字 + 条 + 药丸 = 268px 的极限）。 */
+/* 左栏药丸的小尺寸变体。.pill 是全面板共用的，窄栏里直接改它会牵连别处，
+   所以这里只覆盖左栏作用域内的（配色仍走 .pill 自己的语义色规则）。 */
+.chan-row .pill { font-size: 10px; padding: 2px 7px; white-space: nowrap; }
+
+/* 右栏抬头：这一家是谁 + 一眼要到的三样。 */
+.chan-head { margin: 0 2px 11px; }
+.chh-main { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.chh-main .letter {
+  width: 28px; height: 28px; border-radius: 8px; flex: none;
+  background: var(--panel3); border: 1px solid var(--line);
+  display: grid; place-items: center;
+  font-family: var(--mono); font-size: 10.5px; font-weight: 700; color: var(--ink2);
+}
+.chh-name { font-size: 15px; font-weight: 700; letter-spacing: .2px; }
+.chh-tier {
   font-size: 10.5px; font-weight: 650; letter-spacing: .2px;
   padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor;
 }
-.ctier .tb.ok { color: var(--ok); }
-.ctier .tb.warn { color: var(--warn); }
-.ctier .tb.err { color: var(--err); background: var(--err-soft); }
-.ctier .tb-note { font-size: 10.5px; }
-
-.cmap { padding: 7px 14px 0; border-top: 1px dashed var(--line); display: flex; flex-direction: column; }
-.mrow { display: flex; align-items: center; gap: 9px; font-size: 11.5px; padding: 1.5px 0; }
-.mrow .t { color: var(--dim); width: 46px; flex: none; font-size: 10.5px; letter-spacing: .2px; font-style: normal; }
-.mrow .v { font-family: var(--mono); font-size: 11px; color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
-/* 「实际服务的模型」（v1.0.78 T9）：只有 served 与 target 不一致时才出现，
-   所以用红色——出现即意味着「你以为在用 A，实际跑的是 B」，那是错配不是装饰。 */
-.mrow .serveddiff {
-  font-family: var(--mono); font-size: 10.5px; font-style: normal; flex: none;
-  color: var(--err); border: 1px solid currentColor; border-radius: 4px;
-  padding: 0 4px; cursor: help;
+.chh-tier.ok { color: var(--ok); }
+.chh-tier.warn { color: var(--warn); }
+.chh-tier.err { color: var(--err); background: var(--err-soft); }
+.chh-caveat { font-size: 11px; color: var(--warn); }
+.chh-relay {
+  font-family: var(--mono); font-size: 10.5px; color: var(--dim);
+  padding: 2px 8px; border: 1px solid var(--line); border-radius: 7px;
 }
-
-.crelay { display: flex; align-items: center; gap: 8px; padding: 8px 14px 0; margin-top: auto; }
-.rl { font-family: var(--mono); font-size: 10.5px; color: var(--dim); }
-.rl.ok { color: var(--ok); }
-.rl.warn { color: var(--warn); }
-.rl.err { color: var(--err); }
-.rl.idle { color: var(--idle); }
-.rl2 { font-size: 10.5px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.cfoot {
-  padding: 10px 14px 13px; border-top: 1px solid var(--line);
-  background: var(--panel2); display: flex; align-items: center; gap: 8px;
-}
-.cell.sel .cfoot { background: var(--panel3); }
-.cfoot .btn { flex: 1; justify-content: center; }
-.cstate { font-size: 10px; color: var(--dim); white-space: nowrap; }
-.cstate.ok { color: var(--ok); }
-.cstate.warn { color: var(--warn); }
-.cstate.err { color: var(--err); }
-.cstate.idle { color: var(--idle); }
-
-/* 转移链格里的链序列表 */
-.chainlist { padding: 2px 14px 0; display: flex; flex-direction: column; gap: 4px; flex: 1; }
-.chitem {
-  display: flex; align-items: center; gap: 8px; font-size: 11.5px;
-  padding: 3.5px 7px; border-radius: 7px; border: 1px solid transparent; color: var(--ink2);
-}
-.chitem:first-child { border-color: var(--brand-line); background: var(--brand-soft); color: var(--ink); }
-.chitem b { font-family: var(--mono); font-size: 9.5px; color: var(--dim); width: 12px; flex: none; }
-.chitem .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--idle); }
-.chitem .dot.ok { background: var(--ok); }
-.chitem .dot.warn { background: var(--warn); }
-.chitem .dot.err { background: var(--err); }
-.chainoff { font-size: 10.5px; color: var(--warn); padding-left: 7px; }
+.chh-sub { font-size: 11.5px; color: var(--dim); margin-top: 4px; padding-left: 37px; }
+/* 「接通这家」按钮：抬头右端。禁用态由按钮自己带（未配置时不可接通）。 */
+.chh-apply { margin-left: auto; }
+.chh-apply:disabled { opacity: .5; cursor: not-allowed; }
 
 /* ============================================================================
    8. 映射编辑区
@@ -975,7 +973,6 @@ footer .paths { flex: 1; min-width: 200px; }
    18. 响应式
    ========================================================================== */
 @media (max-width: 1300px) {
-  .matrix { grid-template-columns: repeat(3, 1fr); }
   .edgrid { grid-template-columns: 1fr; }
   .edmain { border-right: none; border-bottom: 1px solid var(--line); }
 }
@@ -986,11 +983,18 @@ footer .paths { flex: 1; min-width: 200px; }
   .credbody .ca { justify-content: flex-start; margin-left: 0; }
 }
 @media (max-width: 980px) {
-  .matrix { grid-template-columns: repeat(2, 1fr); }
+  /* 主从两栏挤不下了：左栏改成横向滚动的一排，右栏占满整宽。
+     横向而不是纵向堆叠 —— 纵向堆叠会把「选谁」推到屏幕外，改一家要滚回顶上。 */
+  .chan-split { grid-template-columns: 1fr; }
+  .chan-rail { position: static; }
+  .chan-list {
+    flex-direction: row; overflow-x: auto; padding-bottom: 6px;
+    scroll-snap-type: x proximity;
+  }
+  .chan-row { flex: 0 0 auto; width: auto; scroll-snap-align: start; }
 }
 @media (max-width: 700px) {
   .app { padding: 0 14px 60px; }
-  .matrix { grid-template-columns: 1fr; }
   .gauge { flex: 1 1 100%; border-right: none; border-bottom: 1px solid var(--line); }
   .gauge:last-child { border-bottom: none; }
   .top { height: auto; flex-wrap: wrap; padding-bottom: 10px; gap: 10px; }
@@ -998,6 +1002,7 @@ footer .paths { flex: 1; min-width: 200px; }
   table.route td:nth-child(1) { width: 40%; }
   /* 窄屏：名字不再截断（让它换行），展开的那块也不必再缩进 */
   .credhead .clname { max-width: none; white-space: normal; }
+  .chh-sub { padding-left: 0; }
   .credbody { padding-left: 16px; }
   .credwhy { padding-left: 0; }
 }

@@ -545,9 +545,10 @@ window.BAI_PROVIDERS = {
  * 以及本表的 id（DOM 容器 id 在 dom 字段）。C9 逐个核对。
  * ========================================================================== */
 window.BAI_VIEWS = [
-  { id: "console", nav: "控制台", dom: "viewConsole", hint: "渠道矩阵 · 映射编辑 · 诊断抽屉", cards: ["model-sync", "oc-transport", "usage-ledger", "audit-ledger", "status-strip", "channel-heatmap"] },
-  { id: "cred", nav: "凭据", dom: "viewCred", hint: "每家渠道各自要的东西", cards: ["token-capture", "model-catalog", "or-rotation", "wb-pool", "mm-member", "plugins", "account-list"] },
+  { id: "console", nav: "总览", dom: "viewConsole", hint: "状态条 · 渠道热力图 · 诊断抽屉", cards: ["model-sync", "usage-ledger", "audit-ledger", "status-strip", "channel-heatmap"] },
+  { id: "channels", nav: "渠道", dom: "viewChannels", hint: "左栏一家 · 右栏改它", cards: ["oc-transport", "token-capture", "model-catalog", "or-rotation", "wb-pool", "mm-member", "plugins", "account-list"] },
   { id: "fo", nav: "故障转移", dom: "viewFo", hint: "开关 · 顺序 · 冷却", cards: ["failover", "gateway-switch", "limits"] },
   { id: "settings", nav: "设置", dom: "viewSettings", hint: "代理 · 端口 · 更新 · 数据目录", cards: ["config-backup", "remote-sync"] },
-  { id: "quota", nav: "额度", dom: "viewQuota", hint: "各家还剩多少 · 还能用多久", cards: ["quota-panel"] },
+  { id: "quota", nav: "额度", dom: "viewQuota", hint: "各家还剩多少 · 还能用多久", cards: ["quota-panel", "price-table"] },
+  { id: "traffic", nav: "流量", dom: "viewTraffic", hint: "按天的花费与用量 · 会话粘在谁身上", cards: ["traffic-page"] },
 ];

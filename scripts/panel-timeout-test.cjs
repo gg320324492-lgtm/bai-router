@@ -22,7 +22,7 @@ const PROBE = `
     sentence: (document.getElementById("statusSentence")||{}).textContent || "",
     svc: (document.getElementById("svc")||{}).textContent || "",
     relay: (document.getElementById("txtRelay")||{}).textContent || "",
-    cells: document.querySelectorAll("#matrixGrid .cell").length,
+    cells: document.querySelectorAll("#matrixGrid .chan-row").length,
     diag: document.querySelectorAll(".ditem").length,
   }))()
 `;

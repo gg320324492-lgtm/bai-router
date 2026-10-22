@@ -155,7 +155,11 @@ window.BAI_CARDS["status-strip"] = {
       if (pending) return pending;
       pending = (async () => {
         try {
-          const r = await ctx.api("/api/channels/state");
+          /* 走渲染层的**共享读法**（ctx.loadChanStates）：同一个端点全屏只拉一份。
+             热力图卡、渠道页左栏、这张状态条读的是同一份数据。 */
+          const r = typeof ctx.loadChanStates === "function"
+            ? await ctx.loadChanStates()
+            : await ctx.api("/api/channels/state");
           data = (r && r.ok === false) ? null : (r || null);
         } catch (e) {
           /* 读不到就把三格画成「—」，不猜数字：错数字比没数字更坏。

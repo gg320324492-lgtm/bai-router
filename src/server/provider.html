@@ -17,18 +17,18 @@
   结构（自上而下，括号内是设计稿 a-console.html 的对应块）：
     header   品牌 + 视图分段导航 + 服务胶囊 + 主题按钮 + 窗控三键
     #statusBand  六个状态单元 + 一句人话总结 + 三个主动作 + 结果行
-    #viewConsole  #matrixGrid（渠道矩阵 4×2）+ #mapPanel（四档映射编辑）+ 诊断抽屉
-    #viewCred     凭据手风琴：九行（八家渠道 + 交还区），一行一家，点开才展开
+    #viewConsole  总览：常驻诊断抽屉 + 渠道热力图（卡片）
+    #viewChannels 渠道（主从布局）：左栏一列渠道，右栏是选中那家的全部内容
     #viewFo       开关 + 顺序（↑↓）+ 冷却 + 「什么情况不会转移」
     #viewSettings 代理 / 端口 / 中转端口 / 更新 / 数据目录
     footer + 横幅族 + #slot-extra
 
   插槽：
-  #matrixGrid   渠道矩阵的八格（六家 + CC Switch 交还区 + 转移链格）——panel-common.js 按清单生成
-  #routeBody    四档映射的三列（档位 / 下拉 / 显示名）——panel-common.js 按 cfg[channel].mapping 生成
+  #matrixGrid   渠道一览（左栏竖排一列：名字 + 状态药丸 + 用量小条）——渲染层按清单 + 状态层生成
+  #routeBody    四档映射的三列（档位 / 下拉 / 显示名）——渲染层按 cfg[channel].mapping 生成
   #slot-sys     设置视图里各家专属的设置字段（令牌只读框等）
   #diagList     诊断抽屉的条目
-  #credList     凭据视图的行容器
+  #credList     凭据行容器（渠道页右栏；只显示选中那家）
   #foPanel      故障转移视图的主体
   #slot-extra   全局卡片插槽（cards/*.js 的默认落点）
 -->
@@ -56,14 +56,17 @@
     <span class="logo-dot"></span>
     <h1 id="h1"><span id="h1Text">路由台</span><small id="h1Sub"></small></h1>
 
-    <!-- 视图分段：4 个，不是 7 个页签。data-view 必须与清单 window.BAI_VIEWS[].id 一一对应，
-         也就是 URL hash 段（#/console · #/cred · #/fo · #/settings）。C9 逐个核对。 -->
+    <!-- 视图分段。data-view 必须与清单 window.BAI_VIEWS[].id 一一对应，
+         也就是 URL hash 段（#/console · #/channels · #/fo · #/settings · #/quota · #/traffic）。C9 逐个核对。
+         旧的 #/cred 不再是视图：凭据已并进「渠道」屏（主从布局的右栏），
+         老链接由渲染层重定向到 #/channels（不 404）。 -->
     <nav class="tabs" id="navViews" role="tablist">
-      <button type="button" role="tab" data-view="console">控制台</button>
-      <button type="button" role="tab" data-view="cred">凭据</button>
+      <button type="button" role="tab" data-view="console">总览</button>
+      <button type="button" role="tab" data-view="channels">渠道</button>
       <button type="button" role="tab" data-view="fo">故障转移</button>
       <button type="button" role="tab" data-view="settings">设置</button>
       <button type="button" role="tab" data-view="quota">额度</button>
+      <button type="button" role="tab" data-view="traffic">流量</button>
     </nav>
 
     <div class="topright">
@@ -148,63 +151,13 @@
     <section class="view on" id="viewConsole">
 
       <div class="sechead">
-        <h2>渠道矩阵</h2>
-        <span class="note">点任意一张卡选中；映射、凭据、须知都在下方就地展开，不跳页</span>
+        <h2>总览</h2>
+        <span class="note">现在能不能用 · 一眼看完八家；要改配置去「渠道」页</span>
         <span class="spacer"></span>
-        <!-- 交还区（CC Switch 那一格）由渲染层在矩阵里生成；这个静态按钮是它的兜底入口，
-             位置沿用旧模板「接线卡 → 接回 CC Switch」那一行的语义。状态带上还有一个
-             #btnRestore2 主动作，两者做的是同一件事。 -->
+        <!-- 接回 CC Switch：把配置交还回去的入口。状态带上还有一个 #btnRestore2
+             主动作，两者做的是同一件事。 -->
         <button class="btn sm ghost" id="btnRestore" type="button">接回 CC Switch</button>
         <span class="note">配色说明：<span class="sem-ok">绿</span>=就绪 · <span class="sem-warn">黄</span>=需留意 · <span class="sem-err">红</span>=故障 · 灰=未配置 · <span class="sem-brand">靛蓝</span>=当前选中</span>
-      </div>
-      <!-- 八格：六家渠道 + CC Switch 交还区 + 故障转移链格。格序 = 转移链顺序，
-           交还区固定在链尾之后。整格由渲染层按清单生成。 -->
-      <div class="matrix" id="matrixGrid"></div>
-
-      <div class="sechead">
-        <h2>映射编辑</h2>
-        <span class="note">下拉即改即生效，改完不用跳页、不用重启服务</span>
-      </div>
-      <!-- 目录出处：实时 / 上次成功的快照 / 内置兜底——三者的可信度不同，
-           不标出来就无法判断这份目录该不该信（v1.0.71 实测同一渠道能拿到两份不一致的目录） -->
-      <div id="catSource" class="catsrc dim">模型目录：未拉取过，点「刷新模型列表」获取</div>
-      <div class="editor" id="mapPanel">
-        <div class="edhead">
-          <div class="mono-badge" id="mapBadge">—</div>
-          <div>
-            <h3 id="mapTitle">路由表 · 模型映射</h3>
-            <div class="sub" id="mapSub">四档全部指向本渠道自己的模型名</div>
-          </div>
-          <span class="spacer"></span>
-        </div>
-        <div class="edgrid">
-          <div class="edmain">
-            <table class="route">
-              <thead>
-                <tr><th style="width:34%">Claude 档位</th><th style="width:38%">目标模型</th><th>界面显示名</th></tr>
-              </thead>
-              <tbody id="routeBody"></tbody>
-            </table>
-          </div>
-          <aside class="edaside">
-            <h4>须知</h4>
-            <!-- 该渠道的接线后说明（清单 wireHint 已退役，这里留给渲染层按渠道生成） -->
-            <div class="note-b" id="patchHint"></div>
-            <div class="fpline"><span class="k">本渠道中转</span><span class="v"><span id="hintRelayPort"></span></span></div>
-          </aside>
-        </div>
-        <div class="edfoot">
-          <button class="btn sm" id="btnSave" type="button">保存映射</button>
-          <button class="btn sm ghost" id="btnTest" type="button">测试连通</button>
-          <button class="btn sm ghost" id="btnModels" type="button" title="从上游 /v1/models 拉取当前真实模型目录，更新下拉框">刷新模型列表</button>
-          <!-- 能力探测（v1.0.74 T3+T6）：默认隐藏，只有清单里声明了 capabilityProbe
-               的渠道才显示（providers.js 是渠道数据的单一事实源，渲染层不认识渠道名）。 -->
-          <button class="btn sm ghost" id="btnProbe" type="button" title="对免费模型逐个发一次真实请求，实测「能不能调通 / 支不支持工具 / 收不收图片」。只探免费模型、并发 2、每个 10 秒；付费模型一次都不探。">检测可用性</button>
-          <button class="btn sm ghost" id="btnResetModels" type="button" title="恢复为发布机默认的模型清单">恢复默认模型</button>
-          <label class="checks"><input type="checkbox" id="ckAllTiers">测全部四档</label>
-          <span class="spacer"></span>
-        </div>
-        <div class="result" id="testResult"></div>
       </div>
 
       <!-- 诊断抽屉（默认折叠）：只呈现本机当前已知问题，没有观察到失败就显示「没有观察到失败」。
@@ -226,24 +179,90 @@
       </section>
     </section>
 
-    <!-- ===================== 视图 2：凭据 ===================== -->
-    <section class="view" id="viewCred">
-      <div class="sechead">
-        <h2>凭据</h2>
-        <span class="note">八家渠道 + 一个交还区，各要的东西不一样，这里一次看全 · 点一行展开</span>
-      </div>
-      <div class="panelbox">
-        <div class="pb-head">
-          <h3>凭据</h3>
-          <span class="sub">只有指纹，没有明文</span>
+    <!-- ===================== 视图 2：渠道（主从布局） =====================
+         左边一列渠道（名字 + 状态药丸 + 用量小条），右边是选中那家的全部内容：
+         映射编辑 / 凭据 / 须知 / 中转端口。
+         「改一家不用滚」——改谁点谁，右栏立刻换成谁，不用在一屏里上下找。
+
+         ⚠ 两个契约 id 换了位置，**名字一个字都没改**（契约只许加不许改）：
+           · #matrixGrid —— 原先是总览屏的 4×2 渠道矩阵，现在承载**左栏渠道一览**
+             （矩阵那种「一格一家」的信息密度正是这一轮要拆掉的东西）。
+           · #viewCred —— 原先是凭据屏的容器，现在承载右栏里的**凭据区块**
+             （凭据屏本身已并入本屏，见 docs/ui-redesign.md §1 的关键决定）。 -->
+    <section class="view" id="viewChannels">
+      <div class="chan-split">
+        <!-- 左栏：渠道一览。行由渲染层按清单 + 状态层生成。 -->
+        <aside class="chan-rail">
+          <div class="sechead">
+            <h2>渠道</h2>
+            <span class="note">点一家，右边改它</span>
+          </div>
+          <div id="matrixGrid" class="chan-list"></div>
+        </aside>
+
+        <div class="chan-detail">
+          <!-- 选中那家的抬头：名字 / 状态 / 标签。 -->
+          <div id="chanHead" class="chan-head"></div>
+
+          <!-- 目录出处：实时 / 上次成功的快照 / 内置兜底——三者的可信度不同，
+               不标出来就无法判断这份目录该不该信（v1.0.71 实测同一渠道能拿到两份不一致的目录） -->
+          <div id="catSource" class="catsrc dim">模型目录：未拉取过，点「刷新模型列表」获取</div>
+          <div class="editor" id="mapPanel">
+            <div class="edhead">
+              <div class="mono-badge" id="mapBadge">—</div>
+              <div>
+                <h3 id="mapTitle">路由表 · 模型映射</h3>
+                <div class="sub" id="mapSub">四档全部指向本渠道自己的模型名</div>
+              </div>
+              <span class="spacer"></span>
+            </div>
+            <div class="edgrid">
+              <div class="edmain">
+                <table class="route">
+                  <thead>
+                    <tr><th style="width:34%">Claude 档位</th><th style="width:38%">目标模型</th><th>界面显示名</th></tr>
+                  </thead>
+                  <tbody id="routeBody"></tbody>
+                </table>
+              </div>
+              <aside class="edaside">
+                <h4>须知</h4>
+                <!-- 该渠道的接线后说明（清单 wireHint 已退役，这里留给渲染层按渠道生成） -->
+                <div class="note-b" id="patchHint"></div>
+                <div class="fpline"><span class="k">本渠道中转</span><span class="v"><span id="hintRelayPort"></span></span></div>
+              </aside>
+            </div>
+            <div class="edfoot">
+              <button class="btn sm" id="btnSave" type="button">保存映射</button>
+              <button class="btn sm ghost" id="btnTest" type="button">测试连通</button>
+              <button class="btn sm ghost" id="btnModels" type="button" title="从上游 /v1/models 拉取当前真实模型目录，更新下拉框">刷新模型列表</button>
+              <!-- 能力探测（v1.0.74 T3+T6）：默认隐藏，只有清单里声明了 capabilityProbe
+                   的渠道才显示（providers.js 是渠道数据的单一事实源，渲染层不认识渠道名）。 -->
+              <button class="btn sm ghost" id="btnProbe" type="button" title="对免费模型逐个发一次真实请求，实测「能不能调通 / 支不支持工具 / 收不收图片」。只探免费模型、并发 2、每个 10 秒；付费模型一次都不探。">检测可用性</button>
+              <button class="btn sm ghost" id="btnResetModels" type="button" title="恢复为发布机默认的模型清单">恢复默认模型</button>
+              <label class="checks"><input type="checkbox" id="ckAllTiers">测全部四档</label>
+              <span class="spacer"></span>
+            </div>
+            <div class="result" id="testResult"></div>
+          </div>
+
+          <div class="panelbox" id="viewCred">
+            <div class="pb-head">
+              <h3>凭据</h3>
+              <span class="sub">只有指纹，没有明文</span>
+            </div>
+            <!-- 九行（八家渠道 + 交还区），一行一家：**手风琴** ——
+                 收起时那行就带着状态药丸（坏消息不许藏起来），点开才展开细的。
+                 行由渲染层按清单 credential.kind 分派生成；apiKey 给输入框、
+                 jwt·jobToken 给状态+重取、keys3 给三行指纹。
+                 ⚠ 主从布局下这一块住在**右栏**：左栏是渠道一览，右栏是选中那家的详情。
+                   凭据屏退役后，老 hash（#/cred）重定向到这一屏（见 panel-common.js 的
+                   viewFromHash）：不 404、也不留死链。 -->
+            <div id="credList"></div>
+          </div>
+          <p class="hintline">页面任何位置都不回显密钥明文，只显示指纹；明文只落在本机 config.json。</p>
         </div>
-        <!-- 九行（八家渠道 + 交还区），一行一家：**手风琴** ——
-             收起时那行就带着状态药丸（坏消息不许藏起来），点开才展开细的。
-             行由渲染层按清单 credential.kind 分派生成；apiKey 给输入框、
-             jwt·jobToken 给状态+重取、keys3 给三行指纹。 -->
-        <div id="credList"></div>
       </div>
-      <p class="hintline">页面任何位置都不回显密钥明文，只显示指纹；明文只落在本机 config.json。</p>
     </section>
 
     <!-- ===================== 视图 3：故障转移 ===================== -->
@@ -311,6 +330,16 @@
       <div class="sechead">
         <h2>额度</h2>
         <span class="note">每家还剩多少、还能用多久 · 探不到就明说探不到</span>
+      </div>
+    </section>
+
+    <!-- ===================== 视图 6：流量 =====================
+         P4：按天的花费与用量、谁在扛请求、哪些会话粘在哪一家。
+         卡片（cards/traffic-page.js）自建盒子，挂在这一屏末尾。 -->
+    <section class="view" id="viewTraffic">
+      <div class="sechead">
+        <h2>流量</h2>
+        <span class="note">按天的花费与用量 · 谁在扛请求 · 会话粘在谁身上</span>
       </div>
     </section>
 

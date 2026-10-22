@@ -511,6 +511,44 @@
   /* ======================================================================
    * 3. 清单 / 视图表 / 选中渠道
    * ==================================================================== */
+  /* ---------- 渠道状态层（/api/channels/state）的**共享一份** ----------
+   *
+   * 为什么要共享：这个端点给出六态 + used/limit/ratio，总览的热力图卡、
+   * 状态条卡、渠道页左栏都要它。**各自拉就是三份**——同一个端点被请求三次，
+   * 而且三份数据可能来自三个时刻（同屏显示的状态对不上，就是这么来的）。
+   *
+   * 所以这里拉一份放进缓存，三处都从缓存读。
+   * 缓存**只新鲜 5 秒**：状态层本身探上游有 5 分钟缓存，再短也没用；
+   * 而 5 秒足够让轮询（也是 5 秒一轮）拿到新的一份。
+   */
+  let chanStates = null;         // { channels: [...] } —— 最近一次读到的
+  let chanStatesAt = 0;          // 读到的时刻（ms）
+  let chanStatesPending = null;  // 在途的请求（防并发重复拉）
+
+  const CHAN_STATES_TTL_MS = 5000;
+
+  async function loadChanStates(force) {
+    const now = Date.now();
+    if (!force && chanStates && now - chanStatesAt < CHAN_STATES_TTL_MS) return chanStates;
+    if (chanStatesPending) return chanStatesPending;      // 已有在途的，排队等它
+    chanStatesPending = (async () => {
+      try {
+        const r = await api("/api/channels/state");
+        if (r && r.ok === false) throw new Error(r.error || "状态层读不到");
+        chanStates = r || null;
+        chanStatesAt = Date.now();
+      } catch (e) {
+        /* 读不到就**保留上一份**（可能已过期但仍是最后已知的真相），
+           不把整表清空——清空会让左栏整列变成「探不到」，比显示旧值更糟。 */
+        console.warn("[chanStates] 读状态层失败", e && e.message);
+      } finally {
+        chanStatesPending = null;
+      }
+      return chanStates;
+    })();
+    return chanStatesPending;
+  }
+
   const MANIFEST = window.BAI_PROVIDERS || {};
   const VIEWS = Array.isArray(window.BAI_VIEWS) ? window.BAI_VIEWS : [];
   const ALL_KEYS = Object.keys(MANIFEST).filter((k) => MANIFEST[k]);
@@ -571,13 +609,25 @@
   }
 
   /* ======================================================================
-   * 4. 视图切换（URL hash：#/console · #/cred · #/fo · #/settings）
-   * ==================================================================== */
+   * 4. 视图切换（URL hash：#/console · #/channels · #/fo · #/settings · #/quota）
+   *
+   * 老 hash 别名：**凭据屏已并入渠道屏**（docs/ui-redesign.md §1 的关键决定），
+   * 但老链接（书签、外部文档）还指向 #/cred。所以这里留一张别名表：
+   * 命中别名就落到新屏去，**不 404、也不留死链**。
+   *
+   * ⚠ 别名只认**旧段名**这一个方向：新段名（channels）永远落到自己。
+   *   反过来把 channels 指向 cred 会在下一轮再退役时又断一次。
+   */
+  const LEGACY_VIEW_ALIAS = { cred: "channels" };
   let currentView = (VIEWS[0] || {}).id || null;
   function viewFromHash() {
     const raw = String(location.hash || "").replace(/^#\/?/, "").trim();
     const hit = VIEWS.find((v) => v && v.id === raw);
-    return hit ? hit.id : ((VIEWS[0] || {}).id);
+    if (hit) return hit.id;
+    /* 老段名 → 新屏。找不到对应的新屏（清单还没改完）时退回首屏，不空白。 */
+    const alias = LEGACY_VIEW_ALIAS[raw];
+    if (alias && VIEWS.some((v) => v && v.id === alias)) return alias;
+    return ((VIEWS[0] || {}).id);
   }
   function viewOf(id) { return VIEWS.find((v) => v && v.id === id) || null; }
 
@@ -839,156 +889,92 @@
    * ==================================================================== */
   const primaryText = (key) => `一键接入 ${nameOf(key)}`;
 
-  function buildMatrix() {
-    const grid = $("matrixGrid");
-    if (!grid) return;
-    grid.innerHTML = "";
+  /* 左栏：渠道一览。**一行一家**——名字 + 状态药丸 + 一个用量小条。
+   *
+   * 为什么不再画 4×2 的矩阵格子：格子把「这家是谁」「能不能用」「映射到哪个模型」
+   * 「中转口是多少」挤在一张卡里，八家排下来要滚一屏半，而其中三样在选中之后
+   * 才有用。左栏只留「选谁」需要的三样，其余全进右栏（改一家不用滚）。
+   *
+   * 状态药丸走**服务端状态层**（/api/channels/state 的六态，与总览热力图同源），
+   * 用量小条同源取 ratio —— 这样同一个渠道在总览与渠道页显示的是同一份事实，
+   * 而不是两套各算各的。
+   */
+  function buildChanList() {
+    const list = $("matrixGrid");
+    if (!list) return;
+    list.innerHTML = "";
     for (const key of chainOf().length ? chainOf() : CHAIN_KEYS) {
-      grid.appendChild(cellFor(key));
+      list.appendChild(chanRowFor(key));
     }
-    for (const key of HANDOFF_KEYS) grid.appendChild(cellFor(key));
-    grid.appendChild(chainCell());
-    paintMatrix();
+    paintChanList();
   }
 
-  function cellFor(key) {
+  function chanRowFor(key) {
     const P = MANIFEST[key] || {};
-    const el = document.createElement("div");
-    el.className = "cell";
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = "chan-row";
     el.dataset.k = key;
-    el.setAttribute("role", "button");
-    el.tabIndex = 0;
     el.innerHTML = `
-      <div class="celltop">
-        <span class="letter">${esc(P.letter || "")}</span>
-        <span class="cbadge ${esc((P.badge || {}).kind || "neutral")}">${esc((P.badge || {}).text || "")}</span>
-      </div>
-      <div class="cname">${esc(nameOf(key))}${P.path ? `<span class="cpath">${esc(P.path)}</span>` : ""}</div>
-      <div class="ctag">${esc(P.tagline || "")}</div>
-      ${P.tierBadge === true ? '<div class="ctier"></div>' : ""}
-      ${P.caveat ? `<div class="ccaveat" title="${esc(P.caveat)}">⚠ ${esc(P.caveat)}</div>` : ""}
-      <div class="cmap"></div>
-      <div class="crelay"></div>
-      <div class="cfoot"></div>`;
-    el.addEventListener("click", (e) => {
-      if (e.target.closest("button")) return;
-      selectChannel(key);
-    });
-    el.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectChannel(key); }
-    });
+      <span class="letter">${esc(P.letter || "")}</span>
+      <span class="cr-name">${esc(nameOf(key))}</span>
+      <span class="cr-meter" data-role="meter"></span>
+      <span class="cr-state" data-role="state"></span>`;
+    el.addEventListener("click", () => selectChannel(key));
     return el;
   }
 
-  function chainCell() {
-    const el = document.createElement("div");
-    el.className = "cell chaincell";
-    el.dataset.k = "__chain";
-    el.innerHTML = `
-      <div class="celltop"><span class="letter">FO</span><span class="cbadge neutral">顺序</span></div>
-      <div class="cname">故障转移链</div>
-      <div class="ctag">额度用光或上游挂掉时，中转按这个顺序自己换人</div>
-      <div class="chainlist"></div>
-      <div class="cfoot"><button class="btn sm ghost" type="button" data-go="fo">调整顺序 →</button></div>`;
-    const btn = q("button", el);
-    if (btn) btn.addEventListener("click", () => setView("fo"));
-    return el;
-  }
-
-  function paintMatrix() {
-    const grid = $("matrixGrid");
-    if (!grid) return;
-    for (const el of qa(".cell", grid)) {
+  /* 左栏重画：状态药丸 + 用量小条。
+   *
+   * 数据来自**服务端状态层**（/api/channels/state）：六态 + used/limit/ratio。
+   * 为什么不用渲染层自己算的那套（channelState）：那套只有四态、且「预算用完」
+   * 与「上游不可用」都落在 err 上，跟总览的热力图对不上——同一渠道在两屏显示
+   * 两种状态，正是改版原则 1（状态是数据，不是一处一处重算）要消灭的东西。
+   *
+   * 探不到就画「—」，**不画 0**：0 会被读成「额度用完了」。
+   */
+  function paintChanList() {
+    const list = $("matrixGrid");
+    if (!list) return;
+    const byKey = {};
+    for (const c of ((chanStates && chanStates.channels) || [])) {
+      if (c && c.key) byKey[c.key] = c;
+    }
+    for (const el of qa(".chan-row", list)) {
       const key = el.dataset.k;
-      if (hasBusyIn(el)) continue;          // 这格里有按钮正在动作，别把它重建掉
-      if (key === "__chain") {
-        const box = q(".chainlist", el);
-        if (box) {
-          const f = (status && status.failover) || {};
-          const list = chainOf();
-          box.innerHTML = !list.length
-            ? '<span class="dim">转移链为空</span>'
-            : list.map((k, i) => {
-              const st = channelState(k);
-              return `<span class="chitem"><i class="dot ${st.s}"></i><b>${i + 1}</b> ${esc(nameOf(k))}</span>`;
-            }).join("") + (f.enabled ? "" : '<span class="chainoff">当前已关闭</span>');
-        }
-        continue;
-      }
-      const st = channelState(key);
-      el.dataset.state = st.s;
+      if (!key) continue;
       clsx(el, key === selected, "sel");
-      const P = MANIFEST[key] || {};
-      /* 档位徽章（v1.0.74 T4）：只有清单声明 tierBadge 的渠道才画这一格，
-       * 档位本身由 /api/status 的 tier* 字段给出——渲染层不认识任何渠道名（C11）。
-       * 两档可用性完全不同（免费档走直连会被拒 / Go 档需订阅），
-       * 不显著标出来用户就不知道自己用的是哪一档。 */
-      const cti = q(".ctier", el);
-      if (cti) {
-        const S2 = stOf(key);
-        const label = S2.tierLabel || "";
-        const needSub = S2.goSubRequired === true;
-        if (!label) {
-          cti.innerHTML = "";
-        } else {
-          const cls = needSub ? "err" : (S2.tier === "go" ? "ok" : "warn");
-          cti.innerHTML = `<span class="tb ${cls}" title="${esc(S2.tierHint || "")}">`
-            + `${needSub ? "需订阅 Go" : esc(label)}</span>`
-            + (needSub ? '<span class="dim tb-note">上游已确认缺订阅</span>' : "");
-        }
+      const c = byKey[key] || null;
+      const st = c ? channelStateOf(c) : null;
+      const stateBox = q('[data-role="state"]', el);
+      if (stateBox) {
+        stateBox.innerHTML = st
+          ? `<span class="pill ${st.tone}" title="${esc(st.reason || "")}">${esc(st.text)}</span>`
+          : '<span class="pill idle" title="状态探不到">探不到</span>';
       }
-      const cm = q(".cmap", el);
-      if (cm) {
-        if (P.chainable !== true) {
-          cm.innerHTML = '<span class="dim">配置交还给它，它自己管端口与凭据</span>';
-        } else {
-          const C = cfgOf(key);
-          const map = C.mapping || {};
-          /* 正在用的那一档旁边补「实际服务的模型」（v1.0.78 T9）。servedNote 只在
-             served 与 target 不一致时吐字——正常路径与改动前**逐字一致**。 */
-          const R = (stOf(key).recent) || null;
-          cm.innerHTML = TIERS.map((t) => {
-            const m = map[t.key] || {};
-            return `<span class="mrow"><i class="t">${esc(t.short)}</i><i class="v">${esc(m.label || m.target || "未设")}</i>${R && R.tier === t.key ? servedNote(R) : ""}</span>`;
-          }).join("");
-        }
-      }
-      const cr = q(".crelay", el);
-      if (cr) {
-        if (P.chainable !== true) {
-          /* 交还区格子：把「它在跑」和「它已经把配置换掉了」分开显示。
-           * 后者是红色的——那一格的语义本来就是「配置交还给它」，被接管不是异常，
-           * 但**你可能不知道**，所以必须说。 */
-          const own = (status && status.ccswitch && status.ccswitch.cli) || null;
-          if (own && own.state === "taken-over") {
-            const who = own.writer === "ccswitch" ? "CC Switch" : "其它程序";
-            cr.innerHTML = `<span class="rl err" title="${esc("本路由台于 " + (own.at || "?") + " 写入的配置在 " + (own.writtenAt || "?") + " 被换掉，现在 CLI 连的是 " + (own.currentBaseUrl || "空") + "。判据：" + (own.evidence || ""))}">已被 ${esc(who)} 接管</span>`;
-          } else if (status && status.ccswitch && status.ccswitch.running) {
-            cr.innerHTML = '<span class="rl warn">正在运行</span>';
-          } else {
-            cr.innerHTML = '<span class="rl idle">未运行</span>';
-          }
-        } else {
-          const C = cfgOf(key);
-          cr.innerHTML = `<span class="rl">中转 :${C.relayPort || "—"}</span><span class="rl2">${esc((P.credential || {}).label || "")}</span>`;
-        }
-      }
-      const foot = q(".cfoot", el);
-      if (foot) {
-        if (P.chainable !== true) {
-          foot.innerHTML = `<button class="btn sm" type="button" data-act="restore">接回 ${esc(nameOf(key))}</button>`;
-        } else {
-          foot.innerHTML = `<button class="btn sm primary" type="button" data-act="apply" ${st.s === "idle" ? "disabled" : ""}>${esc(primaryText(key))}</button>`
-            + `<span class="cstate ${st.s}">${esc(st.txt)}</span>`;
-        }
-        const btn = q("button", foot);
-        if (btn) btn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          if (btn.dataset.act === "apply") applyChannel(key);
-          else restoreExternal();
-        });
+      const meterBox = q('[data-role="meter"]', el);
+      if (meterBox) {
+        /* ratio 是百分比（0–100），meter 收的是比例（0–1）——除以 100 别忘了，
+         * 忘了就会画成满格（10% 显示成 1000%）。 */
+        const r = c && typeof c.ratio === "number" ? c.ratio : null;
+        meterBox.innerHTML = r == null
+          ? '<span class="cr-meter-empty" title="探不到用量">—</span>'
+          : `<span class="cr-meter-bar"><i class="cr-meter-fill" style="width:${Math.max(0, Math.min(100, r)).toFixed(1)}%"></i></span>`;
+        meterBox.title = c && c.used != null && c.limit != null
+          ? `已用 ${c.used} / ${c.limit}`
+          : "探不到用量";
       }
     }
+  }
+
+  /* 服务端六态 → 面板显示用的 {text, tone, reason}。
+   * tone 直接复用语义色（ok/warn/err/idle），所以两屏的同一个渠道是同一个颜色。
+   */
+  function channelStateOf(c) {
+    const s = String((c && c.state) || "unknown");
+    const tone = { ok: "ok", cooling: "warn", resting: "warn", exhausted: "err", unconfigured: "idle", unknown: "idle" }[s] || "idle";
+    const text = { ok: "可用", cooling: "冷却中", resting: "休息中", exhausted: "预算用完", unconfigured: "未配置", unknown: "状态不明" }[s] || "状态不明";
+    return { s, tone, text, reason: String((c && c.reason) || "") };
   }
 
   /* ======================================================================
@@ -2248,7 +2234,7 @@
     cfg = await api("/api/config");
     renderRoute();
     renderSys();
-    paintMatrix();
+    paintChanList();
   }
 
   async function poll() {
@@ -2280,10 +2266,13 @@
     try {
       const s = await api("/api/status");
       status = s;
+      /* 状态层与状态带**并行**拉：它俩互不依赖，串行会把首屏多等一个来回。
+         拉完再画左栏（药丸与用量条都出自它）。 */
+      await loadChanStates();
       if (!selected) { pickInitial(s); applySelectionUi(); loadCatalogSource(); }
       paintBand(s);
       paintBadges(s);
-      paintMatrix();
+      paintChanList();
       repaintCredPills();
       buildDiag();
       renderSys();
@@ -2341,9 +2330,63 @@
     if (t) t.textContent = selected ? nameOf(selected) : "路由台";
     renderRoute();
     renderSys();
-    paintMatrix();
+    paintChanList();
+    paintChanHead();
     paintCredList();
     buildDiag();
+  }
+
+  /* 右栏抬头：**这一家是谁** + 一眼要到的三样（徽章 / 档位 / 中转口）。
+   *
+   * 为什么抬头要有中转口：改一家的时候最常问的是「我改的是哪一路」——
+   * 端口不在眼前的话，改错一路的概率不低（八家各有各的端口）。
+   */
+  function paintChanHead() {
+    const box = $("chanHead");
+    if (!box) return;
+    const key = selected;
+    if (!key) { box.innerHTML = ""; return; }
+    const P = MANIFEST[key] || {};
+    const S = stOf(key);
+    const C = cfgOf(key);
+    const badge = P.badge || {};
+    const bits = [];
+    /* 档位徽章（v1.0.74 T4）：只有清单声明 tierBadge 的渠道才有。
+       两档可用性完全不同（免费档被封 / Go 档需订阅），不显著标出来用户就
+       不知道自己站在哪一档上。档位本身来自 /api/status，渲染层不认渠道名（C11）。 */
+    if (P.tierBadge === true && S.tierLabel) {
+      const needSub = S.goSubRequired === true;
+      const cls = needSub ? "err" : (S.tier === "go" ? "ok" : "warn");
+      bits.push(`<span class="chh-tier tb ${cls}" title="${esc(S.tierHint || "")}">`
+        + `${needSub ? "需订阅 Go" : esc(S.tierLabel)}</span>`);
+    }
+    if (P.caveat) {
+      bits.push(`<span class="chh-caveat" title="${esc(P.caveat)}">⚠ ${esc(P.caveat)}</span>`);
+    }
+    const relay = (P.chainable === true) ? (C.relayPort || "—") : "—";
+    /* 「接通这家」按钮：4×2 矩阵退役后，矩阵格子里那个「一键接入 X」按钮
+       没了宿主 —— 不补回来的话，用户就没有「只接通这一家」的办法了
+       （状态带上的「一键最优」是另一回事：它自己挑一家，不问你选谁）。 */
+    const canApply = P.chainable === true;
+    const st = canApply ? channelState(key) : null;
+    box.innerHTML = `
+      <div class="chh-main">
+        <span class="letter">${esc(P.letter || "")}</span>
+        <span class="chh-name">${esc(nameOf(key))}</span>
+        ${badge.text ? `<span class="cbadge ${esc(badge.kind || "neutral")}">${esc(badge.text)}</span>` : ""}
+        ${bits.join("")}
+        <span class="chh-relay" title="这一路的中转端口">中转 :${esc(relay)}</span>
+        ${canApply
+          ? `<button class="btn sm primary chh-apply" type="button" data-act="apply" ${st && st.s === "idle" ? "disabled" : ""}>${esc(primaryText(key))}</button>`
+          : `<button class="btn sm chh-apply" type="button" data-act="restore">接回 ${esc(nameOf(key))}</button>`}
+      </div>
+      <div class="chh-sub">${esc(P.tagline || "")}</div>`;
+    const btn = q("button[data-act]", box);
+    if (btn) btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (btn.dataset.act === "apply") applyChannel(key);
+      else restoreExternal();
+    });
   }
 
   function selectChannel(key) {
@@ -2351,10 +2394,10 @@
     selected = key;
     clearDirtyInputs();      // 换渠道 = 换一份配置，未保存的半截字不带过去
     applySelectionUi();
-    const cell = q(`.cell[data-k="${CSS.escape(key)}"]`, $("matrixGrid"));
-    if (cell) {
-      cell.classList.add("flash");
-      cell.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    const row = q(`.chan-row[data-k="${CSS.escape(key)}"]`, $("matrixGrid"));
+    if (row) {
+      row.classList.add("flash");
+      row.scrollIntoView({ block: "nearest", behavior: "smooth" });
     }
     refreshCards();
     /* 换渠道时也把目录出处拉一次。不能只在点「刷新模型列表」后才显示出处——
@@ -2526,6 +2569,9 @@
     CATALOG_TIMEOUT_MS, SCAN_ALL_TIMEOUT_MS, OR_REFRESH_TIMEOUT_MS,
     $, q, qa, api, postJSON, showInfo, showResult, setLed, withBusy, poll, refreshConfig,
     renderRoute, selectChannel, setView, fp, registerCapture,
+    /* 渠道状态层的**共享读法**（见上面 loadChanStates 的注释）：
+       卡片改读它，三处共用一份数据，而不是各自拉同一个端点。 */
+    loadChanStates,
   };
 
   function loadScript(src, ms) {
@@ -2602,7 +2648,7 @@
     applyTextOrNull("h1Text", selected ? nameOf(selected) : "路由台");
 
     setView(viewFromHash(), false);
-    buildMatrix();
+    buildChanList();
     buildCredList();
     wireTheme();
     wireWindowCtrls();
@@ -2614,8 +2660,8 @@
     wireFooter();
     setTimeout(() => {
       if (selected && fromPath) {
-        const cell = q(`.cell[data-k="${CSS.escape(selected)}"]`, $("matrixGrid"));
-        if (cell) { cell.scrollIntoView({ block: "center", behavior: "smooth" }); cell.classList.add("flash"); }
+        const row = q(`.chan-row[data-k="${CSS.escape(selected)}"]`, $("matrixGrid"));
+        if (row) { row.scrollIntoView({ block: "center", behavior: "smooth" }); row.classList.add("flash"); }
       }
     }, 350);
 

@@ -89,11 +89,11 @@ app.whenReady().then(async () => {
 
   // ① 点矩阵卡切换选中
   {
-    const before = await js(win, `document.querySelector("#matrixGrid .cell.sel")?.dataset.k`);
-    await js(win, `document.querySelector('.cell[data-k="bai"]').click(); 1`);
+    const before = await js(win, `document.querySelector("#matrixGrid .chan-row.sel")?.dataset.k`);
+    await js(win, `document.querySelector('.chan-row[data-k="bai"]').click(); 1`);
     await sleep(500);
     const after = await js(win, `({
-      sel: document.querySelector("#matrixGrid .cell.sel")?.dataset.k,
+      sel: document.querySelector("#matrixGrid .chan-row.sel")?.dataset.k,
       title: document.getElementById("mapTitle")?.textContent,
       badge: document.getElementById("mapBadge")?.textContent,
       h1: document.getElementById("h1Text")?.textContent,
@@ -145,7 +145,7 @@ app.whenReady().then(async () => {
 
   // ④ 恢复默认模型（有 defaultModels 的渠道才有按钮）
   {
-    await js(win, `document.querySelector('.cell[data-k="qd"]').click(); 1`);
+    await js(win, `document.querySelector('.chan-row[data-k="qd"]').click(); 1`);
     await sleep(400);
     const visQd = await js(win, `(() => { const b=document.getElementById("btnResetModels"); return { show: getComputedStyle(b).display !== "none", disabled: b.disabled }; })()`);
     await js(win, `document.getElementById("btnResetModels").click(); 1`);
@@ -155,18 +155,18 @@ app.whenReady().then(async () => {
     rec("恢复默认模型（Qoder → lite）", /恢复默认模型/.test(res || "") && JSON.stringify(c?.qd?.availableModels) === '["lite"]',
       `${String(res).split("\n")[0]} | 配置 qd.availableModels=${JSON.stringify(c?.qd?.availableModels)}`);
     // 换到没有 defaultModels 的渠道，那个按钮必须消失
-    await js(win, `document.querySelector('.cell[data-k="bai"]').click(); 1`);
+    await js(win, `document.querySelector('.chan-row[data-k="bai"]').click(); 1`);
     await sleep(500);
     const visBai = await js(win, `(() => { const b=document.getElementById("btnResetModels"); return { show: getComputedStyle(b).display !== "none", disabled: b.disabled }; })()`);
     rec("  ↳ 无 defaultModels 的渠道应隐藏该按钮", visBai.show === false && visQd.show === true,
       `Qoder 时可见=${visQd.show}；B.AI 时可见=${visBai.show}`);
-    await js(win, `document.querySelector('.cell[data-k="qd"]').click(); 1`);
+    await js(win, `document.querySelector('.chan-row[data-k="qd"]').click(); 1`);
     await sleep(400);
   }
 
   // ⑤ 测试连通（沙箱无凭据 → 必须**如实报错**，不能假成功）
   {
-    await js(win, `document.querySelector('.cell[data-k="bai"]').click(); 1`);
+    await js(win, `document.querySelector('.chan-row[data-k="bai"]').click(); 1`);
     await sleep(500);
     /* 整段在**一次** executeJavaScript 里跑：点按钮、看它有没有进 disabled、
        再轮询结果行。把"点击"和"读 before"拆成两次往返，中间那几毫秒里
@@ -219,11 +219,15 @@ app.whenReady().then(async () => {
   }
 
   // ⑦ 一键接入（无凭据 → 服务端 400，页面必须优雅呈现而不是崩溃）
+  //    主从布局下「接通这家」在**右栏抬头**（跟着当前选中的那家走），
+  //    而左栏是渠道列表 —— 所以这里先选谁，接通的就是谁。
   {
-    await js(win, `document.querySelector('.cell[data-k="sn"]').click(); 1`);
+    await js(win, `document.querySelector('.chan-row[data-k="sn"]').click(); 1`);
     await sleep(400);
-    const dis = await js(win, `document.querySelector('.cell[data-k="sn"] .cfoot button').disabled`);
-    await js(win, `document.querySelector('.cell[data-k="bai"] .cfoot button').click(); 1`);
+    const dis = await js(win, `document.querySelector('#chanHead .chh-apply').disabled`);
+    await js(win, `document.querySelector('.chan-row[data-k="bai"]').click(); 1`);
+    await sleep(400);
+    await js(win, `document.querySelector('#chanHead .chh-apply').click(); 1`);
     await sleep(2500);
     const res = await js(win, `document.getElementById("applyResult").textContent`);
     rec("一键接入 B.AI（走 /api/apply）", /已接入|请先|出错了|失败/.test(res || ""), String(res).split("\n")[0]);
@@ -263,7 +267,7 @@ app.whenReady().then(async () => {
   }
 
   console.log("\n══════ 凭据视图 ══════");
-  await js(win, `document.querySelector('#navViews [data-view="cred"]').click(); 1`);
+  await js(win, `document.querySelector('#navViews [data-view="channels"]').click(); 1`);
   await sleep(1200);
 
   // ⑪ API Key 输入 + 保存 + 显示/隐藏
@@ -440,7 +444,7 @@ app.whenReady().then(async () => {
     // bai 是平铺的那家：服务端 /api/config 明确不收它的 useProxy（走进程级 proxy），
     // 所以这里**不该**出现勾选框，出现就是骗用户。
     const flat = await js(win, `(async () => {
-      document.querySelector('.cell[data-k="bai"]').click();
+      document.querySelector('.chan-row[data-k="bai"]').click();
       await new Promise(r=>setTimeout(r,700));
       const ck = document.getElementById("ckUseProxy");
       const label = ck.closest("label");
@@ -465,7 +469,7 @@ app.whenReady().then(async () => {
 
     // 嵌套渠道（sn）：勾选框必须在，且 useProxy 真的能存进去
     const nested = await js(win, `(async () => {
-      document.querySelector('.cell[data-k="sn"]').click();
+      document.querySelector('.chan-row[data-k="sn"]').click();
       await new Promise(r=>setTimeout(r,800));
       const ck = document.getElementById("ckUseProxy");
       const shown = getComputedStyle(ck).display !== "none";
@@ -486,7 +490,12 @@ app.whenReady().then(async () => {
       const rows = Array.from(document.querySelectorAll("#setChannels tbody tr"));
       return { n: rows.length, sample: rows.slice(0,3).map(tr => Array.from(tr.children).map(td=>td.textContent.trim())) };
     })()`);
-    rec("设置：六家端口表渲染", r.n === 6, `${r.n} 行 · 例：${JSON.stringify(r.sample[0])}`);
+    /* ⚠ 不写死家数：出厂八家 + 插件渠道，家数会变（写死 6 是陈年断言，
+       渠道数一变它就永远红，脚本的信号就没了）。改成断言**每行都齐**：
+       名字与端口都不空。 */
+    const allFilled = r.sample.length > 0 && r.sample.every((row) => row[0] && row[1] && row[1].startsWith(":"));
+    rec("设置：端口表每行齐（名字 + 端口）", r.n >= 8 && allFilled,
+      `${r.n} 行 · 例：${JSON.stringify(r.sample[0])}`);
   }
 
   console.log("\n══════ 主题 / 视图 / 深链 ══════");
@@ -506,10 +515,10 @@ app.whenReady().then(async () => {
 
   // ㉑ hash 驱动视图切换 + 刷新保持
   {
-    await js(win, `document.querySelector('#navViews [data-view="cred"]').click(); 1`);
+    await js(win, `document.querySelector('#navViews [data-view="channels"]').click(); 1`);
     await sleep(800);
     const h = await js(win, `({ hash: location.hash, view: document.querySelector(".view.on")?.id })`);
-    rec("视图切换写 hash", /#\/cred/.test(h.hash || "") && h.view === "viewCred", `hash=${h.hash} 视图=${h.view}`);
+    rec("视图切换写 hash", /#\/channels/.test(h.hash || "") && h.view === "viewChannels", `hash=${h.hash} 视图=${h.view}`);
   }
 
   // ㉒ 深链：/workbuddy 自动选中
@@ -517,11 +526,11 @@ app.whenReady().then(async () => {
     await js(win, `location.href = "/workbuddy#/console"; 1`).catch(() => {});
     await sleep(3000);
     for (let i = 0; i < 40; i++) {
-      const ok = await js(win, `!!document.querySelector('#matrixGrid .cell.sel')`);
+      const ok = await js(win, `!!document.querySelector('#matrixGrid .chan-row.sel')`);
       if (ok === true) break;
       await sleep(250);
     }
-    const r = await js(win, `({ sel: document.querySelector('#matrixGrid .cell.sel')?.dataset.k, doc: document.title })`);
+    const r = await js(win, `({ sel: document.querySelector('#matrixGrid .chan-row.sel')?.dataset.k, doc: document.title })`);
     rec("深链 /workbuddy 自动选中并高亮", r.sel === "wb", `选中=${r.sel} 标题=${r.doc}`);
   }
 
@@ -530,7 +539,7 @@ app.whenReady().then(async () => {
     const r = await js(win, `(async () => {
       document.querySelector('#navViews [data-view="settings"]').click();
       await new Promise(r=>setTimeout(r,800));
-      document.querySelector('.cell[data-k="sn"]').click();
+      document.querySelector('.chan-row[data-k="sn"]').click();
       await new Promise(r=>setTimeout(r,800));
       const up = document.getElementById("fUpstream");
       up.focus();
