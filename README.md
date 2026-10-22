@@ -55,7 +55,7 @@ qd 15762 / or 15772 / wbai 15782 / mm 15792），Claude Code 连的是某一家�
 - 面板「故障转移」视图里有一张「统一网关」卡：当前模式、请求去向、网关端口、
   开关，以及各家能分到哪些档位。
 
-## 入口协议：Anthropic / Responses / Gemini（v1.0.95-beta.2 起）
+## 入口协议：Anthropic / Responses / Gemini（v1.0.95-beta.1 起）
 
 统一网关不只听得懂 Anthropic 的话。客户端说哪种话，网关就把它翻成 Anthropic 形状
 交给那家的中转 —— **翻完之后与 Anthropic 那条路完全一样**（一样的模型解析、一样的
@@ -74,7 +74,7 @@ Gemini 的模型名在路径里，所以那一段要 URL 编码（`sn%2Fclaude-o
 Gemini 的 `cachedContent` / `safetySettings` 等）—— 静默丢字段会让模型看不到上一轮，
 还答得像模像样。
 
-## 插件渠道：一份 JSON 声明加一家渠道（v1.0.95-beta.2 起）
+## 插件渠道：一份 JSON 声明加一家渠道（v1.0.95-beta.1 起）
 
 把一份声明放进 `<数据目录>\plugins\*.json`，重启或在面板上点「重新扫描目录」：
 
