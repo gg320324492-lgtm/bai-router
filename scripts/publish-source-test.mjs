@@ -125,7 +125,15 @@ function simulatePublish(options = {}) {
       /* src/update-channel.js 同样是**纯函数模块**（不碰文件、不联网、不读环境变量），
        * 它只管「版本号算通道」这一个判据，所以直接用真的那份。 */
       if (name === "../src/update-channel.js") return require("../src/update-channel.js");
-      if (name === "./publish-proxy.cjs") return { decideProxyUse: () => ({ useProxy: false, reason: "fake probe" }), buildGhEnv: (env) => ({ ...env }), runDirectProbe: () => ({ ok: true }) };
+      /* ⚠ 这个桩必须**镜像真模块的导出** —— 少一个就是「真实发布入口」当场崩
+       * （publish.cjs 用 PROXY_ENV_KEYS 给候选 env 去重，桩里没有它就是 undefined.map）。
+       * 桩与真模块对不上时，先怀疑桩。 */
+      if (name === "./publish-proxy.cjs") return {
+        decideProxyUse: () => ({ useProxy: false, reason: "fake probe" }),
+        buildGhEnv: (env) => ({ ...env }),
+        runDirectProbe: () => ({ ok: true }),
+        PROXY_ENV_KEYS: ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "ALL_PROXY", "all_proxy"],
+      };
       throw new Error("unexpected dependency");
     },
   };
