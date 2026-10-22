@@ -63,6 +63,7 @@
       <button type="button" role="tab" data-view="cred">凭据</button>
       <button type="button" role="tab" data-view="fo">故障转移</button>
       <button type="button" role="tab" data-view="settings">设置</button>
+      <button type="button" role="tab" data-view="quota">额度</button>
     </nav>
 
     <div class="topright">
@@ -298,6 +299,16 @@
       <!-- 各渠道中转端口表 / 更新 / 数据目录：由渲染层填（底栏三键由 panel-common.js 注入） -->
       <div class="panelbox" id="setChannels">
         <div class="pb-head"><h3>各渠道中转端口</h3><span class="sub">Claude Code 实际连的就是这些端口</span></div>
+      </div>
+    </section>
+
+    <!-- ===================== 视图 5：额度 =====================
+         每家的额度、预算与休息状态。卡片（cards/quota-panel.js）自建盒子，
+         挂在这一屏末尾。 -->
+    <section class="view" id="viewQuota">
+      <div class="sechead">
+        <h2>额度</h2>
+        <span class="note">每家还剩多少、还能用多久 · 探不到就明说探不到</span>
       </div>
     </section>
 

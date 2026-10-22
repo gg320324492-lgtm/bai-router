@@ -134,6 +134,8 @@ import {
  * ⚠ 口令**绝不落盘**：远端那份是用口令加密的，密钥由用户每次输入。 */
 import { runSync, compareState } from "./sync.mjs";
 import { createTarget } from "./sync-targets.mjs";
+/* 配额真探测（quota-probe.mjs）：问上游「你还剩多少额度」。 */
+import { probeQuota } from "./quota-probe.mjs";
 /* 配置备份（backup.mjs）：快照 → 加密导出 → 导入还原。magpie 的 internal/backup
  * 与 internal/settings（KeepOwn）移植版。
  * ⚠ 备份里**有**真实凭据（那正是它的用处），所以导出必须带口令加密、
@@ -5770,6 +5772,111 @@ function localSyncParts(cfg) {
   };
 }
 
+/* ---------- 配额真探测（quota-probe.mjs 的接线）----------
+ *
+ * 问上游「你还剩多少额度」。magpie 走的是这条；本仓之前只有被动预算
+ * （拿账本里的数对照），看不见「在别处花掉的额度」。
+ *
+ * ⚠ **探测结果要缓存**：面板每 5 秒轮询一次，八家挨个发探测请求会把
+ *   上游打爆（而打爆的后果正是我们要避免的）。缓存 5 分钟。
+ * ⚠ **只读**：quota-probe.mjs 自己有硬闸（只发 GET/HEAD），这里再保证一次
+ *   —— 探测请求绝不能消耗额度或改状态。
+ */
+const PROBE_TTL_MS = 5 * 60 * 1000;
+let probeCache = { at: 0, map: new Map() };
+
+/** 这一家的凭据头（**只从配置里取**；本机登录态那几家的凭据由
+ *  account-discovery 提供，还没接上 —— 探不到就报「没有可用的登录态」，
+ *  那比拿一个错的凭据去撞 401 好）。 */
+function probeHeadersOf(provider, cfg) {
+  const S = sliceOf(cfg, provider);
+  if (!S) return {};
+  const key = String(S.key || "").trim();
+  if (!key) return {};
+  if (provider === "or") return { authorization: `Bearer ${key}` };
+  return { "x-api-key": key, authorization: `Bearer ${key}` };
+}
+
+/** 探一家的额度（带缓存）。探不到就是「探不到」，绝不猜。 */
+async function probeQuotaOf(provider, cfg, now) {
+  const hit = probeCache.map.get(provider);
+  if (hit && now - probeCache.at < PROBE_TTL_MS) return hit;
+  const bases = {};
+  for (const k of allChannelKeys()) {
+    const s = sliceOf(cfg, k);
+    bases[k] = s && s.upstream ? String(s.upstream).replace(/\/+$/, "") : "";
+  }
+  const get = async ({ url, method, headers }) => {
+    const r = await fetch(url, {
+      method: method === "HEAD" ? "HEAD" : "GET",
+      headers: { ...headers, "user-agent": "bai-router-quota-probe" },
+      signal: AbortSignal.timeout(8000),
+    });
+    let text = "";
+    try { text = await r.text(); } catch { }
+    return { status: r.status, text };
+  };
+  let out = null;
+  try {
+    out = await probeQuota(provider, {
+      now,
+      bases,
+      headers: (id) => probeHeadersOf(id, cfg),
+      get,
+    });
+  } catch (e) {
+    out = {
+      provider, known: false, used: null, limit: null, resetAtMs: null,
+      unit: "unknown", source: "", raw: null,
+      error: String((e && e.message) || e),
+    };
+  }
+  probeCache.map.set(provider, out);
+  return out;
+}
+
+/** 额度总览：预算（被动）+ 上游余额（真探测）+ 花费。 */
+async function quotaOverview(cfg, now) {
+  const states = budgetStates(cfg, now);
+  const table = restTable();
+  const rows = [];
+  for (const k of allChannelKeys()) {
+    const st = states.get(k) || null;
+    const S = sliceOf(cfg, k);
+    let budget = null;
+    try { budget = budgetOf(k, cfg); } catch { budget = null; }
+    const rest = (() => { try { return table.entry(k); } catch { return null; } })();
+    const probe = await probeQuotaOf(k, cfg, now);
+    rows.push({
+      key: k,
+      name: PROVIDERS[k] || (S && S.zh) || k,
+      /* ⚠ **没设预算就是没设**（budget 为 null）—— 别拿一个 limit=0 的状态去显示
+       *   「0 / 0（0%）」：那看着像「用完了」，其实这家根本没开预算。 */
+      budget: (budget && (budget.hourly != null || budget.daily != null)) ? {
+        used: st ? st.used : 0, limit: st ? st.limit : 0, ratio: st ? st.ratio : 0,
+        exhausted: !!(st && st.exhausted), resetAtMs: st ? (st.resetAtMs || 0) : 0,
+        hourly: budget.hourly != null ? budget.hourly : null,
+        daily: budget.daily != null ? budget.daily : null,
+        unit: budget.unit || "tokens",
+      } : null,
+      probe: {
+        known: !!probe.known,
+        used: probe.known ? probe.used : null,
+        limit: probe.known ? probe.limit : null,
+        resetAtMs: probe.known ? probe.resetAtMs : null,
+        unit: probe.unit || "unknown",
+        source: probe.source || "",
+        error: probe.known ? null : (probe.error || "探不到"),
+      },
+      resting: !!(rest && rest.until > now),
+      restUntil: rest ? rest.until : 0,
+      restNote: rest && rest.note ? String((rest.note && rest.note.label) || rest.note.kind || "") : "",
+      cooling: !failoverAvailable(k),
+    });
+  }
+  return rows;
+}
+
 /* ---------- middleware 插件（middleware.mjs 的接线）----------
  *
  * 一份 JSON 声明描述「什么时候、对哪个请求、改什么」，装在 <数据目录>\middleware\*.json。
@@ -9293,6 +9400,20 @@ async function unknownMappingTargets(p, mapping, cfg) {
     if (req.method === "POST" && u.pathname === "/api/plugins/reload") {
       const n = reloadPlugins();
       return json(res, 200, { ok: true, loaded: n, errors: pluginErrors });
+    }
+    if (req.method === "GET" && u.pathname === "/api/quota/overview") {
+      /* 「额度」视图的数据源：预算（用户设的，被动）+ 上游余额（真探测）。
+       * ⚠ 探测是**异步**的（要发请求），而面板每 5 秒轮询一次 ——
+       *   所以探测结果在服务端缓存 5 分钟（见 probeQuotaOf），不让面板把上游打爆。 */
+      const cfg = loadCfg();
+      const now = Date.now();
+      let rows = [];
+      try {
+        rows = await quotaOverview(cfg, now);
+      } catch (e) {
+        return json(res, 500, { error: "读额度失败：" + String((e && e.message) || e) });
+      }
+      return json(res, 200, { ok: true, providers: rows, at: now });
     }
     if (req.method === "GET" && u.pathname === "/api/sync") {
       const cfg = loadCfg();

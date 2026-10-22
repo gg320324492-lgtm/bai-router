@@ -549,4 +549,5 @@ window.BAI_VIEWS = [
   { id: "cred", nav: "凭据", dom: "viewCred", hint: "每家渠道各自要的东西", cards: ["token-capture", "model-catalog", "or-rotation", "wb-pool", "mm-member", "plugins"] },
   { id: "fo", nav: "故障转移", dom: "viewFo", hint: "开关 · 顺序 · 冷却", cards: ["failover", "gateway-switch", "limits"] },
   { id: "settings", nav: "设置", dom: "viewSettings", hint: "代理 · 端口 · 更新 · 数据目录", cards: ["config-backup", "remote-sync"] },
+  { id: "quota", nav: "额度", dom: "viewQuota", hint: "各家还剩多少 · 还能用多久", cards: ["quota-panel"] },
 ];
