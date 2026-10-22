@@ -22,13 +22,13 @@ magpie 是 10.3 万行 Go、5661 个文件。它自己的历史是首周每天 2
 | T2 | **单网关化**：8 个中转端口 → 1 个 | 🟡 已落地（beta 默认开，旧端口留作回退） | `internal/gateway/gateway.go` |
 | T3 | **候选层泛化**：provider 级 → 账号/密钥级 | ✅ 完成（`candidates.mjs` + 两级休息 + 归因冷却） | `internal/gateway/fallback.go` |
 | T4 | **路由策略上板**：7 种策略 + 配额感知排序 | ✅ 完成（`routes.mjs` + 面板接线） | `internal/provider/routing.go` |
-| T5 | **协议矩阵补全**：Responses / Gemini + 桥换 IR | 🟡 IR 底座已就位，编解码未做 | `internal/gateway/{responses,gemini}.go` |
+| T5 | **协议矩阵补全**：Responses / Gemini + 桥换 IR | ✅ 完成（两个协议入口已接进网关，活体用例覆盖流式/非流式/Gemini） | `internal/gateway/{responses,gemini}.go` |
 | T6 | **会话身份与亲和**（通用层） | ✅ 完成（`session-id.mjs` + `session-store.mjs`，持久化） | `internal/gateway/sessionHeaders` |
 | T7 | **用量账本** `usage.jsonl` + 面板 | ✅ 完成（`usage-ledger.mjs` + `usage-writer.mjs` + token 扫描） | `internal/usage/` |
 | T8 | **账号发现改读登录态**（替代 hook 注入） | ⬜ 未开始 | `internal/provider/account.go` |
 | T9 | **配额探测与配额感知路由** | ⬜ 未开始 | `internal/provider/quotas.go` |
 | T10 | **脱敏与审计台账** | ✅ 完成（`redact.mjs` + `audit.mjs`，已接进转移链与面板） | `internal/redact/`、`internal/maskrec/` |
-| T11 | **插件体系**（声明式 provider/agent/middleware） | ⬜ 未开始 | `internal/pluginrt/`、`internal/plugin/` |
+| T11 | **插件体系**（声明式 provider/agent/middleware） | 🟡 **provider 插件已完成**（一份 JSON 加一家渠道）；agent / middleware 插件未做 | `internal/pluginrt/`、`internal/plugin/` |
 | T12 | **并发 / RPM 限流通道** | ✅ 完成（`concurrency.mjs` + `rpm.mjs`，**默认不限**，面板可开） | `internal/gateway/{concurrency,rpm}.go` |
 | T13 | **配置同步备份**（WebDAV/S3/GitHub）+ KeepOwn | 🟡 本地备份已接线；**远端同步待接线**（要远端目标与凭据 UI） | `internal/backup/`、`internal/davsync/` |
 | T14 | **面板改版**（插槽制 + 多页） | ⬜ 未开始 | `internal/gui/assets/kernel.js` |
