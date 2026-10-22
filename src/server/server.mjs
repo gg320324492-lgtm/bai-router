@@ -148,7 +148,7 @@ import { discoverAccounts } from "./account-discovery.mjs";
  * 全局面板都从这里取 —— 「状态是数据，不是装饰」（docs/ui-redesign.md 原则 1）。 */
 import { channelState } from "./channel-state.mjs";
 /* 价格表（pricing.mjs）：token 数折成钱。⚠ 价格会漂移，表带快照日期。 */
-import { estimateCost, priceTable, tableFromModelsDev } from "./pricing.mjs";
+import { estimateCost, priceTable, normalizeTable, tableFromModelsDev } from "./pricing.mjs";
 /* 价格表的「用户点了才更新」（pricing-refresh.mjs）：远端表 → 合格表 → 谁说了算。
  * ⚠ **选表规则只有这一份**（chooseTable）—— 别在 server.mjs 里另写一份，
  *   两套规则迟早漂移，而漂移的方向是「悄悄用错表」。 */
@@ -6805,7 +6805,8 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
       });
       if (cap.flushBuffered()) return;
       return wbAnthroError(res, status || 502,
-        `${target.label} 返回 ${status || "网络错误"}，此错误重试其他渠道也不会好转：${describeError(cap)}`);
+        `${target.label} 返回 ${status || "网络错误"}，此错误重试其他渠道也不会好转：${describeError(cap)}`
+        + chainNote(tries));
     }
     lastErr = describeError(cap) || `HTTP ${status}`;
     /* 归因 + 冷却（magpie 的 failure(status, body) 口径）。
@@ -6988,6 +6989,30 @@ function noteFailoverEvent(from, tries, servedModel, cfg) {
 // 原错误被直接还给客户端。措辞刻意避开"故障转移"，只陈述试过哪些渠道。
 function noteChannelAttempt(from, tries) {
   log(`渠道尝试（入口 ${from}，未转移）→ ${describeTries(tries)}`);
+}
+
+/**
+ * 这一链试过什么 —— **报错里必须带上它**。
+ *
+ * ⚠⚠ 为什么（2026-10-23 实测，用户被这条坑了很久）：
+ *   只报「最后一次尝试」的错误，会把**真正的根因**盖住。那次现场是：
+ *     入口 mm（MiniMax 会员）自己挂了（429 限流）→ 转移到 wbai
+ *     → wbai 回 400「request illegal」→ 整条链终止
+ *   用户看到的只有「[WorkBuddy AI] request illegal —— 请求本身有问题」，
+ *   于是去查请求、查模型、查客户端 —— 而真正该先修的是**入口 mm**。
+ *   报错里带上整条链，那一眼就能看出「先修 mm」。
+ *
+ * 只有**一家**试过时不用带（没有别的东西可遮）。
+ */
+function chainNote(tries) {
+  const list = (tries || []).filter((t) => t && t.provider);
+  if (list.length < 2) return "";
+  const parts = list.map((t) => {
+    if (t.ok) return `${t.provider}:成功`;
+    if (t.skipped) return `${t.provider}:${t.skipped}`;
+    return `${t.provider}:失败[${t.status || "网络错"}${t.err ? " " + String(t.err).slice(0, 60) : ""}]`;
+  });
+  return `（这一链试过：${parts.join(" → ")}）`;
 }
 
 function dispatchOne(fo, req, res, cfg, body, rewritten, isProbe) {
