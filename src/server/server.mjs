@@ -130,6 +130,11 @@ import { snapshotOf, exportBundle, importBundle, restoreConfig } from "./backup.
  * ⚠ 默认**不限**（上限 0）—— 限流不该突然开始拦用户的请求，它得由用户自己开。 */
 import { ConcurrencyLimiter } from "./concurrency.mjs";
 import { RpmLimiter } from "./rpm.mjs";
+/* 声明式 provider 插件（plugin.mjs）：magpie 的 internal/plugin + internal/pluginrt
+ * 移植版。一份 JSON 声明就能加一家渠道，**不用改代码**。
+ * ⚠ 声明里**不许带凭据**（凭据是分发物，带 key 等于把 key 发给所有装它的人），
+ *   凭据由用户在面板里填。 */
+import { parseManifest, validateManifest, toProviderSpec, formatErrors, createRegistry } from "./plugin.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -187,7 +192,7 @@ const KEYMATCH_FIELDS = { bai: "keyMatch", sn: "keyMatchSn", wb: "keyMatchWb", z
 /* 把请求里的 provider 参数收敛成渠道键：认识的渠道原样返回，其余（含缺省 "bai"、未知值）
    一律落到 "bai"。三条路由（/api/models、/api/config、/api/apply、/api/test）此前各写了
    一串等价的三元链，此处统一。 */
-const resolveChannelKey = (raw) => (CHANNELS.includes(raw) ? raw : "bai");
+const resolveChannelKey = (raw) => (CHANNELS.includes(raw) || pluginRegistry.has(raw) ? raw : "bai");
 
 const PASS_HEADERS = ["authorization", "content-type", "anthropic-version", "anthropic-beta", "x-api-key", "accept", "user-agent"];
 
@@ -6141,7 +6146,18 @@ function relaySpec(provider, cfg) {
     mm: ["MiniMax 会员", () => cfg.mm?.useProxy === true, { gateV1: true, prepareHeaders: mmPrepareHeaders, prepareBody: mmPrepareBody }],
     or: ["OpenRouter", () => cfg.or?.useProxy === true, { openai: true }],
   }[provider];
-  if (!meta) return null;
+  if (!meta) {
+    /* 插件渠道：形状与协议都来自声明。 */
+    const entry = pluginRegistry.get(provider);
+    if (!entry) return null;
+    const S = sliceOf(cfg, provider);
+    return {
+      provider, label: S.zh || entry.name,
+      useProxy: () => S.useProxy === true,
+      opts: entry.relayOpts || {},
+      S,
+    };
+  }
   return { provider, label: meta[0], useProxy: meta[1], opts: meta[2], S: sliceOf(cfg, provider) };
 }
 
@@ -6452,6 +6468,83 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
  *   · 表里每一项都**逐字**取自改动前那 8 行调用，行为一字未变
  * store（观察表）也放进表里：那是跨请求的唯一可变状态，两边共用同一份数组，
  * 于是「从网关走 sn」与「直连 sn 端口」在面板上看到的调用记录是同一条。 */
+/* ---------- 插件渠道（plugin.mjs 的接线）----------
+ *
+ * 出厂八家之外，由**声明文件**加进来的渠道：<数据目录>\plugins\*.json。
+ *
+ * ⚠ **形状来自声明，凭据来自用户配置**（cfg[插件键]）—— 两者分开：
+ *   声明是**别人写的分发物**，配置是**用户自己的**。插件改了声明就能改用户
+ *   的凭据？那它就该有凭据管理器的权限，而不是渠道插件。
+ *
+ * ⚠ 装不上的插件**记下来但不中断启动** —— 一个坏插件不该让整个应用起不来
+ *   （那是「插件」最劝退的一种失败）。面板要能看到「为什么没装上」。
+ */
+const pluginRegistry = createRegistry({ factoryChannels: CHANNELS });
+const pluginErrors = [];          // [{file, error}]：装不上的声明与原因
+const pluginRelays = Object.create(null);   // 插件键 → 它自己的中转 server
+const pluginStores = Object.create(null);   // 插件键 → 最近调用的观察表
+
+const pluginDir = () => path.join(DATA_DIR, "plugins");
+
+/** 扫插件目录，逐个装上。返回装上几家。 */
+function loadPlugins() {
+  pluginRegistry.clear();
+  pluginErrors.length = 0;
+  let files = [];
+  try {
+    const dir = pluginDir();
+    if (existsSync(dir)) files = readdirSync(dir).filter((f) => f.toLowerCase().endsWith(".json")).sort();
+  } catch { /* 目录读不到就当没有插件 */ }
+  for (const f of files) {
+    try {
+      const text = readFileSync(path.join(pluginDir(), f), "utf8");
+      const obj = parseManifest(text);
+      const v = validateManifest(obj, { factoryChannels: CHANNELS });
+      if (!v.ok) throw new Error(formatErrors(v.errors));
+      /* ⚠ register 收的是**清单本身**（不是校验结果那个包装）——
+       *   塞错的话校验器会把 ok/errors/manifest 当成「不认识的字段」。 */
+      pluginRegistry.register(v.manifest, { now: Date.now() });
+    } catch (e) {
+      const why = String((e && e.message) || e).slice(0, 400);
+      pluginErrors.push({ file: f, error: why });
+      log(`插件 ${f} 装不上：${why.slice(0, 200)}`);
+    }
+  }
+  return pluginRegistry.list().length;
+}
+
+/**
+ * 插件渠道的切片：**形状**来自声明，**凭据**来自用户配置（cfg[插件键]）。
+ * 用户改了配置里的上游/端口/模型清单 → 以用户为准（那是他在面板里设的）。
+ */
+function pluginSliceOf(p, cfg) {
+  const entry = pluginRegistry.get(p);
+  if (!entry) return null;
+  const c = (cfg && cfg[p]) || {};
+  const cred = entry.credentialField ? String(c[entry.credentialField] || "") : "";
+  return {
+    ...entry.slice,
+    key: cred,
+    upstream: c.upstream || entry.upstream,
+    relayPort: Number(c.relayPort) || entry.relayPort,
+    defaultModel: c.defaultModel || entry.defaultModel,
+    availableModels: (Array.isArray(c.availableModels) && c.availableModels.length) ? c.availableModels : entry.availableModels,
+    mapping: (c.mapping && Object.keys(c.mapping).length) ? c.mapping : entry.mapping,
+    useProxy: c.useProxy === undefined ? entry.useProxy : c.useProxy === true,
+  };
+}
+
+/** 全部渠道键：出厂八家 + 插件渠道。 */
+function allChannelKeys() {
+  return [...CHANNELS, ...pluginRegistry.keys()];
+}
+
+/** 这个渠道键认得吗（出厂八家或已装上的插件）。 */
+function isChannelKey(k) {
+  const s = String(k == null ? "" : k);
+  return CHANNELS.includes(s) || pluginRegistry.has(s);
+}
+
 const RELAY_PARAMS = {
   bai: { store: recentCallsBai, slice: (cfg) => ({ upstream: cfg.upstream, mapping: cfg.mapping, defaultModel: cfg.defaultModel, availableModels: cfg.availableModels }), useProxy: () => true, opts: {} },
   sn: { store: recentCallsSn, slice: (cfg) => ({ upstream: cfg.sn.upstream, mapping: cfg.sn.mapping, defaultModel: cfg.sn.defaultModel, availableModels: cfg.sn.availableModels }), useProxy: (cfg) => cfg.sn.useProxy === true, opts: {} },
@@ -6462,6 +6555,57 @@ const RELAY_PARAMS = {
   mm: { store: recentCallsMm, slice: (cfg) => ({ upstream: cfg.mm.upstream, mapping: cfg.mm.mapping, defaultModel: cfg.mm.defaultModel, availableModels: cfg.mm.availableModels }), useProxy: (cfg) => cfg.mm.useProxy === true, opts: { gateV1: true, prepareHeaders: mmPrepareHeaders, prepareBody: mmPrepareBody } },
   or: { store: recentCallsOr, slice: (cfg) => ({ upstream: cfg.or.upstream, mapping: cfg.or.mapping, defaultModel: cfg.or.defaultModel, availableModels: cfg.or.availableModels }), useProxy: (cfg) => cfg.or.useProxy === true, opts: { openai: true } },
 };
+
+/* 插件渠道：装上几家就多几格。形状按声明，凭据在 cfg[插件键] 里。 */
+loadPlugins();
+
+/**
+ * 给一家插件渠道装上中转落点（RELAY_PARAMS 条目 + 它自己的中转 server）。
+ * 初次装载与重载共用这一个 —— 两份写法迟早会漂移。
+ */
+function mountPluginChannel(id) {
+  const entry = pluginRegistry.get(id);
+  if (!entry) return;
+  pluginStores[id] = [];
+  RELAY_PARAMS[id] = {
+    store: pluginStores[id],
+    slice: (cfg) => pluginSliceOf(id, cfg),
+    useProxy: (cfg) => pluginSliceOf(id, cfg)?.useProxy === true,
+    /* 协议走声明：openai 的要过通用桥，anthropic 的原样透传。 */
+    opts: entry.relayOpts || {},
+  };
+  const q = RELAY_PARAMS[id];
+  pluginRelays[id] = makeRelay(id, q.store, q.slice, q.useProxy, q.opts);
+}
+
+/**
+ * 重载插件：关掉旧的中转 → 重新扫目录 → 重建落点。
+ * 出厂的八家**一个字都不动** —— 只有插件那几格会换。
+ */
+function reloadPlugins() {
+  for (const id of Object.keys(pluginRelays)) {
+    try { pluginRelays[id].close(); } catch { }
+    delete pluginRelays[id];
+    delete pluginStores[id];
+    delete RELAY_PARAMS[id];
+    delete gatewayHandlers[id];
+  }
+  const n = loadPlugins();
+  for (const id of pluginRegistry.keys()) {
+    mountPluginChannel(id);
+    const q = RELAY_PARAMS[id];
+    gatewayHandlers[id] = makeRelayHandler(id, q.store, q.slice, q.useProxy, q.opts);
+    const S = pluginSliceOf(id, loadCfg());
+    if (!S) continue;
+    try {
+      pluginRelays[id].listen(S.relayPort, "127.0.0.1");
+      log(`插件渠道中转就绪 http://127.0.0.1:${S.relayPort}（${S.zh}）`);
+    } catch (e) {
+      log(`⚠ 插件渠道 ${id} 的中转端口 ${S.relayPort} 绑不上：${String((e && e.message) || e)}`);
+    }
+  }
+  return n;
+}
 
 // 三个中转：B.AI 走代理（出海）、SenseNova 走直连（境内，可被 sn.useProxy 覆盖）、
 // WorkBuddy 走直连（www.workbuddy.ai 直连可达，可被 wb.useProxy 覆盖；协议桥见 opts.openai）
@@ -6482,6 +6626,11 @@ const mmRelay = makeRelay("mm", RELAY_PARAMS.mm.store, RELAY_PARAMS.mm.slice, RE
 // orPick/orAdvance 每请求现选（这里传的 slice 只提供 upstream/mapping/availableModels）。
 const orRelay = makeRelay("or", RELAY_PARAMS.or.store, RELAY_PARAMS.or.slice, RELAY_PARAMS.or.useProxy, RELAY_PARAMS.or.opts);
 
+/* 插件渠道的中转：每家一个端口（声明里写的 relayPort）。
+ * 与出厂八家用**同一批** handler 逻辑（makeRelay），只是参数不同 ——
+ * 插件渠道不该有一套「插件专用」的中转语义。 */
+for (const id of pluginRegistry.keys()) mountPluginChannel(id);
+
 /* ---------- 统一网关（magpie 形态：一个端口，模型 id 写成 provider/模型） ----------
  *
  * 本步**只做加法**：这是新增的第 9 个端口，8 个旧端口与它们的行为一字未变。
@@ -6490,10 +6639,10 @@ const orRelay = makeRelay("or", RELAY_PARAMS.or.store, RELAY_PARAMS.or.slice, RE
  * 网关的落点表与上面 8 个端口**共用同一批参数**（RELAY_PARAMS）——网关不是
  * 「另一套中转逻辑」，它就是把同一个中转 handler 挂在另一个端口上，
  * 于是「网关走 sn」与「直连 sn 端口」必然是同一套行为。 */
-for (const p of CHANNELS) {
-  if (!RELAY_PARAMS[p]) throw new Error(`统一网关落点表缺渠道 ${p}（RELAY_PARAMS 与 CHANNELS 必须一一对应）`);
+for (const p of allChannelKeys()) {
+  if (!RELAY_PARAMS[p]) throw new Error(`统一网关落点表缺渠道 ${p}（RELAY_PARAMS 与渠道清单必须一一对应）`);
 }
-const gatewayHandlers = Object.fromEntries(CHANNELS.map((p) => {
+const gatewayHandlers = Object.fromEntries(allChannelKeys().map((p) => {
   const q = RELAY_PARAMS[p];
   return [p, makeRelayHandler(p, q.store, q.slice, q.useProxy, q.opts)];
 }));
@@ -6624,6 +6773,9 @@ function sliceOf(cfg, p) {
       useProxy: o.useProxy === true,
     };
   }
+  /* 插件渠道：出厂八家之外的那些（声明给形状，配置给凭据）。 */
+  const ps = pluginSliceOf(p, cfg);
+  if (ps) return ps;
   return {
     p: "bai", zh: "B.AI", key: cfg.apiKey || "", upstream: cfg.upstream || DEFAULTS.upstream,
     relayPort: cfg.relayPort || DEFAULTS.relayPort, defaultModel: cfg.defaultModel || DEFAULTS.defaultModel,
@@ -6632,7 +6784,7 @@ function sliceOf(cfg, p) {
   };
 }
 const PROVIDERS = CHANNEL_LABELS;
-const isOurs = (mode) => CHANNELS.includes(mode);
+const isOurs = (mode) => isChannelKey(mode);
 function hostOf(u) { try { return new URL(u).host; } catch { return ""; } }
 
 // ---------- WorkBuddy 客户端版本与 UA（契约 v18 里程碑 5）----------
@@ -6954,7 +7106,7 @@ function cliMode(cfg, creds) {
       const at = mid.indexOf("/");
       if (at > 0) {
         const p = mid.slice(0, at).trim().toLowerCase();
-        if (CHANNELS.includes(p)) return { mode: p, ...r };
+        if (isChannelKey(p)) return { mode: p, ...r };
       }
       return { mode: "other", ...r };
     }
@@ -7100,7 +7252,7 @@ function desktopMode(cfg, creds) {
         const at = n.indexOf("/");
         if (at > 0) {
           const p = n.slice(0, at).trim().toLowerCase();
-          if (CHANNELS.includes(p)) return { mode: p, ...r };
+          if (isChannelKey(p)) return { mode: p, ...r };
         }
       }
       return { mode: "other", ...r };
@@ -8348,7 +8500,7 @@ const panel = http.createServer(async (req, res) => {
        * {failover:{...}}——不带 provider 是它合法的用法（故障转移是 bai 的顶层设置）。
        * 所以这里只管「给了但不认识」。 */
       const rawP = b.provider;
-      if (rawP != null && rawP !== "" && !CHANNELS.includes(String(rawP))) {
+      if (rawP != null && rawP !== "" && !isChannelKey(String(rawP))) {
         return json(res, 400, {
           error: `未知的提供方 ${JSON.stringify(String(rawP).slice(0, 40))}`
             + `——合法值是 ${CHANNELS.join(" / ")}`
@@ -8387,7 +8539,7 @@ const panel = http.createServer(async (req, res) => {
       if (P === "bai" && b.failover) {
         if (typeof b.failover.enabled === "boolean") cfg.failover = { ...(cfg.failover || {}), enabled: b.failover.enabled };
         if (Array.isArray(b.failover.chain)) {
-          cfg.failover = { ...(cfg.failover || {}), chain: b.failover.chain.filter((x) => CHANNELS.includes(x)) };
+          cfg.failover = { ...(cfg.failover || {}), chain: b.failover.chain.filter((x) => isChannelKey(x)) };
         }
       }
       // —— Qoder 令牌（一般不用填：正常由 worker 补丁写入 tokenFile，此处仅手动兜底）——
@@ -8644,7 +8796,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
         ok: true,
         mode: gatewayOn(cfg) ? "on" : "off",
         port: cfg.gatewayPort || DEFAULTS.gatewayPort,
-        providers: CHANNELS.map((k) => {
+        providers: allChannelKeys().map((k) => {
           const S = sliceOf(cfg, k);
           /* 模型 id 现在写的是 `provider/档位`，所以「这一家能分到哪些」要看**档位**。
            * 每个档位顺带报上它当前的模型（面板上看得见「这一档现在指向什么」）。 */
@@ -8673,7 +8825,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
         /* 只重接**当前接的那一家**——我们不知道用户想接哪家，不该替他决定。
          * 当前接的是谁，从 settings.json 里的 BASE_URL 反查（cliMode 干的就是这事）。 */
         const cur = cliMode(cfg).mode;
-        if (CHANNELS.includes(cur)) {
+        if (isChannelKey(cur)) {
           const S = sliceOf(cfg, cur);
           warns.push(...snapshotExternal());
           await applyToCli(S);
@@ -8772,6 +8924,41 @@ async function unknownMappingTargets(p, mapping, cfg) {
         return json(res, 400, { error: "导入失败：" + String((e && e.message) || e) });
       }
     }
+    /* ---------- 插件渠道（面板读写）---------- */
+    if (req.method === "GET" && u.pathname === "/api/plugins") {
+      const cfg = loadCfg();
+      const list = pluginRegistry.list().map((e) => {
+        const c = cfg[e.id] && typeof cfg[e.id] === "object" ? cfg[e.id] : {};
+        const cred = e.credentialField ? String(c[e.credentialField] || "") : "";
+        return {
+          id: e.id, name: e.name, protocol: e.protocol, auth: e.auth, upstream: e.upstream,
+          relayPort: e.relayPort, models: e.availableModels, defaultModel: e.defaultModel,
+          credentialField: e.credentialField || "",
+          hasCredential: !!cred, loadedAt: e.loadedAt || 0,
+        };
+      });
+      return json(res, 200, { ok: true, dir: pluginDir(), plugins: list, errors: pluginErrors });
+    }
+    if (req.method === "POST" && u.pathname === "/api/plugins/reload") {
+      const n = reloadPlugins();
+      return json(res, 200, { ok: true, loaded: n, errors: pluginErrors });
+    }
+    if (req.method === "POST" && u.pathname === "/api/plugins/credential") {
+      const b = await readBody(req);
+      const id = String(b.id || "").trim();
+      const entry = pluginRegistry.get(id);
+      if (!entry) return json(res, 404, { error: "没有这个插件渠道：" + id });
+      if (!entry.credentialField) {
+        return json(res, 400, { error: `这个渠道的认证方式（${entry.auth}）不需要凭据` });
+      }
+      const cfg = loadCfg();
+      const sub = (cfg[id] && typeof cfg[id] === "object") ? cfg[id] : {};
+      sub[entry.credentialField] = String(b.key || "").trim();
+      cfg[id] = sub;
+      saveCfg(cfg);
+      /* ⚠ **不回显凭据本身** —— 只说「填了没有」。 */
+      return json(res, 200, { ok: true, id, hasCredential: !!sub[entry.credentialField] });
+    }
     /* ---------- 限流上限（面板读写）----------
      * 上限 0 = 不限（默认）。逐家覆盖存在 cfg[provider].limits 里。 */
     if (req.method === "GET" && u.pathname === "/api/limits") {
@@ -8849,7 +9036,9 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const P = resolveChannelKey(b.provider);
       const cfg = loadCfg();
       const S = sliceOf(cfg, P);
-      const name = PROVIDERS[P];
+      /* ⚠ 插件渠道不在 PROVIDERS 里（那是出厂八家的显示名表）→ 用它自己的名字，
+       *   别让错误信息里出现「undefined」。 */
+      const name = PROVIDERS[P] || S.zh || P;
       /* zen 走「OpenCode 客户端中转」时**根本不需要 API Key**——
        * 凭据由 OpenCode 自己带，我们只是转发（`providerConfigured` 早就认了这一点）。
        * 但这里原先硬性要 Key，于是面板「一键接入」被 400「请先填写 API Key」挡住：
@@ -8862,7 +9051,8 @@ async function unknownMappingTargets(p, mapping, cfg) {
             ? `请先在「${name}」页粘贴访问令牌（JWT）——捕获方法见该页说明`
             : P === "or"
               ? "请先在「OpenRouter」页的「免费流水区」填入至少 1 个 sk-or-v1 API Key（最多 3 把）"
-              : `请先在「${name}」路由表里填写 API Key`,
+              : `请先在「${name}」路由表里填写 API Key`
+                + (pluginRegistry.has(P) ? "（插件渠道的凭据填在「插件渠道」卡里）" : ""),
         });
       }
       // Qoder 的 key 是稳定占位符（令牌会轮换、不落 config），故单独校验令牌是否真的读得到
@@ -9184,6 +9374,18 @@ listenWithRetry(zenRelay, cfg0.zen.relayPort, "OpenCodeZen中转");
 listenWithRetry(qdRelay, cfg0.qd.relayPort, "Qoder中转");
 listenWithRetry(mmRelay, cfg0.mm.relayPort, "MiniMax会员中转");
 listenWithRetry(orRelay, cfg0.or.relayPort, "OpenRouter中转");
+/* 插件渠道的中转：端口写错了（被占）时**只记一行继续跑** ——
+ * 一个第三方插件不该让整个路由台起不来。 */
+for (const id of pluginRegistry.keys()) {
+  const S = pluginSliceOf(id, loadCfg());
+  if (!S) continue;
+  try {
+    pluginRelays[id].listen(S.relayPort, "127.0.0.1");
+    log(`插件渠道中转就绪 http://127.0.0.1:${S.relayPort}（${S.zh}）`);
+  } catch (e) {
+    log(`⚠ 插件渠道 ${id} 的中转端口 ${S.relayPort} 绑不上：${String((e && e.message) || e)}`);
+  }
+}
 listenWithRetry(panel, cfg0.panelPort, "面板");
 /* 统一网关的监听：**绑不上也不许拖垮现有中转**。
  *

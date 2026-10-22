@@ -1173,6 +1173,20 @@ export function resultSaid(b) {
  * ------------------------------------------------------------------ */
 
 /**
+ * 往事件数组里塞一个事件。**chatDecoder 与 anthropicDecoder 共用这一个。**
+ *
+ * ⚠⚠ 早前 `emit` 只定义在 chatDecoder 的闭包里，anthropicDecoder 却直接用
+ *   它 —— 于是它**第一次解事件就 ReferenceError**（emit is not defined）。
+ *   而 scripts/ir-test.mjs import 了 anthropicDecoder 却**从没调用过**，
+ *   所以这个 bug 从写下那天起一直活着（2026-10-22 由 Gemini 协议那轮的
+ *   agent 撞出来 —— 它要直连 Anthropic SSE）。
+ *
+ *   教训：**「import 了」不等于「跑过了」**。一个导出函数如果从没被调用过，
+ *   它里面的一切都可能没被验证过 —— 这跟「装饰性代码」是同一类病。
+ */
+const emitEvent = (events, ev) => { events.push(ev); };
+
+/**
  * chatDecoder —— OpenAI Chat Completions 的 SSE → Event。
  *
  * decode(text) 收的是**原始 SSE 文本**，可以是一整段，也可以是任意切开的
@@ -1190,7 +1204,7 @@ export function chatDecoder() {
   let thoughtClose = ""; // 结束思考块的标签
   let past = false;      // 正文已经开始，不再找标签了
 
-  const emit = (events, ev) => { events.push(ev); };
+  const emit = emitEvent;
 
   const text = (events, s) => {
     if (!past && !thought) {
@@ -1371,6 +1385,7 @@ export function chatDecoder() {
  */
 export function anthropicDecoder() {
   let buf = "";
+  const emit = emitEvent;
   const server = {};   // 哪些下标是 Anthropic 自己的服务端工具（不是客户端的调用）
   const whole = {};    // 哪些 tool_use 的参数在 start 里就整个来了
 
@@ -1482,10 +1497,17 @@ export function anthropicDecoder() {
 export function chatUsage(u) {
   if (!u || typeof u !== "object") return emptyUsage();
   const out = emptyUsage();
-  out.input = u.prompt_tokens || 0;
-  out.output = u.completion_tokens || 0;
   const d = u.prompt_tokens_details || {};
-  out.cacheRead = d.cached_tokens || 0;
+  const cached = d.cached_tokens || 0;
+  /* ⚠⚠ **口径必须与 anthropicUsage 一致**：OpenAI 的 `prompt_tokens` **含**缓存命中的
+   *   那部分，而 Anthropic 的 `input_tokens` **不含**。两边不一样的话，同一段提示词
+   *   换个协议上游，账本上的「输入 token」就差一截；而面板把「输入」与「缓存读」
+   *   摆成两格，含缓存的那份会让两者**加起来超过**真实提示词（重复计）。
+   *   统一成 Anthropic 那一套：input 不含缓存，缓存另算（magpie 也是这个口径）。
+   *   ⚠ 别改成「input = prompt_tokens」：那正是重复计的来源。 */
+  out.input = Math.max(0, (u.prompt_tokens || 0) - cached);
+  out.output = u.completion_tokens || 0;
+  out.cacheRead = cached;
   out.reasoning = (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens) || 0;
   return out;
 }

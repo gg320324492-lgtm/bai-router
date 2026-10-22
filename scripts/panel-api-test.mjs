@@ -40,6 +40,7 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
   let dataDir = "";
   let panel = 0;
   let relayOf = {};
+  let gatewayPort = 0;
   let killed = false;
 
   before(async () => {
@@ -52,6 +53,7 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
     ROLES.forEach((k, i) => { relayOf[k] = ports[i]; });
     panel = ports[8];
     const gateway = ports[9];
+    gatewayPort = gateway;
     dataDir = fs.mkdtempSync(path.join(TMPROOT, "data-"));
     const cfg = JSON.parse(fs.readFileSync(DEFAULTS_JSON, "utf8"));
     cfg.failover.enabled = false;
@@ -65,6 +67,37 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
     cfg.apiKey = "sk-test-0000000000000000000000000000000000000001";
     cfg.sn = { ...cfg.sn, apiKey: "sk-test-0000000000000000000000000000000000000002" };
     fs.writeFileSync(path.join(dataDir, "config.json"), JSON.stringify(cfg, null, 2));
+
+    /* 放一份插件声明：出厂八家之外的一家，靠这份 JSON 加进来。
+     * ⚠ 上游指到一个**没人听的端口** → 请求必然失败 —— 这条用例要验的是
+     *   「插件渠道**接进了链路**」（网关认得它、它的中转端口在听、失败被归因），
+     *   不是「它能通」（那要真的上游）。 */
+    const pluginPort = ports[10];
+    relayOf.acme = pluginPort;
+    fs.mkdirSync(path.join(dataDir, "plugins"), { recursive: true });
+    fs.writeFileSync(path.join(dataDir, "plugins", "acme.json"), JSON.stringify({
+      manifestVersion: 1,
+      id: "acme",
+      name: "Acme 测试渠道",
+      upstream: "http://127.0.0.1:9",
+      protocol: "anthropic",
+      auth: "apikey",
+      models: ["acme-pro", "acme-lite"],
+      relayPort: pluginPort,
+      useProxy: false,
+      mapping: {
+        "claude-fable-5": "acme-lite",
+        "claude-sonnet-5": "acme-pro",
+        "claude-opus-5": "acme-pro",
+        "claude-haiku-4-5": "acme-lite",
+      },
+    }, null, 2));
+    /* 再放一份**装不上**的：渠道键撞了出厂的 bai。面板要说清为什么。 */
+    fs.writeFileSync(path.join(dataDir, "plugins", "bad.json"), JSON.stringify({
+      manifestVersion: 1, id: "bai", name: "冒充 B.AI", upstream: "https://x.example/v1",
+      protocol: "anthropic", auth: "apikey", models: ["m"], relayPort: 15899,
+      mapping: { "claude-opus-5": "m" },
+    }, null, 2));
 
     const env = { ...process.env, BAI_DATA_DIR: dataDir, BAI_ENV_FIXED: "1", BAI_NO_PROXY_AUTODETECT: "1" };
     for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]) delete env[k];
@@ -234,6 +267,56 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
     assert.equal(JSON.stringify(au.body.records).includes("sk-test-0000"), false, "审计台账里出现了凭据！");
 
     await post("/api/limits", { concurrency: 0, rpm: 0 });
+  });
+
+  test("⑩ 插件渠道：装上了、坏的那份说清为什么、凭据能存且**不回显**", async () => {
+    const r = await api("/api/plugins");
+    assert.equal(r.status, 200);
+    const ids = (r.body.plugins || []).map((p) => p.id);
+    assert.ok(ids.includes("acme"), `插件没装上：${JSON.stringify(r.body)}`);
+    assert.ok(!ids.includes("bai"), "撞出厂渠道的声明居然装上了 —— 那等于让插件改掉用户的 bai 配置");
+    /* 装不上的那份要说清为什么（人话） */
+    const errs = r.body.errors || [];
+    const bad = errs.find((e) => e.file === "bad.json");
+    assert.ok(bad, "装不上的声明没被记下来");
+    assert.match(String(bad.error || ""), /bai|出厂/, `没说明为什么装不上：${bad.error}`);
+    /* 面板要能看到插件的上游/端口/模型 */
+    const acme = r.body.plugins.find((p) => p.id === "acme");
+    assert.equal(acme.protocol, "anthropic");
+    assert.deepEqual(acme.models, ["acme-pro", "acme-lite"]);
+    assert.equal(acme.hasCredential, false, "还没填凭据");
+
+    /* 凭据：存进去，**不回显** */
+    const save = await post("/api/plugins/credential", { id: "acme", key: "sk-test-0000000000000000000000000000000000000009" });
+    assert.equal(save.status, 200, `存凭据失败：${JSON.stringify(save.body)}`);
+    assert.equal(save.body.hasCredential, true);
+    assert.equal(JSON.stringify(save.body).includes("sk-test-0000"), false, "凭据被回显了");
+    const after = await api("/api/plugins");
+    assert.equal(after.body.plugins.find((p) => p.id === "acme").hasCredential, true, "凭据没存上");
+  });
+
+  test("⑪ ★ 插件渠道**接进了链路**：网关认得它、它的中转端口在听", async () => {
+    /* 网关按模型 id 的 provider 前缀分流 → 认得 acme 吗？ */
+    const gw = await api("/api/gateway-mode");
+    const keys = (gw.body.providers || []).map((p) => p.key);
+    assert.ok(keys.includes("acme"), `网关的落点表里没有插件渠道：${JSON.stringify(keys)}`);
+    /* 它的中转端口在听吗？（插件的中转是单独一个端口） */
+    const r = await fetch(`http://127.0.0.1:${relayOf.acme}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-opus-5", max_tokens: 8, messages: [{ role: "user", content: "插件自检" }] }),
+    }).catch(() => null);
+    assert.ok(r, "插件渠道的中转端口没人听 —— 声明装上了但链路没接上");
+    /* 走网关也一样（模型 id 带 acme/ 前缀） */
+    const g = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "acme/claude-opus-5", max_tokens: 8, messages: [{ role: "user", content: "网关自检" }] }),
+    }).catch(() => null);
+    assert.ok(g, "网关不认插件渠道的前缀");
+    /* 上游没人听 → 失败是必然的，但**失败得被归因**（不能是 404「不认识这家」） */
+    const text = g ? await g.text() : "";
+    assert.ok(!/不认识 provider|404/.test(text), `网关把插件渠道当成了不认识的渠道：${text.slice(0, 160)}`);
   });
 });
 

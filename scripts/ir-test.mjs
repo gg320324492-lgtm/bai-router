@@ -12,6 +12,7 @@ import {
   KIND, EV,
   parseAnthropic, parseChat, buildChat, buildAnthropic,
   chatDecoder, anthropicDecoder, anthropicEncoder, chatEncoder,
+  chatUsage, anthropicUsage,
   pairToolMessages, pairToolBlocks, collector, renderChat, renderAnthropic,
 } from "../src/server/ir.mjs";
 
@@ -352,6 +353,58 @@ test("④ 流式解出来的事件：文本、思考、工具调用、结束、�
   const usage = events.filter((e) => e.kind === EV.USAGE).pop();
   assert.equal(usage.usage.input, 10);
   assert.equal(usage.usage.output, 20);
+});
+
+test("★ ④b anthropicDecoder **真的解得动**（这条以前只 import 过，从没调用过）", () => {
+  /* ⚠⚠ 本文件早前 import 了 anthropicDecoder 却**从没调用过** ——
+   *   于是它里面「emit 只定义在 chatDecoder 闭包里」这个 bug 一直活着：
+   *   第一次解事件就 ReferenceError（emit is not defined）。
+   *   2026-10-22 由 Gemini 协议那轮的 agent 撞出来。
+   *
+   *   教训：**「import 了」不等于「跑过了」** —— 一个从没被调用的导出函数，
+   *   它里面的一切都可能没被验证过。这条用例就是那道保险。 */
+  const ANTHROPIC_SSE = [
+    'event: message_start',
+    'data: {"type":"message_start","message":{"id":"m1","model":"hy3","usage":{"input_tokens":10}}}',
+    '',
+    'event: content_block_start',
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+    '',
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}',
+    '',
+  ].join("\n");
+  const d = anthropicDecoder();
+  let events = [];
+  assert.doesNotThrow(() => { events = d.decode(ANTHROPIC_SSE); },
+    "anthropicDecoder 一解事件就抛 —— 那说明它的闭包里有没定义的东西");
+  const kinds = events.map((e) => e.kind);
+  assert.ok(kinds.includes(EV.START), "要有 start");
+  assert.ok(kinds.includes(EV.TEXT), "要有 text");
+  assert.ok(kinds.includes(EV.STOP), "要有 stop");
+  assert.ok(kinds.includes(EV.USAGE), "要有 usage");
+  assert.equal(events.find((e) => e.kind === EV.TEXT).text, "你好");
+  const usage = events.filter((e) => e.kind === EV.USAGE).pop();
+  assert.equal(usage.usage.output, 5);
+});
+
+test("★ ⑦b 两种协议的用量口径必须一致（input 不含缓存）", () => {
+  /* OpenAI 的 prompt_tokens 含缓存命中那部分，Anthropic 的 input_tokens 不含。
+   * 口径不一样的话，同一段提示词换个协议上游，账本上的「输入 token」就差一截；
+   * 面板把「输入」与「缓存读」摆成两格，含缓存的那份会让两者加起来**超过**真实提示词。 */
+  const chat = chatUsage({ prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 40 } });
+  const an = anthropicUsage({ input_tokens: 60, output_tokens: 20, cache_read_input_tokens: 40 });
+  assert.equal(chat.input, 60, "chat 的 input 要扣掉缓存命中那部分");
+  assert.equal(chat.cacheRead, 40);
+  assert.equal(chat.input, an.input, "两种协议的 input 必须相等");
+  assert.equal(chat.cacheRead, an.cacheRead, "两种协议的 cacheRead 必须相等");
+  /* 没有缓存信息时不能凭空扣 */
+  assert.equal(chatUsage({ prompt_tokens: 100 }).input, 100);
+  /* 缓存比总数还大时不能出负数 */
+  assert.equal(chatUsage({ prompt_tokens: 10, prompt_tokens_details: { cached_tokens: 99 } }).input, 0);
 });
 
 test("④ 工具调用开了却没带参数时，编码器补一个空对象", () => {

@@ -45,9 +45,12 @@ const DEFAULTS = {
 
 /** 用假依赖跑真的 cliMode。 */
 function modeOf(settings, cfg) {
+  /* ⚠ 依赖清单要**跟着源码的依赖走**：cliMode 现在判渠道认的是 isChannelKey
+   *   （出厂八家 + 插件渠道），不再直接认 CHANNELS。少注入一个 → 谁也认不出来，
+   *   而症状是「认不出渠道」——极难查（真源码里那个函数是在的，只是没注入）。 */
   const factory = new Function(
     "SETTINGS", "readJson", "keyFp", "loadCfg", "channelCredentials", "CHANNELS",
-    "cliViaRelay", "hostOf", "DEFAULTS", "PROXY_MANAGED_TOKEN",
+    "cliViaRelay", "hostOf", "DEFAULTS", "PROXY_MANAGED_TOKEN", "isChannelKey",
     `${SRC_CLI_MODE}\nreturn cliMode;`,
   );
   return factory(
@@ -61,6 +64,7 @@ function modeOf(settings, cfg) {
     (u) => { try { return new URL(String(u)).host; } catch { return ""; } },
     DEFAULTS,
     "PROXY_MANAGED",
+    (k) => CHANNELS.includes(String(k == null ? "" : k)),
   )(cfg);
 }
 
