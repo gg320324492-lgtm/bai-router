@@ -49,6 +49,11 @@
 </head>
 <body>
 
+<!-- 跳过导航：键盘用户的第一个 Tab 就能跳到主内容。
+     顶栏有六段导航 + 一排状态格，不给这条捷径的话，键盘用户每换一屏
+     都要从头 Tab 过去一遍。 -->
+<a class="skiplink" href="#mainContent">跳到主内容</a>
+
 <div class="app">
 
   <!-- ===================== 顶栏：品牌 + 视图分段导航 ===================== -->
@@ -61,12 +66,12 @@
          旧的 #/cred 不再是视图：凭据已并进「渠道」屏（主从布局的右栏），
          老链接由渲染层重定向到 #/channels（不 404）。 -->
     <nav class="tabs" id="navViews" role="tablist">
-      <button type="button" role="tab" data-view="console">总览</button>
-      <button type="button" role="tab" data-view="channels">渠道</button>
-      <button type="button" role="tab" data-view="fo">故障转移</button>
-      <button type="button" role="tab" data-view="settings">设置</button>
-      <button type="button" role="tab" data-view="quota">额度</button>
-      <button type="button" role="tab" data-view="traffic">流量</button>
+      <button type="button" role="tab" id="tab-console" aria-controls="viewConsole" data-view="console">总览</button>
+      <button type="button" role="tab" id="tab-channels" aria-controls="viewChannels" data-view="channels">渠道</button>
+      <button type="button" role="tab" id="tab-fo" aria-controls="viewFo" data-view="fo">故障转移</button>
+      <button type="button" role="tab" id="tab-settings" aria-controls="viewSettings" data-view="settings">设置</button>
+      <button type="button" role="tab" id="tab-quota" aria-controls="viewQuota" data-view="quota">额度</button>
+      <button type="button" role="tab" id="tab-traffic" aria-controls="viewTraffic" data-view="traffic">流量</button>
     </nav>
 
     <div class="topright">
@@ -145,10 +150,13 @@
     <div class="result" id="applyResult"></div>
   </section>
 
-  <main>
+  <!-- tabindex="-1"：让「跳到主内容」那条链接能把焦点真的送进主区
+       （没有 tabindex 的元素不能被程序性聚焦，跳过去等于没跳）。
+       视图切换时焦点也落在这里（见 panel-common.js 的 focusView）。 -->
+  <main id="mainContent" tabindex="-1">
 
     <!-- ===================== 视图 1：控制台 ===================== -->
-    <section class="view on" id="viewConsole">
+    <section class="view on" id="viewConsole" role="tabpanel" aria-labelledby="tab-console" tabindex="-1">
 
       <div class="sechead">
         <h2>总览</h2>
@@ -189,7 +197,7 @@
              （矩阵那种「一格一家」的信息密度正是这一轮要拆掉的东西）。
            · #viewCred —— 原先是凭据屏的容器，现在承载右栏里的**凭据区块**
              （凭据屏本身已并入本屏，见 docs/ui-redesign.md §1 的关键决定）。 -->
-    <section class="view" id="viewChannels">
+    <section class="view" id="viewChannels" role="tabpanel" aria-labelledby="tab-channels" tabindex="-1">
       <div class="chan-split">
         <!-- 左栏：渠道一览。行由渲染层按清单 + 状态层生成。 -->
         <aside class="chan-rail">
@@ -266,7 +274,7 @@
     </section>
 
     <!-- ===================== 视图 3：故障转移 ===================== -->
-    <section class="view" id="viewFo">
+    <section class="view" id="viewFo" role="tabpanel" aria-labelledby="tab-fo" tabindex="-1">
       <div class="sechead">
         <h2>自动故障转移</h2>
         <span class="note">当前渠道 429 / 5xx / 超时 / 断线时，中转按下面的顺序自己换人</span>
@@ -292,7 +300,7 @@
     </section>
 
     <!-- ===================== 视图 4：设置 ===================== -->
-    <section class="view" id="viewSettings">
+    <section class="view" id="viewSettings" role="tabpanel" aria-labelledby="tab-settings" tabindex="-1">
       <div class="sechead">
         <h2>本机设置</h2>
         <span class="note">换电脑 / 换代理时改这里</span>
@@ -326,7 +334,7 @@
     <!-- ===================== 视图 5：额度 =====================
          每家的额度、预算与休息状态。卡片（cards/quota-panel.js）自建盒子，
          挂在这一屏末尾。 -->
-    <section class="view" id="viewQuota">
+    <section class="view" id="viewQuota" role="tabpanel" aria-labelledby="tab-quota" tabindex="-1">
       <div class="sechead">
         <h2>额度</h2>
         <span class="note">每家还剩多少、还能用多久 · 探不到就明说探不到</span>
@@ -336,7 +344,7 @@
     <!-- ===================== 视图 6：流量 =====================
          P4：按天的花费与用量、谁在扛请求、哪些会话粘在哪一家。
          卡片（cards/traffic-page.js）自建盒子，挂在这一屏末尾。 -->
-    <section class="view" id="viewTraffic">
+    <section class="view" id="viewTraffic" role="tabpanel" aria-labelledby="tab-traffic" tabindex="-1">
       <div class="sechead">
         <h2>流量</h2>
         <span class="note">按天的花费与用量 · 谁在扛请求 · 会话粘在谁身上</span>

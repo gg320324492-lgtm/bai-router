@@ -1,0 +1,237 @@
+{
+  "at": "2026-10-22T20:40:05.698Z",
+  "base": "http://127.0.0.1:16723",
+  "widths": [
+    {
+      "w": 1440,
+      "view": "viewConsole",
+      "scrollW": 1415,
+      "clientW": 1415,
+      "over": 0
+    },
+    {
+      "w": 1440,
+      "view": "viewChannels",
+      "scrollW": 1415,
+      "clientW": 1415,
+      "over": 0
+    },
+    {
+      "w": 1440,
+      "view": "viewFo",
+      "scrollW": 1415,
+      "clientW": 1415,
+      "over": 0
+    },
+    {
+      "w": 1440,
+      "view": "viewSettings",
+      "scrollW": 1415,
+      "clientW": 1415,
+      "over": 0
+    },
+    {
+      "w": 1440,
+      "view": "viewQuota",
+      "scrollW": 1415,
+      "clientW": 1415,
+      "over": 0
+    },
+    {
+      "w": 1440,
+      "view": "viewTraffic",
+      "scrollW": 1415,
+      "clientW": 1415,
+      "over": 0
+    },
+    {
+      "w": 1100,
+      "view": "viewConsole",
+      "scrollW": 1075,
+      "clientW": 1075,
+      "over": 0
+    },
+    {
+      "w": 1100,
+      "view": "viewChannels",
+      "scrollW": 1075,
+      "clientW": 1075,
+      "over": 0
+    },
+    {
+      "w": 1100,
+      "view": "viewFo",
+      "scrollW": 1075,
+      "clientW": 1075,
+      "over": 0
+    },
+    {
+      "w": 1100,
+      "view": "viewSettings",
+      "scrollW": 1075,
+      "clientW": 1075,
+      "over": 0
+    },
+    {
+      "w": 1100,
+      "view": "viewQuota",
+      "scrollW": 1075,
+      "clientW": 1075,
+      "over": 0
+    },
+    {
+      "w": 1100,
+      "view": "viewTraffic",
+      "scrollW": 1075,
+      "clientW": 1075,
+      "over": 0
+    },
+    {
+      "w": 900,
+      "view": "viewConsole",
+      "scrollW": 875,
+      "clientW": 875,
+      "over": 0
+    },
+    {
+      "w": 900,
+      "view": "viewChannels",
+      "scrollW": 875,
+      "clientW": 875,
+      "over": 0
+    },
+    {
+      "w": 900,
+      "view": "viewFo",
+      "scrollW": 875,
+      "clientW": 875,
+      "over": 0
+    },
+    {
+      "w": 900,
+      "view": "viewSettings",
+      "scrollW": 875,
+      "clientW": 875,
+      "over": 0
+    },
+    {
+      "w": 900,
+      "view": "viewQuota",
+      "scrollW": 875,
+      "clientW": 875,
+      "over": 0
+    },
+    {
+      "w": 900,
+      "view": "viewTraffic",
+      "scrollW": 875,
+      "clientW": 875,
+      "over": 0
+    },
+    {
+      "w": 700,
+      "view": "viewConsole",
+      "scrollW": 675,
+      "clientW": 675,
+      "over": 0
+    },
+    {
+      "w": 700,
+      "view": "viewChannels",
+      "scrollW": 675,
+      "clientW": 675,
+      "over": 0
+    },
+    {
+      "w": 700,
+      "view": "viewFo",
+      "scrollW": 675,
+      "clientW": 675,
+      "over": 0
+    },
+    {
+      "w": 700,
+      "view": "viewSettings",
+      "scrollW": 675,
+      "clientW": 675,
+      "over": 0
+    },
+    {
+      "w": 700,
+      "view": "viewQuota",
+      "scrollW": 675,
+      "clientW": 675,
+      "over": 0
+    },
+    {
+      "w": 700,
+      "view": "viewTraffic",
+      "scrollW": 675,
+      "clientW": 675,
+      "over": 0
+    },
+    {
+      "w": 480,
+      "view": "viewConsole",
+      "scrollW": 455,
+      "clientW": 455,
+      "over": 0
+    },
+    {
+      "w": 480,
+      "view": "viewChannels",
+      "scrollW": 455,
+      "clientW": 455,
+      "over": 0
+    },
+    {
+      "w": 480,
+      "view": "viewFo",
+      "scrollW": 455,
+      "clientW": 455,
+      "over": 0
+    },
+    {
+      "w": 480,
+      "view": "viewSettings",
+      "scrollW": 455,
+      "clientW": 455,
+      "over": 0
+    },
+    {
+      "w": 480,
+      "view": "viewQuota",
+      "scrollW": 455,
+      "clientW": 455,
+      "over": 0
+    },
+    {
+      "w": 480,
+      "view": "viewTraffic",
+      "scrollW": 455,
+      "clientW": 455,
+      "over": 0
+    }
+  ],
+  "keyboard": {
+    "skipLink": {
+      "ok": true,
+      "inViewport": true,
+      "top": 8
+    },
+    "focusFollows": {
+      "ok": true,
+      "activeId": "viewChannels",
+      "viewOn": "viewChannels"
+    },
+    "escape": {
+      "bannerClosed": true
+    },
+    "focusRing": {
+      "total": 24,
+      "noRing": []
+    }
+  },
+  "problems": [],
+  "errors": []
+}

@@ -369,7 +369,7 @@ body.no-frame .winCtrls { display: none; }
 .chan-row {
   display: grid;
   /* 字母徽章 · 名字 · 用量条 · 状态药丸 —— 名字吃掉剩余宽度，其余按内容。 */
-  grid-template-columns: 26px minmax(0, 1fr) 44px auto;
+  grid-template-columns: 26px minmax(0, 1fr) 52px auto;
   align-items: center;
   gap: 9px;
   width: 100%;
@@ -406,16 +406,20 @@ body.no-frame .winCtrls { display: none; }
   font-weight: 650;
 }
 
-/* 用量小条：一条极窄的横条，只表示「用了多少」，不表示好坏。
+/* 用量小条：一条短横条，只表示「额度用了多少」，**不表示能不能用**。
+   能不能用是左边那颗状态药丸的事 —— 两件事分给两处视觉，一行只讲一件事。
    颜色仍走语义色（额度紧张偏黄/红），但**宽度**才是主信息。 */
-.chan-row .cr-meter { width: 44px; display: flex; justify-content: flex-end; }
+.chan-row .cr-meter { width: 52px; display: flex; justify-content: flex-end; }
 .cr-meter-bar {
-  display: block; width: 44px; height: 4px; border-radius: 99px;
-  background: var(--idle-soft); overflow: hidden;
+  display: block; width: 52px; height: 6px; border-radius: 99px;
+  background: var(--panel3); border: 1px solid var(--line); overflow: hidden;
 }
 .cr-meter-fill {
   display: block; height: 100%; border-radius: 99px; background: var(--idle);
 }
+/* 用量越高越紧张：过 75% 转黄、过 90% 转红（与额度屏同一套阈值）。 */
+.cr-meter-fill.warn { background: var(--warn); }
+.cr-meter-fill.err { background: var(--err); }
 /* 探不到用量：显示「—」而不是一条空条（空条会被读成「用了 0%」）。 */
 .cr-meter-empty { font-size: 10.5px; color: var(--dim); font-family: var(--mono); }
 
@@ -1091,3 +1095,69 @@ footer .paths { flex: 1; min-width: 200px; }
 .bkit-heat-meter { display: block; margin-top: 8px; }
 .bkit-heat-meta { font-size: 10.5px; color: var(--dim); margin-top: 6px; font-family: var(--mono); }
 .bkit-heat-empty { color: var(--dim); font-size: 12px; padding: 10px 0; }
+
+/* ── 三态：空 / 错 / 加载 ──────────────────────────────────────────────
+ *
+ * 三态共用一个盒子，差别只在**图标与语义色**：
+ *   空   —— 灰（idle）：没有数据不是出事，别吓唬人；
+ *   错   —— 红（err）：真的出事了，且必须带「下一步」；
+ *   加载 —— 品牌色（brand）+ 转圈：还在读，不是空也不是错。
+ *
+ * ⚠ 颜色只经语义令牌取（--idle-soft / --err-soft / --brand-soft），
+ *   不写死色值 —— 浅色主题下写死的色值对比度会掉到 4.5:1 以下。
+ */
+.bkit-state {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 13px 15px; margin-top: 10px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--panel2);
+}
+.bkit-state-icon {
+  flex: none; width: 22px; height: 22px; border-radius: 7px;
+  display: grid; place-items: center; font-size: 12px; font-weight: 700;
+}
+.bkit-state-spin {
+  flex: none; width: 20px; height: 20px; border-radius: 50%;
+  border: 2px solid var(--brand-soft); border-top-color: var(--brand);
+  animation: spin .9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) { .bkit-state-spin { animation: none; } }
+.bkit-state-main { min-width: 0; }
+.bkit-state-text { font-size: 12.5px; color: var(--ink); line-height: 1.55; }
+.bkit-state-hint { font-size: 11.5px; color: var(--ink2); margin-top: 4px; line-height: 1.6; }
+.bkit-state-detail { font-size: 11px; color: var(--dim); margin-top: 4px; line-height: 1.6; word-break: break-word; }
+.bkit-state-empty .bkit-state-icon { background: var(--idle-soft); color: var(--idle); }
+.bkit-state-error .bkit-state-icon { background: var(--err-soft); color: var(--err); }
+.bkit-state-error { border-color: var(--err-soft); }
+.bkit-state-loading .bkit-state-text { color: var(--ink2); }
+
+/* ============================================================================
+   19b. 键盘可达
+   ========================================================================== */
+
+/* 跳过导航：平时藏在屏幕外，**聚焦时**才露出来。
+   ⚠ 不能用 display:none —— 那样它就进不了 Tab 序列，捷径等于没有。
+   用 clip-path 把它裁掉，屏幕读屏软件仍能读到它（这是 a11y 的标准做法）。 */
+.skiplink {
+  position: absolute; left: 8px; top: -60px; z-index: 999;
+  padding: 9px 14px; border-radius: 9px;
+  background: var(--brand); color: var(--brand-ink);
+  font-size: 12.5px; font-weight: 600; text-decoration: none;
+  transition: top .12s;
+}
+.skiplink:focus, .skiplink:focus-visible { top: 8px; outline: 2px solid var(--ink); outline-offset: 2px; }
+
+/* 焦点环：**全局**一条，谁都能用。
+   ⚠ 之前只有 button / .chan-row / .credhead 三处有 —— 链接、可聚焦的
+   div、视图容器（tabindex="-1"）全都没有，键盘用户根本看不出自己在哪儿。
+   ⚠ 颜色用 var(--brand) —— 它在两套主题里都够 4.5:1（浅色那套的
+     --brand 是 #4A5BE8，深色是 #7C8CFF）。 */
+a:focus-visible, [tabindex]:focus-visible, input:focus-visible, select:focus-visible,
+textarea:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 6px;
+}
+/* 程序性聚焦（切屏时把焦点送进视图容器）**不画环**：
+   那个焦点不是用户按出来的，画环会让人以为「有个东西被选中了」。 */
+.view:focus, .view:focus-visible, main:focus, main:focus-visible { outline: none; }
+
+/* 键盘用户得看得见当前焦点在左栏的哪一家（左栏是列表，得看得见游标）。 */
+.chan-row:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }

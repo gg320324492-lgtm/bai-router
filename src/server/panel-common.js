@@ -191,6 +191,32 @@
   }
   if (has("bnrInfoX")) $("bnrInfoX").onclick = () => $("bnrInfo").classList.remove("show");
 
+  /* --- 2.3b 键盘：Esc 关掉浮层；Tab / 方向键 = 键盘操作 ---
+   *
+   * ⚠ **Esc 关浮层**是硬要求：键盘用户打开一个弹层后，焦点被关在弹层里，
+   *   而弹层只有一个「×」按钮时，Tab 出来就是一圈绕不出去的死路。
+   *   弹层是「临时的」，Esc 是最自然的「我不要了」。
+   *
+   * ⚠ **键盘 vs 鼠标**要分清：切屏时挪焦点只对键盘用户有用
+   *   （鼠标点一下导航，焦点跟着跳走反而像失灵）。 */
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Tab" || e.key.startsWith("Arrow")) lastFocusWasKeyboard = true;
+    if (e.key !== "Escape") return;
+    /* 浮层优先：更新弹窗 > 通知横幅。 */
+    const modal = $("updModal");
+    if (modal && modal.classList.contains("show")) {
+      try { closeUpdateModal(); } catch { }
+      return;
+    }
+    const b = $("bnrInfo");
+    if (b && b.classList.contains("show")) { b.classList.remove("show"); return; }
+    const su = $("bnrUpdate");
+    if (su && su.classList.contains("show")) { su.classList.remove("show"); return; }
+    /* 输入框里按 Esc 不该关浮层（用户可能要放弃输入但保留弹层）—— 这里不处理输入框，
+       上面的浮层优先级已经够了。 */
+  }, true);
+  document.addEventListener("mousedown", () => { lastFocusWasKeyboard = false; }, true);
+
   function showResult(el, text, good) {
     if (!el) return;
     el.textContent = text;
@@ -620,16 +646,23 @@
    */
   const LEGACY_VIEW_ALIAS = { cred: "channels" };
   let currentView = (VIEWS[0] || {}).id || null;
+  /* 这次是**老段名**（要走别名）吗？—— 用来决定要不要把地址栏改成新段名。 */
+  let hashWasLegacy = false;
   function viewFromHash() {
     const raw = String(location.hash || "").replace(/^#\/?/, "").trim();
     const hit = VIEWS.find((v) => v && v.id === raw);
-    if (hit) return hit.id;
+    if (hit) { hashWasLegacy = false; return hit.id; }
     /* 老段名 → 新屏。找不到对应的新屏（清单还没改完）时退回首屏，不空白。 */
     const alias = LEGACY_VIEW_ALIAS[raw];
-    if (alias && VIEWS.some((v) => v && v.id === alias)) return alias;
+    if (alias && VIEWS.some((v) => v && v.id === alias)) { hashWasLegacy = true; return alias; }
+    hashWasLegacy = false;
     return ((VIEWS[0] || {}).id);
   }
   function viewOf(id) { return VIEWS.find((v) => v && v.id === id) || null; }
+
+  /* 焦点是从键盘来的吗（Tab / 方向键）？—— 用来决定「切屏要不要挪焦点」。
+   * 键盘用户挪焦点才有用；鼠标用户挪了反而像失灵。 */
+  let lastFocusWasKeyboard = false;
 
   function setView(id, push) {
     const v = viewOf(id);
@@ -643,12 +676,44 @@
       const on = b.getAttribute("data-view") === v.id;
       b.classList.toggle("on", on);
       b.setAttribute("aria-selected", String(on));
+      /* ⚠ **roving tabindex**：tablist 里只有**当前那个** tab 能被 Tab 到达，
+       *   其余是 -1（用方向键移动）。这是 ARIA tab 模式的标准做法 ——
+       *   否则键盘用户每换一屏都要 Tab 过六个按钮才能进内容。
+       *   （鼠标不受影响：点哪个都点得着。） */
+      b.setAttribute("tabindex", on ? "0" : "-1");
     }
-    if (push !== false) {
+    /* 老段名落地后**把地址栏改成新段名**：内容已经是新屏了，地址栏还挂着
+       旧段名会让人以为没跳转成功（老书签、老文档里传的都是旧段名）。
+       只改 hash、不加历史记录 —— 用户按「后退」该回到上一个视图，
+       而不是在自己开的这一屏里来回弹。
+       ⚠ 与 push 无关：老段名是「纠正一个过期的地址」，不是「切屏」，
+       所以首屏加载（push=false）时也要改。 */
+    if (push !== false || hashWasLegacy) {
       const want = "#/" + v.id;
       if (location.hash !== want) history.replaceState(null, "", want);
     }
     mountCardsFor(v.id);
+    focusView(v.id);
+  }
+
+  /* 视图切换后把焦点送进新视图。
+   *
+   * ⚠ 为什么必须做：键盘用户按了「渠道」之后，焦点还留在导航栏的那颗按钮上 ——
+   *   屏幕阅读器会继续念「渠道，按钮」，用户得自己 Tab 过去才知道换屏了。
+   *   焦点跟着内容走，是「换屏了」这件事对键盘与读屏用户**可见**的唯一办法。
+   *
+   * ⚠ 焦点落在容器上（tabindex="-1"）而不是标题上：标题不是交互元素，
+   *   给它加 tabindex 会让它出现在 Tab 序列里（多一个停靠点）。
+   *   容器带 role="region" + aria-label，读屏软件会念出这一屏的名字。
+   *
+   * ⚠ 只在**键盘**操作时移动焦点：鼠标用户点导航不移动焦点，
+   *   否则鼠标点一下、焦点就跳走，视觉上像是「点了没反应」。 */
+  function focusView(id) {
+    try {
+      if (lastFocusWasKeyboard === false) return;
+      const box = $("view" + id.charAt(0).toUpperCase() + id.slice(1));
+      if (box && typeof box.focus === "function") box.focus({ preventScroll: true });
+    } catch { /* 焦点挪不动不该影响切屏 */ }
   }
 
   /* ======================================================================
@@ -956,10 +1021,17 @@
       if (meterBox) {
         /* ratio 是百分比（0–100），meter 收的是比例（0–1）——除以 100 别忘了，
          * 忘了就会画成满格（10% 显示成 1000%）。 */
-        const r = c && typeof c.ratio === "number" ? c.ratio : null;
+        /* 未配置（unconfigured）的渠道**不画用量条**：它压根没在用，
+           画一条出来会被读成「它在跑、用了多少」—— 而真相是「它还没接上」。
+           这正是「探不到 ≠ 0」的同一条纪律：不画 ≠ 画 0。 */
+        const notConfigured = st && st.s === "unconfigured";
+        const r = !notConfigured && c && typeof c.ratio === "number" ? c.ratio : null;
+        /* 阈值与额度屏一致（过 75% 转黄、过 90% 转红）：同一件事在两屏
+           用同一套阈值，用户不用记两遍。 */
+        const tone = r == null ? "" : (r >= 90 ? "err" : (r >= 75 ? "warn" : ""));
         meterBox.innerHTML = r == null
-          ? '<span class="cr-meter-empty" title="探不到用量">—</span>'
-          : `<span class="cr-meter-bar"><i class="cr-meter-fill" style="width:${Math.max(0, Math.min(100, r)).toFixed(1)}%"></i></span>`;
+          ? `<span class="cr-meter-empty" title="${notConfigured ? "还没配置，不在用" : "探不到用量"}">—</span>`
+          : `<span class="cr-meter-bar"><i class="cr-meter-fill ${tone}" style="width:${Math.max(0, Math.min(100, r)).toFixed(1)}%"></i></span>`;
         meterBox.title = c && c.used != null && c.limit != null
           ? `已用 ${c.used} / ${c.limit}`
           : "探不到用量";
@@ -2628,6 +2700,28 @@
   function wire() {
     for (const b of qa("#navViews [data-view]")) {
       b.addEventListener("click", () => setView(b.getAttribute("data-view")));
+      /* ⚠ **方向键在 tablist 里移动**（ARIA tab 模式的标准键盘行为）：
+       *   ← → 换屏、Home/End 跳首尾。
+       *   配合 roving tabindex（只有当前 tab 在 Tab 序列里），键盘用户
+       *   才能既快又不错位地换屏。 */
+      b.addEventListener("keydown", (e) => {
+        if (!e) return;
+        const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+        if (keys.indexOf(e.key) < 0) return;
+        const all = qa("#navViews [data-view]");
+        if (!all.length) return;
+        const i = all.indexOf(b);
+        let j = i;
+        if (e.key === "ArrowLeft") j = (i - 1 + all.length) % all.length;
+        else if (e.key === "ArrowRight") j = (i + 1) % all.length;
+        else if (e.key === "Home") j = 0;
+        else j = all.length - 1;
+        if (e.preventDefault) e.preventDefault();     // 别让方向键去滚页面
+        const next = all[j];
+        if (!next) return;
+        next.focus();
+        setView(next.getAttribute("data-view"));
+      });
     }
     onClick("btnBest", applyBest);
     onClick("btnRestore2", () => withBusy($("btnRestore2"), restoreExternal, $("applyResult")));

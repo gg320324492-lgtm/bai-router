@@ -37,6 +37,12 @@
  *   heatmap(channels, opts)
  *     channels  [{ key, name, state, reason, busy, used, limit, ratio, detail }]
  *     opts      { empty?, showMeter?=true, className? }
+ *   emptyState(text, opts) / errorState(text, opts) / loadingState(text, opts)
+ *     text     主句（说清发生了什么）
+ *     opts     { hint?, detail?, className? }
+ *              hint = **下一步**（错误态必给：一句「加载失败」是猜谜）
+ *              detail = 补充（原始报错、trace id 之类；给用户看的是「怎么办」，
+ *              原始报错进这里，别把技术黑话当主句）
  *
  * ── CSS 契约（.bkit-* 由渲染层补；颜色一律 var(--*)，不许写死）──
  *   .bkit-badge .bkit-meter .bkit-meter-track .bkit-meter-fill{ok,warn,err,idle}
@@ -215,6 +221,50 @@
     return "<div class=\"bkit-heat" + (o.className ? " " + esc(o.className) : "") + "\">" + cells + "</div>";
   }
 
+  /* ── 三态：空 / 错 / 加载 ──────────────────────────────────────────
+   *
+   * 同一个意思在二十张卡里说二十种话，是「用户得自己翻译」的最大来源：
+   * 「还没有记录」/「没有数据」/「空空如也」/「暂无」…… 各写一遍，
+   * 用户得自己认出「这几种说法是一件事」。所以三态只在这里定义一次。
+   *
+   * 三态必须**分开**，不能都叫「没数据」：
+   *   · 空态 —— 没有数据**不是出错**。「还没发生过」与「读不到」混成一句，
+   *     用户会以为出了故障，去查一个根本没发生的事。
+   *   · 错态 —— **必须带下一步**。一句「加载失败」是猜谜；
+   *     「读不到：连接被拒 —— 看诊断抽屉」才是能执行的。
+   *   · 加载态 —— 读屏软件要能读出来（role=status + aria-busy）。
+   *
+   * 颜色一律经**类名**给（idle / err / brand），由 CSS 去 var() 取值 ——
+   * 写死色值就等于只支持一套主题。
+   */
+  function stateBlock(kind, text, opts) {
+    const o = opts || {};
+    const hint = o.hint == null ? "" : String(o.hint);
+    const detail = o.detail == null ? "" : String(o.detail);
+    const cls = "bkit-state bkit-state-" + kind + (o.className ? " " + String(o.className) : "");
+    /* 图标是**装饰**：读屏软件读它只会多念一个符号，所以 aria-hidden。
+       文字本身已经说清了一切。 */
+    const icon = kind === "loading"
+      ? '<span class="bkit-state-spin" aria-hidden="true"></span>'
+      : '<span class="bkit-state-icon" aria-hidden="true">' + (kind === "error" ? "!" : "○") + "</span>";
+    return '<div class="' + esc(cls) + '" role="status"' + (kind === "loading" ? ' aria-busy="true"' : "") + ">"
+      + icon
+      + '<div class="bkit-state-main">'
+      + '<div class="bkit-state-text">' + esc(text == null ? "" : String(text)) + "</div>"
+      + (hint ? '<div class="bkit-state-hint">' + esc(hint) + "</div>" : "")
+      + (detail ? '<div class="bkit-state-detail">' + esc(detail) + "</div>" : "")
+      + "</div></div>";
+  }
+
+  /** 空态：还没有数据。给「怎么才会出现」，别给「读不到」。 */
+  function emptyState(text, opts) { return stateBlock("empty", text, opts); }
+
+  /** 错误态：读不到 / 坏了。**必须给下一步**（opts.hint）。 */
+  function errorState(text, opts) { return stateBlock("error", text, opts); }
+
+  /** 加载态：正在读。 */
+  function loadingState(text, opts) { return stateBlock("loading", text, opts); }
+
   global.BAI_KIT = {
     STATES: STATES,
     STATE_TEXT: STATE_TEXT,
@@ -229,5 +279,8 @@
     meter: meter,
     statusStrip: statusStrip,
     heatmap: heatmap,
+    emptyState: emptyState,
+    errorState: errorState,
+    loadingState: loadingState,
   };
 })(typeof window !== "undefined" ? window : (typeof globalThis !== "undefined" ? globalThis : this));

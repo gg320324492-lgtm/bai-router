@@ -53,6 +53,27 @@ const STATE_TONES = {
 };
 const ALL_LABELS = Object.values(STATE_LABELS);
 
+/**
+ * 卡片**自己写了状态措辞**吗（返回写了的那些）。
+ *
+ * ⚠ 判据是「**独立的引号字面量**」，不是「源码里出现过这个词」——
+ *   「还没有**可用**的渠道」这种自然表达里的「可用」**不是**状态措辞，
+ *   按字面量扫会把好文案误伤（给热力图卡补空态时就踩到过这个）。
+ *   而自己造一个状态措辞，一定是 `"冷却中"` 这样的独立字面量 —— 那才是要抓的。
+ *
+ * ⚠ 注释里的字面量不算（注释不是行为）：所以先剥注释再扫。
+ */
+function selfWritesStateWording(src) {
+  const code = stripComments(String(src || ""));
+  const out = [];
+  for (const w of ALL_LABELS) {
+    for (const q of ['"', "'", "`"]) {
+      if (code.indexOf(q + w + q) >= 0) { out.push(w); break; }
+    }
+  }
+  return out;
+}
+
 /* ====================================================================== *
  * 工具
  * ====================================================================== */
@@ -212,8 +233,8 @@ describe("① 组件库的边界 —— 纯函数，不碰 DOM，不 import", ()
       "组件库不许 import：它由 provider.html 用普通 <script> 静态引入");
   });
 
-  test("①c 四个组件都在，签名对", () => {
-    for (const fn of ["stateBadge", "meter", "statusStrip", "heatmap"]) {
+  test("①c 七个组件都在，签名对", () => {
+    for (const fn of ["stateBadge", "meter", "statusStrip", "heatmap", "emptyState", "errorState", "loadingState"]) {
       assert.equal(typeof KIT[fn], "function", `缺组件 ${fn}`);
     }
     assert.equal(typeof KIT.esc, "function", "必须有 esc() 助手");
@@ -221,6 +242,85 @@ describe("① 组件库的边界 —— 纯函数，不碰 DOM，不 import", ()
     assert.equal(KIT.meter.length, 2, "meter(ratio, opts)");
     assert.equal(KIT.statusStrip.length, 1, "statusStrip(data)");
     assert.equal(KIT.heatmap.length, 2, "heatmap(channels, opts)");
+    assert.equal(KIT.emptyState.length, 2, "emptyState(text, opts)");
+    assert.equal(KIT.errorState.length, 2, "errorState(text, opts)");
+    assert.equal(KIT.loadingState.length, 2, "loadingState(text, opts)");
+  });
+});
+
+/* ====================================================================== *
+ * ①b 三态：空 / 错 / 加载 —— 「没有数据」「读不到」「还在读」是三件事
+ * ====================================================================== */
+describe("①b 三态 —— 空 / 错 / 加载，三件事不许混成一句", () => {
+  test("①b-a 空态是灰的，不是红的（没有数据不是出事）", () => {
+    const html = KIT.emptyState("还没有调用记录");
+    assert.ok(html.indexOf("bkit-state-empty") >= 0, "空态要认得出是空态");
+    assert.ok(html.indexOf("bkit-state-error") < 0, "空态不许长成错误态");
+    assert.ok(html.indexOf("还没有调用记录") >= 0, "主句要在");
+  });
+
+  test("①b-b 错误态是红的，而且**必须带下一步**", () => {
+    const html = KIT.errorState("读不到额度信息", { hint: "看诊断抽屉" });
+    assert.ok(html.indexOf("bkit-state-error") >= 0, "错误态要认得出是错误态");
+    assert.ok(html.indexOf("看诊断抽屉") >= 0, "错误态必须带下一步（一句「加载失败」是猜谜）");
+    assert.ok(html.indexOf("bkit-state-hint") >= 0, "下一步要有自己的位置（不能混进主句里）");
+  });
+
+  test("①b-c 加载态认得出「还在读」，而且读屏软件能读出来", () => {
+    const html = KIT.loadingState("正在读额度…");
+    assert.ok(html.indexOf("bkit-state-loading") >= 0, "加载态要认得出是加载态");
+    assert.ok(html.indexOf("aria-busy=\"true\"") >= 0, "加载中的东西要标 aria-busy（读屏软件才知道它在忙）");
+    assert.ok(html.indexOf("role=\"status\"") >= 0, "加载态是 status 区域（不打断读屏）");
+  });
+
+  test("①b-d 三态的**结构**一致（同一个盒子，只差图标与语义色）", () => {
+    /* ⚠ 归一化时把 aria-busy 一并**删掉**：它是加载态的**语义**差异
+     *   （「还在忙」），不是骨架差异 —— 骨架一样就说明三个组件是同一套东西。
+     *   aria-busy 本身由 ①b-c 单独断言。 */
+    const shapes = [KIT.emptyState("a"), KIT.errorState("a"), KIT.loadingState("a")]
+      .map((h) => h.replace(/bkit-state-(empty|error|loading)/g, "KIND")
+        .replace(/<span class="bkit-state-icon"[^>]*>.*?<\/span>/g, "ICON")
+        .replace(/<span class="bkit-state-spin"[^>]*><\/span>/g, "ICON")
+        .replace(/ aria-busy="true"/g, ""));
+    assert.equal(shapes[0], shapes[1], "空态与错误态的结构不该不一样");
+    assert.equal(shapes[1], shapes[2], "错误态与加载态的结构不该不一样");
+  });
+
+  test("①b-e 文案必须转义（卡片会把上游的报错原文塞进来）", () => {
+    const html = KIT.errorState("<img src=x onerror=alert(1)>", { hint: "</div><script>" });
+    assert.ok(html.indexOf("<img") < 0, "上游原文里的标签必须被转义");
+    assert.ok(html.indexOf("onerror=alert") >= 0, "转义不等于删掉内容（原文还要看得见）");
+  });
+
+  test("①b-f detail（原始报错）与 hint（下一步）分开摆", () => {
+    const html = KIT.errorState("读不到", { hint: "看诊断抽屉", detail: "ECONNREFUSED 127.0.0.1:7897" });
+    const hintAt = html.indexOf("看诊断抽屉");
+    const detailAt = html.indexOf("ECONNREFUSED");
+    assert.ok(hintAt >= 0 && detailAt >= 0, "两段都要在");
+    assert.ok(hintAt < detailAt, "先说「怎么办」，再给原始报错 —— 顺序反了用户会先读技术黑话");
+  });
+
+  test("①b-g 反向对照：把「错误态必须带下一步」改坏 → 断言必须红", () => {
+    /* 判据：把 hint 丢掉（用户就只看到「读不到」，不知道该干什么）。 */
+    const { kit } = withBrokenCopy(KIT_SRC, "kit-nohint.mjs", (src) => {
+      const before = '(hint ? \'<div class="bkit-state-hint">\' + esc(hint) + "</div>" : "")';
+      assert.ok(src.indexOf(before) >= 0, "锚点对不上源码了 —— 这条反向对照已经失效");
+      return src.replace(before, '""');
+    });
+    const html = kit.errorState("读不到额度信息", { hint: "看诊断抽屉" });
+    assert.ok(html.indexOf("看诊断抽屉") < 0,
+      "改坏之后 hint 还在 —— 那「错误态必须带下一步」这条断言是恒真的");
+  });
+
+  test("①b-h 反向对照：把「加载态标 aria-busy」改坏 → 断言必须红", () => {
+    const { kit } = withBrokenCopy(KIT_SRC, "kit-nobusy.mjs", (src) => {
+      const before = "(kind === \"loading\" ? ' aria-busy=\"true\"' : \"\")";
+      assert.ok(src.indexOf(before) >= 0, "锚点对不上源码了 —— 这条反向对照已经失效");
+      return src.replace(before, '""');
+    });
+    const html = kit.loadingState("正在读…");
+    assert.ok(html.indexOf("aria-busy") < 0,
+      "改坏之后 aria-busy 还在 —— 那「加载态要能被读屏认出」这条断言是恒真的");
   });
 });
 
@@ -478,10 +578,9 @@ describe("⑥ 两张卡用共享组件画", () => {
 
   test("⑥d 两张卡都不得自己写状态措辞", () => {
     for (const [label, src] of [["热力图卡", HEATMAP_SRC], ["横条卡", STRIP_SRC]]) {
-      for (const w of ALL_LABELS) {
-        assert.equal(src.indexOf(w) < 0, true,
-          `${label}里出现了「${w}」—— 状态措辞只能在 panel-kit.js 里定义一次`);
-      }
+      const own = selfWritesStateWording(src);
+      assert.deepEqual(own, [],
+        `${label}里自己写了状态措辞${own.length ? "：" + own.join("、") : ""}—— 状态措辞只能在 panel-kit.js 里定义一次`);
     }
   });
 
@@ -561,10 +660,11 @@ describe("⑧ 反向对照 —— 改坏实现，对应断言必须红", () => {
   test("⑧c 在卡片里自己写状态措辞 ⇒ ⑥d 必须红", () => {
     const broken = HEATMAP_SRC.replace('const kit = window.BAI_KIT || null;',
       'const kit = window.BAI_KIT || null;\n    const LOCAL_WORD = "冷却中";');
-    const hit = ALL_LABELS.filter((w) => broken.indexOf(w) >= 0);
+    /* 用**与 ⑥d 同一条判据**（不然这两条断言会各说各话）。 */
+    const hit = selfWritesStateWording(broken);
     assert.deepEqual(hit, ["冷却中"], "改坏的卡片应当被抓出自己写的措辞");
     assert.throws(() => {
-      assert.equal(broken.indexOf("冷却中") < 0, true,
+      assert.deepEqual(selfWritesStateWording(broken), [],
         "状态措辞只能在 panel-kit.js 里定义一次");
     }, "卡片措辞纪律的断言必须红");
   });
