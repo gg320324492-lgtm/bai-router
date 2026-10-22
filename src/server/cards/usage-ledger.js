@@ -120,12 +120,19 @@ window.BAI_CARDS["usage-ledger"] = {
       const sf = q('[data-role="s-fail"]');
       if (sf) sf.textContent = "转交下一候选的尝试不计失败";
 
-      /* 费用：服务端还没统计就说还没统计——不拿 0 冒充「没花钱」。 */
-      const cost = Number(t.cost);
-      const hasCost = Number.isFinite(cost);
+      /* 费用：服务端现在**会算**了（pricing.mjs）。
+       * ⚠ 算不出来时是 null（不是 0）—— 一个错数字比没有数字更坏，用户要拿它对账。
+       *   所以「估不出」要说清是**哪些模型**估不出，而不是笼统一句「未统计」。 */
+      const cost = t.cost == null ? null : Number(t.cost);
+      const hasCost = cost != null && Number.isFinite(cost);
       set("t-cost", hasCost ? cost.toFixed(4) : "—");
       const sc = q('[data-role="s-cost"]');
-      if (sc) sc.textContent = hasCost ? "" : "服务端未统计";
+      if (sc) {
+        const unknown = Array.isArray(t.unknownModels) ? t.unknownModels : [];
+        if (hasCost && !unknown.length) sc.textContent = t.pricedAt ? `单价表快照 ${t.pricedAt}` : "";
+        else if (hasCost) sc.textContent = `${unknown.length} 个模型估不出（未计入）`;
+        else sc.textContent = unknown.length ? `${unknown.length} 个模型估不出` : "价格表里没有这些模型";
+      }
       const sr = q('[data-role="s-req"]');
       if (sr) sr.textContent = "";
     }

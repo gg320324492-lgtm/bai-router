@@ -17,7 +17,7 @@ import {
   shouldFailover, FAILOVER_COOLDOWN_MS, noteSilentJump, silentJumpSnapshot,
   restTable, failoverCooldownFor,
 } from "./failover.mjs";
-import { qpApply, qpRevert, qpStatus } from "./qoder-patch.mjs";
+import { qpApply, qpRevert, qpStatus, QODER_PATCH_PATHS } from "./qoder-patch.mjs";
 /* 逐模型能力探测（v1.0.74 · T3+T6）：只探免费模型、只在用户显式点「检测可用性」时跑。
  * 纯逻辑（判定 / 并发 / 落盘）在 zen-probe.mjs 里，HTTP 由下面的 zenProbeSend 注入。 */
 import {
@@ -136,6 +136,13 @@ import { runSync, compareState } from "./sync.mjs";
 import { createTarget } from "./sync-targets.mjs";
 /* 配额真探测（quota-probe.mjs）：问上游「你还剩多少额度」。 */
 import { probeQuota } from "./quota-probe.mjs";
+/* 账号发现（account-discovery.mjs）：每家的凭据从哪来、有几个可用账号、缺什么。 */
+import { discoverAccounts } from "./account-discovery.mjs";
+/* 渠道状态计算层（channel-state.mjs）：一个渠道 → 六态之一 + 原因 + 数字。
+ * 全局面板都从这里取 —— 「状态是数据，不是装饰」（docs/ui-redesign.md 原则 1）。 */
+import { channelState } from "./channel-state.mjs";
+/* 价格表（pricing.mjs）：token 数折成钱。⚠ 价格会漂移，表带快照日期。 */
+import { estimateCost, priceTable } from "./pricing.mjs";
 /* 配置备份（backup.mjs）：快照 → 加密导出 → 导入还原。magpie 的 internal/backup
  * 与 internal/settings（KeepOwn）移植版。
  * ⚠ 备份里**有**真实凭据（那正是它的用处），所以导出必须带口令加密、
@@ -5835,8 +5842,27 @@ async function probeQuotaOf(provider, cfg, now) {
   return out;
 }
 
-/** 额度总览：预算（被动）+ 上游余额（真探测）+ 花费。 */
-async function quotaOverview(cfg, now) {
+/**
+ * Qoder 令牌文件的原始读法（给账号发现用）。
+ *
+ * ⚠ 不用 qpStatus()：它只回**截断**的令牌（前 14 个字符 + 省略号），
+ *   而指纹要按**整把**算 —— 拿截断的串去算指纹，等于每把令牌的指纹都一样。
+ */
+function qdTokenRaw() {
+  const p = QODER_PATCH_PATHS.TOKFILE;
+  try {
+    const j = JSON.parse(readFileSync(p, "utf8"));
+    const token = j && typeof j.token === "string" ? j.token.trim() : "";
+    if (!token) return { ok: false, reason: "empty" };
+    return { ok: true, token, at: typeof j.at === "number" ? j.at : 0, via: "file" };
+  } catch {
+    let present = false;
+    try { present = existsSync(p); } catch { }
+    return { ok: false, reason: present ? "read-error" : "no-file" };
+  }
+}
+
+/** 额度总览：预算（被动）+ 上游余额（真探测）+ 花费。 */async function quotaOverview(cfg, now) {
   const states = budgetStates(cfg, now);
   const table = restTable();
   const rows = [];
@@ -5859,6 +5885,13 @@ async function quotaOverview(cfg, now) {
         daily: budget.daily != null ? budget.daily : null,
         unit: budget.unit || "tokens",
       } : null,
+      cost: (() => {
+        try {
+          const rows = loadUsageRows().filter((r) => String(r.provider || "") === k);
+          const c = estimateCost(rows, { now });
+          return { known: !!c.known, total: c.total, pricedAt: c.pricedAt, unknownModels: c.unknownModels };
+        } catch { return { known: false, total: null, pricedAt: "", unknownModels: [] }; }
+      })(),
       probe: {
         known: !!probe.known,
         used: probe.known ? probe.used : null,
@@ -6009,21 +6042,21 @@ async function dispatchGated(provider, target, req, res, cfg, body, rewritten, i
   const lim = limitsOf(provider, cfg);
   let slot = null;
   let rpmAt = 0;
-  if (lim.concurrency > 0 || lim.rpm > 0) {
-    slot = await concurrencyGate.acquire(provider, {
-      limit: lim.concurrency, waitMs: lim.waitMs, signal: req.signal,
-    });
-    if (!slot.ok) {
-      return { gated: true, reason: slot.reason === "aborted" ? "客户端已断开" : "并发已满", retryAfterSec: 1 };
+  /* ⚠ **总是**取一次名额（哪怕上限是 0）：上限 0 时闸门不拦，但**在途数照样被记**
+   *   ——「在途几个」是面板热力图要显示的数字，不设上限就不统计的话那一格永远是 0。 */
+  slot = await concurrencyGate.acquire(provider, {
+    limit: lim.concurrency, waitMs: lim.waitMs, signal: req.signal,
+  });
+  if (!slot.ok) {
+    return { gated: true, reason: slot.reason === "aborted" ? "客户端已断开" : "并发已满", retryAfterSec: 1 };
+  }
+  if (lim.rpm > 0) {
+    const r = rpmGate.reserve(provider, { limit: lim.rpm });
+    if (!r.ok) {
+      slot.release();
+      return { gated: true, reason: "超过每分钟上限", retryAfterSec: Math.max(1, Math.ceil(r.retryAfterSec || 1)) };
     }
-    if (lim.rpm > 0) {
-      const r = rpmGate.reserve(provider, { limit: lim.rpm });
-      if (!r.ok) {
-        slot.release();
-        return { gated: true, reason: "超过每分钟上限", retryAfterSec: Math.max(1, Math.ceil(r.retryAfterSec || 1)) };
-      }
-      rpmAt = r.at;
-    }
+    rpmAt = r.at;
   }
   let dispatched = false;
   try {
@@ -8577,6 +8610,13 @@ const panel = http.createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
       return res.end(readFileSync(path.join(HERE, "panel-common.js")));
     }
+    /* 共享组件库（panel-kit.js）：状态徽章 / 量条 / 状态条 / 渠道热力图。
+     * 刻意**不放** cards/ 下 —— C6 要求 cards/*.js 与视图卡片表双向一一对应，
+     * 一个没被任何视图引用的文件会红。它由 provider.html 静态引入。 */
+    if (req.method === "GET" && u.pathname === "/panel-kit.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
+      return res.end(readFileSync(path.join(HERE, "panel-kit.js")));
+    }
     if (req.method === "GET" && u.pathname === "/api/ping") return json(res, 200, { ok: true });
     if (req.method === "GET" && u.pathname === "/api/version") return json(res, 200, { version: APP_VERSION });
 
@@ -9401,6 +9441,87 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const n = reloadPlugins();
       return json(res, 200, { ok: true, loaded: n, errors: pluginErrors });
     }
+    if (req.method === "GET" && u.pathname === "/api/accounts") {
+      /* 账号发现：每家有哪些可用账号、凭据从哪来、缺什么。
+       * ⚠ **绝不回显凭据本身** —— 只给 id / 标签 / 指纹。 */
+      const cfg = loadCfg();
+      const found = discoverAccounts(cfg, {
+        now: Date.now(),
+        wbPool: (p, c) => { try { return wbPoolOf(c, p); } catch { return null; } },
+        qdToken: (c) => qdTokenRaw(),
+        mmStatus: () => { try { return mmTokens.recheck(); } catch { return null; } },
+        zenTransport: (c) => { try { return zenTransportOf(c); } catch { return null; } },
+      });
+      return json(res, 200, { ok: true, providers: (found && found.providers) || [] });
+    }
+    if (req.method === "GET" && u.pathname === "/api/channels/state") {
+      /* 渠道状态：六态之一 + 原因 + 数字。**全局面板都从这里取**（docs/ui-redesign.md 原则 1）——
+       * 同一个渠道在任何地方都显示同一个状态，取到的必然一致。 */
+      const cfg = loadCfg();
+      const now = Date.now();
+      const budgetStates2 = budgetStates(cfg, now);
+      const table = restTable();
+      const creds = (() => {
+        try {
+          const r = discoverAccounts(cfg, {
+            now,
+            wbPool: (p, c) => { try { return wbPoolOf(c, p); } catch { return null; } },
+            qdToken: (c) => qdTokenRaw(),
+            mmStatus: () => { try { return mmTokens.recheck(); } catch { return null; } },
+            zenTransport: (c) => { try { return zenTransportOf(c); } catch { return null; } },
+          });
+          const map = new Map();
+          for (const p of ((r && r.providers) || [])) map.set(p.key, p);
+          return map;
+        } catch { return new Map(); }
+      })();
+      const ctx = {
+        now,
+        keyOf: (p) => String(p || ""),
+        nameOf: (p) => {
+          const S = sliceOf(cfg, p);
+          return PROVIDERS[p] || (S && S.zh) || p;
+        },
+        busyOf: (p) => { try { return concurrencyGate.stats(p).busy; } catch { return null; } },
+        coolingOf: (p) => {
+          const ok = failoverAvailable(p);
+          const st = (() => { try { return failoverSnapshot ? failoverSnapshot()[p] : null; } catch { return null; } })();
+          /* ⚠ 快照里是**剩余秒数**（cooldownLeftSec），不是到期时刻 ——
+           *   换算成时刻再给状态层（它只认 epoch 毫秒）。 */
+          const left = st && typeof st.cooldownLeftSec === "number" ? st.cooldownLeftSec : 0;
+          return { cooling: !ok, until: ok ? 0 : Date.now() + left * 1000 };
+        },
+        restingOf: (p) => {
+          const e = (() => { try { return table.entry(p); } catch { return null; } })();
+          return {
+            resting: !!(e && e.until > now),
+            until: e ? e.until : 0,
+            note: e && e.note ? String((e.note && e.note.label) || e.note.kind || "") : "",
+          };
+        },
+        budgetOf: (p) => {
+          const st = budgetStates2.get(p);
+          if (!st) return null;
+          return {
+            exhausted: !!st.exhausted, used: st.used, limit: st.limit,
+            ratio: st.ratio, resetAtMs: st.resetAtMs || 0,
+          };
+        },
+        credentialOf: (p) => {
+          const c = creds.get(p);
+          if (!c) return null;
+          return { configured: !!c.configured, missing: c.missing || null, accounts: c.accounts || [] };
+        },
+        probeOf: (p) => {
+          const e = (() => { try { return probeCache.map.get(p); } catch { return null; } })();
+          if (!e) return null;      // 这一家没有探测源（**不是失败**）
+          return { known: !!e.known, used: e.known ? e.used : null, limit: e.known ? e.limit : null, error: e.error || null };
+        },
+      };
+      const keys = allChannelKeys();
+      const channels = keys.map((k) => channelState(k, ctx));
+      return json(res, 200, { ok: true, channels, at: now });
+    }
     if (req.method === "GET" && u.pathname === "/api/quota/overview") {
       /* 「额度」视图的数据源：预算（用户设的，被动）+ 上游余额（真探测）。
        * ⚠ 探测是**异步**的（要发请求），而面板每 5 秒轮询一次 ——
@@ -9637,8 +9758,22 @@ async function unknownMappingTargets(p, mapping, cfg) {
         status: r.status, error: r.error, tries: r.tries, ms: r.ms, ttftMs: r.ttft_ms,
         tierServed: r.tier_served, kind: r.kind, handedOn: r.handed_on,
       }));
+      /* 费用：按价格表把 token 数折成钱。
+       * ⚠ **估不出来就是 null**（不是 0）—— 一个错数字比没有数字更坏：
+       *   用户会拿它跟厂商账单对账。估不出的模型列在 unknownModels 里。 */
+      const cost = (() => {
+        try { return estimateCost(rows, { now: Date.now() }); } catch { return null; }
+      })();
+      const totals2 = {
+        ...totals,
+        cost: cost ? cost.total : null,
+        costKnown: cost ? !!cost.known : false,
+        unknownModels: cost ? cost.unknownModels : [],
+        pricedAt: cost ? cost.pricedAt : "",
+        currency: cost ? cost.currency : "USD",
+      };
       return json(res, 200, {
-        ok: true, totals,
+        ok: true, totals: totals2,
         rows: recent,
         byProvider: Array.from(byProvider.values()).sort((a, b) => b.requests - a.requests),
         byModel: Array.from(byModel.values()).sort((a, b) => b.requests - a.requests).slice(0, 30),

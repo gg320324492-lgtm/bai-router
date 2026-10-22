@@ -955,3 +955,63 @@ footer .paths { flex: 1; min-width: 200px; }
   color: var(--warn); background: var(--warn-soft);
   border-radius: 7px; cursor: help;
 }
+
+/* ══════════════════════════════════════════════════════════════════════
+ * 共享组件库（panel-kit.js）的样式
+ *
+ * 颜色一律走语义变量（--ok/--warn/--err/--idle/--brand）——
+ * **写死颜色就等于只有一套主题能用**（深浅切换时那条会露馅）。
+ * 尺度沿用本文件既有的一套：圆角 10/14、边框 1px var(--line)、字号 10–14.5。
+ * ══════════════════════════════════════════════════════════════════════ */
+
+.bkit-badge { display: inline-flex; align-items: center; gap: 6px; }
+
+/* 量条：一条细轨 + 一段填充 + 一个百分比 */
+.bkit-meter { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.bkit-meter-label { font-size: 10.5px; color: var(--dim); white-space: nowrap; }
+.bkit-meter-track {
+  flex: 1 1 60px; min-width: 40px; height: 5px; border-radius: 99px;
+  background: var(--panel3); overflow: hidden; display: inline-block; vertical-align: middle;
+}
+.bkit-meter-fill { display: block; height: 100%; border-radius: 99px; background: var(--idle); transition: width .18s; }
+.bkit-meter-fill.ok { background: var(--ok); }
+.bkit-meter-fill.warn { background: var(--warn); }
+.bkit-meter-fill.err { background: var(--err); }
+.bkit-meter-fill.idle { background: var(--idle); }
+.bkit-meter-pct {
+  font-size: 10.5px; color: var(--dim); font-family: var(--mono);
+  min-width: 34px; text-align: right;
+}
+
+/* 顶部横条：五格（服务 / 当前接的 / 流量 / 用量 / 额度） */
+.bkit-strip {
+  display: flex; flex-wrap: wrap;
+  border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel);
+}
+.bkit-strip-cell { flex: 1 1 150px; min-width: 132px; padding: 10px 14px; border-right: 1px solid var(--line); }
+.bkit-strip-cell:last-child { border-right: none; }
+.bkit-strip-cap {
+  display: block; font-size: 10px; letter-spacing: 1.1px; color: var(--dim);
+  text-transform: uppercase; margin-bottom: 4px;
+}
+.bkit-strip-val { display: flex; align-items: center; gap: 7px; font-size: 14.5px; font-weight: 640; color: var(--ink); }
+.bkit-strip-sub { display: block; font-size: 11px; color: var(--dim); margin-top: 2px; font-family: var(--mono); }
+.bkit-strip-sub:empty { display: none; }
+
+/* 渠道热力图：一家一格 */
+.bkit-heat {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 8px;
+}
+.bkit-heat-cell {
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+  background: var(--panel2); cursor: pointer; transition: .14s; min-width: 0;
+}
+.bkit-heat-cell:hover { border-color: var(--line2); background: var(--panel3); }
+.bkit-heat-top { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.bkit-heat-name {
+  font-size: 12.5px; font-weight: 620; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bkit-heat-meter { display: block; margin-top: 8px; }
+.bkit-heat-meta { font-size: 10.5px; color: var(--dim); margin-top: 6px; font-family: var(--mono); }
+.bkit-heat-empty { color: var(--dim); font-size: 12px; padding: 10px 0; }
