@@ -9836,7 +9836,14 @@ async function unknownMappingTargets(p, mapping, cfg) {
           return { configured: !!c.configured, missing: c.missing || null, accounts: c.accounts || [] };
         },
         probeOf: (p) => {
-          const e = (() => { try { return probeCache.map.get(p); } catch { return null; } })();
+          /* ⚠ 缓存的形状是 `{ at, value }`（逐条记时刻，见 probeCache 那段注释）——
+           *   这里必须取 .value。早先写成 probeCache.map.get(p)（旧形状），
+           *   改形状之后这一行就**静悄悄**地抛异常、被 catch 吃掉、返回 null：
+           *   于是「探到的余额」永远进不了状态层，渠道热力图上的
+           *   「额度快用完 / 探不到」两态**永远不出现**，而面板上看不出任何异常。
+           *   这类「改了数据结构、忘了改取的那一处」的 bug 只有真接线才暴露。 */
+          const hit = (() => { try { return probeCache.get(p) || null; } catch { return null; } })();
+          const e = hit && hit.value ? hit.value : null;
           if (!e) return null;      // 这一家没有探测源（**不是失败**）
           return { known: !!e.known, used: e.known ? e.used : null, limit: e.known ? e.limit : null, error: e.error || null };
         },
