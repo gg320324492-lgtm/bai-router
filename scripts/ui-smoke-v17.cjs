@@ -190,7 +190,13 @@ app.whenReady().then(async () => {
            拿"刷新模型列表"当样本不行：它 1.2 秒就结束，1000ms 的走秒器来不及跳。 */
         if (/处理中/.test(btn.textContent) && ticks[ticks.length-1] !== btn.textContent.trim()) ticks.push(btn.textContent.trim());
         const txt = document.getElementById("testResult").textContent;
-        if (txt !== before) { mo.disconnect(); window.fetch = of;
+        /* ⚠ 判据是「**结论**出现了」，不是「文本变了」：
+           探测进行中时结果行会先写成「⏳ 正在逐档探测…（已 Ns）」，
+           那**不是结论**。等「文本变了」会在第 250 毫秒就抓到这句中间态，
+           于是「如实失败」验的是一句「正在探测」—— 断言看着红，其实没测到东西。
+           结论态的特征：不再含「正在」/「⏳」，且有实质内容。 */
+        const isConclusion = txt && txt !== before && !/正在|⏳|处理中/.test(txt);
+        if (isConclusion) { mo.disconnect(); window.fetch = of;
           return { took: Date.now() - t0, txt, cls: document.getElementById("testResult").className, sawDisabled, fetches, ticks }; }
       }
       mo.disconnect(); window.fetch = of;
