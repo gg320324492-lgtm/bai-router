@@ -6397,6 +6397,17 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
      *   不去试下一家（试下一家等于绕过插件的策略）。 */
     const cp = await applyCodePlugins(fo.provider, tier0, mwRewritten, req);
     if (cp.denied) {
+      /* ⚠ **也要进审计台账**：被插件拒绝是一次「链路上发生过的事」，
+       *   不记的话用户事后翻台账只看到「没有这条」，而请求确实来过、
+       *   也确实没出去。kind 不用默认的 "auth"（那说的是鉴权失败，
+       *   与插件的策略决定不是一回事）。 */
+      auditRecord({
+        provider: fo.provider,
+        model: String((mwRewritten || {}).model || ""),
+        status: 403, outcome: "error", kind: "plugin_denied",
+        error: `代码插件拒绝：${cp.reason}`,
+        ms: Date.now() - startedAt,
+      });
       return wbAnthroError(res, 403, `代码插件拒绝了这次请求：${cp.reason}`);
     }
     if (cp.body) {
@@ -6502,6 +6513,14 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     const cp = await applyCodePlugins(provider, tier0, sub.rewritten, req);
     if (cp.denied) {
       tries.push({ provider, skipped: "代码插件拒绝" });
+      /* 同样进审计台账（理由见单家路径那一条）。 */
+      auditRecord({
+        provider,
+        model: String((sub.rewritten || {}).model || ""),
+        status: 403, outcome: "error", kind: "plugin_denied",
+        error: `代码插件拒绝：${cp.reason}`,
+        ms: Date.now() - attemptStart,
+      });
       return wbAnthroError(res, 403, `代码插件拒绝了这次请求：${cp.reason}`);
     }
     if (cp.body) {
