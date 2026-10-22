@@ -39,6 +39,15 @@
  *  provider 前缀不在这里 → 解析失败 → 网关如实说「不认识这家」，不猜。 */
 export const KNOWN_PROVIDERS = Object.freeze(["bai", "sn", "wb", "wbai", "zen", "qd", "mm", "or"]);
 
+/* 协议入口那一侧要用的东西（都是纯逻辑，不碰 fs、不联网）：
+ *   · protocols.mjs   —— Responses / Gemini 的适配器（解析、渲染、编解码）
+ *   · protocol-res.mjs —— 回程包装（上游的 Anthropic 应答 → 客户端的协议） */
+import { pickProtocol, PROTOCOLS } from "./protocols.mjs";
+import { ProtocolRes } from "./protocol-res.mjs";
+
+/* 转出去给接线层用：它要按路径决定「这个请求走协议入口还是走 Anthropic 入口」。 */
+export { pickProtocol, PROTOCOLS };
+
 /** req[GATEWAY_MODEL]：这个请求的模型名**已经定稿**，中转**不许再解析**。
  *  用 Symbol 而不是普通字符串键：不会与客户端可能带来的任何 header/字段撞名。 */
 export const GATEWAY_MODEL = Symbol("bai.gateway.model");
@@ -180,25 +189,135 @@ export function makeGatewayHandler({ handlers, isProvider = defaultIsProvider, g
        *   档位只能反查，而**多档同模型时反查必然歧义** → 那时 tier 留 null，
        *   转移时用**目标家自己的默认模型**（而不是把这一家的模型硬发过去）。
        */
-      let tier = null;
-      let literal = true;
-      try {
-        const cfg = typeof getCfg === "function" ? getCfg() : null;
-        if (cfg) {
-          if (typeof tierKeyFor === "function") {
-            const k = tierKeyFor(parsed.provider, parsed.model, cfg);
-            if (k) { tier = k; literal = false; }
-          }
-          if (!tier && typeof tierOf === "function") {
-            /* 反查：**命中多个就是歧义**，tierOfModel 会返回 null —— 不猜。 */
-            tier = tierOf(parsed.provider, parsed.model, cfg) || null;
-          }
-        }
-      } catch { /* 档位识别失败不该挡住请求 */ }
+      const { tier, literal } = resolveTier(
+        parsed.provider, parsed.model,
+        typeof getCfg === "function" ? getCfg() : null,
+        tierKeyFor, tierOf,
+      );
       if (literal) req[GATEWAY_MODEL] = parsed.model;
       if (tier) req[GATEWAY_TIER] = tier;
       try {
         handler(req, res);
+      } catch (e) {
+        gatewayError(res, 502, `provider「${parsed.provider}」的中转处理抛异常：${String((e && e.message) || e)}`);
+      }
+    });
+  };
+}
+
+/**
+ * 档位判定：**两条入口共用这一个**（Anthropic 那条与协议那条）。
+ *
+ * @returns {{tier:string|null, literal:boolean}}
+ *   literal=true → 模型段是**最终模型名**（中转不许再解析它）；
+ *   literal=false → 模型段是**档位**（中转按本家映射解析，档位无损）。
+ */
+function resolveTier(provider, model, cfg, tierKeyFor, tierOf) {
+  let tier = null;
+  let literal = true;
+  try {
+    if (cfg) {
+      if (typeof tierKeyFor === "function") {
+        const k = tierKeyFor(provider, model, cfg);
+        if (k) { tier = k; literal = false; }
+      }
+      if (!tier && typeof tierOf === "function") {
+        /* 反查：**命中多个就是歧义**，tierOfModel 会返回 null —— 不猜。 */
+        tier = tierOf(provider, model, cfg) || null;
+      }
+    }
+  } catch { /* 档位识别失败不该挡住请求 */ }
+  return { tier, literal };
+}
+
+/**
+ * makeProtocolHandler —— **协议入口**（Responses / Gemini）。
+ *
+ * 与 Anthropic 那条路的**分界**：本处理器只管「客户端说另一种话」的情形，
+ * 一旦翻成 Anthropic 形状，就交给**同一个**中转 handler（一样的模型解析、
+ * 一样的故障转移、一样的冷却）—— 所以两条路在「到了那家之后」的行为逐字相同。
+ *
+ * 回程由 protocol-res.mjs 负责：把上游的应答翻回客户端的协议。
+ *
+ * ⚠ 模型 id 的约定与 Anthropic 那条路**一样**：`provider/档位`。
+ *   没有前缀 → 400；前缀不认识 → 404。两种失败分开说（理由同 Anthropic 那条路）。
+ */
+export function makeProtocolHandler({ handlers, isProvider = defaultIsProvider, getCfg = null, tierKeyFor = null, tierOf = null } = {}) {
+  const map = handlers && typeof handlers === "object" ? handlers : {};
+  return (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const urlPath = String(req.url || "").split("?")[0];
+      const epPath = urlPath.length > 1 ? urlPath.replace(/\/+$/, "") : urlPath;
+      const proto = pickProtocol(epPath, req.method);
+      if (!proto) {
+        return gatewayError(res, 404,
+          `统一网关不认这个路径（${epPath}）——本入口只承接 Anthropic 的 /v1/messages 与 ${PROTOCOLS.map((p) => p.id).join(" / ")}`);
+      }
+      const raw = Buffer.concat(chunks);
+      let body = null;
+      try { body = JSON.parse(raw.toString("utf8")); } catch { body = null; }
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return gatewayError(res, 400, `${proto.label} 的请求体必须是一个 JSON 对象（${describeBody(raw)}）`);
+      }
+      const modelName = String(proto.modelIdOf(epPath, body) || "").trim();
+      if (!modelName) {
+        return gatewayError(res, 400,
+          `${proto.label} 的请求里没有模型名——它得写成 provider/档位（例如 sn/claude-opus-5）`);
+      }
+      const parsed = parseGatewayModel(modelName, isProvider);
+      if (!parsed) {
+        const at = modelName.indexOf("/");
+        if (at < 0) {
+          return gatewayError(res, 400,
+            `模型名「${modelName}」没有 provider 前缀——统一网关要求写成 provider/档位（例如 sn/claude-opus-5）`);
+        }
+        return gatewayError(res, 404,
+          `统一网关不认识 provider「${modelName.slice(0, at).trim()}」（已知渠道：${KNOWN_PROVIDERS.join("、")}）`);
+      }
+      const handler = Object.prototype.hasOwnProperty.call(map, parsed.provider) ? map[parsed.provider] : null;
+      if (typeof handler !== "function") {
+        return gatewayError(res, 404,
+          `provider「${parsed.provider}」在本实例没有中转处理器（已知渠道：${KNOWN_PROVIDERS.join("、")}）`);
+      }
+      /* 协议 → 统一 IR → Anthropic 形状。解析失败**如实报错**：
+       * 静默丢字段会让模型看不到上一轮，还答得像模像样。 */
+      let parsedProto = null;
+      try { parsedProto = proto.parse(body); }
+      catch (e) {
+        return gatewayError(res, 400, `${proto.label} 的请求体不符合规范：${String((e && e.message) || e)}`);
+      }
+      if (!parsedProto || parsedProto.ok === false) {
+        const why = (parsedProto && (parsedProto.error || parsedProto.reason)) || "解析不出来";
+        return gatewayError(res, 400, `${proto.label} 的请求体不符合规范：${String(why)}`);
+      }
+      const irReq = parsedProto.request || parsedProto;
+      /* 模型段原样带进 Anthropic 形状（是档位就由中转按本家映射解析，
+       * 是最终模型名就标「已定稿」—— 与 Anthropic 那条路同一套判据）。 */
+      irReq.model = parsed.model;
+      const streaming = !!proto.streamingOf(irReq, epPath);
+      irReq.stream = streaming;
+      let anth = null;
+      try { anth = proto.toAnthropic(irReq); }
+      catch (e) {
+        return gatewayError(res, 400, `${proto.label} 的请求翻不出 Anthropic 形状：${String((e && e.message) || e)}`);
+      }
+      req[GATEWAY_BODY] = Buffer.from(JSON.stringify(anth));
+      const cfg = typeof getCfg === "function" ? getCfg() : null;
+      const { tier, literal } = resolveTier(parsed.provider, parsed.model, cfg, tierKeyFor, tierOf);
+      if (literal) req[GATEWAY_MODEL] = parsed.model;
+      if (tier) req[GATEWAY_TIER] = tier;
+      /* 回程包装：上游的 Anthropic 应答 → 客户端的协议。 */
+      const wrapped = new ProtocolRes(res, {
+        decoder: proto.decoder({ model: parsed.model }),
+        buildJson: proto.buildJson,
+        errorBody: proto.errorBody,
+        streaming,
+        model: parsed.model,
+      });
+      try {
+        handler(req, wrapped);
       } catch (e) {
         gatewayError(res, 502, `provider「${parsed.provider}」的中转处理抛异常：${String((e && e.message) || e)}`);
       }

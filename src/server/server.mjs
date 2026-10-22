@@ -109,7 +109,7 @@ import { makeUsageScanner } from "./usage-scan.mjs";
  * 就起服务（wb-token.mjs 顶部的教训）。本步**只做加法**：8 个旧端口一字未变，
  * 网关是新增的第 9 个端口；切默认、拆旧端口是后面的步骤。 */
 import {
-  GATEWAY_MODEL, GATEWAY_BODY, GATEWAY_TIER, makeGatewayHandler,
+  GATEWAY_MODEL, GATEWAY_BODY, GATEWAY_TIER, makeGatewayHandler, makeProtocolHandler, pickProtocol,
 } from "./gateway.mjs";
 /* 网关的故障转移（gateway-failover.mjs）：把「档位」从最终模型名反查回来，
  * 转移时才能按**目标家**重解析（各家同一档位是不同模型）。 */
@@ -6646,7 +6646,14 @@ const gatewayHandlers = Object.fromEntries(allChannelKeys().map((p) => {
   const q = RELAY_PARAMS[p];
   return [p, makeRelayHandler(p, q.store, q.slice, q.useProxy, q.opts)];
 }));
-const gatewayServer = http.createServer(makeGatewayHandler({
+/* 网关的两个入口：
+ *   · Anthropic 入口（/v1/messages）—— 原��那条路，**一个字都没改**；
+ *   · 协议入口（Responses / Gemini）—— 客户端说另一种话时的那条。
+ *
+ * ⚠ 两个入口**共用同一批中转 handler**：翻成 Anthropic 形状之后，模型解析、
+ *   故障转移、冷却、账本全走同一条路 —— 所以「到了那家之后」的行为逐字相同。
+ */
+const gatewayParams = {
   handlers: gatewayHandlers,
   /* 「这个 provider 键认识吗」：以**本实例真有中转处理器**为准，
    * 而不是抄一份渠道名单——名单与处理器不同步时，网关会说「这家没接线」，
@@ -6660,7 +6667,17 @@ const gatewayServer = http.createServer(makeGatewayHandler({
   /* 「哪个档位指向这个模型」——模型 id 写 `provider/最终模型` 时走这条。
    * ⚠ 命中多个 = 歧义 = 返回 null（tierOfModel 的语义），不猜。 */
   tierOf: tierOfModel,
-}));
+};
+const gatewayAnthropicHandler = makeGatewayHandler(gatewayParams);
+const gatewayProtocolHandler = makeProtocolHandler(gatewayParams);
+const gatewayServer = http.createServer((req, res) => {
+  /* 按路径分派：协议路径走协议入口，其余走 Anthropic 入口。
+   * ⚠ 分派**只看路径与方法**，不看请求体 —— 请求体还没读呢。 */
+  const p = String(req.url || "").split("?")[0];
+  const ep = p.length > 1 ? p.replace(/\/+$/, "") : p;
+  if (pickProtocol(ep, req.method)) return gatewayProtocolHandler(req, res);
+  return gatewayAnthropicHandler(req, res);
+});
 
 // ---------- 文件级操作 ----------
 function readJson(file) {

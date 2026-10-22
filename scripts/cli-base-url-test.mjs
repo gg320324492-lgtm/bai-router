@@ -647,6 +647,137 @@ describe("⑦ 统一网关模式：接线指向网关，请求按 provider 前�
 });
 
 /* ------------------------------------------------------------------ *
+ * ⑨ 协议入口：Responses / Gemini 也走这同一个网关
+ *
+ * 客户端说另一种话（Codex 说 Responses、Gemini CLI 说 generateContent）时，
+ * 网关要把它的话翻成 Anthropic 形状交给中转，再把上游的应答翻回客户端的协议。
+ *
+ * ⚠ 假上游这次回的是 **Anthropic 形状**（直连渠道 bai 就是透传的），
+ *   所以回程那一段是真的被测到了，不是绕过。
+ * ------------------------------------------------------------------ */
+const ANTHROPIC_SSE = [
+  `event: message_start`,
+  `data: ${JSON.stringify({ type: "message_start", message: { id: "m1", model: "hy3", usage: { input_tokens: 5 } } })}`,
+  ``,
+  `event: content_block_start`,
+  `data: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+  ``,
+  `event: content_block_delta`,
+  `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "协议标记" } })}`,
+  ``,
+  `event: message_delta`,
+  `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } })}`,
+  ``,
+  `event: message_stop`,
+  `data: ${JSON.stringify({ type: "message_stop" })}`,
+  ``,
+].join("\n");
+
+describe("⑨ 协议入口：Responses / Gemini 走同一个网关", () => {
+  let srv, fake, seen;
+  const mutate = (cfg, P) => {
+    /* 每家的上游都指到同一个假上游；**bai 是扁平的**，它的上游在 cfg.upstream。 */
+    for (const k of ["sn", "wb", "wbai", "zen", "qd", "mm", "or"]) cfg[k] = { ...cfg[k], upstream: `http://127.0.0.1:${P.fake}` };
+    cfg.upstream = `http://127.0.0.1:${P.fake}`;
+  };
+  mutate.gatewayMode = "on";
+  before(async () => {
+    srv = await bootServer(TREES.after, "protocol", mutate);
+    seen = [];
+    fake = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => { body += d; });
+      req.on("end", () => {
+        seen.push({ url: req.url, body });
+        let j = null;
+        try { j = JSON.parse(body); } catch { }
+        /* 客户端要流式 → 回 SSE；不要 → 回一整包 JSON。 */
+        if (j && j.stream) {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end(ANTHROPIC_SSE);
+        } else {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            id: "msg_1", type: "message", role: "assistant", model: "hy3",
+            content: [{ type: "text", text: "协议标记" }],
+            stop_reason: "end_turn", usage: { input_tokens: 5, output_tokens: 2 },
+          }));
+        }
+      });
+    });
+    await new Promise((r) => fake.listen(srv.P.fake, "127.0.0.1", r));
+  }, { timeout: 180000 });
+  after(async () => {
+    try { srv && srv.kill(); } catch { }
+    try { fake && fake.closeAllConnections && fake.closeAllConnections(); } catch { }
+    try { fake && await new Promise((r) => fake.close(r)); } catch { }
+  });
+
+  const gw = () => `http://127.0.0.1:${srv.P.gateway}`;
+
+  test("① Responses：请求 provider/档位 → 客户端收到 Responses 形状的 SSE", async () => {
+    const r = await fetch(`${gw()}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "bai/claude-opus-5", input: "协议自检", stream: true }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await r.text();
+    assert.equal(r.status, 200, `期望 200，实际 ${r.status}：${text.slice(0, 200)}`);
+    assert.match(text, /response\.created/, "要有 response.created");
+    assert.match(text, /response\.output_text\.delta/, "要有 response.output_text.delta");
+    assert.match(text, /response\.completed/, "要有 response.completed");
+    assert.match(text, /协议标记/, "正文要转到目标协议里");
+    /* 上游收到的是**档位解析出来的模型名**（bai 的 opus 档 → hy3），不是档位本身 */
+    assert.equal(seen.length, 1, `应当只向上游发一次，实际 ${seen.length} 次`);
+    const got = JSON.parse(seen[0].body);
+    assert.equal(got.model, "hy3", "上游该收到档位解析出来的模型名");
+    /* 客户端的话要真的翻成 Anthropic 形状送到上游（不是只把模型名带过去） */
+    assert.match(seen[0].body, /协议自检/, "客户端的输入没翻到上游");
+    assert.equal(got.stream, true, "客户端要流式，上游也该是流式");
+  });
+
+  test("② Responses 非流式：客户端收到一整包 JSON", async () => {
+    const r = await fetch(`${gw()}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "bai/claude-opus-5", input: "非流式自检" }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await r.text();
+    assert.equal(r.status, 200, `期望 200，实际 ${r.status}：${text.slice(0, 200)}`);
+    const j = JSON.parse(text);
+    assert.equal(j.object, "response", "非流式要回一整包 Responses 应答");
+    assert.ok(Array.isArray(j.output) && j.output.length, "要有 output 数组");
+    const body = JSON.stringify(j.output);
+    assert.match(body, /协议标记/, "正文要转到目标协议里");
+  });
+
+  test("③ Gemini：模型名在路径里 → 客户端收到 Gemini 形状", async () => {
+    const r = await fetch(`${gw()}/v1beta/models/${encodeURIComponent("bai/claude-opus-5")}:generateContent`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "协议自检" }] }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await r.text();
+    assert.equal(r.status, 200, `期望 200，实际 ${r.status}：${text.slice(0, 200)}`);
+    const j = JSON.parse(text);
+    assert.ok(Array.isArray(j.candidates), "Gemini 的应答要有 candidates 数组");
+    const body = JSON.stringify(j);
+    assert.match(body, /协议标记/, "正文要转到目标协议里");
+  });
+
+  test("④ 模型名没有 provider 前缀 → 400，说清怎么写（不猜）", async () => {
+    const r = await fetch(`${gw()}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "claude-opus-5", input: "没前缀" }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await r.text();
+    assert.equal(r.status, 400, `期望 400，实际 ${r.status}：${text.slice(0, 200)}`);
+    assert.match(text, /provider/, "错误信息要说明模型名该怎么写");
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * ⑧ 网关模式下的**故障转移**：档位随目标家重解析
  *
  * 这是整轮改造里最容易「看起来对、其实错」的一环：

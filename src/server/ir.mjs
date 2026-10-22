@@ -1530,6 +1530,43 @@ export function anthropicUsage(u) {
   return out;
 }
 
+/**
+ * parseAnthropicResponse —— Anthropic Messages 的**应答 JSON** → IR 的应答形状。
+ *
+ * ⚠ 为什么需要它：IR 原本只有**流式**那条路（事件 → collector → 应答）。
+ *   但「客户端要非流式应答」时，上游回的是**一整包 JSON**，没有事件可解 ——
+ *   没有这个函数，那条路就**没有出口**（协议适配层拿不到 IR 的应答形状）。
+ *
+ * 形状与 collector 的产物一致：{ id, model, parts, stop, usage }。
+ * 只认 Anthropic 规范的 content 块（text / thinking / tool_use）；
+ * 认不出来的块**跳过**（不猜、不报错 —— 上游偶尔多塞一个块，不该让整次调用失败）。
+ */
+export function parseAnthropicResponse(json) {
+  const out = { id: "", model: "", parts: [], stop: "", usage: emptyUsage() };
+  if (!json || typeof json !== "object") return out;
+  out.id = String(json.id || "");
+  out.model = String(json.model || "");
+  out.stop = String(json.stop_reason || "");
+  out.usage = anthropicUsage(json.usage);
+  const content = Array.isArray(json.content) ? json.content : [];
+  for (const b of content) {
+    if (!b || typeof b !== "object") continue;
+    if (b.type === "text") {
+      out.parts.push(makePart({ kind: KIND.TEXT, text: String(b.text || "") }));
+    } else if (b.type === "thinking") {
+      out.parts.push(makePart({
+        kind: KIND.THINKING, text: String(b.thinking || ""), signature: String(b.signature || ""),
+      }));
+    } else if (b.type === "tool_use") {
+      out.parts.push(makePart({
+        kind: KIND.TOOL_CALL, id: String(b.id || ""), name: String(b.name || ""),
+        args: b.input && typeof b.input === "object" ? b.input : {},
+      }));
+    }
+  }
+  return out;
+}
+
 /** usageToAnthropic —— IR 的用量转成 Anthropic 的形状。 */
 export function usageToAnthropic(u) {
   const out = {

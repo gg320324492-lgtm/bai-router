@@ -55,6 +55,45 @@ qd 15762 / or 15772 / wbai 15782 / mm 15792），Claude Code 连的是某一家�
 - 面板「故障转移」视图里有一张「统一网关」卡：当前模式、请求去向、网关端口、
   开关，以及各家能分到哪些档位。
 
+## 入口协议：Anthropic / Responses / Gemini（v1.0.95-beta.2 起）
+
+统一网关不只听得懂 Anthropic 的话。客户端说哪种话，网关就把它翻成 Anthropic 形状
+交给那家的中转 —— **翻完之后与 Anthropic 那条路完全一样**（一样的模型解析、一样的
+故障转移、一样的冷却、一样的账本）。
+
+| 客户端 | 说的协议 | 端点 |
+| --- | --- | --- |
+| Claude Code / Claude 桌面版 | Anthropic Messages | `POST /v1/messages` |
+| Codex / 新版 OpenAI SDK | OpenAI **Responses** | `POST /v1/responses` |
+| Gemini CLI / Google SDK | Gemini `generateContent` | `POST /v1beta/models/{model}:generateContent` |
+
+**模型 id 三条路一样**：`provider/档位`（如 `sn/claude-opus-5`）。
+Gemini 的模型名在路径里，所以那一段要 URL 编码（`sn%2Fclaude-opus-5`）。
+
+明确不支持的字段一律**报错**（Responses 的 `previous_response_id` / `store`、
+Gemini 的 `cachedContent` / `safetySettings` 等）—— 静默丢字段会让模型看不到上一轮，
+还答得像模像样。
+
+## 插件渠道：一份 JSON 声明加一家渠道（v1.0.95-beta.2 起）
+
+把一份声明放进 `<数据目录>\plugins\*.json`，重启或在面板上点「重新扫描目录」：
+
+```json
+{
+  "manifestVersion": 1, "id": "acme", "name": "Acme",
+  "upstream": "https://api.acme.example/v1", "protocol": "openai", "auth": "apikey",
+  "models": ["acme-pro"], "relayPort": 15802,
+  "mapping": { "claude-fable-5": "acme-lite", "claude-sonnet-5": "acme-pro",
+               "claude-opus-5": "acme-pro", "claude-haiku-4-5": "acme-lite" }
+}
+```
+
+- **声明里不许带凭据** —— 插件是要分发给别人的东西，带 key 等于把你的 key 发给所有
+  装它的人。凭据在面板的「插件渠道」卡里填。
+- 撞出厂渠道的键**报错不覆盖**；装不上的插件**不拖垮启动**，且面板说清为什么。
+- 面板「凭据」页有「插件渠道」卡；「控制台」页有「审计台账」卡；
+  「故障转移」页有「限流」卡；「设置」页有「配置备份」卡。
+
 ## 回退：装回旧版本
 
 一行命令（列出可用版本让你选）：

@@ -75,7 +75,11 @@
           "sync.mjs",
           "concurrency.mjs",
           "rpm.mjs",
-          "plugin.mjs"
+          "plugin.mjs",
+          "responses.mjs",
+          "gemini.mjs",
+          "protocols.mjs",
+          "protocol-res.mjs"
         ]
       },
       {
