@@ -60,7 +60,10 @@ function sliceBetween(startAnchor, endAnchor) {
 /** 组装一个沙箱：返回抠出来的真实函数 + 可观察状态。 */
 function loadRealCode() {
   const relayErrorsSrc = sliceBetween("const relayErrors = {", "function noteRelayError(");
-  const attrSrc = sliceBetween('let wbErrPrefix = "WorkBuddy";', "function wbAnthroError(");
+  /* 起点是**注释的第一行** —— 注释里写着「为什么挂在请求上」，那条断言要读它。
+     ⚠ 终点之前含 `const ERR_CTX = Symbol(...)` 的声明，所以它**不能再作为
+     new Function 的参数**传进去（与函数体里的 const 同名 = 重复声明 = SyntaxError）。 */
+  const attrSrc = sliceBetween("/* 错误前缀与归因渠道", "function wbAnthroError(");
   const noteSrc = sliceToClosingBrace("function noteRelayError(");
   const atomicSrc = sliceBetween("const ATOMIC_TRANSIENT = ", "function writeAtomic(file, data, opts) {");
   const waSrc = sliceToClosingBrace("function writeAtomic(file, data, opts) {");
@@ -73,9 +76,7 @@ ${noteSrc}
 ${atomicSrc}
 ${waSrc}
 return {
-  relayErrors, noteRelayError, setErrProvider, errChannel, writeAtomic,
-  get prefix() { return wbErrPrefix; },
-  get channel() { return wbErrChannel; },
+  relayErrors, noteRelayError, setErrProvider, errPrefixOf, errChannelOf, writeAtomic,
   delays: ATOMIC_DELAYS,
 };`
   );
@@ -113,7 +114,7 @@ describe("T1 流式故障归因（setErrProvider 带渠道）", () => {
     const pipeSrc = sliceBetween("async function wbPipe(", "const DUMP_MAX_BYTES = ");
     const slots = pipeSrc.match(/noteRelayError\(([^,]+),/g) || [];
     assert.equal(slots.length, 4, `wbPipe 里应有 4 处 noteRelayError，实际 ${slots.length}`);
-    const notChannelled = slots.filter((s) => !s.startsWith("noteRelayError(errChannel()"));
+    const notChannelled = slots.filter((s) => !s.startsWith("noteRelayError(errChannelOf(res)"));
     assert.deepEqual(notChannelled, [], `wbPipe 里还有写死/间接渠道的归因：${notChannelled.join(" | ")}`);
     // 四种故障类型都要在：首事件闸门超时 / 上游 SSE 报错 / 流中断 / 未知形状（不判失败，只记诊断）
     for (const kind of ["timeout", "upstream_sse_error", "network", "unrecognized_shape"]) {
@@ -129,15 +130,18 @@ describe("T1 流式故障归因（setErrProvider 带渠道）", () => {
     assert.deepEqual(openai.sort(), ["or", "qd", "wb", "wbai", "zen"]);
   });
 
-  test("setErrProvider(name, channel) 五个渠道各归各槽", () => {
+  test("setErrProvider(res, name, channel) 五个渠道各归各槽", () => {
     const C = loadRealCode();
     const channels = ["wb", "wbai", "zen", "qd", "or"];
     for (const p of channels) {
       // 清干净所有槽位
       for (const k of Object.keys(C.relayErrors)) C.relayErrors[k] = { kind: null, message: null, at: null };
-      C.setErrProvider("OpenCode Zen", p);
-      assert.equal(C.channel, p, "setErrProvider 没把渠道记下来");
-      C.noteRelayError(C.errChannel(), "timeout", `${p} 上游 60s 内未发出首个响应块`);
+      /* ⚠ 上下文挂在**这次请求的 res** 上（2026-10-23 改：原来是模块级全局，
+       *   并发请求会互相覆盖前缀 —— 见 err-prefix-test.mjs）。 */
+      const res = {};
+      C.setErrProvider(res, "OpenCode Zen", p);
+      assert.equal(C.errChannelOf(res), p, "setErrProvider 没把渠道记下来");
+      C.noteRelayError(C.errChannelOf(res), "timeout", `${p} 上游 60s 内未发出首个响应块`);
       assert.equal(C.relayErrors[p].kind, "timeout", `${p} 的故障没记到自己的槽位`);
       for (const other of channels) {
         if (other === p) continue;
@@ -148,34 +152,36 @@ describe("T1 流式故障归因（setErrProvider 带渠道）", () => {
 
   test("三个真实调用点都把渠道 key 传了下去", () => {
     const C = loadRealCode();
-    // openaiExchange：setErrProvider(NAME, p);
-    let line = evalCallSiteLine(/^\s*setErrProvider\(NAME, p\);.*$/m,
-      ["setErrProvider"], [C.setErrProvider], { NAME: "OpenCode Zen", p: "zen" });
-    assert.equal(C.channel, "zen");
-    assert.equal(C.prefix, "OpenCode Zen");
+    /* openaiExchange：setErrProvider(res, NAME, p); */
+    const r1 = {};
+    evalCallSiteLine(/^\s*setErrProvider\(res, NAME, p\);.*$/m,
+      ["setErrProvider"], [C.setErrProvider], { NAME: "OpenCode Zen", p: "zen", res: r1 });
+    assert.equal(C.errChannelOf(r1), "zen");
+    assert.equal(C.errPrefixOf(r1), "OpenCode Zen");
 
-    // makeRelay：setErrProvider(relayLabel(p), p);
-    C.setErrProvider("X", "wb");
-    evalCallSiteLine(/^\s*setErrProvider\(relayLabel\(p\), p\);.*$/m,
-      ["setErrProvider", "relayLabel"], [C.setErrProvider, (x) => ({ or: "OpenRouter" }[x] || x)], { p: "or" });
-    assert.equal(C.channel, "or");
-    assert.equal(C.prefix, "OpenRouter");
+    /* makeRelay：setErrProvider(res, relayLabel(p), p); */
+    const r2 = {};
+    evalCallSiteLine(/^\s*setErrProvider\(res, relayLabel\(p\), p\);.*$/m,
+      ["setErrProvider", "relayLabel"], [C.setErrProvider, (x) => ({ or: "OpenRouter" }[x] || x)], { p: "or", res: r2 });
+    assert.equal(C.errChannelOf(r2), "or");
+    assert.equal(C.errPrefixOf(r2), "OpenRouter");
 
-    // 影子 res 分支：setErrProvider(relayLabel(fo.provider), fo.provider);
-    C.setErrProvider("X", "wb");
-    evalCallSiteLine(/^\s*setErrProvider\(relayLabel\(fo\.provider\), fo\.provider\);.*$/m,
-      ["setErrProvider", "relayLabel"], [C.setErrProvider, (x) => ({ qd: "Qoder" }[x] || x)], { fo: { provider: "qd" } });
-    assert.equal(C.channel, "qd");
-    assert.equal(C.prefix, "Qoder");
+    /* 影子 res 分支：setErrProvider(res, relayLabel(fo.provider), fo.provider); */
+    const r3 = {};
+    evalCallSiteLine(/^\s*setErrProvider\(res, relayLabel\(fo\.provider\), fo\.provider\);.*$/m,
+      ["setErrProvider", "relayLabel"], [C.setErrProvider, (x) => ({ qd: "Qoder" }[x] || x)], { fo: { provider: "qd" }, res: r3 });
+    assert.equal(C.errChannelOf(r3), "qd");
+    assert.equal(C.errPrefixOf(r3), "Qoder");
   });
 
-  test("向后兼容：setErrProvider(name) 不传渠道时回落到 wb，不产出 undefined 槽位", () => {
+  test("向后兼容：setErrProvider 不传渠道时回落到 wb，不产出 undefined 槽位", () => {
     const C = loadRealCode();
     for (const bad of [undefined, null, "", 0, {}, []]) {
-      C.setErrProvider("WorkBuddy", "zen");
-      C.setErrProvider("WorkBuddy", bad);
-      assert.equal(C.channel, "wb", `传 ${JSON.stringify(bad)} 时应回落 wb`);
-      C.noteRelayError(C.errChannel(), "network", "断流");
+      const r1 = {}, r2 = {};
+      C.setErrProvider(r1, "WorkBuddy", "zen");
+      C.setErrProvider(r2, "WorkBuddy", bad);
+      assert.equal(C.errChannelOf(r2), "wb", `传 ${JSON.stringify(bad)} 时应回落 wb`);
+      C.noteRelayError(C.errChannelOf(r2), "network", "断流");
       assert.equal(C.relayErrors.wb.kind, "network");
       assert.equal(C.relayErrors.zen.kind, null, "上一轮 zen 的槽位不该残留");
     }
@@ -183,12 +189,17 @@ describe("T1 流式故障归因（setErrProvider 带渠道）", () => {
     assert.equal(Object.prototype.hasOwnProperty.call(C.relayErrors, "undefined"), false);
   });
 
-  test("残留并发风险已在注释里写明（模块级全局仍会串）", () => {
-    const blk = sliceBetween('let wbErrPrefix = "WorkBuddy";', "function wbAnthroError(");
-    assert.match(blk, /残留并发风险/);
-    assert.match(blk, /本轮有意没动/);
-    assert.match(blk, /errChannel\(\)/, "注释应点名仍会串的读取点");
-    assert.match(blk, /模块级全局/);
+  test("并发串台已根治：上下文挂在请求上，不再是模块级全局", () => {
+    /* 2026-10-23 之前这里是「残留并发风险（有意没动）」—— 现在根治了，
+     * 所以这条断言**反过来**盯住新形态：上下文必须挂在 res 上。
+     * 真串台的用例在 scripts/err-prefix-test.mjs（含反向对照）。 */
+    const blk = sliceBetween("/* 错误前缀与归因渠道", "function wbAnthroError(");
+    assert.match(blk, /挂在请求/, "注释要说明上下文挂在请求/影子上");
+    assert.match(blk, /并发/, "注释要点名并发这件事");
+    assert.equal(/let\s+wbErrPrefix\b/.test(SRC), false, "模块级全局必须没有");
+    assert.equal(/let\s+wbErrChannel\b/.test(SRC), false, "模块级全局必须没有");
+    assert.match(SRC, /function setErrProvider\(res,/, "写侧必须收 res");
+    assert.match(SRC, /function errChannelOf\(res\)/, "读侧必须经由 res");
   });
 });
 

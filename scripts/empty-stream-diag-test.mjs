@@ -112,11 +112,19 @@ const iShape = CLASSIFY.indexOf("unrecognized_shape");
 assert.ok(iRejected > 0, "判据段抠错位置：缺非 2xx 的状态码早退");
 assert.ok(iRejected < iShape, "状态码判据必须排在 unrecognized_shape 之前");
 
-/** 把抠出来的真函数组装成一个可注入 wbErrPrefix 的沙箱。 */
+/** 把抠出来的真函数组装成一个可注入**渠道前缀**的沙箱。
+ *
+ * ⚠ 2026-10-23：前缀不再是模块级全局（那正是并发串台的根因），而是**形参** ——
+ *   wbEmptyStreamCore(kind, prefix) 与 wbUnknownPassthroughText(unknown, prefix)
+ *   都得由调用方把「这一家是谁」传进来。沙箱在这里用一层包装补上默认值，
+ *   免得每个用例都写两遍前缀。
+ *   真代码里这两个函数的调用点一律传 errPrefixOf(res)（见 server.mjs）。 */
 function loadDiag(errPrefix = "WorkBuddy") {
-  const factory = new Function("wbErrPrefix",
+  const factory = new Function("DEFAULT_PREFIX",
     `${CONSTS}\n${SHAPES}\n${RESIDUE}\n${ATTRS}\n${CLASSIFY}
-return { wbFrameResidue, classifyEmptyStream, wbEmptyStreamCore, wbUnknownPassthroughText,
+return { wbFrameResidue, classifyEmptyStream,
+         wbEmptyStreamCore: (k) => wbEmptyStreamCore(k, DEFAULT_PREFIX),
+         wbUnknownPassthroughText: (u) => wbUnknownPassthroughText(u, DEFAULT_PREFIX),
          wbShapeOf, wbResidueHasValue, EMPTY_STREAM_ATTRIBUTIONS };`);
   return factory(errPrefix);
 }

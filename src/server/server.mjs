@@ -3945,32 +3945,38 @@ function wbToOpenAI(j) {
 // 这段桥被 **五个**提供方共用（makeRelay 的 openai:true —— 见 relaySpec 里的
 // wb / wbai / zen / qd / or，v1.0.73 的国际版补全把 3 个加到了 5 个），
 // 前缀不能写死 WorkBuddy——否则 Zen/Qoder 的报错会顶着 "[WorkBuddy]" 出现在用户面前。
-let wbErrPrefix = "WorkBuddy";
+/* 错误前缀与归因渠道：**挂在请求/影子上**，不是模块级全局。
+ *
+ * ⚠⚠ 为什么必须挂上去（2026-10-23 实测）：三个中转端口的请求是**并发**的，
+ *   模块级全局会被别的请求抢先改掉 —— 于是 wb 的错误顶着「[MiniMax 会员]」的前缀，
+ *   面板上那句自相矛盾的报错会把排查**引到错的渠道**上
+ *   （实测：「wb:失败[st=503/[MiniMax 会员] WorkBuddy 令牌账号被判死]」）。
+ *   挂在 res 上就天然是 per-request / per-attempt 的：影子 res 每次尝试新建一个。
+ *
+ * ⚠ 没挂上时回落成 "WorkBuddy"（旧行为）——宁可前缀泛一点，也不许前缀是错的。 */
+const ERR_CTX = Symbol("bai.errCtx");
 // 同一段桥里的 noteRelayError 也必须按**真实渠道**归因（面板每渠道只有一个槽位）。
 // 以前三处全写死 "wb"，其中 bail() 那处还是个三元的**两个分支都等于 "wb"** 的退化写法——
 // 意图是按渠道归因、从未填完。后果：Zen / Qoder / OpenRouter 的流式超时与断流
 // 在面板的归因里**完全看不见**，全被记到 WorkBuddy 名下。
-let wbErrChannel = "wb";
-function setErrProvider(name, channel) {
-  wbErrPrefix = name;
-  // 向后兼容：不传 channel 的调用（老调用点 / 未来新增的提供方）一律回 "wb"，
-  // 绝不让 undefined 流进 relayErrors 去造一个空白槽位。
-  wbErrChannel = typeof channel === "string" && channel ? channel : "wb";
+function setErrProvider(res, name, channel) {
+  try {
+    if (res) res[ERR_CTX] = { name: String(name || "WorkBuddy"), channel: typeof channel === "string" && channel ? channel : "wb" };
+  } catch { /* res 不可写就当没有上下文（前缀回落成 WorkBuddy） */ }
 }
-// 读取侧再兜一层：万一有路径绕过 setErrProvider 直接写 wbErrChannel，
+// 读取侧再兜一层：万一有路径绕过 setErrProvider 直接读，
 // 也不会把 undefined 当成槽位名写进去（noteRelayError 会 fallback 到 bai，更糟）。
-function errChannel() { return wbErrChannel || "wb"; }
-// ⚠️ 残留并发风险（**本轮有意没动**，别当成已解决）：wbErrPrefix / wbErrChannel 都是
-// **模块级全局**，而三个中转端口的请求是并发的。仍可能串的正是下面三处读它们的行：
-//   · setErrProvider 调用点（openaiExchange / makeRelay / 影子 res 分支）设值
-//   · 首事件闸门超时    → noteRelayError(errChannel(), "timeout", …)
-//   · bail() 上游 SSE 报错 → noteRelayError(errChannel(), "upstream_sse_error", …)
-//   · 迭代器抛异常断流   → noteRelayError(errChannel(), "network", …)
-// 期间若另一个请求抢先 setErrProvider 了别的渠道，本请求的归因与前缀都会串过去。
-// 根治要把这份上下文挂到请求/连接上（makeRelay 的 req 或 wbPipe 的入参），
-// 属于另一次重构；本轮只把「写死的 wb」修成「真实渠道」，**没碰并发语义**。
-// 提供方 → 展示名（中转端口自己答错时用：全局 wbErrPrefix 是别的请求留下的，
-// 不重设会把 [Qoder] 的错误挂上 [WorkBuddy] 之类的前缀）
+function errPrefixOf(res) { const c = res && res[ERR_CTX]; return (c && c.name) || "WorkBuddy"; }
+function errChannelOf(res) { const c = res && res[ERR_CTX]; return (c && c.channel) || "wb"; }
+// ⚠ 读点与写点现在**成对挂在同一个 res 上**，所以并发请求之间不会串：
+//   · setErrProvider(res, …) 设值（openaiExchange / makeRelay / 转移链的每次尝试）
+//   · 首事件闸门超时    → noteRelayError(errChannelOf(res), "timeout", …)
+//   · bail() 上游 SSE 报错 → noteRelayError(errChannelOf(res), "upstream_sse_error", …)
+//   · 迭代器抛异常断流   → noteRelayError(errChannelOf(res), "network", …)
+//   ⚠ 影子 res（cap）每次尝试新建一个 → 转移链里不同渠道各归各的，
+//     不会出现「wb 的错误顶着 [MiniMax 会员] 的前缀」这种自相矛盾的话
+//     （2026-10-23 实测出现过，正是这个原因）。
+// 提供方 → 展示名（中转端口自己答错时用）
 const RELAY_LABELS = CHANNEL_LABELS;   // 与 PROVIDERS 同一张表，见文件头 CHANNELS 处
 function relayLabel(p) { return RELAY_LABELS[p] || p; }
 function wbAnthroError(res, status, msg) {
@@ -3979,7 +3985,7 @@ function wbAnthroError(res, status, msg) {
   const typeMap = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 500: "api_error", 503: "overloaded_error", 529: "overloaded_error" };
   const type = typeMap[s] || (s >= 500 ? "api_error" : "invalid_request_error");
   res.writeHead(s, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-  res.end(JSON.stringify({ type: "error", error: { type, message: `[${wbErrPrefix}] ${String(msg).slice(0, 400)}` } }));
+  res.end(JSON.stringify({ type: "error", error: { type, message: `[${errPrefixOf(res)}] ${String(msg).slice(0, 400)}` } }));
 }
 
 async function* sseLines(body) {
@@ -4200,18 +4206,18 @@ function classifyEmptyStream(probe) {
   return "upstream_blank";
 }
 /** 归因正文（**不含渠道前缀**——bail() 会自己加 [前缀]，重复加会出现 [X] [X]）。 */
-function wbEmptyStreamCore(kind) {
+function wbEmptyStreamCore(kind, prefix) {
   const a = EMPTY_STREAM_ATTRIBUTIONS[kind] || EMPTY_STREAM_ATTRIBUTIONS.upstream_nothing;
   return `${a.label} —— ${a.zh}${a.hint}${a.do}`;
 }
 /** 透传给客户端的原文。原文回传给**发起这次请求的同一个客户端**，不构成新的信息外泄；
  *  日志侧只写键名/形状（见 wbResidue），两边都受 WB_PASSTHROUGH_MAX / WB_RESIDUE_RAW_MAX 约束。 */
-function wbUnknownPassthroughText(unknown) {
+function wbUnknownPassthroughText(unknown, prefix) {
   const hits = (unknown || []).filter((u) => u && u.hasValue);
   const names = [...new Set(hits.map((u) => (u.where ? `${u.where}.` : "") + (u.key || "?")))].slice(0, 8);
   const raw = hits.map((u) => u.raw).join("\n").slice(0, WB_PASSTHROUGH_MAX);
   const tail = hits.map((u) => u.raw).join("\n").length > WB_PASSTHROUGH_MAX ? "\n…（已截断）" : "";
-  return `【${wbErrPrefix} ${EMPTY_STREAM_ATTRIBUTIONS.unrecognized_shape.label}】${EMPTY_STREAM_ATTRIBUTIONS.unrecognized_shape.do}\n` +
+  return `【${prefix || "WorkBuddy"} ${EMPTY_STREAM_ATTRIBUTIONS.unrecognized_shape.label}】${EMPTY_STREAM_ATTRIBUTIONS.unrecognized_shape.do}\n` +
     `未识别的字段：${names.join("、")}\n上游原文（未改写）：\n${raw}${tail}`;
 }
 
@@ -4239,12 +4245,12 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs, usage
      * `upstream_429`，会把那条更准的槽位**覆盖掉**。
      * 那正是「诊断跑偏」本身：只不过不是诊断说错，而是把对的诊断擦成了粗的。
      * 所以这一段只负责**给客户端一句不说反话的话**，不碰面板槽位。 */
-    const tail = wbEmptyStreamCore("upstream_rejected")
+    const tail = wbEmptyStreamCore("upstream_rejected", errPrefixOf(res))
       .replace(/。$/, "") + `（本次 HTTP ${httpStatus}）`;
     if (res.headersSent) return wbAnthroError(res, 502, tail);
     res.writeHead(httpStatus >= 400 && httpStatus < 600 ? httpStatus : 502,
       { "content-type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: `[${wbErrPrefix}] ${tail}｜上游原文：${upstreamBodyText(bodyText, 200)}` } }));
+    res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: `[${errPrefixOf(res)}] ${tail}｜上游原文：${upstreamBodyText(bodyText, 200)}` } }));
     return;
   }
   const lines = sseLines(r.body)[Symbol.asyncIterator]();
@@ -4258,9 +4264,9 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs, usage
   // 才知道是正常流还是伪装成 200 的错误，头也就还没发出去，仍可整段丢弃换渠道。
   const first = timeoutMs > 0 ? await withDeadline(lines.next(), timeoutMs) : await lines.next();
   if (first.timedOut) {
-    noteRelayError(errChannel(), "timeout", `${wbErrPrefix} 上游 ${Math.round(timeoutMs / 1000)}s 内未发出首个响应块`);
+    noteRelayError(errChannelOf(res), "timeout", `${errPrefixOf(res)} 上游 ${Math.round(timeoutMs / 1000)}s 内未发出首个响应块`);
     await dropBody(r);
-    return wbAnthroError(res, 504, `${wbErrPrefix} 上游 ${Math.round(timeoutMs / 1000)} 秒内没有返回任何内容，已中断本次请求`);
+    return wbAnthroError(res, 504, `${errPrefixOf(res)} 上游 ${Math.round(timeoutMs / 1000)} 秒内没有返回任何内容，已中断本次请求`);
   }
   if (!first.done) firstVal = first.value;
   let idx = -1;
@@ -4298,15 +4304,15 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs, usage
   // （Qoder 后端全挂）能被故障转移兜住的关键。头一旦发出（流式已 message_start），
   // 就只剩把错误事件交给客户端这一条路（和之前一样）。
   const bail = (msg, kind, status) => {
-    noteRelayError(errChannel(), "upstream_sse_error", msg.slice(0, 180));
+    noteRelayError(errChannelOf(res), "upstream_sse_error", msg.slice(0, 180));
     if (!res.headersSent) {
       // 影子 res：只记状态码与正文，由 attemptWithFailover 决定转移还是落盘
       res.writeHead(status || 502, { "content-type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ type: "error", error: { type: kind || "api_error", message: `[${wbErrPrefix}] ${msg}` } }));
+      res.end(JSON.stringify({ type: "error", error: { type: kind || "api_error", message: `[${errPrefixOf(res)}] ${msg}` } }));
       return true;
     }
     if (clientStream) {
-      emit("error", { type: "error", error: { type: kind || "api_error", message: `[${wbErrPrefix}] ${msg}` } });
+      emit("error", { type: "error", error: { type: kind || "api_error", message: `[${errPrefixOf(res)}] ${msg}` } });
       try { res.end(); } catch { }
       return true;
     }
@@ -4402,12 +4408,12 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs, usage
     }
   } catch (e) {
     // 上游流中断：把错误以 Anthropic error 事件/JSON 形式交还客户端。
-    // 前缀用 wbErrPrefix（渠道展示名）而不是写死的 "WorkBuddy"——槽位归因修好之后，
+    // 前缀用 errPrefixOf(res)（渠道展示名）而不是写死的 "WorkBuddy"——槽位归因修好之后，
     // 这行是最后还会把 [WorkBuddy] 挂到 Zen/Qoder/OpenRouter 头上的地方。
     const brk = String(e && e.message || e).slice(0, 200);
-    noteRelayError(errChannel(), "network", `${wbErrPrefix} 流中断: ${brk.slice(0, 160)}`);
+    noteRelayError(errChannelOf(res), "network", `${errPrefixOf(res)} 流中断: ${brk.slice(0, 160)}`);
     if (clientStream) {
-      emit("error", { type: "error", error: { type: "api_error", message: `[${wbErrPrefix}] 上游流中断: ${brk}` } });
+      emit("error", { type: "error", error: { type: "api_error", message: `[${errPrefixOf(res)}] 上游流中断: ${brk}` } });
       try { res.end(); } catch { }
       return;
     }
@@ -4429,14 +4435,14 @@ async function wbPipe(r, res, { model, clientStream, inputJson, timeoutMs, usage
   const emptyKind = classifyEmptyStream(probe);
   if (idx < 0 && emptyKind === "unrecognized_shape") {
     // 记一条具名诊断给面板（不 bail——这正是"兜底取反"），并把上游原文透传出去。
-    noteRelayError(errChannel(), "unrecognized_shape", wbEmptyStreamCore(emptyKind));
-    passthrough = wbUnknownPassthroughText(probe.unknown);
+    noteRelayError(errChannelOf(res), "unrecognized_shape", wbEmptyStreamCore(emptyKind, errPrefixOf(res)));
+    passthrough = wbUnknownPassthroughText(probe.unknown, errPrefixOf(res));
     if (clientStream) {
       openCur("text", { type: "text", text: "" });
       emit("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: passthrough } });
     }
   } else if (idx < 0 && !usage) {
-    if (bail(wbEmptyStreamCore(emptyKind), "api_error", 502)) return;
+    if (bail(wbEmptyStreamCore(emptyKind, errPrefixOf(res)), "api_error", 502)) return;
   }
 
   closeCur();
@@ -5135,7 +5141,7 @@ try {
 
 async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs, usageOut, acctOut, sessionKey }) {
   const NAME = p === "zen" ? "OpenCode Zen" : p === "qd" ? "Qoder" : p === "or" ? "OpenRouter" : wkZh(p);
-  setErrProvider(NAME, p);   // 渠道 key 一起传下去：wbPipe 里的 noteRelayError 要按真实渠道归因
+  setErrProvider(res, NAME, p);   // 渠道 key 一起传下去：wbPipe 里的 noteRelayError 要按真实渠道归因
   /* ---- OpenCode 传输：**在取令牌之前**提前分流（v1.0.75）----
    *
    * 位置是判据不是随手放的：这一档用 OpenCode 自己的认证，**根本不需要 cfg.zen.apiKey**
@@ -7169,7 +7175,7 @@ function makeRelayHandler(p, store, getSlice, useProxy, opts = {}) {
       if (opts.openai || opts.gateV1) {
         // 端点匹配用：容忍结尾多余的 "/"（路径归一化只影响识别，判 404 的文案仍用原样 urlPath）
         const epPath = urlPath.length > 1 ? urlPath.replace(/\/+$/, "") : urlPath;
-        setErrProvider(relayLabel(p), p);
+        setErrProvider(res, relayLabel(p), p);
         // —— 桌面版探测端点 ①：token 计数。本机按字符数估算应答，绝不为此调用上游 ——
         if (epPath === "/v1/messages/count_tokens") {
           if (req.method !== "POST") {
@@ -7331,7 +7337,7 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
             prepared = await fo.opts.prepareHeaders({ req, cfg, headers, isProbe, provider: fo.provider });
           } catch (e) {
             const why = String((e && e.message) || e);
-            setErrProvider(relayLabel(fo.provider), fo.provider);
+            setErrProvider(res, relayLabel(fo.provider), fo.provider);
             noteRelayError(fo.provider, "auth", why);
             if (!res.headersSent) return wbAnthroError(res, 401, why);
             try { res.end(); } catch { }
@@ -7374,7 +7380,7 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
             const why = !len ? "请求体为空"
               : !ctv.toLowerCase().includes("json") ? "Content-Type 不是 JSON"
               : "body 不是合法 JSON";
-            setErrProvider(relayLabel(fo.provider), fo.provider);
+            setErrProvider(res, relayLabel(fo.provider), fo.provider);
             return wbAnthroError(res, 400, `请求体无法解析为 Anthropic messages JSON：${why}｜Content-Type=${ctv}｜长度=${len} 字节｜前 80 字节=${raw}`);
           }
           try {
