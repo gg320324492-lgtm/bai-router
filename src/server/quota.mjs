@@ -544,6 +544,55 @@ export function applyQuotaToSeat(seat, quota, opts = {}) {
   });
 }
 
+/**
+ * 把**上游自己报的余额**折算进一个座位（routes.mjs 的 Seat）。
+ *
+ * 与 {@link applyQuotaToSeat} 的分工：那个吃的是**我们自己估的预算**
+ * （账本 + 用户设的上限），这个吃的是**上游探回来的真值**。
+ * 真值更权威，所以取 max —— 上游说 90%、我们估 30%，该按 90% 走
+ * （上游是硬事实）；上游说 30%、我们估 90%，也该按 90% 走（我们替用户省着花）。
+ *
+ * ⚠⚠ **探不到 ≠ 用完，也 ≠ 没用过**：探不到时**原样返回座位**，一个字节都不改。
+ *   把「探不到」当成 0% → 这一家看起来「额度很富余」被排到最前，而真相可能是
+ *   它已经欠费了；把它当成 100% → 一家好渠道因为网络不通被踢出候选。
+ *   **没有信号就是没有信号**，两种猜法都会把猜测变成行为。
+ *
+ * ⚠ **只折进 used，不动 resting**：额度用完的那家仍然**留在候选里**，
+ *   只是排到最后（routes.mjs 的 smart 把 used≥98 的算「spent」档）。
+ *   直接踢掉的话，「所有渠道都冷却」会变成「没有渠道」，用户看到的是一句
+ *   没有出处的失败，而不是上游真实的 402/429 —— 宁可试一次拿到真错误。
+ *
+ * ⚠ **分母必须是正的**：上游只给百分比时 limit 记 100（百分数的分母），
+ *   那是能算的；但 limit 为 0 或缺失时**没有比例可言**，按「没有信号」处理。
+ *
+ * @param {object} seat 原来的座位（routes.Seat）
+ * @param {object} probe 探测结果 { known, used, limit, unit }
+ * @returns {Seat} 新座位；没有信号时原样返回
+ */
+export function applyProbeToSeat(seat, probe) {
+  const s = seat && typeof seat === "object" ? seat : {};
+  if (!probe || probe.known !== true) return s;
+  const used = num(probe.used);
+  const limit = num(probe.limit);
+  if (used == null || limit == null || limit <= 0) return s;   // 没有分母 = 没有比例
+  const pct = Math.round(clampPct((used / limit) * 100));
+  const merged = Math.max(Math.round(clampPct(num(s.used) ?? 0)), pct);
+  const weight = Math.max(1, Math.round((num(s.weight) ?? 1) * Math.max(0, 1 - merged / 100)));
+  return new Seat({
+    key: s.key == null ? "" : String(s.key),
+    account: !!s.account,
+    known: true,                  // 上游报了真值 = 我们知道这家用了多少
+    learns: !!s.learns,
+    used: merged,
+    soon: Array.isArray(s.soon) ? s.soon.slice() : [],
+    pace: num(s.pace) ?? 0,
+    weight,
+    resting: !!s.resting,
+    tokens: num(s.tokens) ?? 0,
+    free: !!s.free,
+  });
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ⑧ 休息：预算耗尽 → 让这家歇到窗口重置
  * ══════════════════════════════════════════════════════════════════════ */

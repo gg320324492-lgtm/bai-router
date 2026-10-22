@@ -406,6 +406,28 @@ describe("③ 活体：统一网关与旧中转端口逐字等价", () => {
     assert.equal(r.status, 404, `实际 ${r.status}：${r.text.slice(0, 300)}`);
     assert.match(r.text, /nope/, "错误信息必须点名是哪一家不认识");
   }, { timeout: 180000 });
+
+  test("★ 小版本降级：客户端送 claude-opus-5-5 → 上游仍收到映射目标（不是默认模型）", async () => {
+    /* 2026-10-22 从中转日志里查出来的真问题：客户端送来的 id 带**小版本**
+     * （claude-opus-5-5），而映射表的 key 是**档位名**（claude-opus-5）。
+     * 差最后一段就查不到 → 静默落回本渠道默认模型 → 用户点 opus、跑的是默认那个。
+     * 实测日志里 claude-opus-5-5 出现过 7 次，全是回落。 */
+    const a = await measure(S, S.P.sn, "claude-opus-5-5");
+    assert.equal(a.res.status, 200, `直连路径必须成功。实际 ${a.res.status}：${a.res.text.slice(0, 200)}`);
+    assert.equal(a.hit.model, FAKE_MODEL,
+      `★ 直连路径必须把 claude-opus-5-5 解析成映射目标。实际 ${a.hit.model}`);
+    assert.notEqual(a.hit.model, FAKE_DEFAULT,
+      "★ 落回默认模型就是「用户点 opus、跑的是默认那个」——那条静默回落");
+
+    /* 网关路径同理：sn/claude-opus-5-5 必须照样打到映射目标，
+       而不是把 claude-opus-5-5 原样发给上游（上游压根没有这个模型名 → 400）。 */
+    const b = await measure(S, S.P.gateway, "sn/claude-opus-5-5");
+    assert.equal(b.res.status, 200, `网关路径必须成功。实际 ${b.res.status}：${b.res.text.slice(0, 200)}`);
+    assert.equal(b.hit.model, FAKE_MODEL,
+      `★ 网关路径也必须解析成映射目标。实际 ${b.hit.model}`);
+    assert.equal(b.hit.raw, a.hit.raw,
+      "★ 两条路径的上游请求体必须逐字相同（降级后它们本该是同一个请求）");
+  }, { timeout: 180000 });
 });
 
 /* ====================================================================== *

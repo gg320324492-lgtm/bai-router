@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { apply as applyRouteStrategy, Builtin } from "../src/server/routes.mjs";
 import { seatOf } from "../src/server/seat-builder.mjs";
 import { makeCandidate } from "../src/server/candidates.mjs";
+import { applyQuotaToSeat, applyProbeToSeat } from "../src/server/quota.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = fs.readFileSync(path.join(ROOT, "src/server/server.mjs"), "utf8");
@@ -38,9 +39,22 @@ function sliceFn(src, anchor) {
 }
 const SRC_ORDER_CHAIN = sliceFn(SRC, "function orderChain");
 
+/**
+ * 造一个 orderChain，依赖从外面注进去。
+ *
+ * ⚠⚠ **loadCfg 必须注入**：orderChain 内部第一件事就是 loadCfg()，
+ *   而它整个函数体包在 try/catch 里 —— 之前这条测试**没有注入 loadCfg**，
+ *   于是每次调用都在第一行 ReferenceError、被 catch 吞掉、直接 return 原序。
+ *   也就是说：②「信号不足 → 顺序一字不变」与③「排序坏了不许崩」两条断言
+ *   **恒真**（它们看到的永远是那条「什么都没做」的路径）。
+ *   恒真的测试比没有测试更坏 —— 它会让人以为这条链验过了。
+ *   现在把依赖补齐，orderChain 真的跑起来，断言才有意义。
+ */
 function makeOrderChain(opts = {}) {
   const factory = new Function(
     "seatOf", "makeCandidate", "applyRouteStrategy", "Builtin", "failoverAvailable", "restTable",
+    "loadCfg", "budgetStates", "budgetExhausted", "applyQuotaToSeat", "applyProbeToSeat",
+    "cachedProbeOf",
     `${SRC_ORDER_CHAIN}\nreturn orderChain;`,
   );
   return factory(
@@ -50,6 +64,12 @@ function makeOrderChain(opts = {}) {
     Builtin,
     opts.cooling ? (p) => opts.cooling.includes(p) : () => true,
     () => ({ has: () => false, due: () => true, entry: () => null }),
+    opts.loadCfg ? opts.loadCfg : () => ({}),
+    opts.budgetStates ? opts.budgetStates : () => new Map(),
+    opts.budgetExhausted ? opts.budgetExhausted : () => false,
+    opts.applyQuotaToSeat ? opts.applyQuotaToSeat : applyQuotaToSeat,
+    opts.applyProbeToSeat ? opts.applyProbeToSeat : applyProbeToSeat,
+    opts.cachedProbeOf ? opts.cachedProbeOf : () => null,
   );
 }
 
@@ -100,5 +120,47 @@ describe("转移链排序", () => {
     const orderChain = makeOrderChain();
     assert.deepEqual(orderChain(["bai"], NOW), ["bai"]);
     assert.deepEqual(orderChain([], NOW), []);
+  });
+
+  test("⑥ 上游真报的余额把「快用完的那家」排到最后（探测信号接进排序了）", () => {
+    /* T9 的最后一块：排序除了「我们自己估的预算」，还要看「上游自己报的余额」。
+     * 后者是真值，权威：上游说 zen 用了 99/100，zen 就该排到后面。 */
+    const orderChain = makeOrderChain({
+      cachedProbeOf: (p) => (p === "zen"
+        ? { known: true, used: 99, limit: 100, unit: "requests" }
+        : { known: true, used: 3, limit: 100, unit: "requests" }),
+    });
+    const out = orderChain(["zen", "sn"], NOW);
+    assert.deepEqual(out, ["sn", "zen"],
+      "上游说 zen 用了 99%，它就该排到后面（原来 zen 排在前面）");
+  });
+
+  test("⑦ 探不到 ≠ 用完：探不到的那家**不许**被挪到后面", () => {
+    /* 这是最容易写反的一条：「探不到」被当成 0% → 排最前；被当成 100% → 排最后。
+     * 两种都是把猜测变成行为。正确做法是：没有信号 = 不动。 */
+    const orderChain = makeOrderChain({
+      cachedProbeOf: (p) => (p === "zen"
+        ? { known: false, used: null, limit: null, unit: "unknown", error: "探不到" }
+        : null),
+    });
+    assert.deepEqual(orderChain(["zen", "sn"], NOW), ["zen", "sn"],
+      "探不到的那家不该被挪到后面去");
+  });
+
+  test("⑧ 缓存里没有这一家 = 没有信号（不许当成 0%）", () => {
+    const orderChain = makeOrderChain({ cachedProbeOf: () => null });
+    assert.deepEqual(orderChain(["zen", "sn"], NOW), ["zen", "sn"]);
+  });
+
+  test("⑨ 探测信号与预算信号取 max（上游的真值压得住我们的估计）", () => {
+    /* 预算说 zen 用了 30%，上游说 90% → 按 90% 走（上游是硬事实）。 */
+    const orderChain = makeOrderChain({
+      budgetStates: () => new Map([["zen", { known: true, usedPct: 30, weightFactor: 0.7, provider: "zen" }]]),
+      cachedProbeOf: (p) => (p === "zen"
+        ? { known: true, used: 90, limit: 100, unit: "requests" }
+        : { known: true, used: 1, limit: 100, unit: "requests" }),
+    });
+    const out = orderChain(["zen", "sn"], NOW);
+    assert.deepEqual(out, ["sn", "zen"], "上游说 zen 用了 90%，它就该排到后面");
   });
 });

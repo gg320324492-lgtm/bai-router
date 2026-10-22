@@ -46,6 +46,7 @@ import {
   quotaState,
   quotaWeights,
   applyQuotaToSeat,
+  applyProbeToSeat,
   budgetRestNote,
   budgetRestUntil,
   budgetRestDecision,
@@ -382,6 +383,59 @@ describe("休息：预算耗尽的归因必须与「上游额度用尽」分开"
 });
 
 /* ══════════════════════════════════════════════════════════════════════
+ * ⑤b 上游真报的余额 → 座位（applyProbeToSeat）
+ *
+ * 这是 T9 的最后一块：转移链的排序除了「我们自己估的预算」，还要看
+ * 「上游自己报的余额」—— 后者是真值，权威。
+ *
+ * ⚠ 最容易写反的一条：**探不到 ≠ 0，也 ≠ 100**。
+ *   把「探不到」当成 0% → 那家看起来「额度富余」被排到最前（真相可能是欠费了）；
+ *   把它当成 100% → 一家好渠道因为网络不通被踢到最后。
+ *   正确做法：没有信号 = 一个字节都不改。
+ * ══════════════════════════════════════════════════════════════════════ */
+
+describe("applyProbeToSeat —— 上游真报的余额折进座位", () => {
+  const base = () => new Seat({ key: "sn", used: 0, weight: 1 });
+
+  test("① 上游说用了 99% → 座位 used 变成 99", () => {
+    const s = applyProbeToSeat(base(), { known: true, used: 99, limit: 100, unit: "requests" });
+    assert.equal(s.used, 99);
+  });
+
+  test("② 探不到 → 座位一个字都不改（不是 0，也不是 100）", () => {
+    const b = base();
+    const s = applyProbeToSeat(b, { known: false, used: null, limit: null, unit: "unknown", error: "探不到" });
+    assert.equal(s.used, 0, "探不到不许变成 0%（那会让它显得额度富余）");
+    assert.equal(s.known, false, "探不到不许变成「我们知道了」");
+    assert.equal(s, b, "探不到时原样返回同一个座位");
+  });
+
+  test("③ 没有分母（limit 为 0 或缺失）→ 没有信号", () => {
+    const b = base();
+    assert.equal(applyProbeToSeat(b, { known: true, used: 5, limit: 0 }).used, 0,
+      "limit 为 0 时没有比例可言（0/0 不是 0%）");
+    assert.equal(applyProbeToSeat(b, { known: true, used: 5, limit: null }).used, 0);
+  });
+
+  test("④ 取 max：上游报的更高时，不能被我们自己的估计压低", () => {
+    const s = applyProbeToSeat(new Seat({ key: "sn", used: 30 }), { known: true, used: 90, limit: 100 });
+    assert.equal(s.used, 90, "上游是硬事实，我们的估计不能把它压低");
+  });
+
+  test("⑤ 上游说用完了 → 排到最后，但不踢出候选", () => {
+    const s = applyProbeToSeat(base(), { known: true, used: 100, limit: 100 });
+    assert.equal(s.used, 100, "routes 的 smart 策略把 used≥98 算「spent」档 → 排最后");
+    assert.equal(s.resting, false,
+      "不许踢出候选：所有渠道都冷却时会变成「没有渠道」，用户看到的是一句没有出处的失败");
+  });
+
+  test("⑥ 只给百分比的上游（limit=100 是分母）也算得出来", () => {
+    const s = applyProbeToSeat(base(), { known: true, used: 37, limit: 100, unit: "unknown" });
+    assert.equal(s.used, 37);
+  });
+});
+
+/* ══════════════════════════════════════════════════════════════════════
  * ⑥ 硬规矩：内部不取时钟
  * ══════════════════════════════════════════════════════════════════════ */
 
@@ -481,4 +535,31 @@ test("反向对照⑤：改坏「小时窗口从整点起算」，resetAtMs 必�
   ]);
   const broken = bad.quotaState("bai", CFG, [], T0 + 17 * MIN);
   assert.notEqual(broken.resetAtMs, good.resetAtMs, "窗口边界一坏，休息的到期时刻就跟着错——否则上面的断言是空的");
+});
+
+test("反向对照⑥：改坏「探不到 = 不动」，判定必须现形", async () => {
+  const good = applyProbeToSeat(new Seat({ key: "sn" }), { known: false, used: null, limit: null });
+  assert.equal(good.used, 0, "正向：探不到 → 座位不动");
+
+  const bad = await sabotage([
+    ["if (!probe || probe.known !== true) return s;",
+      "if (!probe || probe.known !== true) return new Seat({ key: s.key, used: 100, weight: 1 }); // SABOTAGE"],
+  ]);
+  const broken = bad.applyProbeToSeat(new Seat({ key: "sn" }), { known: false, used: null, limit: null });
+  assert.equal(broken.used, 100,
+    "改坏之后「探不到」被当成用完了 —— 正是「探不到 ≠ 0 也 ≠ 100」那条要防的");
+  assert.notEqual(broken.used, good.used, "否则上面那些断言是空的");
+});
+
+test("反向对照⑦：改坏「取 max」，上游的真值必须能压过我们的估计", async () => {
+  const good = applyProbeToSeat(new Seat({ key: "sn", used: 30 }), { known: true, used: 90, limit: 100 });
+  assert.equal(good.used, 90);
+
+  const bad = await sabotage([
+    ["const merged = Math.max(Math.round(clampPct(num(s.used) ?? 0)), pct);",
+      "const merged = Math.round(clampPct(num(s.used) ?? 0)); // SABOTAGE: 不取 max"],
+  ]);
+  const broken = bad.applyProbeToSeat(new Seat({ key: "sn", used: 30 }), { known: true, used: 90, limit: 100 });
+  assert.equal(broken.used, 30, "改坏之后上游的真值被我们自己的估计盖住了");
+  assert.notEqual(broken.used, good.used, "否则上面那些断言是空的");
 });

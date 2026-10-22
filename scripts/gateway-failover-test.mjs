@@ -149,6 +149,51 @@ describe("档位反查", () => {
   });
 });
 
+/* ⚠⚠ 小版本降级 —— 2026-10-22 从中转日志里查出来的真问题
+ *
+ * 客户端（Claude Code）送来的模型 id 带**小版本号**：
+ *   claude-sonnet-5-5、claude-opus-5-5
+ * 而映射表的 key 是**档位名**（不带小版本）：claude-sonnet-5、claude-opus-5。
+ * 差最后一段就查不到 → **静默回落到本渠道默认模型** → 用户点 opus、跑的是默认那个。
+ * 实测日志里 claude-sonnet-5-5 出现过 41 次、claude-opus-5-5 出现过 7 次，全是回落。
+ * （只有 haiku 那一档侥幸对得上：claude-haiku-4-5 恰好与档位名逐字相同。）
+ *
+ * 修法**不是**把 key 改成带小版本（小版本会继续涨：5-5 → 5-6 → 6-0，下次又对不上），
+ * 而是**查表时逐级降级** —— 用户的映射表不用因为厂商升小版本而重填一遍。
+ */
+describe("小版本降级（claude-sonnet-5-5 → claude-sonnet-5）", () => {
+  test("③d 档位识别认得带小版本的档位名", () => {
+    const cfg = makeCfg();
+    assert.equal(GF.tierKeyFor("sn", "claude-sonnet-5-5", cfg), "claude-sonnet-5",
+      "客户端送 claude-sonnet-5-5 → 认得是 claude-sonnet-5 那一档");
+    assert.equal(GF.tierKeyFor("sn", "claude-opus-5-5", cfg), "claude-opus-5");
+    assert.equal(GF.tierKeyFor("wb", "claude-sonnet-5-5", cfg), "claude-sonnet-5");
+    /* 精确命中优先：haiku 那一档逐字相同，不许被降级成 claude-haiku-4 */
+    assert.equal(GF.tierKeyFor("sn", "claude-haiku-4-5", cfg), "claude-haiku-4-5");
+    /* 带日期 + 小版本一起来，也认得 */
+    assert.equal(GF.tierKeyFor("sn", "claude-haiku-4-5-20251001", cfg), "claude-haiku-4-5");
+  });
+
+  test("③e 重解析跟着降级：claude-sonnet-5-5 → 本家的 glm-5.2（不是默认模型）", () => {
+    const cfg = makeCfg();
+    assert.equal(GF.resolveForProvider("claude-sonnet-5-5", "sn", cfg), "glm-5.2",
+      "带小版本的档位名也该解析到本家映射里的那个模型");
+    assert.equal(GF.resolveForProvider("claude-sonnet-5-5", "wb", cfg), "hy3",
+      "转移后按目标家重解析，也认得带小版本的档位名");
+    assert.notEqual(GF.resolveForProvider("claude-sonnet-5-5", "sn", cfg), "sn-default",
+      "落到默认模型就是那条「用户点 opus、跑的是默认那个」的静默回落");
+  });
+
+  test("③f 转移时按目标家重解析：降级后的档位在下一家也解析得对", () => {
+    const cfg = makeCfg();
+    const fb = GF.gatewayFallbacks("sn", "claude-sonnet-5-5", cfg);
+    assert.equal(fb[0].provider, "wb");
+    assert.equal(fb[0].model, "hy3",
+      "转移后用**目标家**的 claude-sonnet-5 档，不是入口家的模型，也不是目标家的默认模型");
+    assert.notEqual(fb[0].model, "wb-default");
+  });
+});
+
 describe("转移时的重解析", () => {
   test("④ 入口在 sn、chain 里有 wb → 第二项是 wb，模型是 wb 自己映射的那个", () => {
     const cfg = makeCfg();
@@ -188,7 +233,9 @@ describe("转移时的重解析", () => {
 
     for (const p of ["bai", "sn", "wb", "zen"]) {
       const tiers = ["claude-opus-5", "claude-sonnet-5", "claude-fable-5",
-        "claude-haiku-4-5", "claude-opus-5-20251001", "压根没有的档位"];
+        "claude-haiku-4-5", "claude-opus-5-20251001", "压根没有的档位",
+        /* 带小版本的档位名（客户端真实发来的形状）—— 两边口径必须一样 */
+        "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-5", "claude-haiku-4-5-20251001"];
       for (const c of [cfg, cfg2]) {
         const slice = GF.sliceOfProvider(p, c);
         for (const t of tiers) {
@@ -285,6 +332,12 @@ function contractChecks(mod) {
   assert.equal(mod.tierKeyFor("sn", "claude-opus-5", cfg), "claude-opus-5", "③b 档位识别");
   assert.equal(mod.tierKeyFor("sn", "glm-5.2", cfg), null, "③b 模型名不是档位");
 
+  /* 小版本降级（2026-10-22 从日志里查出来的真问题） */
+  assert.equal(mod.tierKeyFor("sn", "claude-sonnet-5-5", cfg), "claude-sonnet-5",
+    "③d 带小版本的档位名认得出来");
+  assert.equal(mod.resolveForProvider("claude-sonnet-5-5", "sn", cfg), "glm-5.2",
+    "③e 重解析跟着降级，不落回默认模型");
+
   const plan = mod.planGatewayChain("sn/glm-5.2", cfg);
   assert.equal(plan[1].provider, "wb", "④ 第二项是 wb");
   assert.equal(plan[1].model, "hy3", "④ 模型是 wb 自己映射的那个");
@@ -364,6 +417,44 @@ describe("反向对照（改坏源码，断言必须红）", () => {
     assert.equal(plan[1].model, "sn-default", "回落用错了家 → 发出去的模型不对");
     assert.notEqual(plan[1].model, "wb-default");
   });
+
+  test("⑯ 把「去小版本」这一步改坏（网关这一份）→ 必须打红", async () => {
+    /* 去掉降级 = 回到 2026-10-22 之前的状态：客户端送 claude-sonnet-5-5，
+     * 查表查不到 → 静默落回本渠道默认模型 → 用户点 opus、跑的是默认那个。 */
+    const bad = await mutantModule(
+      "no-minor-degrade",
+      "  for (let i = 0; i < 2; i++) {",
+      "  for (let i = 0; i < 0; i++) { /* SABOTAGE: 去掉「去小版本」这一步 */",
+    );
+    assert.throws(() => contractChecks(bad),
+      "去掉降级之后断言竟然还绿 —— 那这条断言是恒真的");
+    const cfg = makeCfg();
+    assert.equal(bad.tierKeyFor("sn", "claude-sonnet-5-5", cfg), null,
+      "改坏之后带小版本的档位名认不出来");
+    assert.equal(bad.resolveForProvider("claude-sonnet-5-5", "sn", cfg), "sn-default",
+      "认不出来 → 落回默认模型 = 用户点 opus、跑的是默认那个");
+  });
+
+  test("⑯b 把 server.mjs 的「去小版本」改坏 → 两边不再对拍（必须红）", () => {
+    /* 这一条盯的是**两边口径一致**：server.mjs 的 resolveModelTarget 与
+     * gateway-failover.mjs 的 resolveTargetIn 是同一件事的两份实现。
+     * 一份带降级、另一份不带，就是「入口解析对了、转移时又当成不知道的模型名」。 */
+    const bad = serverResolveModelFactory((src) => {
+      const ANCHOR = "for (let i = 0; i < 2; i++) {";
+      assert.equal(src.includes(ANCHOR), true,
+        `锚点对不上源码了（server.mjs 的 tierKeyChain 变了）：${ANCHOR}`);
+      return src.replace(ANCHOR, "for (let i = 0; i < 0; i++) { /* SABOTAGE */");
+    });
+    const cfg = makeCfg();
+    const slice = GF.sliceOfProvider("sn", cfg);
+    assert.equal(GF.resolveForProvider("claude-sonnet-5-5", "sn", cfg), "glm-5.2",
+      "网关这一份仍然是降级后的正确解析");
+    assert.equal(bad("claude-sonnet-5-5", slice, "sn"), "sn-default",
+      "改坏之后 server.mjs 落回默认模型 —— 两边口径分叉了");
+    assert.notEqual(bad("claude-sonnet-5-5", slice, "sn"),
+      GF.resolveForProvider("claude-sonnet-5-5", "sn", cfg),
+      "★ 两边口径必须一致：一边认得带小版本的档位名、另一边不认，就会出现「查表认得、转移不认」");
+  });
 });
 
 /* ========================================================================== *
@@ -384,13 +475,16 @@ function sliceFn(src, anchor) {
   throw new Error(`锚点 ${anchor} 的大括号没配平`);
 }
 
-/** 造出 server.mjs 的 resolveModel（留痕函数换成空实现——它不影响解析结果）。 */
-function serverResolveModelFactory() {
-  const SRC = fs.readFileSync(path.join(ROOT, "src/server/server.mjs"), "utf8");
+/** 造出 server.mjs 的 resolveModel（留痕函数换成空实现——它不影响解析结果）。
+ *  `mutate` 用来做**反向对照**：把 server.mjs 的解析本体改坏，看对拍断言会不会红。 */
+function serverResolveModelFactory(mutate) {
+  let SRC = fs.readFileSync(path.join(ROOT, "src/server/server.mjs"), "utf8");
+  if (typeof mutate === "function") SRC = mutate(SRC);
   const body = [
     sliceFn(SRC, "function normalizeModel"),
     sliceFn(SRC, "function tierKeyOf"),
     sliceFn(SRC, "function listedModelOf"),
+    sliceFn(SRC, "function tierKeyChain"),
     sliceFn(SRC, "function resolveModelTarget"),
     sliceFn(SRC, "function resolveModel(name, cfg, ch)"),
   ].join("\n");

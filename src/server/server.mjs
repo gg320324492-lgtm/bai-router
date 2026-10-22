@@ -121,7 +121,7 @@ import { tierOfModel, tierKeyFor } from "./gateway-failover.mjs";
  * ⚠ 台账里绝不能出现凭据 —— audit.mjs 每个字符串字段都过一遍 redact.mjs。 */
 import { createAudit } from "./audit.mjs";
 /* 配额预算（quota.mjs）：用户设上限 + 账本里的 token → 超了主动休息。 */
-import { quotaState, budgetOf, budgetRestDecision, applyQuotaToSeat } from "./quota.mjs";
+import { quotaState, budgetOf, budgetRestDecision, applyQuotaToSeat, applyProbeToSeat } from "./quota.mjs";
 /* middleware 插件（middleware.mjs）：声明式的请求/应答改写。
  * ⚠ **只做数据不做代码** —— magpie 的中间件是真 JS（跑在网关进程里，能读能写能发网络请求）。
  *   能跑任意代码的分发物是另一个量级的风险（要另配沙箱、权限模型、审计）；
@@ -1188,6 +1188,9 @@ function onActivated() {
   // 激活后探测一次；此后周期性自检；上游 fetch 失败时由请求处理路径立刻触发
   scheduleProxyCheck(0, "启动探测");
   setInterval(() => scheduleProxyCheck(0, "周期探测"), 10 * 60 * 1000);
+  // 额度探测循环：把「上游自己报的余额」喂进缓存，供转移链的排序读
+  // （那条路是同步的，只能读缓存；缓存没人喂，排序就永远拿不到信号）。
+  try { startQuotaProbeLoop(); } catch (e) { log(`额度探测循环没起来：${String((e && e.message) || e)}`); }
 }
 
 // ---------- 中转服务 ----------
@@ -1209,6 +1212,49 @@ function normalizeModel(name) {
 function tierKeyOf(base) {
   const m = /^(.+)-\d{8}$/.exec(String(base));
   return m ? m[1] : String(base);
+}
+
+/**
+ * 档位名的**降级序列**：查不到就一级一级地短。
+ *
+ * ⚠⚠ **为什么必须有这一层**（2026-10-22 实测踩到，用户侧真实影响）：
+ *   客户端（Claude Code）送来的模型 id 带**小版本号**：
+ *     claude-sonnet-5-5、claude-opus-5-5
+ *   而映射表的 key 是**档位名**（不带小版本）：
+ *     claude-sonnet-5、claude-opus-5、claude-fable-5
+ *   差最后一段就查不到 → **静默回落到本渠道默认模型** →
+ *   用户点 opus、实际跑的是默认那个（面板的「模型回落」留痕能看到，但用户
+ *   不会去看）。实测日志里 claude-sonnet-5-5 出现过 41 次、claude-opus-5-5
+ *   出现过 7 次，全是回落。
+ *   （只有 haiku 那档侥幸对得上：claude-haiku-4-5 恰好与档位名逐字相同。）
+ *
+ *   这不是本仓库写错了 key，是**厂商把模型 id 的小版本加进去了**。
+ *   而小版本**会继续涨**（5-5 → 5-6 → 6-0）—— 所以修法不是把 key 改成
+ *   claude-sonnet-5-5（那下次升级又对不上），而是**查表时逐级降级**：
+ *   用户的映射表不用因为厂商升小版本而重填一遍。
+ *
+ * 顺序：**先精确、后降级**。claude-haiku-4-5 要能精确命中（降级会把它
+ * 错降成 claude-haiku-4，那不是任何一档）。
+ */
+function tierKeyChain(base) {
+  const out = [];
+  const push = (v) => {
+    const s = String(v == null ? "" : v);
+    if (s && !out.includes(s)) out.push(s);
+  };
+  push(base);
+  /* ① 去掉日期后缀（claude-haiku-4-5-20251001 → claude-haiku-4-5） */
+  push(tierKeyOf(base));
+  /* ② 去掉小版本（claude-sonnet-5-5 → claude-sonnet-5） */
+  /* ③ 再去掉一段（claude-sonnet-5 → claude-sonnet） */
+  let cur = out[out.length - 1] || "";
+  for (let i = 0; i < 2; i++) {
+    const m = /^(.+)-\d+$/.exec(cur);
+    if (!m) break;
+    cur = m[1];
+    push(cur);
+  }
+  return out;
 }
 /**
  * 可用清单里的匹配：**大小写不敏感**，命中时返回**清单里的原样写法**。
@@ -1238,15 +1284,23 @@ function listedModelOf(base, list) {
  *   而对不上的时候面板报的是**两个方向都可能错**的差异，用户无从判断该信哪个。
  */
 function resolveModelTarget(base, cfg) {
-  const key = tierKeyOf(base);
-  const m0 = cfg.mapping?.[base];
-  if (m0 && m0.target) return m0.target;
-  const m1 = cfg.mapping?.[key];
-  if (m1 && m1.target) return m1.target;
-  const l0 = listedModelOf(base, cfg.availableModels);
-  if (l0) return l0;
-  const l1 = listedModelOf(key, cfg.availableModels);
-  if (l1) return l1;
+  /* 查表**逐级降级**：先精确，再去日期后缀，再去小版本（见 tierKeyChain 的注释）。
+   * ⚠ 顺序要紧：claude-haiku-4-5 必须精确命中（降级会把它错降成 claude-haiku-4）。
+   * ⚠ **映射表整体优先于可用清单**：用户在映射表里写死的对应关系，比上游目录里
+   *   一个同名条目更权威。降级前就是这个顺序（映射[原名] → 映射[档位名] →
+   *   清单[原名] → 清单[档位名]）；降级只是给这两组**各加几级**，
+   *   组序不许调换 —— 调换的后果很具体：客户端送 claude-opus-5-20251001
+   *   （带日期的规范 id），而上游清单里正好有这一条，于是「清单[原名]」先命中，
+   *   用户在映射表里写的那个对应关系被跳过了，跑的是另一个模型。 */
+  const chain = tierKeyChain(base);
+  for (const k of chain) {
+    const m = cfg.mapping?.[k];
+    if (m && m.target) return m.target;
+  }
+  for (const k of chain) {
+    const l = listedModelOf(k, cfg.availableModels);
+    if (l) return l;
+  }
   return null;
 }
 /* ---------- 模型回落留痕（v1.0.78 T9） ----------
@@ -5790,7 +5844,17 @@ function localSyncParts(cfg) {
  *   —— 探测请求绝不能消耗额度或改状态。
  */
 const PROBE_TTL_MS = 5 * 60 * 1000;
-let probeCache = { at: 0, map: new Map() };
+/**
+ * 探测缓存：provider → { at, value }。
+ *
+ * ⚠⚠ **必须逐条记时刻，不能只记一个全局的 at**：
+ *   原来写成 `{ at: 0, map }` 而 `at` 从来没被赋过值 → `now - probeCache.at`
+ *   恒等于 now（一个巨大的数）→ **缓存永远不命中** → 面板每 5 秒轮询一次
+ *   「额度」屏，就把八家上游各打一遍。实测：一次刷新 = 8 个请求。
+ *   「5 分钟缓存」这条约定当时是**写在注释里但没生效**的。
+ *   现在每条各记各的时刻：谁先探到谁先过期，别的家不受影响。
+ */
+let probeCache = new Map();
 
 /** 这一家的凭据头（**只从配置里取**；本机登录态那几家的凭据由
  *  account-discovery 提供，还没接上 —— 探不到就报「没有可用的登录态」，
@@ -5806,8 +5870,8 @@ function probeHeadersOf(provider, cfg) {
 
 /** 探一家的额度（带缓存）。探不到就是「探不到」，绝不猜。 */
 async function probeQuotaOf(provider, cfg, now) {
-  const hit = probeCache.map.get(provider);
-  if (hit && now - probeCache.at < PROBE_TTL_MS) return hit;
+  const hit = probeCache.get(provider);
+  if (hit && now - hit.at < PROBE_TTL_MS) return hit.value;
   const bases = {};
   for (const k of allChannelKeys()) {
     const s = sliceOf(cfg, k);
@@ -5838,8 +5902,54 @@ async function probeQuotaOf(provider, cfg, now) {
       error: String((e && e.message) || e),
     };
   }
-  probeCache.map.set(provider, out);
+  probeCache.set(provider, { at: now, value: out });
   return out;
+}
+
+/**
+ * 缓存里的探测结果（**同步**读 —— 供热路径用）。
+ *
+ * ⚠ 为什么必须同步：转移链的排序在请求路径上，那条路不许等网络。
+ *   所以这里**只读缓存**，不发请求；缓存由后台的周期探测与面板的「额度」屏喂。
+ *   没有缓存 / 缓存过期 → null（**没有信号**），调用方按「不知道」处理。
+ */
+function cachedProbeOf(provider, now) {
+  try {
+    const hit = probeCache.get(provider);
+    if (!hit) return null;
+    if (!Number.isFinite(now) || now - hit.at >= PROBE_TTL_MS) return null;
+    return hit.value || null;
+  } catch { return null; }
+}
+
+/**
+ * 周期探测：把八家的额度**探一遍**，把缓存喂热。
+ *
+ * 为什么要后台探：转移链的排序要读「上游自己报的余额」，而那条路是**同步**的
+ * （热路径不许等网络）。缓存没人喂就永远是空的 → 排序永远拿不到信号。
+ * 面板的「额度」屏会喂它，但用户不开那一屏时就不喂 —— 于是排序功能等于没有。
+ *
+ * ⚠ **不发多余请求**：探测是只读的（GET/HEAD），没配凭据的家**一个请求都不发**
+ *   （quota-probe.mjs 自己那道闸），上游回 4xx/5xx 一律算「探不到」、**不重试**
+ *   （重试只会白耗上游的额度）。
+ * ⚠ **不拖累启动**：首次探测延后 20 秒，避开启动期那一串配置合并与目录同步。
+ * ⚠ **定时器 unref**：它不该让进程赖着不走（退出时进程该结束就结束）。
+ */
+function startQuotaProbeLoop() {
+  let running = false;
+  const tick = async () => {
+    if (running) return;              // 上一轮还没跑完（上游慢）→ 这一轮跳过
+    running = true;
+    try {
+      const cfg = loadCfg();
+      const now = Date.now();
+      await Promise.allSettled(allChannelKeys().map((k) => probeQuotaOf(k, cfg, now)));
+    } catch { /* 探测失败不该有任何后果：探不到就是探不到 */ }
+    finally { running = false; }
+  };
+  const timer = setInterval(() => { void tick(); }, PROBE_TTL_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  setTimeout(() => { void tick(); }, 20000).unref?.();
 }
 
 /**
@@ -5866,13 +5976,25 @@ function qdTokenRaw() {
   const states = budgetStates(cfg, now);
   const table = restTable();
   const rows = [];
-  for (const k of allChannelKeys()) {
+  /* ⚠ 探测**并行**发起，别一家一家等：每家最多等 8 秒（上游不回就是超时），
+   *   串起来最坏 8×8=64 秒 —— 面板 api() 的默认预算只有 12 秒，那会让「额度」屏
+   *   永远超时。并行的最坏是 8 秒（等最慢的那家）。
+   *   ⚠ 没配凭据的家**一个请求都不发**（quota-probe.mjs 自己那道闸），
+   *   所以「并行」不会变成「凭空多打八家上游」。 */
+  const keys = allChannelKeys();
+  const probed = await Promise.all(keys.map((k) =>
+    probeQuotaOf(k, cfg, now).catch(() => null)));
+  const probeOf = new Map(keys.map((k, i) => [k, probed[i]]));
+  for (const k of keys) {
     const st = states.get(k) || null;
     const S = sliceOf(cfg, k);
     let budget = null;
     try { budget = budgetOf(k, cfg); } catch { budget = null; }
     const rest = (() => { try { return table.entry(k); } catch { return null; } })();
-    const probe = await probeQuotaOf(k, cfg, now);
+    const probe = probeOf.get(k) || {
+      known: false, used: null, limit: null, resetAtMs: null,
+      unit: "unknown", source: "", error: "探不到",
+    };
     rows.push({
       key: k,
       name: PROVIDERS[k] || (S && S.zh) || k,
@@ -6016,6 +6138,13 @@ function orderChain(providers, now) {
        * 取 max 而不是覆盖：上游自己报的使用率更高时，不能被我们的预算压低。 */
       const q = states.get(p);
       if (q) seat = applyQuotaToSeat(seat, q);
+      /* ★ 上游**自己报的余额**也折进来（真探测的结果，缓存里读）。
+       *   这是「额度快用完的那家排后面」这条规则的**另一半**：上面那条是我们
+       *   照用户设的预算**估**的，这里是上游**真报**的。两者取 max。
+       *   ⚠ 读的是缓存、不发请求：这条在请求路径上，不能等网络。
+       *   ⚠ 探不到就是没有信号（cachedProbeOf 返回 null → 这一格一个字都不改）。 */
+      const probe = cachedProbeOf(p, now);
+      if (probe) seat = applyProbeToSeat(seat, probe);
       return seat;
     });
     const idx = applyRouteStrategy(Builtin.smart, "chain", seats, now);

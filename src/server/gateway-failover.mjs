@@ -178,14 +178,46 @@ export function tierKeyFor(provider, name, cfg, opts = {}) {
   if (!provider || name == null) return null;
   const base = normalizeModel(name);
   if (!base) return null;
-  const key = tierKeyOf(base);
   const mapping = sliceOfProvider(provider, cfg).mapping;
-  if (Object.prototype.hasOwnProperty.call(mapping, base)) return base;
-  if (Object.prototype.hasOwnProperty.call(mapping, key)) return key;
   const known = Array.isArray(opts.tiers) ? opts.tiers : [];
-  if (known.includes(base)) return base;
-  if (known.includes(key)) return key;
+  /* 逐级降级：先精确，再去日期后缀，再去小版本（claude-sonnet-5-5 → claude-sonnet-5）。
+   * ⚠ 与 server.mjs 的 resolveModelTarget **同一套降级序列** —— 两边口径必须一致：
+   *   一边认得「带小版本的档位名」、另一边不认，就会出现「查表认得、转移不认」
+   *   这种鬼故事（档位在入口解析对了，转移时又当成不知道的模型名）。 */
+  for (const k of tierKeyChain(base)) {
+    if (Object.prototype.hasOwnProperty.call(mapping, k)) return k;
+    if (known.includes(k)) return k;
+  }
   return null;
+}
+
+/**
+ * 档位名的降级序列：先精确，再去日期后缀，再去小版本。
+ *
+ * ⚠ 为什么必须有：客户端（Claude Code）送来的模型 id 带**小版本**
+ *   （claude-sonnet-5-5），而映射表的 key 是**档位名**（claude-sonnet-5）。
+ *   差一段就查不到 → 静默回落到默认模型 → 用户点 opus、跑的是默认那个。
+ *   小版本**会继续涨**，所以修法不是把 key 改成带小版本（下次升级又对不上），
+ *   而是查表时逐级降级 —— 用户的映射表不用因为厂商升小版本而重填。
+ *
+ * 顺序要紧：claude-haiku-4-5 必须**精确**命中（降级会把它错降成 claude-haiku-4）。
+ */
+function tierKeyChain(base) {
+  const out = [];
+  const push = (v) => {
+    const s = String(v == null ? "" : v);
+    if (s && !out.includes(s)) out.push(s);
+  };
+  push(base);
+  push(tierKeyOf(base));
+  let cur = out[out.length - 1] || "";
+  for (let i = 0; i < 2; i++) {
+    const m = /^(.+)-\d+$/.exec(cur);
+    if (!m) break;
+    cur = m[1];
+    push(cur);
+  }
+  return out;
 }
 
 /**
@@ -224,21 +256,31 @@ export function resolveForProvider(tier, provider, cfg, opts = {}) {
 
 /**
  * 在**某一片渠道**（切片）里解析档位 → 模型名。**命中返回模型名，没命中返回 null**
- * （要不要回落交给调用方）——与 `server.mjs` 的 `resolveModelTarget` 同一形状、同一顺序。
+ * （要不要回落交给调用方）。
+ *
+ * ⚠ 与 `server.mjs` 的 `resolveModelTarget` **同一形状、同一顺序**：
+ *   逐级降级（tierKeyChain），**每一级里先查映射表再查可用清单**。
+ *   两条路径的「档位 → 模型」是同一件事，规则必须逐字一致 ——
+ *   入口解析对了、转移时解析成别的模型，用户看到的就是「有时 opus 有时不是 opus」，
+ *   而面板上只多一条看不出所以然的记录。
  */
 function resolveTargetIn(tier, slice) {
   if (tier == null) return null;
   const base = normalizeModel(tier);
   if (!base) return null;
-  const key = tierKeyOf(base);
-  const m0 = slice.mapping?.[base];
-  if (m0 && m0.target) return m0.target;
-  const m1 = slice.mapping?.[key];
-  if (m1 && m1.target) return m1.target;
-  const l0 = listedModelOf(base, slice.availableModels);
-  if (l0) return l0;
-  const l1 = listedModelOf(key, slice.availableModels);
-  if (l1) return l1;
+  /* ⚠ **映射表整体优先于可用清单** —— 与 `server.mjs` 的 resolveModelTarget
+   *   同一顺序（映射各级查完，再查清单各级）。组序调换的后果很具体：
+   *   客户端送 claude-opus-5-20251001（带日期的规范 id），上游清单里正好有这一条，
+   *   于是清单先命中，用户在映射表里写的那个对应关系被跳过，跑的是另一个模型。 */
+  const chain = tierKeyChain(base);
+  for (const k of chain) {
+    const m = slice.mapping?.[k];
+    if (m && m.target) return m.target;
+  }
+  for (const k of chain) {
+    const l = listedModelOf(k, slice.availableModels);
+    if (l) return l;
+  }
   return null;
 }
 

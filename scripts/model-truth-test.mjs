@@ -697,13 +697,34 @@ describe("T9 ★④ 源码判据：面板必须一眼看出「以为在用 A 其
     /* 这两条是 2026-10-20 实测加上的：mm 的上游 id 大小写敏感（MiniMax-M3.1-Flash），
        而 Claude Code 发的是带日期的规范 id（claude-haiku-4-5-20251001）。
        少任何一条，正常流量都会被记成「模型回落」——那条留痕是「以为在用 A 其实在用 B」
-       的唯一防线，它自己误报就等于没有。 */
+       的唯一防线，它自己误报就等于没有。
+       ⚠ 2026-10-22 又加了一条：**小版本号**（claude-sonnet-5-5 → claude-sonnet-5）。
+       于是查表改成**逐级降级**（tierKeyChain），「原名 + 档位名」这两级不再直接
+       写在 resolveModelTarget 里，而是由那条链产出。
+       所以下面这组断言盯的是**语义**（两级都查、映射表整体优先、清单大小写不敏感），
+       而不是某一行文本 —— 文本形状会随实现变，语义不能变。 */
     const fn = sliceBetween(SRC, "function resolveModelTarget(base, cfg) {", "\n}");
-    assert.match(fn, /tierKeyOf\(base\)/, "必须先算出去掉日期后缀的档位 key");
-    assert.match(fn, /cfg\.mapping\?\.\[base\]/, "映射表必须先查原名");
-    assert.match(fn, /cfg\.mapping\?\.\[key\]/, "映射表必须再查档位 key（带日期后缀的那种请求靠这条命中）");
-    assert.match(fn, /listedModelOf\(base, cfg\.availableModels\)/, "清单必须查原名");
-    assert.match(fn, /listedModelOf\(key, cfg\.availableModels\)/, "清单必须再查档位 key");
+    assert.match(fn, /tierKeyChain\(base\)/, "必须走逐级降级链（去日期后缀、去小版本都在链里）");
+    assert.match(fn, /cfg\.mapping\?\.\[k\]/, "映射表必须按链逐级查");
+    assert.match(fn, /listedModelOf\(k, cfg\.availableModels\)/, "清单必须按链逐级查");
+
+    /* ★ 映射表必须**整体**优先于可用清单：用户在映射表里写死的对应关系，
+       比上游目录里一个同名条目更权威。调换组序的后果很具体：客户端送
+       claude-opus-5-20251001（带日期的规范 id），而上游清单里正好有这一条，
+       于是「清单[原名]」先命中，用户在映射表里写的那个对应关系被跳过，
+       跑的是另一个模型 —— 而面板上只多一条看不出所以然的记录。 */
+    const mapIdx = [...fn.matchAll(/cfg\.mapping\?\.\[k\]/g)].map((m) => m.index);
+    const listIdx = [...fn.matchAll(/listedModelOf\(k, cfg\.availableModels\)/g)].map((m) => m.index);
+    assert.ok(mapIdx.length >= 1, "映射表必须被查");
+    assert.ok(listIdx.length >= 1, "可用清单必须被查");
+    assert.ok(Math.max(...mapIdx) < Math.min(...listIdx),
+      `★ 映射表必须整体优先于可用清单。实际片段：\n${fn}`);
+
+    /* 降级链必须同时含「原名」与「去日期后缀的档位名」两级，外加去小版本那一级。 */
+    const chain = sliceBetween(SRC, "function tierKeyChain(base) {", "\n}");
+    assert.match(chain, /push\(base\)/, "链的第一级必须是原名（精确命中优先）");
+    assert.match(chain, /push\(tierKeyOf\(base\)\)/, "链的第二级必须去掉日期后缀");
+    assert.match(chain, /\^\(\.\+\)-\\d\+\$/, "链里必须还有去小版本那一级（claude-sonnet-5-5 → claude-sonnet-5）");
 
     /* 大小写不敏感这件事必须真的在 listedModelOf 里，不能只在调用处做——
        调用处拿到的 base 早就被 normalizeModel 转小写了。 */
