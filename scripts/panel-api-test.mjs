@@ -15,6 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import net from "node:net";
+import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 
@@ -41,12 +42,14 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
   let panel = 0;
   let relayOf = {};
   let gatewayPort = 0;
+  let pluginUpstream = null;
+  let pluginUpstreamSeen = [];
   let killed = false;
 
   before(async () => {
     const ports = [];
-    for (let i = 0; i < 11; i++) ports.push(await freePort());
-    assert.equal(new Set(ports).size, 11, "端口必须互不相同");
+    for (let i = 0; i < 12; i++) ports.push(await freePort());
+    assert.equal(new Set(ports).size, 12, "端口必须互不相同");
     /* ⚠ 端口逐个对号入座，别用 indexOf 去索引 —— 那样很容易把两个角色分到同一个号
      *   （本仓库吃过一次：面板和中转撞号，服务起不来，测试只报「超时」看不出原因）。 */
     const ROLES = ["bai", "sn", "wb", "wbai", "zen", "qd", "mm", "or"];
@@ -79,7 +82,7 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
       manifestVersion: 1,
       id: "acme",
       name: "Acme 测试渠道",
-      upstream: "http://127.0.0.1:9",
+      upstream: `http://127.0.0.1:${ports[11]}`,
       protocol: "anthropic",
       auth: "apikey",
       models: ["acme-pro", "acme-lite"],
@@ -95,13 +98,29 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
     /* 再放一份**装不上**的：渠道键撞了出厂的 bai。面板要说清为什么。 */
     fs.writeFileSync(path.join(dataDir, "plugins", "bad.json"), JSON.stringify({
       manifestVersion: 1, id: "bai", name: "冒充 B.AI", upstream: "https://x.example/v1",
-      protocol: "anthropic", auth: "apikey", models: ["m"], relayPort: 15899,
+      protocol: "anthropic", auth: "apikey", models: ["m"], relayPort: ports[10],
       mapping: { "claude-opus-5": "m" },
     }, null, 2));
 
     const env = { ...process.env, BAI_DATA_DIR: dataDir, BAI_ENV_FIXED: "1", BAI_NO_PROXY_AUTODETECT: "1" };
     for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]) delete env[k];
     env.NO_PROXY = "127.0.0.1,localhost";
+    /* 插件渠道的**假上游**：录下它收到的请求 —— middleware 的改写要在这里看得见。 */
+    pluginUpstreamSeen = [];
+    pluginUpstream = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => { body += d; });
+      req.on("end", () => {
+        pluginUpstreamSeen.push({ url: req.url, headers: req.headers, body });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id: "msg_1", type: "message", role: "assistant", model: "acme-pro",
+          content: [{ type: "text", text: "上游收到" }], stop_reason: "end_turn",
+          usage: { input_tokens: 3, output_tokens: 2 },
+        }));
+      });
+    });
+    await new Promise((r) => pluginUpstream.listen(ports[11], "127.0.0.1", r));
     child = spawn(process.execPath, [SERVER_PATH], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     const out = [];
     child.stdout.on("data", (d) => out.push(String(d)));
@@ -123,6 +142,11 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
       try { spawnSync("taskkill", ["/PID", String(child.pid), "/F"], { stdio: "ignore", windowsHide: true }); } catch { }
       try { child.stdout.destroy(); child.stderr.destroy(); } catch { }
       try { child.unref(); } catch { }
+    }
+    /* 假上游也要关：不关的话它攥着端口，事件循环不退出 → 整个文件挂到超时。 */
+    if (pluginUpstream) {
+      try { pluginUpstream.closeAllConnections && pluginUpstream.closeAllConnections(); } catch { }
+      try { pluginUpstream.close(); } catch { }
     }
     try { fs.rmSync(TMPROOT, { recursive: true, force: true }); } catch { }
   });
@@ -293,6 +317,86 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
     assert.equal(JSON.stringify(save.body).includes("sk-test-0000"), false, "凭据被回显了");
     const after = await api("/api/plugins");
     assert.equal(after.body.plugins.find((p) => p.id === "acme").hasCredential, true, "凭据没存上");
+  });
+
+  test("⑫ 额度预算：超了 → 这家歇着（且与「上游额度用尽」分开说）", async () => {
+    /* 往账本里塞一条 sn 的用量（in + out = 1500），再给 sn 设一个比它小的预算。
+     * ⚠ 单位是 **token**，不是钱 —— 账本里没有价格字段。 */
+    const led = path.join(dataDir, "usage.jsonl");
+    fs.writeFileSync(led, JSON.stringify({
+      t: new Date().toISOString(), provider: "sn", in: 1000, out: 500,
+      cache_read: 0, cache_write: 0, status: 200,
+    }) + "\n");
+    const save = await post("/api/quota", { provider: "sn", hourly: 100 });
+    assert.equal(save.status, 200, `保存预算失败：${JSON.stringify(save.body)}`);
+    const lim = await api("/api/limits");
+    const b = lim.body.stats && lim.body.stats.sn && lim.body.stats.sn.budget;
+    assert.ok(b, "统计里要有预算");
+    assert.equal(b.exhausted, true, `用了 1500 > 上限 100，应该算用完：${JSON.stringify(b)}`);
+    assert.equal(b.used, 1500, "已用量");
+    assert.equal(b.hourly, 100, "上限本身要能看见（不然改不回去）");
+    /* 请求要被挡住（单家路径 → 429 + Retry-After） */
+    const r = await fetch(`http://127.0.0.1:${relayOf.sn}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-opus-5", max_tokens: 8, messages: [{ role: "user", content: "预算自检" }] }),
+    }).catch(() => null);
+    assert.ok(r, "请求没发出去");
+    assert.equal(r.status, 429, `期望 429（预算用完，等窗口重置），实际 ${r.status}`);
+    /* 取消预算，恢复后面的用例 */
+    await post("/api/quota", { provider: "sn", hourly: null, daily: null });
+  });
+
+  test("⑬ middleware 插件：声明的改写**真的落到上游请求上**", async () => {
+    /* 装一份声明：插件渠道 acme 的请求加一个头、把 temperature 压到 0.1。 */
+    fs.mkdirSync(path.join(dataDir, "middleware"), { recursive: true });
+    fs.writeFileSync(path.join(dataDir, "middleware", "rules.json"), JSON.stringify({
+      manifestVersion: 1, id: "test-rules", name: "自检规则",
+      rules: [{
+        when: { provider: "acme" },
+        request: { setHeaders: { "X-Test": "1" }, setParams: { temperature: 0.1 } },
+      }],
+    }));
+    const rl = await post("/api/middleware/reload", {});
+    assert.equal(rl.status, 200);
+    assert.equal(rl.body.loaded, 1, `没装上：${JSON.stringify(rl.body.errors)}`);
+
+    const before = pluginUpstreamSeen.length;
+    const r = await fetch(`http://127.0.0.1:${relayOf.acme}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-opus-5", max_tokens: 8, temperature: 1, messages: [{ role: "user", content: "改写自检" }] }),
+    }).catch(() => null);
+    assert.ok(r, "请求没发出去");
+    assert.equal(pluginUpstreamSeen.length, before + 1, "上游没收到请求");
+    const up = pluginUpstreamSeen[before];
+    assert.equal(up.headers["x-test"], "1", "插件设置的头没到上游");
+    const body = JSON.parse(up.body);
+    assert.equal(body.temperature, 0.1, "插件改的参数没到上游");
+    assert.equal(body.max_tokens, 8, "没被改的参数不该动");
+  });
+
+  test("⑭ middleware 改写不合法 → **明确拒绝**（fail-closed，不半改着发）", async () => {
+    fs.writeFileSync(path.join(dataDir, "middleware", "rules.json"), JSON.stringify({
+      manifestVersion: 1, id: "bad-rules", name: "坏规则",
+      rules: [{
+        when: { provider: "acme" },
+        request: { model: "这家根本没有的模型" },
+      }],
+    }));
+    await post("/api/middleware/reload", {});
+    const before = pluginUpstreamSeen.length;
+    const r = await fetch(`http://127.0.0.1:${relayOf.acme}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-opus-5", max_tokens: 8, messages: [{ role: "user", content: "坏规则" }] }),
+    }).catch(() => null);
+    assert.ok(r, "请求没发出去");
+    assert.equal(r.status, 400, `期望 400（明确拒绝），实际 ${r.status}`);
+    assert.equal(pluginUpstreamSeen.length, before, "被拒的请求**不该**发到上游（半改着发出去最坏）");
+    /* 复原：把规则删掉，后面的用例不受影响 */
+    fs.unlinkSync(path.join(dataDir, "middleware", "rules.json"));
+    await post("/api/middleware/reload", {});
   });
 
   test("⑪ ★ 插件渠道**接进了链路**：网关认得它、它的中转端口在听", async () => {

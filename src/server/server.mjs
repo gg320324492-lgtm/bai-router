@@ -120,6 +120,16 @@ import { tierOfModel, tierKeyFor } from "./gateway-failover.mjs";
  *   用途是**事后**复盘（用户报「昨天卡了」，得能翻出那段时间每条请求去了哪）。
  * ⚠ 台账里绝不能出现凭据 —— audit.mjs 每个字符串字段都过一遍 redact.mjs。 */
 import { createAudit } from "./audit.mjs";
+/* 配额预算（quota.mjs）：用户设上限 + 账本里的 token → 超了主动休息。 */
+import { quotaState, budgetOf, budgetRestDecision, applyQuotaToSeat } from "./quota.mjs";
+/* middleware 插件（middleware.mjs）：声明式的请求/应答改写。
+ * ⚠ **只做数据不做代码** —— magpie 的中间件是真 JS（跑在网关进程里，能读能写能发网络请求）。
+ *   能跑任意代码的分发物是另一个量级的风险（要另配沙箱、权限模型、审计）；
+ *   分发物的权力越小，审它的人越敢点「装」。 */
+import {
+  parseMiddlewareManifest, validateMiddlewareManifest, createMiddlewareRegistry,
+  formatErrors as formatMiddlewareErrors,
+} from "./middleware.mjs";
 /* 配置备份（backup.mjs）：快照 → 加密导出 → 导入还原。magpie 的 internal/backup
  * 与 internal/settings（KeepOwn）移植版。
  * ⚠ 备份里**有**真实凭据（那正是它的用处），所以导出必须带口令加密、
@@ -5617,13 +5627,162 @@ async function openaiExchange(p, { cfg, S, j, isProbe, res, useProxy, obs, usage
  *
  * ⚠ 排序坏了**不许**让转移链崩 —— 排序只决定「先试谁」，排不出来就按原顺序试。
  */
+/* ---------- 配额预算（quota.mjs 的接线）----------
+ *
+ * 用户给每家设一个额度上限 → 拿账本里**已经记着的** token 对照 → 超了就让这家歇着。
+ *
+ * ⚠ 这是**被动信号**版：magpie 是拿 OAuth 登录态去问供应商的配额接口，
+ *   本仓没有那个前提，只能吃自己账本里的数。所以它比「上游额度」弱 ——
+ *   面板与日志里必须**分开说**（kind 用 budget，不是 quota/credit）。
+ *
+ * ⚠ 单位是 **token 数**，不是钱：账本里没有价格字段，算钱要外挂价格表，
+ *   而价格表会随厂商调价漂移 —— 预算会悄悄变含义。
+ *
+ * ⚠ 账本是 JSONL，**每个请求读一遍太贵** → 按 30 秒缓存（用量只会慢慢涨，
+ *   而预算耗尽也不差这几十秒）。
+ */
+let budgetCache = { at: 0, states: new Map() };
+
+/** 刷新预算状态，并把「预算耗尽」写成休息（这样 isResting 认得它）。 */
+function budgetStates(cfg, now) {
+  if (budgetCache.states.size && now - budgetCache.at < 30000) return budgetCache.states;
+  let records = [];
+  try { records = loadUsageRows(); } catch { records = []; }
+  const states = new Map();
+  for (const p of allChannelKeys()) {
+    let st = null;
+    try { st = quotaState(p, cfg, records, now); } catch { st = null; }
+    if (!st) continue;
+    states.set(p, st);
+    /* 预算耗尽 → 这家**主动休息**到窗口重置。
+     * ⚠ 休息键是**裸渠道键**（不是 provider@account）—— 预算是「这家」的额度，
+     *   而账户级的候选（wb@acct）查的是自己的键；providerUsable 那边用裸键查，
+     *   两边才都对得上。 */
+    try {
+      const d = budgetRestDecision(p, cfg, records, now);
+      if (d && d.rest) restTable().rest(p, d.untilMs, d.note);
+    } catch { /* 休息表坏了不该影响请求 */ }
+  }
+  budgetCache = { at: now, states };
+  return states;
+}
+
+/** 这家的预算是不是用完了（入口据此让位 —— 「等也没用」的那一类）。 */
+function budgetExhausted(provider, cfg, now) {
+  try {
+    const st = budgetStates(cfg, now).get(provider);
+    return !!(st && st.exhausted);
+  } catch { return false; }
+}
+
+/* ---------- middleware 插件（middleware.mjs 的接线）----------
+ *
+ * 一份 JSON 声明描述「什么时候、对哪个请求、改什么」，装在 <数据目录>\middleware\*.json。
+ *
+ * ⚠ **fail-closed**：改写结果不合法（比如把模型改成这家没有的）→ **拒绝这次请求**
+ *   并说清是哪一条规则、为什么。magpie 的钩子抛错就原样放行；声明写错却原样放行
+ *   = 把「我以为改了」藏起来。
+ *   ⚠ 只影响**匹配到的那一家**（别的家照常）。
+ *
+ * ⚠ 头只把插件**明确设置**的那些带上去 —— 不是把客户端的头全转发过去
+ *   （那会把 cookie 之类的也送到上游）。
+ */
+const middlewareRegistry = createMiddlewareRegistry();
+/** 装不上的 middleware 声明与原因（面板要能看到「为什么没装上」）。 */
+const middlewareErrors = [];
+/** req[MIDDLEWARE_CTX]：这次尝试要加/要删的头（应答那侧也要用）。 */
+const MIDDLEWARE_CTX = Symbol("bai.middleware.ctx");
+
+function loadMiddleware() {
+  middlewareRegistry.clear();
+  middlewareErrors.length = 0;
+  let files = [];
+  try {
+    const dir = path.join(DATA_DIR, "middleware");
+    if (existsSync(dir)) files = readdirSync(dir).filter((f) => f.toLowerCase().endsWith(".json")).sort();
+  } catch { /* 目录读不到就当没有 */ }
+  for (const f of files) {
+    try {
+      const obj = parseMiddlewareManifest(readFileSync(path.join(DATA_DIR, "middleware", f), "utf8"));
+      const v = validateMiddlewareManifest(obj);
+      if (!v.ok) throw new Error(formatMiddlewareErrors(v.errors));
+      middlewareRegistry.register(v.manifest, { now: Date.now() });
+    } catch (e) {
+      const why = String((e && e.message) || e).slice(0, 400);
+      middlewareErrors.push({ file: f, error: why });
+      log(`middleware ${f} 装不上：${why.slice(0, 200)}`);
+    }
+  }
+  return middlewareRegistry.keys().length;
+}
+
+/** 请求体里算「参数」的那几格（其余是结构性的，不给插件碰）。 */
+const MW_PARAMS = ["max_tokens", "temperature", "top_p", "top_k", "stop_sequences"];
+
+/**
+ * 按 middleware 规则改写**这一次尝试**的请求体。
+ *
+ * ⚠ 为什么在**每个目标家**各改一次（而不是改一次就到处用）：故障转移会按目标家
+ *   重新解析档位（bodyFor），那一步会把插件改过的模型**覆盖掉**。所以改写必须
+ *   发生在 bodyFor 之后 —— 每个目标家改一次，各自的模型与模型清单才对得上。
+ *
+ * @returns {{ok:boolean, body?:object, extraHeaders?:object, removeHeaders?:string[], applied?:object[], errors?:object[]}}
+ */
+function applyMiddleware(provider, tier, bodyObj, req, sliceCfg) {
+  if (!middlewareRegistry.keys().length) return { ok: true };
+  const src = bodyObj && typeof bodyObj === "object" ? bodyObj : {};
+  const params = {};
+  for (const k of MW_PARAMS) if (src[k] !== undefined) params[k] = src[k];
+  const ctx = {
+    provider: String(provider || ""),
+    tier: String(tier || ""),
+    model: String(src.model || ""),
+    protocol: "anthropic",
+    path: String((req && req.url) || "").split("?")[0],
+    stream: !!src.stream,
+    headers: (req && req.headers) || {},
+    params,
+    availableModels: (sliceCfg && sliceCfg.availableModels) || [],
+  };
+  let r = null;
+  try { r = middlewareRegistry.applyRequest(ctx); }
+  catch (e) { return { ok: false, errors: [{ field: "", message: String((e && e.message) || e) }] }; }
+  if (!r || !r.ok) return { ok: false, errors: (r && r.errors) || [] };
+  const out = { ...src };
+  const applied = r.applied || [];
+  for (const a of applied) {
+    if (a.action === "removeParams" && a.key) delete out[a.key];
+  }
+  if (r.request && r.request.model) out.model = r.request.model;
+  for (const [k, v] of Object.entries((r.request && r.request.params) || {})) out[k] = v;
+  /* 头：只把插件**明确设置**的那些带上去；删掉的记下来（转发时要跳过）。 */
+  const extraHeaders = {};
+  const removeHeaders = [];
+  for (const a of applied) {
+    if (a.action === "setHeaders" && a.key) extraHeaders[String(a.key).toLowerCase()] = String(a.value);
+    if (a.action === "removeHeaders" && a.key) removeHeaders.push(String(a.key).toLowerCase());
+  }
+  return { ok: true, body: out, extraHeaders, removeHeaders, applied };
+}
+
 function orderChain(providers, now) {
   const list = (providers || []).filter(Boolean);
   if (list.length < 2) return list;
   try {
-    const seats = list.map((p) => seatOf(makeCandidate({
-      provider: p, model: "", resting: !failoverAvailable(p),
-    }), { now, restTable: restTable() }));
+    const cfg = loadCfg();
+    const states = budgetStates(cfg, now);
+    const seats = list.map((p) => {
+      let seat = seatOf(makeCandidate({
+        /* 休息的判据要多一条：预算用完的也歇着。入口仍排第一（那是「等也没用」的，
+         * 入口该让位的那一条在 attemptWithFailover 里单独判）。 */
+        provider: p, model: "", resting: !failoverAvailable(p) || budgetExhausted(p, cfg, now),
+      }), { now, restTable: restTable() });
+      /* 配额压力折进**已有的** Seat.used（0–100 的百分比）—— 不另造一个排序器。
+       * 取 max 而不是覆盖：上游自己报的使用率更高时，不能被我们的预算压低。 */
+      const q = states.get(p);
+      if (q) seat = applyQuotaToSeat(seat, q);
+      return seat;
+    });
     const idx = applyRouteStrategy(Builtin.smart, "chain", seats, now);
     const out = [];
     for (const i of idx) { const p = list[i]; if (p && !out.includes(p)) out.push(p); }
@@ -5706,8 +5865,35 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
      * ⚠ 这里不用 CaptureRes 套一层 —— 那个东西的 setHeader 是空实现，
      *   套上去会把中转设的头悄悄吞掉。单家路径的状态码直接读 res.statusCode。 */
     const startedAt = Date.now();
-    const g = await dispatchGated(fo.provider, fo, req, res, cfg, body, rewritten, isProbe,
-      () => dispatchOne(fo, req, res, cfg, body, rewritten, isProbe));
+    /* 预算用完 → 这条路没有别的家可试，回 429 + Retry-After（等窗口重置）。
+     * ⚠ 与「上游额度用尽」**分开说**：那是我们自己的估算，不是上游告诉我们的。 */
+    if (budgetExhausted(fo.provider, cfg, startedAt)) {
+      gatedError(res, "这家超出了你设的额度预算", 60);
+      return;
+    }
+    /* middleware：单家路径**也要过**（改写规则对谁都成立）。
+     * ⚠ 改写不合法 → 明确拒绝（fail-closed），别半改着发出去。 */
+    let mwBody = body, mwRewritten = rewritten;
+    const mw = applyMiddleware(fo.provider, tier0, rewritten, req, {
+      availableModels: (fo.S && fo.S.availableModels) || [],
+    });
+    if (!mw.ok) {
+      const why = (mw.errors || []).map((e) => e.message).join("；");
+      return wbAnthroError(res, 400, `middleware 改写失败：${why}`);
+    }
+    if (mw.body) {
+      mwRewritten = mw.body;
+      mwBody = Buffer.from(JSON.stringify(mw.body));
+    }
+    if (mw.extraHeaders || mw.removeHeaders) {
+      req[MIDDLEWARE_CTX] = {
+        ...(req[MIDDLEWARE_CTX] || {}),
+        provider: fo.provider, tier: tier0, model: String((mwRewritten || {}).model || ""),
+        extraHeaders: mw.extraHeaders || {}, removeHeaders: mw.removeHeaders || [],
+      };
+    }
+    const g = await dispatchGated(fo.provider, fo, req, res, cfg, mwBody, mwRewritten, isProbe,
+      () => dispatchOne(fo, req, res, cfg, mwBody, mwRewritten, isProbe));
     if (g.gated) { gatedError(res, g.reason, g.retryAfterSec); return; }
     const st = Number(res && res.statusCode) || 0;
     auditRecord({
@@ -5750,6 +5936,12 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     // （手动选的就是首选，90 秒的抖动不该改变用户的选择）；但额度用尽等多久都没用，
     // 继续把它排第一只是让每条请求都先白撞一次死渠道。冷却到期后自动回到第一。
     if (isEntry && failoverQuotaBlocked(provider)) { tries.push({ provider, skipped: "额度冷却中" }); continue; }
+    /* 预算用完的入口也要让位（与额度冷却同一类：「等也没用」）。
+     * ⚠ 与额度冷却**分开记**：预算是我们自己的估算，不是上游额度耗尽。 */
+    if (isEntry && budgetExhausted(provider, cfg, Date.now())) {
+      tries.push({ provider, skipped: "超出额度预算" });
+      continue;
+    }
     if (!isEntry && !failoverAvailable(provider)) { tries.push({ provider, skipped: "冷却中" }); continue; }
     // 目标渠道必须已配置凭据，否则跳（避免拿一个必然 401 的渠道去试）
     if (!providerConfigured(provider, cfg)) { tries.push({ provider, skipped: "未配置" }); continue; }
@@ -5762,6 +5954,29 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     const attemptStart = Date.now();
     /* 这一家连默认模型都没有 → 没法构造给它的请求，跳过（别硬发一个它不认的模型名）。 */
     if (!sub) { tries.push({ provider, skipped: "没有可用模型" }); continue; }
+    /* middleware 插件：**按目标家各改一次**（改写必须发生在 bodyFor 之后 ——
+     * 转移会按目标家重新解析档位，那一步会把插件改过的模型覆盖掉）。
+     * ⚠ 改写不合法 → **明确拒绝**这一家（fail-closed），不给半改的结果。 */
+    const mw = applyMiddleware(provider, tier0, sub.rewritten, req, {
+      availableModels: (target.S && target.S.availableModels) || [],
+    });
+    if (!mw.ok) {
+      const why = (mw.errors || []).map((e) => e.message).join("；");
+      tries.push({ provider, skipped: "middleware 改写失败" });
+      noteRelayError(provider, "middleware", `middleware 改写失败：${why}`);
+      continue;
+    }
+    if (mw.body) {
+      sub.rewritten = mw.body;
+      sub.body = Buffer.from(JSON.stringify(mw.body));
+    }
+    if (mw.extraHeaders || mw.removeHeaders) {
+      req[MIDDLEWARE_CTX] = {
+        ...(req[MIDDLEWARE_CTX] || {}),
+        provider, tier: tier0, model: String((sub.rewritten || {}).model || ""),
+        extraHeaders: mw.extraHeaders || {}, removeHeaders: mw.removeHeaders || [],
+      };
+    }
     /* 这次尝试的用量出口。上游报出来的 token 数会写进来，账本据此记账。
      * 每次尝试**新的**一个：转交给下一家时，数字必须跟着换——上一家的数字
      * 记到这一家头上就是**错账**。 */
@@ -6332,6 +6547,14 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
 async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
         let headers = {};
         for (const k of PASS_HEADERS) if (req.headers[k]) headers[k] = req.headers[k];
+        /* middleware 插件要加/删的头。
+         * ⚠ 只加插件**明确设置**的那些 —— 不是把客户端的头全转发过去
+         *   （那会把 cookie 之类的也送到上游）。 */
+        const mwCtx = req[MIDDLEWARE_CTX] || null;
+        if (mwCtx) {
+          for (const k of (mwCtx.removeHeaders || [])) delete headers[k];
+          for (const [k, v] of Object.entries(mwCtx.extraHeaders || {})) headers[k] = v;
+        }
         /* 渠道专属的**整份**请求头（v1.0.89 · mm）。
          *
          * mm 的上游同时校验 Bearer 令牌 / 完整浏览器 UA / Origin / Referer，
@@ -6436,6 +6659,20 @@ async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
             ? ["content-length", "transfer-encoding", "connection"]
             : ["content-length", "transfer-encoding", "connection", "content-encoding"];
           r.headers.forEach((v, k) => { if (!strip.includes(k)) h[k] = v; });
+          /* middleware 的**应答**规则：只改头。
+           * ⚠ 不改正文：应答到这层可能已经是一个字节流（SSE），改正文要整份缓冲
+           *   再拆事件重切 —— 那是接线层事件管道的事，不在这里做。 */
+          if (mwCtx && middlewareRegistry.keys().length) {
+            try {
+              const rr = middlewareRegistry.applyResponse({
+                provider: mwCtx.provider, tier: mwCtx.tier, model: mwCtx.model,
+                protocol: "anthropic", status: r.status, headers: h,
+              });
+              if (rr && rr.ok && rr.response && rr.response.headers) {
+                for (const [k, v] of Object.entries(rr.response.headers)) h[k] = v;
+              }
+            } catch { /* 应答改写坏了不该把一次成功的调用变成失败 */ }
+          }
           res.writeHead(r.status, h);
           if (r.body) {
             const stream = r._nodeStream ? r.body : Readable.fromWeb(r.body);
@@ -6558,6 +6795,8 @@ const RELAY_PARAMS = {
 
 /* 插件渠道：装上几家就多几格。形状按声明，凭据在 cfg[插件键] 里。 */
 loadPlugins();
+/* middleware 插件（声明式的请求改写）：装在 <数据目录>\middleware\*.json。 */
+loadMiddleware();
 
 /**
  * 给一家插件渠道装上中转落点（RELAY_PARAMS 条目 + 它自己的中转 server）。
@@ -8960,6 +9199,20 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const n = reloadPlugins();
       return json(res, 200, { ok: true, loaded: n, errors: pluginErrors });
     }
+    if (req.method === "GET" && u.pathname === "/api/middleware") {
+      return json(res, 200, {
+        ok: true,
+        dir: path.join(DATA_DIR, "middleware"),
+        list: middlewareRegistry.list().map((e) => ({
+          id: e.id, name: e.name, rules: (e.compiled && e.compiled.rules && e.compiled.rules.length) || 0,
+        })),
+        errors: middlewareErrors,
+      });
+    }
+    if (req.method === "POST" && u.pathname === "/api/middleware/reload") {
+      const n = loadMiddleware();
+      return json(res, 200, { ok: true, loaded: n, errors: middlewareErrors });
+    }
     if (req.method === "POST" && u.pathname === "/api/plugins/credential") {
       const b = await readBody(req);
       const id = String(b.id || "").trim();
@@ -8980,18 +9233,64 @@ async function unknownMappingTargets(p, mapping, cfg) {
      * 上限 0 = 不限（默认）。逐家覆盖存在 cfg[provider].limits 里。 */
     if (req.method === "GET" && u.pathname === "/api/limits") {
       const cfg = loadCfg();
+      const now = Date.now();
+      const states = budgetStates(cfg, now);
       const stats = {};
-      for (const k of CHANNELS) {
+      for (const k of allChannelKeys()) {
         const st = concurrencyGate.stats(k);
         const rp = rpmGate.stats(k);
+        const q = states.get(k) || null;
+        const bud = (() => { try { return budgetOf(k, cfg); } catch { return null; } })();
         stats[k] = {
           limit: limitsOf(k, cfg).concurrency, rpm: limitsOf(k, cfg).rpm,
           busy: st.busy, waiting: st.waiting, rejected: st.rejected, leaked: st.leaked,
           acquired: st.acquired, released: st.released,
           rpmUsed: rp ? rp.used : 0,
+          /* 预算：面板要能看见「用了多少 / 上限多少 / 什么时候重置」，
+           * 也要能看见**上限本身**（不然改不回去）。 */
+          budget: (q || bud) ? {
+            used: q ? q.used : 0, limit: q ? q.limit : 0,
+            ratio: q ? q.ratio : 0, exhausted: !!(q && q.exhausted),
+            resetAtMs: q ? q.resetAtMs : 0,
+            hourly: bud && bud.hourly != null ? bud.hourly : null,
+            daily: bud && bud.daily != null ? bud.daily : null,
+          } : null,
         };
       }
       return json(res, 200, { ok: true, limits: limitsOf("", cfg), stats });
+    }
+    if (req.method === "POST" && u.pathname === "/api/quota") {
+      const b = await readBody(req);
+      const provider = String(b.provider || "").trim();
+      if (!isChannelKey(provider)) return json(res, 400, { error: "不认识的渠道：" + provider });
+      const num = (v) => {
+        if (v === null || v === undefined || v === "") return null;
+        const n = Number(v);
+        return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+      };
+      const hourly = num(b.hourly);
+      const daily = num(b.daily);
+      if (hourly === null && daily === null) {
+        /* 两个都空 = 取消这家的预算（不限）。 */
+        const cfg = loadCfg();
+        if (cfg.quota && typeof cfg.quota === "object") delete cfg.quota[provider];
+        if (cfg[provider] && cfg[provider].quota) delete cfg[provider].quota;
+        saveCfg(cfg);
+        budgetCache = { at: 0, states: new Map() };   // 让下次请求重算
+        return json(res, 200, { ok: true, provider, hourly: null, daily: null });
+      }
+      const cfg = loadCfg();
+      const entry = { unit: "tokens" };
+      if (hourly !== null) entry.hourly = hourly;
+      if (daily !== null) entry.daily = daily;
+      /* 预算存在**顶层**的 cfg.quota[渠道键] 里（quota.mjs 的读法：顶层优先，
+       * 其次才是 cfg[渠道].quota）。放顶层是因为 bai 是**扁平**的（没有 cfg.bai 这一层），
+       * 放自家块里的话 bai 就存不下了。 */
+      if (!cfg.quota || typeof cfg.quota !== "object") cfg.quota = {};
+      cfg.quota[provider] = entry;
+      saveCfg(cfg);
+      budgetCache = { at: 0, states: new Map() };
+      return json(res, 200, { ok: true, provider, ...entry });
     }
     if (req.method === "POST" && u.pathname === "/api/limits") {
       const b = await readBody(req);

@@ -40,6 +40,7 @@ window.BAI_CARDS["plugins"] = {
           <div class="result" data-role="p-result"></div>
           <div data-role="p-note"></div>
           <div data-role="p-body"></div>
+          <div data-role="p-mw"></div>
         </div>`;
       const viewRoot = (slot.closest && slot.closest(".view")) || slot;
       viewRoot.appendChild(box);
@@ -153,6 +154,53 @@ window.BAI_CARDS["plugins"] = {
       }
     }
 
+    /* middleware 插件（声明式的请求改写）：**另一个目录**，别和 provider 插件混在一起。 */
+    async function loadMiddleware() {
+      try {
+        const r = await ctx.api("/api/middleware");
+        return r && r.ok !== false ? r : { list: [], errors: [], dir: "" };
+      } catch { return { list: [], errors: [], dir: "" }; }
+    }
+
+    function renderMiddleware(mw) {
+      const box = q('[data-role="p-mw"]');
+      if (!box) return;
+      const list = Array.isArray(mw.list) ? mw.list : [];
+      const errors = Array.isArray(mw.errors) ? mw.errors : [];
+      if (!list.length && !errors.length) { box.innerHTML = ""; return; }
+      box.innerHTML = `
+        <div class="sechead" style="margin:16px 0 4px">
+          <h2 style="font-size:12px">middleware 插件</h2>
+          <span class="note">声明式的请求改写 · 装在 <span class="mono">${esc(String(mw.dir || ""))}</span></span>
+        </div>
+        <div class="fpline">
+          <span class="k">已装</span>
+          <span class="v">${list.length ? list.map((m) => `${esc(String(m.name || m.id))}（${esc(String(m.id))}，${num(m.rules)} 条规则）`).join("；") : "（无）"}</span>
+        </div>
+        ${errors.length ? errors.map((e) => `<div class="hint" style="margin-top:6px;padding:10px 12px;border:1px solid var(--line);border-radius:9px">
+          <b class="mono">${esc(String(e.file || ""))}</b><br>${esc(String(e.error || ""))}
+        </div>`).join("") : ""}
+        <div style="margin-top:8px">
+          <button type="button" class="btn sm" data-role="p-mw-reload">重新扫描 middleware 目录</button>
+        </div>`;
+      const btn = box.querySelector('[data-role="p-mw-reload"]');
+      if (btn) {
+        btn.addEventListener("click", async () => {
+          setResult("正在重新扫描…");
+          try {
+            const r = await ctx.api("/api/middleware/reload", {
+              method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+            });
+            if (r && r.ok === false) throw new Error(r.error || "重载失败");
+            setResult(`✔ 已重载：装上 ${num(r.loaded)} 条${(r.errors || []).length ? `，${r.errors.length} 份装不上` : ""}`, true);
+            renderMiddleware(await loadMiddleware());
+          } catch (e) {
+            setResult("✖ 重载失败：" + String((e && e.message) || e), false);
+          }
+        });
+      }
+    }
+
     async function load() {
       if (inflight) return;
       inflight = true;
@@ -206,7 +254,7 @@ window.BAI_CARDS["plugins"] = {
         const dir = q('[data-role="p-dir"]');
         if (dir && data) dir.textContent = String(data.dir || "—");
         const s = signature();
-        if (s !== sig) { sig = s; renderBody(); bindRows(); }
+        if (s !== sig) { sig = s; renderBody(); bindRows(); renderMiddleware(await loadMiddleware()); }
       },
       refresh() { return load(); },
     };

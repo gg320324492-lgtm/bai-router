@@ -51,6 +51,7 @@ window.BAI_CARDS["limits"] = {
           <div class="result" data-role="l-result"></div>
           <div data-role="l-note"></div>
           <div data-role="l-body"></div>
+          <div data-role="l-budget"></div>
         </div>`;
       const viewRoot = (slot.closest && slot.closest(".view")) || slot;
       viewRoot.appendChild(box);
@@ -126,6 +127,70 @@ window.BAI_CARDS["limits"] = {
         </table>`;
     }
 
+    function renderBudget() {
+      const box = q('[data-role="l-budget"]');
+      if (!box) return;
+      const stats = (data && data.stats) || {};
+      const keys = Object.keys(stats);
+      if (!keys.length) { box.innerHTML = ""; return; }
+      const rows = keys.map((k) => {
+        const s = stats[k] || {};
+        const b = s.budget || null;
+        const used = b ? num(b.used) : 0;
+        const limit = b ? num(b.limit) : 0;
+        const pct = limit ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+        const exhausted = b && b.exhausted;
+        return `<tr>
+            <td>${esc(nameOfKey(k))}</td>
+            <td><input type="number" min="0" step="1000" data-role="q-h-${esc(k)}" value="${b && b.hourly ? esc(num(b.hourly)) : ""}" placeholder="不限" style="width:110px"></td>
+            <td><input type="number" min="0" step="10000" data-role="q-d-${esc(k)}" value="${b && b.daily ? esc(num(b.daily)) : ""}" placeholder="不限" style="width:110px"></td>
+            <td class="dim">${limit ? `${int(used)} / ${int(limit)}（${pct}%）` : "—"}</td>
+            <td>${exhausted ? '<span class="led err"></span> 已用完' : (b ? '<span class="led ok"></span> 正常' : "—")}</td>
+            <td><button type="button" class="btn sm" data-role="q-save-${esc(k)}">保存</button></td>
+          </tr>`;
+      }).join("");
+      box.innerHTML = `
+        <div class="sechead" style="margin:16px 0 4px">
+          <h2 style="font-size:12px">额度预算</h2>
+          <span class="note">单位是 token（不是钱）· 用完了这家会自己歇到窗口重置</span>
+        </div>
+        <table class="route" style="table-layout:fixed">
+          <thead><tr>
+            <th style="width:20%">渠道</th>
+            <th style="width:20%">每小时上限</th>
+            <th style="width:20%">每天上限</th>
+            <th style="width:20%">已用 / 上限</th>
+            <th style="width:12%">状态</th>
+            <th style="width:8%"></th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+      for (const k of keys) {
+        const btn = box.querySelector(`[data-role="q-save-${k}"]`);
+        if (!btn) continue;
+        btn.addEventListener("click", async () => {
+          const h = box.querySelector(`[data-role="q-h-${k}"]`);
+          const d = box.querySelector(`[data-role="q-d-${k}"]`);
+          setResult("正在保存…");
+          try {
+            const r = await ctx.api("/api/quota", {
+              method: "POST", headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                provider: k,
+                hourly: h && h.value !== "" ? h.value : null,
+                daily: d && d.value !== "" ? d.value : null,
+              }),
+            });
+            if (r && r.ok === false) throw new Error(r.error || "保存失败");
+            setResult(`✔ 已保存 ${nameOfKey(k)} 的额度预算`, true);
+            await load(); renderTotals(); renderBody(); renderBudget();
+          } catch (e) {
+            setResult("✖ 保存失败：" + String((e && e.message) || e), false);
+          }
+        });
+      }
+    }
+
     async function load() {
       if (inflight) return;
       inflight = true;
@@ -177,7 +242,8 @@ window.BAI_CARDS["limits"] = {
       const s = (data && data.stats) || {};
       return JSON.stringify([(data && data.limits && data.limits.concurrency) || 0,
         (data && data.limits && data.limits.rpm) || 0,
-        Object.keys(s).map((k) => [k, s[k].busy, s[k].waiting, s[k].rejected]).flat()]);
+        Object.keys(s).map((k) => [k, s[k].busy, s[k].waiting, s[k].rejected,
+          s[k].budget ? s[k].budget.used : 0, s[k].budget ? s[k].budget.limit : 0]).flat()]);
     }
 
     return {
@@ -190,7 +256,7 @@ window.BAI_CARDS["limits"] = {
             : "";
         }
         const s = signature();
-        if (s !== sig) { sig = s; renderInputs(); renderBody(); }
+        if (s !== sig) { sig = s; renderInputs(); renderBody(); renderBudget(); }
       },
       refresh() { return load(); },
     };
