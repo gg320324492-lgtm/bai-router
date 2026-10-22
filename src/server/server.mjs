@@ -114,6 +114,22 @@ import {
 /* 网关的故障转移（gateway-failover.mjs）：把「档位」从最终模型名反查回来，
  * 转移时才能按**目标家**重解析（各家同一档位是不同模型）。 */
 import { tierOfModel, tierKeyFor } from "./gateway-failover.mjs";
+/* 审计台账（audit.mjs）：每一次对外交互记一条（谁、何时、哪一家、哪个模型、
+ * 结果、耗时、失败被归成哪一类）。magpie 的 internal/maskrec 移植版。
+ * ⚠ 它与用量账本不是一回事：用量账本记「钱花到哪儿」，审计台账记「链路上发生过什么」，
+ *   用途是**事后**复盘（用户报「昨天卡了」，得能翻出那段时间每条请求去了哪）。
+ * ⚠ 台账里绝不能出现凭据 —— audit.mjs 每个字符串字段都过一遍 redact.mjs。 */
+import { createAudit } from "./audit.mjs";
+/* 配置备份（backup.mjs）：快照 → 加密导出 → 导入还原。magpie 的 internal/backup
+ * 与 internal/settings（KeepOwn）移植版。
+ * ⚠ 备份里**有**真实凭据（那正是它的用处），所以导出必须带口令加密、
+ *   而且**明文绝不落盘**（backup.mjs 的 exportBundle 走 AES-256-GCM）。 */
+import { snapshotOf, exportBundle, importBundle, restoreConfig } from "./backup.mjs";
+/* 并发闸门与 RPM 限流（concurrency.mjs / rpm.mjs）：magpie 的
+ * internal/gateway/concurrency.go 与 rpm.go 移植版。
+ * ⚠ 默认**不限**（上限 0）—— 限流不该突然开始拦用户的请求，它得由用户自己开。 */
+import { ConcurrencyLimiter } from "./concurrency.mjs";
+import { RpmLimiter } from "./rpm.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 用户数据目录：Electron 安装版通过 BAI_DATA_DIR 指向 %APPDATA%\bai-router（升级不覆盖）；
@@ -5611,10 +5627,90 @@ function orderChain(providers, now) {
   } catch { return list; }
 }
 
+/* 一次对外尝试：**过闸门**（并发 + 每分钟上限）→ 打上游 → **保证**还名额。
+ *
+ * ⚠ 为什么单独抽出来：限流得对**两条路**都生效 ——
+ *   「不开故障转移」那条路（单家直连，最常见）也要过闸，
+ *   而它根本不进 attemptWithFailover 的候选循环。
+ *   闸门写在循环里的话，单家场景就等于**没过闸**。
+ *
+ * @param {Function} fn 真正发请求的函数（由调用方给，这样异常照常往外抛，
+ *   而闸门的释放仍然由 finally 保证）。
+ * @returns {{gated:boolean, reason?:string, retryAfterSec?:number, value?:any}}
+ *   gated=true → 这一家没轮到（满了 / 超了每分钟上限），调用方决定跳过还是回 429。
+ */
+async function dispatchGated(provider, target, req, res, cfg, body, rewritten, isProbe, fn) {
+  const lim = limitsOf(provider, cfg);
+  let slot = null;
+  let rpmAt = 0;
+  if (lim.concurrency > 0 || lim.rpm > 0) {
+    slot = await concurrencyGate.acquire(provider, {
+      limit: lim.concurrency, waitMs: lim.waitMs, signal: req.signal,
+    });
+    if (!slot.ok) {
+      return { gated: true, reason: slot.reason === "aborted" ? "客户端已断开" : "并发已满", retryAfterSec: 1 };
+    }
+    if (lim.rpm > 0) {
+      const r = rpmGate.reserve(provider, { limit: lim.rpm });
+      if (!r.ok) {
+        slot.release();
+        return { gated: true, reason: "超过每分钟上限", retryAfterSec: Math.max(1, Math.ceil(r.retryAfterSec || 1)) };
+      }
+      rpmAt = r.at;
+    }
+  }
+  let dispatched = false;
+  try {
+    const value = await fn();
+    dispatched = true;
+    return { gated: false, value };
+  } finally {
+    /* ⚠ 释放写在 finally：成功、失败、抛异常，三条路都得还。
+     *   漏一次 = 永久占一个坑 = 那家的请求从此全排队（用户看到的是「卡住」，
+     *   而不是「并发上限」—— 那种 bug 极难查）。 */
+    if (slot) { try { slot.release(); } catch { } }
+    /* 请求压根没发出去（抛异常）→ 每分钟的名额还回去：
+     * 它记的是「真发出去的请求」，没发出去就不该占额度。 */
+    if (rpmAt && !dispatched) { try { rpmGate.giveBack(provider, rpmAt); } catch { } }
+  }
+}
+
+/** 闸门把人挡在外面时的应答：429 + Retry-After（等一会儿自己就好）。 */
+function gatedError(res, reason, retryAfterSec) {
+  const sec = Math.max(1, Math.floor(Number(retryAfterSec) || 1));
+  try {
+    if (res && !res.headersSent && typeof res.writeHead === "function") {
+      res.writeHead(429, {
+        "content-type": "application/json; charset=utf-8",
+        "retry-after": String(sec),
+      });
+      res.end(JSON.stringify({
+        type: "error",
+        error: { type: "rate_limit_error", message: `本地限流：${reason}。约 ${sec} 秒后再试。` },
+      }));
+      return;
+    }
+  } catch { /* 下面兜底 */ }
+  try { if (res && typeof res.end === "function") res.end(); } catch { }
+}
+
 async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, tier0) {
   const foCfg = cfg.failover || {};
   if (!foCfg.enabled) {
-    await dispatchOne(fo, req, res, cfg, body, rewritten, isProbe);
+    /* 单家直连：**也要过闸门**（限流对这条路同样成立）。
+     * ⚠ 这里不用 CaptureRes 套一层 —— 那个东西的 setHeader 是空实现，
+     *   套上去会把中转设的头悄悄吞掉。单家路径的状态码直接读 res.statusCode。 */
+    const startedAt = Date.now();
+    const g = await dispatchGated(fo.provider, fo, req, res, cfg, body, rewritten, isProbe,
+      () => dispatchOne(fo, req, res, cfg, body, rewritten, isProbe));
+    if (g.gated) { gatedError(res, g.reason, g.retryAfterSec); return; }
+    const st = Number(res && res.statusCode) || 0;
+    auditRecord({
+      provider: fo.provider,
+      model: String((rewritten || {}).model || ""),
+      status: st, outcome: st >= 400 ? "error" : "ok",
+      ms: Date.now() - startedAt,
+    });
     return;
   }
   const order = (Array.isArray(foCfg.chain) && foCfg.chain.length ? foCfg.chain : [fo.provider])
@@ -5656,6 +5752,9 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     if (!target) { tries.push({ provider, skipped: "未知渠道" }); continue; }
     const cap = new CaptureRes(res);
     const sub = bodyFor(target, isEntry);
+    /* 这次尝试从这一刻开始计时（审计台账要「耗时」）。
+     * ⚠ 计时含**这一家自己的**等待，不含排队 —— 排队不归某一家。 */
+    const attemptStart = Date.now();
     /* 这一家连默认模型都没有 → 没法构造给它的请求，跳过（别硬发一个它不认的模型名）。 */
     if (!sub) { tries.push({ provider, skipped: "没有可用模型" }); continue; }
     /* 这次尝试的用量出口。上游报出来的 token 数会写进来，账本据此记账。
@@ -5671,16 +5770,24 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     if (!isEntry && !providerUsable(provider, (sub.rewritten || {}).model)) {
       tries.push({ provider, skipped: "该模型冷却中" }); continue;
     }
+    /* 并发 / RPM 闸门（magpie 的两级限流）。默认不限 → 闸门里直接放行。
+     * 拿不到名额 → 这一家跳过，换下一家（不是把请求判死）。 */
+    let g = null;
     try {
-      await dispatchOne(target, req, cap, cfg, sub.body, sub.rewritten, isProbe);
+      g = await dispatchGated(provider, target, req, cap, cfg, sub.body, sub.rewritten, isProbe,
+        () => dispatchOne(target, req, cap, cfg, sub.body, sub.rewritten, isProbe));
     } catch (e) {
       cap.discard();
       lastErr = String((e && e.message) || e);
       tries.push({ provider, ok: false, err: lastErr.slice(0, 120) });
       failoverCooldown(provider, lastErr);
       noteRelayError(provider, "failover", `转移走（异常）：${lastErr.slice(0, 120)}`);
+      /* 审计：这次尝试也发生过，它该在册（哪怕崩了）。 */
+      auditRecord({ provider, model: String((sub.rewritten || {}).model || ""), status: 0, error: lastErr, ms: Date.now() - attemptStart, handedOn: true });
       continue;
     }
+    /* 闸门没放行 → 这一家跳过，换下一家（不是把请求判死）。 */
+    if (g && g.gated) { tries.push({ provider, skipped: g.reason }); continue; }
     if (cap.ok()) {
       failoverClear(provider);
       /* 成功 ⇒ 清掉这家/这个模型的休息与连续失败计数。
@@ -5694,6 +5801,12 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
         t.forget(provider);
       } catch { /* 休息表坏了不该影响这次应答 */ }
       tries.push({ provider, ok: true });
+      /* 审计：这一次尝试成功了 —— 谁、哪一家、哪个模型、多久。 */
+      auditRecord({
+        provider,
+        model: String((sub.rewritten || {}).model || (rewritten || {}).model || ""),
+        status: 200, outcome: "ok", ms: Date.now() - attemptStart,
+      });
       /* 用量：这次请求的**最终**结果（magpie 的口径：一个请求 = 一条记录，
        * 按它怎么结束只数一次）。 */
       usageWriter.record({
@@ -5742,6 +5855,12 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
       // 注意：这里是**没有发生转移**的分支（换渠道也没用，直接原样返回）。
       // 措辞必须与行为一致，否则排查时会被"故障转移"字样误导成渠道切换过。
       noteChannelAttempt(fo.provider, tries);
+      /* 审计：这一次尝试也发生过 —— 哪怕它就是终点（没有转交）。 */
+      auditRecord({
+        provider,
+        model: String((sub.rewritten || {}).model || (rewritten || {}).model || ""),
+        status, error: describeError(cap), ms: Date.now() - attemptStart, handedOn: false,
+      });
       if (cap.flushBuffered()) return;
       return wbAnthroError(res, status || 502,
         `${target.label} 返回 ${status || "网络错误"}，此错误重试其他渠道也不会好转：${describeError(cap)}`);
@@ -5779,6 +5898,14 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
     }
     /* 用量：这次尝试**失败但已把活交出去了**（handed_on）——它计费了什么、为什么失败，
      * 都要留痕；但它**不计入失败数**（magpie 的口径：转交出去的 try 照样写记录）。 */
+    /* 审计：同样记一条。kind 直接用归因结果（额度/限流/不被服务…），
+     * 不用再猜一遍 —— 归因器是同一个，猜两遍迟早会对不上。 */
+    auditRecord({
+      provider,
+      model: servedModel,
+      status, outcome: "error", kind: fcls.kind,
+      error: lastErr, ms: Date.now() - attemptStart, handedOn: true,
+    });
     usageWriter.recordAttempt({
       provider,
       model: servedModel,
@@ -6670,6 +6797,93 @@ const usageWriter = makeUsageWriter({
   now: () => Date.now(),
   logger: (m) => log("用量账本: " + m),
 });
+
+/* 审计台账（audit.mjs）。**只在内存里**，有硬上界，不落盘。
+ *
+ * 为什么落盘的决定权在接线层、不在模块里：落哪儿、留几天、要不要分文件，
+ * 都是**这个应用**的事（magpie 是按天一个 JSONL 放 ~/.config/magpie/masking/）。
+ * 模块只保证一件事 —— 内存里的条数有上界，长跑不会把它吃光。
+ *
+ * ⚠ 记台账是**旁路**：它坏了不许把一次正常的模型调用带崩（同用量账本那条纪律）。 */
+const auditLedger = createAudit({ max: 2000, now: () => Date.now() });
+
+/** 记一条审计。**永不抛** —— 台账坏了不许影响应答。 */
+function auditRecord(entry) {
+  try {
+    auditLedger.record(entry);
+  } catch { /* 台账是旁路 */ }
+}
+
+/* ---------- 配置备份（备份模块的接线）----------
+ *
+ * 导出：把配置快照（providers / settings / claude 三块）用**口令加密**成一坨二进制，
+ *       写进 <数据目录>\backups\backup-<时间戳>.bak。
+ * 导入：读那份文件 → 解密 → **合并**回当前配置（restoreConfig 做的是合并不是替换，
+ *       magpie 的 KeepOwn：这台机器自己的端口/代理不该被一份旧快照覆盖）。
+ *
+ * ⚠ **口令绝不落盘、绝不进日志**。它只在这一请求的生命周期里活着。
+ * ⚠ **只还原路由台自己的配置**，不动 ~/.claude/settings.json —— 那是用户自己写的
+ *   权限与钩子，还原它要走 applyToCli 那套「保格式的最小改动」，而不是整份覆盖
+ *   （整份覆盖会抹掉注释与键序，那是本仓库吃过大亏的地方）。快照里**带着**那一块，
+ *   供换机时手工取用。
+ * ⚠ 备份目录**沿用**已有的 BACKUP_DIR（<数据目录>\backups）——那里已经躺着
+ *   external-cli.json / external-desktop.json 两份外部快照，同一个目录省得用户找。
+ *   文件名后缀 *.bak 与那两份 .json 区分得开，不会混。 */
+
+/** 备份目录里的备份清单（新的在前）。读不到就当没有 —— 备份是可选功能。 */
+function listBackups() {
+  try {
+    if (!existsSync(BACKUP_DIR)) return [];
+    return readdirSync(BACKUP_DIR)
+      .filter((f) => f.endsWith(".bak"))
+      .map((f) => {
+        let st = null;
+        try { st = statSync(path.join(BACKUP_DIR, f)); } catch { }
+        return { name: f, bytes: st ? st.size : 0, at: st ? st.mtimeMs : 0 };
+      })
+      .sort((a, b) => b.at - a.at);
+  } catch { return []; }
+}
+
+/** 口令太短就拒 —— 六位以内的口令等于没加密，而用户会以为自己加密了。 */
+function checkPassphrase(p) {
+  const s = String(p == null ? "" : p);
+  if (s.length < 8) throw new Error("口令至少 8 个字符（太短的话，等于没加密）");
+  return s;
+}
+
+/* ---------- 并发 / RPM 闸门 ----------
+ *
+ * 为什么要它：把某一家打爆 → 上游回 429 → 整条转移链跟着挨打。
+ * magpie 有两道闸（并发道 + 每分钟请求数），我们照抄。
+ *
+ * ⚠ **默认不限**（上限 0）：限流是用户自己开的开关，不该突然开始拦他的请求。
+ *   上限从 cfg.limits 读（全局），cfg[provider].limits 可逐家覆盖。
+ *
+ * ⚠ 顺序：**先并发名额、后 RPM 位**。RPM 记的是「真发出去的请求」，
+ *   先占 RPM 会在并发排队时白耗额度（排了 30 秒才轮到，结果额度已经扣了）。
+ *
+ * ⚠ 两道闸的拒绝**不重叠**：并发满是本地决策（换一家即可），
+ *   RPM 超了要回 429 + Retry-After（等一分钟自己就好了，换家反而更慢）。 */
+const concurrencyGate = new ConcurrencyLimiter({ now: () => Date.now() });
+const rpmGate = new RpmLimiter({ now: () => Date.now() });
+
+/** 某家的限流上限：全局的 + 逐家覆盖的。0 = 不限。 */
+function limitsOf(provider, cfg) {
+  const c = cfg || {};
+  const g = c.limits && typeof c.limits === "object" ? c.limits : {};
+  const sub = provider === "bai" ? c : (c[provider] || {});
+  const p = sub.limits && typeof sub.limits === "object" ? sub.limits : {};
+  const num = (v, d) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : d;
+  };
+  return {
+    concurrency: num(p.concurrency !== undefined ? p.concurrency : g.concurrency, 0),
+    rpm: num(p.rpm !== undefined ? p.rpm : g.rpm, 0),
+    waitMs: num(p.waitMs !== undefined ? p.waitMs : g.waitMs, 120000),
+  };
+}
 
 /* 这家供应商现在还能接这个模型吗？
  *
@@ -8474,6 +8688,121 @@ async function unknownMappingTargets(p, mapping, cfg) {
         });
       }
       return json(res, 200, { ok: true, mode: want, warnings: warns });
+    }
+    /* ---------- 审计台账（面板读）----------
+     * 只在内存里，有硬上界（audit.mjs 的 max）。所以它回答的是
+     * 「**最近**这段时间链路上发生过什么」，不是全量历史 ——
+     * 全量历史在用量账本那份 JSONL 里（那是落盘的、跨进程重启也在）。
+     *
+     * ⚠ 台账里的字段已经过脱敏（audit.mjs 每个字符串都过 redact），
+     *   这里**原样**返回即可，渲染层不必再脱敏一遍。 */
+    if (req.method === "GET" && u.pathname === "/api/audit") {
+      const limit = Math.max(1, Math.min(200, Number(u.searchParams.get("limit")) || 50));
+      const provider = (u.searchParams.get("provider") || "").trim();
+      try {
+        return json(res, 200, {
+          ok: true,
+          records: auditLedger.list({ provider, limit }),
+          summary: auditLedger.summary(),
+        });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: "读不到审计台账：" + String((e && e.message) || e), records: [], summary: null });
+      }
+    }
+    /* ---------- 配置备份（面板读 / 写）----------
+     * 导出会写出**带真实凭据**的快照，所以它必须带口令加密；
+     * 口令只在这一请求里活着，**不落盘、不进日志**。 */
+    if (req.method === "GET" && u.pathname === "/api/backup") {
+      return json(res, 200, { ok: true, dir: BACKUP_DIR, files: listBackups() });
+    }
+    if (req.method === "POST" && u.pathname === "/api/backup/export") {
+      const b = await readBody(req);
+      try {
+        const pass = checkPassphrase(b.passphrase);
+        const cfg = loadCfg();
+        const snap = snapshotOf(cfg, { now: Date.now() });
+        const bytes = exportBundle(snap, pass, { now: Date.now() });
+        const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+        const dir = BACKUP_DIR;
+        mkdirSync(dir, { recursive: true });
+        const name = "backup-" + new Date().toISOString().replace(/[:.]/g, "-") + ".bak";
+        const file = path.join(dir, name);
+        writeAtomic(file, buf);
+        /* ⚠ 不回显口令，不回显内容，只回「写在哪、多大」。 */
+        return json(res, 200, { ok: true, file, name, bytes: buf.length, at: Date.now() });
+      } catch (e) {
+        return json(res, 400, { error: "导出失败：" + String((e && e.message) || e) });
+      }
+    }
+    if (req.method === "POST" && u.pathname === "/api/backup/import") {
+      const b = await readBody(req);
+      try {
+        const pass = checkPassphrase(b.passphrase);
+        const name = String(b.file || "").trim();
+        if (!name) return json(res, 400, { error: "没说要导入哪个备份文件" });
+        /* ⚠ 文件名不许带路径：**只认备份目录下的那一个文件名**。
+         *   否则一个 "../" 就能把任意文件读进来解密。 */
+        if (name.includes("/") || name.includes("\\") || name.includes("..")) {
+          return json(res, 400, { error: "备份文件名不合法（只接受备份目录下的文件名）" });
+        }
+        const file = path.join(BACKUP_DIR, name);
+        let raw = null;
+        try { raw = readFileSync(file); } catch { }
+        if (!raw) return json(res, 404, { error: "找不到这个备份文件：" + name });
+        const snap = importBundle(raw, pass, { now: Date.now() });
+        const cur = loadCfg();
+        const merged = restoreConfig(snap, cur, { now: Date.now() });
+        /* ⚠ 还原**之前**先把当前配置另存一份 —— 还原是破坏性的，
+         *   得留一条回头路（用户当年就是这么丢过配置的）。 */
+        let safety = "";
+        try {
+          const dir = BACKUP_DIR;
+          mkdirSync(dir, { recursive: true });
+          const pre = path.join(dir, "before-import-" + new Date().toISOString().replace(/[:.]/g, "-") + ".json");
+          writeAtomic(pre, JSON.stringify(cur, null, 2) + "\n");
+          safety = pre;
+        } catch { /* 留不下就继续（还原本身仍然可逆：导出的那份还在） */ }
+        if (merged.changed) saveCfg(merged.config);
+        return json(res, 200, {
+          ok: true, changed: !!merged.changed,
+          safety, parts: Object.keys(snap.parts || {}),
+          note: "只还原了路由台自己的配置；~/.claude/settings.json 未改动。",
+        });
+      } catch (e) {
+        return json(res, 400, { error: "导入失败：" + String((e && e.message) || e) });
+      }
+    }
+    /* ---------- 限流上限（面板读写）----------
+     * 上限 0 = 不限（默认）。逐家覆盖存在 cfg[provider].limits 里。 */
+    if (req.method === "GET" && u.pathname === "/api/limits") {
+      const cfg = loadCfg();
+      const stats = {};
+      for (const k of CHANNELS) {
+        const st = concurrencyGate.stats(k);
+        const rp = rpmGate.stats(k);
+        stats[k] = {
+          limit: limitsOf(k, cfg).concurrency, rpm: limitsOf(k, cfg).rpm,
+          busy: st.busy, waiting: st.waiting, rejected: st.rejected, leaked: st.leaked,
+          acquired: st.acquired, released: st.released,
+          rpmUsed: rp ? rp.used : 0,
+        };
+      }
+      return json(res, 200, { ok: true, limits: limitsOf("", cfg), stats });
+    }
+    if (req.method === "POST" && u.pathname === "/api/limits") {
+      const b = await readBody(req);
+      const num = (v, d) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n >= 0 ? Math.floor(n) : d;
+      };
+      const cur = loadCfg();
+      const g = cur.limits && typeof cur.limits === "object" ? { ...cur.limits } : {};
+      if (b.concurrency !== undefined) g.concurrency = num(b.concurrency, g.concurrency || 0);
+      if (b.rpm !== undefined) g.rpm = num(b.rpm, g.rpm || 0);
+      if (b.waitMs !== undefined) g.waitMs = num(b.waitMs, g.waitMs || 120000);
+      cur.limits = g;
+      saveCfg(cur);
+      return json(res, 200, { ok: true, limits: limitsOf("", cur) });
     }
     /* ---------- 用量账本（面板读）----------
      * 账本是 JSONL 追加日志（usage-ledger.mjs）。读的时候**坏行跳过**——

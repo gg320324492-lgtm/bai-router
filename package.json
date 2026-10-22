@@ -8,7 +8,7 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test --test-concurrency=1 scripts/attrib-atomic-test.mjs scripts/zen-go-tier-test.mjs scripts/zen-capability-probe-test.mjs scripts/zen-probe-free-tier-test.mjs scripts/empty-stream-diag-test.mjs scripts/oc-runtime-test.mjs scripts/oc-bridge-test.mjs scripts/oc-wiring-test.mjs scripts/oc-install-test.mjs scripts/oc-ui-test.mjs scripts/api-config-strict-test.mjs scripts/pid-identity-test.mjs scripts/wb-pool-test.mjs scripts/wb-pool-wiring-test.mjs scripts/wb-pool-rotation-e2e.mjs scripts/wb-token-test.mjs scripts/wb-429-test.mjs scripts/wb-catalog-bucket-test.mjs scripts/publish-proxy-test.mjs scripts/publish-source-test.mjs scripts/oc-tool-guard-test.mjs scripts/model-truth-test.mjs scripts/cli-base-url-test.mjs scripts/wb-capture-report-test.mjs scripts/wb-auto-capture-test.mjs scripts/api-timeout-budget-test.mjs scripts/wb-header-budget-test.mjs scripts/panel-state-truth-test.mjs scripts/silent-jump-test.mjs scripts/mm-auth-test.mjs scripts/publish-seed-test.mjs scripts/routes-test.mjs scripts/ir-test.mjs scripts/edit-json-test.mjs scripts/apply-to-cli-test.mjs scripts/failover-refusal-test.mjs scripts/session-id-test.mjs scripts/usage-ledger-test.mjs scripts/update-channel-test.mjs scripts/ps-parse-test.mjs scripts/ps-verify-test.mjs scripts/gateway-test.mjs scripts/candidates-test.mjs scripts/allowance-test.mjs scripts/usage-writer-test.mjs scripts/session-store-test.mjs scripts/usage-scan-test.mjs scripts/seat-builder-test.mjs scripts/chain-order-test.mjs scripts/gateway-mode-test.mjs scripts/gateway-failover-test.mjs scripts/wb-pool-affinity-test.mjs",
+    "test": "node --test --test-concurrency=1 scripts/attrib-atomic-test.mjs scripts/zen-go-tier-test.mjs scripts/zen-capability-probe-test.mjs scripts/zen-probe-free-tier-test.mjs scripts/empty-stream-diag-test.mjs scripts/oc-runtime-test.mjs scripts/oc-bridge-test.mjs scripts/oc-wiring-test.mjs scripts/oc-install-test.mjs scripts/oc-ui-test.mjs scripts/api-config-strict-test.mjs scripts/pid-identity-test.mjs scripts/wb-pool-test.mjs scripts/wb-pool-wiring-test.mjs scripts/wb-pool-rotation-e2e.mjs scripts/wb-token-test.mjs scripts/wb-429-test.mjs scripts/wb-catalog-bucket-test.mjs scripts/publish-proxy-test.mjs scripts/publish-source-test.mjs scripts/oc-tool-guard-test.mjs scripts/model-truth-test.mjs scripts/cli-base-url-test.mjs scripts/wb-capture-report-test.mjs scripts/wb-auto-capture-test.mjs scripts/api-timeout-budget-test.mjs scripts/wb-header-budget-test.mjs scripts/panel-state-truth-test.mjs scripts/silent-jump-test.mjs scripts/mm-auth-test.mjs scripts/publish-seed-test.mjs scripts/routes-test.mjs scripts/ir-test.mjs scripts/edit-json-test.mjs scripts/apply-to-cli-test.mjs scripts/failover-refusal-test.mjs scripts/session-id-test.mjs scripts/usage-ledger-test.mjs scripts/update-channel-test.mjs scripts/ps-parse-test.mjs scripts/ps-verify-test.mjs scripts/gateway-test.mjs scripts/candidates-test.mjs scripts/allowance-test.mjs scripts/usage-writer-test.mjs scripts/session-store-test.mjs scripts/usage-scan-test.mjs scripts/seat-builder-test.mjs scripts/chain-order-test.mjs scripts/gateway-mode-test.mjs scripts/gateway-failover-test.mjs scripts/wb-pool-affinity-test.mjs scripts/redact-test.mjs scripts/audit-test.mjs scripts/backup-test.mjs scripts/sync-test.mjs scripts/panel-api-test.mjs scripts/concurrency-test.mjs scripts/rpm-test.mjs",
     "dist": "electron-builder --win nsis",
     "publish": "node scripts/publish.cjs",
     "postinstall": "node scripts/patch-updater.cjs",
@@ -68,7 +68,13 @@
           "session-store.mjs",
           "usage-scan.mjs",
           "seat-builder.mjs",
-          "gateway-failover.mjs"
+          "gateway-failover.mjs",
+          "redact.mjs",
+          "audit.mjs",
+          "backup.mjs",
+          "sync.mjs",
+          "concurrency.mjs",
+          "rpm.mjs"
         ]
       },
       {

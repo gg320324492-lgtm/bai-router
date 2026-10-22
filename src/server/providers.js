@@ -545,8 +545,8 @@ window.BAI_PROVIDERS = {
  * 以及本表的 id（DOM 容器 id 在 dom 字段）。C9 逐个核对。
  * ========================================================================== */
 window.BAI_VIEWS = [
-  { id: "console", nav: "控制台", dom: "viewConsole", hint: "渠道矩阵 · 映射编辑 · 诊断抽屉", cards: ["model-sync", "oc-transport", "usage-ledger"] },
+  { id: "console", nav: "控制台", dom: "viewConsole", hint: "渠道矩阵 · 映射编辑 · 诊断抽屉", cards: ["model-sync", "oc-transport", "usage-ledger", "audit-ledger"] },
   { id: "cred", nav: "凭据", dom: "viewCred", hint: "每家渠道各自要的东西", cards: ["token-capture", "model-catalog", "or-rotation", "wb-pool", "mm-member"] },
-  { id: "fo", nav: "故障转移", dom: "viewFo", hint: "开关 · 顺序 · 冷却", cards: ["failover", "gateway-switch"] },
-  { id: "settings", nav: "设置", dom: "viewSettings", hint: "代理 · 端口 · 更新 · 数据目录", cards: [] },
+  { id: "fo", nav: "故障转移", dom: "viewFo", hint: "开关 · 顺序 · 冷却", cards: ["failover", "gateway-switch", "limits"] },
+  { id: "settings", nav: "设置", dom: "viewSettings", hint: "代理 · 端口 · 更新 · 数据目录", cards: ["config-backup"] },
 ];

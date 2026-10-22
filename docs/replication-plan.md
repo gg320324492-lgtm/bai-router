@@ -27,10 +27,10 @@ magpie 是 10.3 万行 Go、5661 个文件。它自己的历史是首周每天 2
 | T7 | **用量账本** `usage.jsonl` + 面板 | ✅ 完成（`usage-ledger.mjs` + `usage-writer.mjs` + token 扫描） | `internal/usage/` |
 | T8 | **账号发现改读登录态**（替代 hook 注入） | ⬜ 未开始 | `internal/provider/account.go` |
 | T9 | **配额探测与配额感知路由** | ⬜ 未开始 | `internal/provider/quotas.go` |
-| T10 | **脱敏与审计台账** | ⬜ 未开始 | `internal/redact/`、`internal/maskrec/` |
+| T10 | **脱敏与审计台账** | ✅ 完成（`redact.mjs` + `audit.mjs`，已接进转移链与面板） | `internal/redact/`、`internal/maskrec/` |
 | T11 | **插件体系**（声明式 provider/agent/middleware） | ⬜ 未开始 | `internal/pluginrt/`、`internal/plugin/` |
-| T12 | **并发 / RPM 限流通道** | ⬜ 未开始 | `internal/gateway/{concurrency,rpm}.go` |
-| T13 | **配置同步备份**（WebDAV/S3/GitHub）+ KeepOwn | ⬜ 未开始 | `internal/backup/`、`internal/davsync/` |
+| T12 | **并发 / RPM 限流通道** | ✅ 完成（`concurrency.mjs` + `rpm.mjs`，**默认不限**，面板可开） | `internal/gateway/{concurrency,rpm}.go` |
+| T13 | **配置同步备份**（WebDAV/S3/GitHub）+ KeepOwn | 🟡 本地备份已接线；**远端同步待接线**（要远端目标与凭据 UI） | `internal/backup/`、`internal/davsync/` |
 | T14 | **面板改版**（插槽制 + 多页） | ⬜ 未开始 | `internal/gui/assets/kernel.js` |
 
 ---
@@ -153,6 +153,37 @@ provider 跳。模型寻址靠本地四档映射表（`TIERS` + `resolveModelTar
 所有 provider 骑在同一套上；`failover.mjs` 的 provider 级逻辑退成它的特例。
 
 **这是「差距不在能力，在抽象层级」的落点。**
+
+---
+
+## T10 / T12 / T13 · 三个新模块（2026-10-22 一轮做完）
+
+这三个是**并行 agent 各做一个模块、我接线与复验**的一轮。记下三件不该被忘的事：
+
+**① 脱敏（`redact.mjs`）用「等长掩码」而不是「换占位符」。**
+magpie 靠进程内的值表往返还原（同一个值还原成同一个占位符），我们要的是
+「**落盘那份看不出真值**」——所以头尾留几个字符（认得出是 Anthropic 的 key），
+中间填 `*`，**长度逐字不变**。不做 Restore/known：不记值也是「明文不外落」的前提。
+边界刻意收窄：`sk-` 紧贴其它词字符时不认（否则 `risk-` / `task-` 会被误伤）。
+
+**② 并发/RPM 闸门默认「不限」，而且释放写在 `finally` 里。**
+释放漏一次 = **永久占一个坑** = 那家的请求从此全排队 —— 用户看到的是「卡住」，
+不是「并发上限」，那种 bug 极难查。所以：`dispatchGated()` 把「拿名额 → 发请求 →
+还名额」收在一处，调用方只给一个发请求的回调，异常照常往外抛而名额**一定**还。
+实测把释放去掉，那条活体用例会**挂满 180 秒**而不是快速失败 —— 那正是它在防的故障。
+
+**③ 备份用「二进制容器」而不是 JSON 信封。**
+magpie 只能靠「像不像备份」的启发式区分「不是备份」与「备份被截断」，为此多写了一整套
+缓存副本比对；固定 magic 头一次字节比较就分开了。口令走 PBKDF2-HMAC-SHA256
+（60 万次，与 magpie 同值）+ AES-256-GCM，**盐与 IV 全进 AAD**。
+
+**接线时踩到的一个结构性问题**：限流闸门一开始写在故障转移的**候选循环里**，
+而「不开故障转移」那条路（单家直连，最常见）根本不进那个循环 —— 等于
+**最常见的场景反而没过闸**。抽成 `dispatchGated()` 给两条路共用才解决。
+（这类毛病只有真读代码能发现：功能都在、单测都绿，但**接线**少了一条路。）
+
+**还没接线的**：T13 的**远端同步**（WebDAV / GitHub）—— 模块（`sync.mjs`）已就位且
+84 条断言全绿，但接线要远端目标与凭据的 UI，本轮没做。本地备份已接线并有活体用例。
 
 ---
 
