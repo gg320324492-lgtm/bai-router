@@ -399,6 +399,41 @@ describe("备份 / 审计接口（真 server.mjs）", () => {
     await post("/api/middleware/reload", {});
   });
 
+  test("⑮ 远端同步：推上去 → 改远端 → 拉回本地（往返）", async () => {
+    const dir = path.join(dataDir, "sync-target");
+    const cfg = await post("/api/sync/target", { kind: "local", dir });
+    assert.equal(cfg.status, 200, `配同步目标失败：${JSON.stringify(cfg.body)}`);
+
+    const pass = "sync-passphrase-1234";
+    const first = await post("/api/sync", { passphrase: pass });
+    assert.equal(first.status, 200, `第一次同步失败：${JSON.stringify(first.body)}`);
+    assert.equal(first.body.pushed, true, "第一次应当推到远端（远端还没有）");
+
+    /* 远端目录里确实有文件了 */
+    const files = fs.readdirSync(dir).filter((f) => !f.endsWith(".json") || f !== "config.json");
+    const remote = path.join(dir, files[0]);
+    assert.ok(fs.existsSync(remote), `远端没有文件：${JSON.stringify(fs.readdirSync(dir))}`);
+    /* ⚠ 远端那份是**密文** —— 明文不该落在远端 */
+    const raw = fs.readFileSync(remote);
+    assert.equal(raw.toString("latin1").includes("sk-test-0000"), false, "远端文件里出现了明文凭据");
+
+    /* 改远端（解密 → 改一个部件 → 再加密写回），然后同步 → 本地该被拉回来。
+     * ⚠ 改的是 **providers** 部件里的真字段：settings 部件只认 failover 子块，
+     *   往那儿塞别的东西还原时会被忽略（那是设计，不是 bug）。 */
+    const B = await import("../src/server/backup.mjs");
+    const opened = B.importBundle(raw, pass, { now: Date.now() });
+    const parts = JSON.parse(JSON.stringify(opened.parts));
+    parts.providers = { ...(parts.providers || {}), sn: { ...((parts.providers || {}).sn || {}), defaultModel: "远端改的模型" } };
+    const again = B.exportBundle({ ...opened, parts, createdAt: Date.now() }, pass, { now: Date.now() });
+    fs.writeFileSync(remote, again);
+
+    const second = await post("/api/sync", { passphrase: pass });
+    assert.equal(second.status, 200, `第二次同步失败：${JSON.stringify(second.body)}`);
+    assert.ok((second.body.pulled || []).length, `远端更新了却没拉回来：${JSON.stringify(second.body)}`);
+    const after = JSON.parse(fs.readFileSync(path.join(dataDir, "config.json"), "utf8"));
+    assert.equal(after.sn.defaultModel, "远端改的模型", "远端的内容没被拉回本地");
+  });
+
   test("⑪ ★ 插件渠道**接进了链路**：网关认得它、它的中转端口在听", async () => {
     /* 网关按模型 id 的 provider 前缀分流 → 认得 acme 吗？ */
     const gw = await api("/api/gateway-mode");

@@ -130,6 +130,10 @@ import {
   parseMiddlewareManifest, validateMiddlewareManifest, createMiddlewareRegistry,
   formatErrors as formatMiddlewareErrors,
 } from "./middleware.mjs";
+/* 远端同步（sync.mjs 的纯逻辑 + sync-targets.mjs 的三个目标适配器）。
+ * ⚠ 口令**绝不落盘**：远端那份是用口令加密的，密钥由用户每次输入。 */
+import { runSync, compareState } from "./sync.mjs";
+import { createTarget } from "./sync-targets.mjs";
 /* 配置备份（backup.mjs）：快照 → 加密导出 → 导入还原。magpie 的 internal/backup
  * 与 internal/settings（KeepOwn）移植版。
  * ⚠ 备份里**有**真实凭据（那正是它的用处），所以导出必须带口令加密、
@@ -5675,6 +5679,97 @@ function budgetExhausted(provider, cfg, now) {
   } catch { return false; }
 }
 
+/* ---------- 远端同步（sync.mjs + sync-targets.mjs 的接线）----------
+ *
+ * 「换电脑配置不丢」：把配置快照（三个部件：providers / settings / claude）
+ * 用**口令加密**推到远端；远端更新了再拉回本地。
+ *
+ * ⚠ **口令绝不落盘** —— 远端那份是用它加密的，所以每次同步都要用户输入。
+ * ⚠ **冲突绝不静默覆盖**：远端变了就说「远端比我新」，由用户选边。
+ * ⚠ **拉回来的东西要走「改用户的文件不丢任何东西」那套**（restoreConfig），
+ *   不是整份覆盖。
+ */
+const SYNC_STATE_FILE = () => path.join(DATA_DIR, "sync-state.json");
+
+/** 同步目标配置（cfg.sync）。 */
+function syncCfgOf(cfg) {
+  const s = (cfg && cfg.sync && typeof cfg.sync === "object") ? cfg.sync : {};
+  return {
+    kind: String(s.kind || "").trim().toLowerCase(),
+    url: String(s.url || "").trim(),
+    token: String(s.token || "").trim(),
+    user: String(s.user || "").trim(),
+    pass: String(s.pass || ""),
+    dir: String(s.dir || "").trim(),
+    repo: String(s.repo || "").trim(),
+    branch: String(s.branch || "").trim(),
+  };
+}
+
+/** 造一个同步目标。**IO 全在这里注入**（适配器自己不碰盘、不联网）。 */
+function makeSyncTarget(cfg) {
+  const s = syncCfgOf(cfg);
+  if (s.kind === "local") {
+    const dir = s.dir || path.join(DATA_DIR, "sync");
+    return createTarget("local", {
+      dir,
+      readFile: async (p) => { try { return readFileSync(p); } catch (e) { if (e && e.code === "ENOENT") return null; throw e; } },
+      writeFile: async (p, bytes) => { mkdirSync(path.dirname(p), { recursive: true }); writeFileSync(p, bytes); },
+      rename: async (a, b) => { renameSync(a, b); },
+      unlink: async (p) => { try { rmSync(p, { force: true }); } catch { } },
+      stat: async (p) => { try { return statSync(p); } catch { return null; } },
+      now: Date.now(),
+    });
+  }
+  if (s.kind === "webdav") {
+    return createTarget("webdav", {
+      baseUrl: s.url,
+      fetch: (u, init) => fetch(u, init),
+      auth: s.token ? { bearer: s.token } : (s.user ? { user: s.user, pass: s.pass } : undefined),
+      now: Date.now(),
+    });
+  }
+  if (s.kind === "github") {
+    return createTarget("github", {
+      repo: s.repo,
+      token: s.token,
+      branch: s.branch,
+      fetch: (u, init) => fetch(u, init),
+      now: Date.now(),
+    });
+  }
+  return null;
+}
+
+/** 上次同步的账（跨重启记住）。 */
+function loadSyncState() {
+  try {
+    const j = JSON.parse(readFileSync(SYNC_STATE_FILE(), "utf8"));
+    return j && typeof j === "object" ? j : null;
+  } catch { return null; }
+}
+function saveSyncState(state) {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(SYNC_STATE_FILE(), JSON.stringify(state, null, 2) + "\n");
+  } catch { /* 记不住账不影响这次同步 */ }
+}
+
+/** 本地的三个部件 + 各自的改动时刻 + 整份快照（封远端那份要用它的 format/version）。 */
+function localSyncParts(cfg) {
+  const snap = snapshotOf(cfg, { now: Date.now() });
+  let m = null;
+  try { m = statSync(CONFIG_FILE); } catch { }
+  let m2 = null;
+  try { m2 = statSync(SETTINGS); } catch { }
+  const at = (st) => (st && typeof st.mtimeMs === "number" ? st.mtimeMs : 0);
+  return {
+    snapshot: snap,
+    parts: snap.parts,
+    changedAt: { providers: at(m), settings: at(m), claude: at(m2) },
+  };
+}
+
 /* ---------- middleware 插件（middleware.mjs 的接线）----------
  *
  * 一份 JSON 声明描述「什么时候、对哪个请求、改什么」，装在 <数据目录>\middleware\*.json。
@@ -9198,6 +9293,87 @@ async function unknownMappingTargets(p, mapping, cfg) {
     if (req.method === "POST" && u.pathname === "/api/plugins/reload") {
       const n = reloadPlugins();
       return json(res, 200, { ok: true, loaded: n, errors: pluginErrors });
+    }
+    if (req.method === "GET" && u.pathname === "/api/sync") {
+      const cfg = loadCfg();
+      const s = syncCfgOf(cfg);
+      const st = loadSyncState();
+      return json(res, 200, {
+        ok: true,
+        configured: !!s.kind,
+        kind: s.kind, url: s.url, repo: s.repo, dir: s.dir,
+        hasToken: !!s.token, hasUser: !!s.user,
+        lastSyncAt: st && st.at ? st.at : 0,
+        lastAction: st && st.action ? st.action : "",
+      });
+    }
+    if (req.method === "POST" && u.pathname === "/api/sync/target") {
+      const b = await readBody(req);
+      const cfg = loadCfg();
+      const kind = String(b.kind || "").trim().toLowerCase();
+      if (!["local", "webdav", "github"].includes(kind)) {
+        return json(res, 400, { error: "同步目标只能是 local / webdav / github" });
+      }
+      const next = {
+        kind,
+        url: String(b.url || "").trim(),
+        token: String(b.token || "").trim(),
+        user: String(b.user || "").trim(),
+        pass: String(b.pass || ""),
+        dir: String(b.dir || "").trim(),
+        repo: String(b.repo || "").trim(),
+        branch: String(b.branch || "").trim(),
+      };
+      /* ⚠ 口令（WebDAV 的 basic 密码）也在配置里 —— 那是**同步目标的凭据**，
+       *   与各家的 API Key 同级：留在本地配置里，不进快照、不进日志、不回显。 */
+      cfg.sync = next;
+      saveCfg(cfg);
+      return json(res, 200, { ok: true, kind, hasToken: !!next.token, hasUser: !!next.user });
+    }
+    if (req.method === "POST" && u.pathname === "/api/sync") {
+      const b = await readBody(req);
+      const cfg = loadCfg();
+      const s = syncCfgOf(cfg);
+      if (!s.kind) return json(res, 400, { error: "还没配同步目标" });
+      let target = null;
+      try { target = makeSyncTarget(cfg); }
+      catch (e) { return json(res, 400, { error: "同步目标配得不对：" + String((e && e.message) || e) }); }
+      if (!target) return json(res, 400, { error: "还不认识的同步目标：" + s.kind });
+      let pass = "";
+      try { pass = checkPassphrase(b.passphrase); }
+      catch (e) { return json(res, 400, { error: String((e && e.message) || e) }); }
+      const { snapshot: localSnapshot, parts: localParts, changedAt } = localSyncParts(cfg);
+      const state = loadSyncState();
+      const open = async (bytes) => importBundle(bytes, pass, { now: Date.now() });
+      /* ⚠ 封远端那份要用**整份快照**的形状（format / version / app）——
+       *   只给 parts 的话 backup.mjs 会说「这不是 B.AI 路由台的快照」。 */
+      const seal = async (parts, opts) => exportBundle(
+        { ...localSnapshot, parts, createdAt: Date.now() }, pass, opts || {},
+      );
+      try {
+        const r = await runSync({
+          target, open, seal, localParts, localChangedAt: changedAt, state, now: Date.now(),
+        });
+        /* 远端更新的部分写回本地（**合并**，不是整份覆盖）。 */
+        let pulled = [];
+        if (r.pull && Object.keys(r.pull).length) {
+          const cur = loadCfg();
+          const merged = restoreConfig(
+            { ...localSnapshot, parts: { ...localParts, ...r.pull }, createdAt: Date.now() },
+            cur, { now: Date.now() },
+          );
+          if (merged.changed) saveCfg(merged.config);
+          pulled = Object.keys(r.pull);
+        }
+        saveSyncState({ ...(r.state || {}), at: Date.now(), action: r.plan && r.plan.action });
+        return json(res, 200, {
+          ok: true,
+          action: r.plan && r.plan.action, pushed: !!r.pushed, pulled,
+          notice: r.notice || "", conflicts: (r.plan && r.plan.conflicts) || [],
+        });
+      } catch (e) {
+        return json(res, 400, { error: "同步失败：" + String((e && e.message) || e) });
+      }
     }
     if (req.method === "GET" && u.pathname === "/api/middleware") {
       return json(res, 200, {
