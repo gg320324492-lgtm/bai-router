@@ -2389,11 +2389,26 @@
     });
   }
 
+  /* 让选中那家的凭据行是**展开**的。
+   *
+   * 为什么右栏只显示这一家：左栏已经是一列渠道（名字 + 状态药丸 + 用量条），
+   * 那是手风琴「收起时也看得见状态」的活儿 —— 两边都列八家就是同一份信息
+   * 出现两次（改版原则 1 要消灭的正是这个）。右栏只留「选中那家的凭据细节」。
+   *
+   * ⚠ 九行**都留在 DOM 里**，只有非选中那家被隐藏：卡片（令牌捕获 / 模型目录 /
+   *   轮换区）是按 credential.kind 认领行的，隐藏掉行会让它们没有宿主。
+   */
+  function openSelectedCredRow(key) {
+    const row = q(`.credrow[data-k="${CSS.escape(key)}"]`, $("credList"));
+    if (row && !row.classList.contains("open")) toggleCredRow(row);
+  }
+
   function selectChannel(key) {
     if (!MANIFEST[key]) return;
     selected = key;
     clearDirtyInputs();      // 换渠道 = 换一份配置，未保存的半截字不带过去
     applySelectionUi();
+    openSelectedCredRow(key);
     const row = q(`.chan-row[data-k="${CSS.escape(key)}"]`, $("matrixGrid"));
     if (row) {
       row.classList.add("flash");

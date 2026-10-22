@@ -425,6 +425,13 @@ body.no-frame .winCtrls { display: none; }
    所以这里只覆盖左栏作用域内的（配色仍走 .pill 自己的语义色规则）。 */
 .chan-row .pill { font-size: 10px; padding: 2px 7px; white-space: nowrap; }
 
+/* 右栏的凭据区：**只显示选中那家**。
+   九行都在 DOM 里（卡片按 credential.kind 认领行，隐藏行会让它们没宿主），
+   但只有选中的那行露出来 —— 左栏已经列了八家，右栏再列一遍就是同一份
+   信息出现两次。 */
+#viewCred .credrow { display: none; }
+#viewCred .credrow.sel { display: block; }
+
 /* 右栏抬头：这一家是谁 + 一眼要到的三样。 */
 .chan-head { margin: 0 2px 11px; }
 .chh-main { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
