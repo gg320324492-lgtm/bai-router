@@ -1194,6 +1194,29 @@
     paintCredList();
   }
 
+  /* 只重画**常驻的那一格**（状态药丸与它的原因），不动输入框与按钮。
+   *
+   * 为什么不能直接调 paintCredList：它会把行内的 innerHTML 重写一遍，而
+   * apiKey 那一档的行里**有输入框** —— 每 5 秒重写一次，用户正在敲的半截 key
+   * 会被抹掉。所以这里只碰药丸与原因两处。
+   *
+   * 为什么需要它：状态药丸是**折叠时唯一看得见的状态**（不藏坏消息），
+   * 它要是停在启动那一刻的样子，「刚才还正常的渠道现在坏了」就没人看得见了。 */
+  function repaintCredPills() {
+    const box = $("credList");
+    if (!box) return;
+    for (const row of qa(".credrow", box)) {
+      const key = row.dataset.k;
+      if (!key) continue;
+      if (hasBusyIn(row)) continue;        // 行内有动作在飞就别动它
+      const st = credState(key);
+      const pill = q('[data-role="pill"]', row);
+      if (pill) pill.innerHTML = credPillHtml(st);
+      const why = q('[data-role="why"]', row);
+      if (why) why.innerHTML = credWhyHtml(st);
+    }
+  }
+
   function paintCredList() {
     const box = $("credList");
     if (!box) return;
@@ -2261,6 +2284,7 @@
       paintBand(s);
       paintBadges(s);
       paintMatrix();
+      repaintCredPills();
       buildDiag();
       renderSys();
       for (const c of cards) {

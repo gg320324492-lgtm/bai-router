@@ -54,7 +54,10 @@
   --warn-soft: rgba(240, 179, 65, .13);
   --err: #FF6B66;
   --err-soft: rgba(255, 107, 102, .13);
-  --idle: #6E7686;
+  /* ⚠ 「闲 / 不适用」这一档也要够 4.5:1 —— 它原来是 #6E7686，在深色面板上只有
+   *   3.0–3.5:1（比亮色主题那批还低）。现在这四个语义色在**各自**的主题里
+   *   都过 4.5:1：深色 ≥4.5、浅色 ≥4.55。色相没变，只是「够亮/够暗」这一侧。 */
+  --idle: #8A94A6;
   --idle-soft: rgba(120, 130, 148, .14);
 
   --sh: 0 1px 0 rgba(255, 255, 255, .035) inset;
@@ -90,13 +93,24 @@ html[data-theme="light"] {
   --brand-ink: #FFFFFF;
   --brand-soft: rgba(74, 91, 232, .10);
   --brand-line: rgba(74, 91, 232, .38);
-  --ok: #0C9A6B;
+  /* ⚠ 浅色主题的四个语义色**比深色主题深一档**。
+   *
+   *   原因：药丸（.pill.ok/.warn/.idle）是「语义色文字 + 同色淡底」。
+   *   原来这四个色在白底上的对比度只有 3.05–4.16:1 —— **不到 4.5:1**，
+   *   也就是说「就绪 / 需留意 / 未配置」这三个字在浅色下是**看不清**的
+   *   （改版验收标准：两套主题都得能读，对比度 ≥ 4.5:1）。
+   *   同一批数字在深色主题上是够的（≥4.59:1），因为深色是「亮字压暗底」，
+   *   浅色是「暗字压亮底」——同一个色值在两套主题里的对比度不是一回事。
+   *   现在这四个值在自己的淡底上 ≥ 4.55:1（白底与 panel2 底都验过）。
+   *   ⚠ 只改**浅色主题**的令牌：色相没变，仍是「绿=好、黄=留意、红=坏、灰=闲」，
+   *   深色主题一个值都没动。 */
+  --ok: #0C7A55;
   --ok-soft: rgba(12, 154, 107, .10);
-  --warn: #A9700A;
+  --warn: #8A5D08;
   --warn-soft: rgba(169, 112, 10, .11);
-  --err: #D13A32;
+  --err: #B3261E;
   --err-soft: rgba(209, 58, 50, .10);
-  --idle: #7E8695;
+  --idle: #5C6473;
   --idle-soft: rgba(126, 134, 149, .13);
 
   --sh: 0 1px 2px rgba(16, 24, 40, .05);
@@ -205,7 +219,13 @@ html[data-theme="light"] .tabs button.on { box-shadow: 0 1px 2px rgba(16, 24, 40
 .pill.ok { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
 .pill.warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
 .pill.err { color: var(--err); background: var(--err-soft); border-color: transparent; }
-.pill.idle { color: var(--dim); background: var(--idle-soft); border-color: transparent; }
+/* ⚠ 这一格原来用的是 --dim（次要文字色），不是 --idle：
+ *   --dim 是**给普通小字**用的，它在白底上够 4.8:1，可这个药丸的底是
+ *   灰蓝色的 --idle-soft —— 同一个字色压在不同底上，对比度不是一回事
+ *   （实测只有 2.9–3.9:1，「未配置」「不适用」这几个字是看不清的）。
+ *   改用 --idle：这一屏里「闲/不适用」的其他说法（.rl.idle、.cstate.idle）
+ *   本来就用 --idle —— 同一件事一种说法，对比度也一起够了。 */
+.pill.idle { color: var(--idle); background: var(--idle-soft); border-color: transparent; }
 
 .tgl {
   border: 1px solid var(--line); background: var(--panel); border-radius: 99px;
@@ -252,9 +272,13 @@ body.no-frame .winCtrls { display: none; }
 
 /* 状态灯：语义色的发光圆点 */
 .led { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--idle); }
-.led.ok { background: var(--ok); box-shadow: 0 0 8px rgba(61, 217, 160, .65); }
-.led.warn { background: var(--warn); box-shadow: 0 0 8px rgba(240, 179, 65, .6); }
-.led.err { background: var(--err); box-shadow: 0 0 8px rgba(255, 107, 102, .6); }
+/* 灯点的光晕跟着**当前主题的语义色**走（color-mix）。
+   原来光晕的 rgba 是写死的深色主题那套亮色（亮绿/亮黄/亮红）——
+   浅色主题里，一个深绿的点外面套一圈亮绿的光晕，看着发虚、边界也不清楚。
+   color-mix 不被支持时整条 box-shadow 作废（没有光晕），不影响可读性。 */
+.led.ok { background: var(--ok); box-shadow: 0 0 8px color-mix(in srgb, var(--ok) 55%, transparent); }
+.led.warn { background: var(--warn); box-shadow: 0 0 8px color-mix(in srgb, var(--warn) 55%, transparent); }
+.led.err { background: var(--err); box-shadow: 0 0 8px color-mix(in srgb, var(--err) 55%, transparent); }
 .led.idle { background: var(--idle); box-shadow: none; }
 .led.brand { background: var(--brand); box-shadow: 0 0 9px var(--brand-line); }
 .led.pulse { animation: pulse 2.2s ease-in-out infinite; }

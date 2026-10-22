@@ -18,7 +18,7 @@
     header   品牌 + 视图分段导航 + 服务胶囊 + 主题按钮 + 窗控三键
     #statusBand  六个状态单元 + 一句人话总结 + 三个主动作 + 结果行
     #viewConsole  #matrixGrid（渠道矩阵 4×2）+ #mapPanel（四档映射编辑）+ 诊断抽屉
-    #viewCred     八行凭据（凭据类型徽章 / 状态 / 操作区）
+    #viewCred     凭据手风琴：九行（八家渠道 + 交还区），一行一家，点开才展开
     #viewFo       开关 + 顺序（↑↓）+ 冷却 + 「什么情况不会转移」
     #viewSettings 代理 / 端口 / 中转端口 / 更新 / 数据目录
     footer + 横幅族 + #slot-extra
@@ -230,15 +230,17 @@
     <section class="view" id="viewCred">
       <div class="sechead">
         <h2>凭据</h2>
-        <span class="note">六家渠道各自要的东西不一样，这里一次看全</span>
+        <span class="note">八家渠道 + 一个交还区，各要的东西不一样，这里一次看全 · 点一行展开</span>
       </div>
       <div class="panelbox">
         <div class="pb-head">
           <h3>凭据</h3>
           <span class="sub">只有指纹，没有明文</span>
         </div>
-        <!-- 八行（每渠道一行：凭据类型徽章 / 状态 / 操作区）。行由渲染层按清单
-             credential.kind 分派生成；apiKey 给输入框、jwt·jobToken 给状态+重取、keys3 给三行指纹。 -->
+        <!-- 九行（八家渠道 + 交还区），一行一家：**手风琴** ——
+             收起时那行就带着状态药丸（坏消息不许藏起来），点开才展开细的。
+             行由渲染层按清单 credential.kind 分派生成；apiKey 给输入框、
+             jwt·jobToken 给状态+重取、keys3 给三行指纹。 -->
         <div id="credList"></div>
       </div>
       <p class="hintline">页面任何位置都不回显密钥明文，只显示指纹；明文只落在本机 config.json。</p>
