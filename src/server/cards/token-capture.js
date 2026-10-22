@@ -19,6 +19,13 @@ window.BAI_CARDS["token-capture"] = {
     const hosts = (typeof ctx.rowsOfKind === "function" ? ctx.rowsOfKind("jwt") : []) || [];
     if (!hosts.length) return { update() { }, refresh() { } };
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     /* 每家一个独立的作用域：同一张卡挂在多行上时，id 必须带渠道 key 才不打架 */
     let seq = 0;
     const scoped = hosts.map((host) => {
@@ -39,7 +46,7 @@ window.BAI_CARDS["token-capture"] = {
               <div class="pDesc" data-role="pdesc"></div>
             </div>
           </div>
-          <div class="tokstat" data-role="stat">正在读取令牌状态…</div>
+          <div class="tokstat" data-role="stat">${S3("loadingState", "正在读令牌状态…", { hint: "读完这一行就知道有没有捕获到访问令牌、还能用多久。" })}</div>
           <div class="keybox" data-role="keys" style="display:none"></div>
           <div class="result" data-role="res"></div>
         </div>`;
@@ -263,9 +270,27 @@ window.BAI_CARDS["token-capture"] = {
       const S = ctx.stOf(sc.key) || {};
       const t = S.token || {};
       const parts = [];
+      /* ⚠ 服务端状态还没到 ⇒ 说「在读」。**不能**当成「没捕获到令牌」：
+         那个结论要的是「真的找过了、确实没有」，不是「还没找」。 */
+      if (!status && !ctx.status) {
+        stat.innerHTML = S3("loadingState", "正在读令牌状态…", { hint: "读完这一行就知道有没有捕获到访问令牌、还能用多久。" });
+        return;
+      }
+      if (!S.token) {
+        /* 状态到了、但里面没有令牌这一段 ⇒ 读不到（**不是「还没捕获」**）。 */
+        stat.innerHTML = S3("errorState", "读不到令牌状态", {
+          hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+        });
+        return;
+      }
       if (S.edition) parts.push(`<span>版别：<b>${esc(S.edition)}</b></span>`);
       if (S.authDomain) parts.push(`<span>登录域名：<b>${esc(S.authDomain)}</b></span>`);
       if (!t.configured) {
+        /* 空态要说清「怎么才会出现」：用户得知道先点哪个按钮。
+           ⚠ 空态**不是出错** —— 没捕获到令牌只是一件事还没发生。 */
+        parts.unshift(S3("emptyState", "还没有捕获到访问令牌", {
+          hint: "点上面的「一键获取令牌」，或者在客户端里发一条消息 —— 路由台会在它带鉴权的请求上顺手把令牌接住。",
+        }));
         parts.push('<span>访问令牌：<b class="warn">未捕获</b></span>');
         parts.push('<span>本机需已安装并登录对应客户端</span>');
       } else {

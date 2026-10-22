@@ -44,9 +44,17 @@ window.BAI_CARDS["status-strip"] = {
     const esc = ctx.esc || (kit && kit.esc) || ((s) => String(s == null ? "" : s));
     const nameOf = (key) => (ctx.nameOf ? ctx.nameOf(key) : key);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     let data = null;
     let pending = null;
     let sig = "";
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 没有渠道）
+    let lasterr = "";     // 最近一次读失败的原因
 
     const num = (v) => {
       const n = Number(v);
@@ -146,7 +154,24 @@ window.BAI_CARDS["status-strip"] = {
         body.innerHTML = `<div class="hint" style="margin-top:12px">共享组件库没加载 —— 这一行画不出来。</div>`;
         return;
       }
-      body.innerHTML = kit.statusStrip(buildCells());
+      /* ⚠ 读不到时**不把整行换成错误块**：这一行还带着服务端已经知道的事实
+       *   （服务在不在跑、当前接的是谁），整块换掉会把已知信息一起抹了。
+       *   所以横条照画，下面补一句「读不到哪一块、怎么办」。 */
+      const rows = Array.isArray(data && data.channels) ? data.channels : [];
+      let tail = "";
+      if (!loaded) {
+        tail = S3("loadingState", "正在读渠道状态…", { hint: "读完这一行就知道谁在扛请求、额度还剩多少。" });
+      } else if (lasterr) {
+        tail = S3("errorState", "读不到渠道状态", {
+          hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通。",
+          detail: lasterr,
+        });
+      } else if (!rows.length) {
+        tail = S3("emptyState", "还没有渠道信息", {
+          hint: "清单里还没有可用的渠道 —— 先在设置里接一家。",
+        });
+      }
+      body.innerHTML = kit.statusStrip(buildCells()) + tail;
     }
 
     /* 挂载时已经在读的那一次，update() 要接着等它而不是跳过 ——
@@ -161,12 +186,17 @@ window.BAI_CARDS["status-strip"] = {
             ? await ctx.loadChanStates()
             : await ctx.api("/api/channels/state");
           data = (r && r.ok === false) ? null : (r || null);
+          lasterr = "";
         } catch (e) {
-          /* 读不到就把三格画成「—」，不猜数字：错数字比没数字更坏。
-             错误本身由同一屏的热力图卡报出来，不必在这里重复一遍。 */
+          /* 读不到就如实说读不到，并给出下一步；不猜数字：错数字比没数字更坏。
+             （三格仍画「—」，但下面有一句说明为什么是「—」——不然用户以为没数据。） */
           data = null;
+          lasterr = String((e && e.message) || e);
         } finally {
+          loaded = true;
           pending = null;
+          /* ⚠ 读完就重画：数据一到就更新，不必等下一轮 5 秒轮询。 */
+          render();
         }
       })();
       return pending;
@@ -189,10 +219,12 @@ window.BAI_CARDS["status-strip"] = {
     return {
       async update() {
         await load();
-        const s = signature();
+        /* 签名里带上「读到没有」与「上一次为什么失败」——
+           否则读失败那一轮签名不变，错误态就永远画不出来。 */
+        const s = signature() + "|" + (loaded ? "1" : "0") + "|" + lasterr;
         if (s !== sig) { sig = s; render(); }
       },
-      refresh() { return load(); },
+      refresh() { return load().then(() => { render(); }); },
     };
   },
 };

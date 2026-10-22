@@ -39,9 +39,12 @@ window.BAI_CARDS["oc-transport"] = {
    * @param {object|null} o.probe {state,path,source,hint,error,checkedAt}
    * @param {string} o.hint      「何时生效」说明（服务端给的）
    * @param {Function} [o.esc]
+   * @param {object} [o.kit] 共享组件库（window.BAI_KIT）。**传进来才有三态**：
+   *   这个纯函数在单测里被直接求值（vm 里只有一个空 window），那时没有组件库。
    * @returns {string} HTML
    */
   renderTransportPanel(o) {
+    const kit = o.kit || null;
     const esc = o.esc || ((s) => String(s == null ? "" : s).replace(/[&<>"']/g,
       (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])));
     const opts = Array.isArray(o.options) && o.options.length ? o.options : [];
@@ -81,7 +84,11 @@ window.BAI_CARDS["oc-transport"] = {
         + `<div class="hint" data-role="oc-probe-hint" style="margin-top:6px;white-space:pre-wrap">${esc(probe.hint || "")}</div>`
         + (probe.error ? `<div class="hint" data-role="oc-probe-error" style="margin-top:4px;color:var(--err)">${esc(probe.error)}</div>` : "");
     } else {
-      probeLine = `<div class="fpline"><span class="k">本机检测</span><span class="v">尚未读到</span></div>`;
+      /* 「还没读到探测结果」= **还在读**，不是「没装」。这两种混起来，
+         处置会从「等一下」变成「去装一个可能早就装好的东西」。 */
+      probeLine = (kit && kit.loadingState)
+        ? kit.loadingState("尚未读到本机的安装情况…", { hint: "面板正在等本机的探测结果。" })
+        : `<div class="fpline"><span class="k">本机检测</span><span class="v">尚未读到</span></div>`;
     }
 
     return `<div class="fieldset">
@@ -160,6 +167,9 @@ window.BAI_CARDS["oc-transport"] = {
       return self.shouldShow(P) ? P : null;
     };
     const resultSlot = () => body.querySelector('[data-role="oc-transport-result"]');
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
 
     function paint() {
       const P = declared();
@@ -172,12 +182,30 @@ window.BAI_CARDS["oc-transport"] = {
       const prevText = prev ? String(prev.textContent || "") : "";
       const prevGood = prev ? /(^|\s)good(\s|$)/.test(String(prev.className || "")) : false;
       const S = ctx.stOf(key()) || {};
-      body.innerHTML = self.renderTransportPanel({
+      const probe = S.transportProbe || null;
+      /* 探测出错 ⇒ 在最顶上补一块错误态（**带下一步**）。
+         下面那一行「检测失败」是服务端给的事实，**不等于没装**；
+         这一块负责说清「那该怎么办」—— 两件事分工不同，缺一块用户就只能干瞪眼。 */
+      const probeErr = (kit && probe && probe.state === "error")
+        ? kit.errorState("面板此刻说不出本机装没装", {
+          hint: "这不等于没装 —— 先自己确认一下（终端里敲 which opencode），还不行就看诊断抽屉（右上角）。",
+          detail: probe.error || probe.hint || "",
+        })
+        : "";
+      /* 没装客户端 = **这一档没有任何本地客户端可用**（缺前置条件，不是出错）。
+         它和「检测失败」是两回事：处置一个是要装，一个是要重试。 */
+      const probeMissing = (kit && probe && probe.state === "missing")
+        ? kit.emptyState("本机没有可用的客户端中转", {
+          hint: "这一档要经本机的客户端发请求 —— 点上面的「一键安装 OpenCode CLI」（官方源 · 固定版本 · sha512 校验 · 仅点击时下载），或先装好它再回来。",
+        })
+        : "";
+      body.innerHTML = probeErr + probeMissing + self.renderTransportPanel({
         options: P.transportOptions || [],
         current: S.transport || "",
-        probe: S.transportProbe || null,
+        probe: probe,
         hint: S.transportHint || "",
         esc: ctx.esc,
+        kit: kit,
       });
       if (prevText && ctx.showResult) ctx.showResult(resultSlot(), prevText, prevGood);
       for (const el of body.querySelectorAll('[data-role="oc-transport-opt"]')) {

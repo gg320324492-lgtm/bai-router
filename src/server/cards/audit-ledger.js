@@ -67,6 +67,13 @@ window.BAI_CARDS["audit-ledger"] = {
     }
     const q = (sel) => box.querySelector(sel);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     const RECENT_MAX = 30;     // 最近尝试最多列这么多条
     const KIND_MAX = 8;        // 按归类最多列这么多行
     const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -75,6 +82,7 @@ window.BAI_CARDS["audit-ledger"] = {
     let data = null;      // 最近一次成功读到的 /api/audit
     let lasterr = "";     // 最近一次读失败的原因
     let inflight = false;
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 没有记录）
     let sig = "";         // 上一次画过的数据签名（数据没变就不重画表）
 
     /* 清单里认识的渠道 → 显示名；不认识的原样显示 key。 */
@@ -134,6 +142,11 @@ window.BAI_CARDS["audit-ledger"] = {
     function renderBody() {
       const body = q('[data-role="a-body"]');
       if (!body) return;
+      if (!loaded && !lasterr) {
+        /* 第一次读还没回来：先说「在读」，别拿空态冒充「没有记录」。 */
+        body.innerHTML = S3("loadingState", "正在读审计台账…", { hint: "读完这一块就能看到链路上发生过什么。" });
+        return;
+      }
       const recs = Array.isArray(data && data.records) ? data.records : [];
       const s = (data && data.summary) || {};
       const kinds = Array.isArray(s.byKind) ? s.byKind : [];
@@ -141,11 +154,11 @@ window.BAI_CARDS["audit-ledger"] = {
 
       if (!recs.length && !num(s.total)) {
         /* 空态：**没有记录 ≠ 出错**。这句话必须写清楚——空态被当成报错，用户会
-         * 以为台账坏了，去翻日志、去看磁盘，越查越慌。 */
-        body.innerHTML = `<div class="hint" style="margin-top:14px;padding:12px 14px;border:1px solid var(--line);border-radius:9px;background:var(--panel2)">
-            还没有审计记录 —— <b>这不是出错</b>。台账是在第一次真实调用之后才开始记的：<br>
-            每一次对外尝试（<b>包括失败的那次</b>）会逐行出现在这里：时间、渠道、模型、结果、归类、耗时。
-          </div>`;
+         * 以为台账坏了，去翻日志、去看磁盘，越查越慌。
+         * 空态还要说清「怎么才会出现」：不然用户不知道要等什么。 */
+        body.innerHTML = S3("emptyState", "还没有审计记录", {
+          hint: "台账是在第一次真实调用之后才开始记的 —— 每一次对外尝试（包括失败的那次）会逐行出现在这里：时间、渠道、模型、结果、归类、耗时。",
+        });
         return;
       }
 
@@ -223,7 +236,21 @@ window.BAI_CARDS["audit-ledger"] = {
       const note = q('[data-role="a-note"]');
       const result = q('[data-role="a-result"]');
       if (lasterr) {
-        if (note) note.innerHTML = `<div class="hint" style="margin-top:12px">读不到审计台账：${esc(lasterr)}</div>`;
+        /* 读不到而且手上**没有**旧数据 ⇒ 整块换成错误态（必须带下一步）。
+           有旧数据时保留旧数据 + 一行说明 —— 记录旧一天比清空好。 */
+        if (!data) {
+          if (note) note.innerHTML = "";
+          const body = q('[data-role="a-body"]');
+          if (body) {
+            body.innerHTML = S3("errorState", "读不到审计台账", {
+              hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+              detail: lasterr,
+            });
+          }
+          renderTotals();
+          return;
+        }
+        if (note) note.innerHTML = `<div class="hint" style="margin-top:12px">上一次刷新失败：${esc(lasterr)}（下面显示的是上一次读到的结果）</div>`;
         if (result) result.textContent = "";
         renderTotals();
         renderBody();
@@ -242,15 +269,17 @@ window.BAI_CARDS["audit-ledger"] = {
     }
 
     /* 数据签名：只画给用户看的那些字段变了才重画表（每 5 秒一次轮询，
-     * 不看签名的话每次都重建整张表 DOM，滚动位置会跳）。 */
+     * 不看签名的话每次都重建整张表 DOM，滚动位置会跳）。
+     * ⚠ 签名里必须带上「读失败的原因」：否则失败那一轮签名不变，
+     *   错误态就永远画不出来。 */
     function signature() {
-      if (!data) return "";
+      if (!data) return "!" + lasterr;
       const recs = Array.isArray(data.records) ? data.records : [];
       return JSON.stringify([
         (data.summary || {}).total, (data.summary || {}).failed,
         (data.summary || {}).avgMs, (data.summary || {}).p95Ms,
         recs.length ? [recs[0].ts, recs[0].provider, recs[0].model, recs[0].outcome, recs[0].kind, recs[0].ms] : null,
-      ]);
+      ]) + "|" + lasterr;
     }
 
     async function load() {
@@ -265,8 +294,17 @@ window.BAI_CARDS["audit-ledger"] = {
         lasterr = String((e && e.message) || e);
       } finally {
         inflight = false;
+        loaded = true;
+        /* ⚠ 读完就重画：不重画的话这一块会**停在「正在读」**直到下一轮 5 秒轮询
+           （load() 里 `if (inflight) return;` 不会等这次读，update() 也等不到它）。 */
+        render();
       }
     }
+
+    /* 首屏先画「在读」并把第一次读发出去：否则这 5 秒里这一块是空白，
+       空白既不是「在读」也不是「没有记录」，用户只能猜。 */
+    render();
+    load();
 
     return {
       async update() {

@@ -241,6 +241,12 @@ describe("③ 状态药丸与用量小条 —— 数据来源与口径", () => {
     assert.match(paint, /typeof c\.ratio === "number" \? c\.ratio : null/, "ratio 必须先判类型");
   });
 
+  test("③f 没配置的渠道不画用量条（它压根没在用，画出来会被读成「它在跑」）", () => {
+    assert.match(paint, /unconfigured/, "★ 未配置要单独判");
+    assert.match(paint, /notConfigured[\s\S]*?r = null|!notConfigured[\s\S]*?c && typeof c\.ratio/,
+      "★ 未配置时 ratio 当作没有");
+  });
+
   test("③f ratio 是百分比，要除以 100 才是比例（忘了就画成满格）", () => {
     assert.match(paint, /Math\.max\(0, Math\.min\(100, r\)\)/, "百分比必须夹在 0–100");
     assert.equal(/r\s*\/\s*100/.test(paint), false,
@@ -320,6 +326,14 @@ describe("⑤ 老 hash 不 404", () => {
     assert.match(VIEWS, /dom: "viewChannels"/, "channels 的容器是 viewChannels");
     assert.equal(/id: "cred"/.test(VIEWS), false, "凭据屏已并入渠道页，视图表里不该再有 cred");
   });
+
+  test("⑤e 老段名落地后地址栏要改成新段名（内容已经是新屏，地址栏还挂旧名会像没跳成）", () => {
+    const setView = sliceBetween(PANEL, "  function setView(id, push) {", "  function focusView(id) {");
+    assert.match(setView, /hashWasLegacy/, "★ 要记得这次是不是老段名");
+    assert.match(setView, /push !== false \|\| hashWasLegacy/,
+      "★ 首屏加载（push=false）时也要改写 —— 老段名是纠正过期地址，不是切屏");
+    assert.match(setView, /history\.replaceState\(null, "", want\)/, "改写用 replaceState（不加历史记录）");
+  });
 });
 
 /* ====================================================================== *
@@ -378,7 +392,8 @@ describe("⑦ 样式 —— 两栏与语义色", () => {
 
   test("⑦d 颜色一律走语义变量", () => {
     assert.match(chanCss, /var\(--brand-soft\)/, "选中态用语义色");
-    assert.match(chanCss, /var\(--idle-soft\)/, "量条轨道用语义色");
+    assert.match(chanCss, /\.cr-meter-bar \{[\s\S]*?var\(--panel3\)/, "量条轨道用面板色");
+    assert.match(chanCss, /\.cr-meter-fill \{[\s\S]*?var\(--idle\)/, "量条填充用语义色");
   });
 
   test("⑦e 用量条的填充色来自语义色而不是写死值", () => {
@@ -412,18 +427,35 @@ describe("⑧ 反向对照 —— 改坏实现，对应断言必须红", () => {
 
   test("⑧b 把探不到当成 0（画成满条）⇒ ③e 必须红", () => {
     const src = broken(PANEL,
-      "const r = c && typeof c.ratio === \"number\" ? c.ratio : null;",
-      "const r = c && typeof c.ratio === \"number\" ? c.ratio : 0;",
+      "const r = !notConfigured && c && typeof c.ratio === \"number\" ? c.ratio : null;",
+      "const r = !notConfigured && c && typeof c.ratio === \"number\" ? c.ratio : 0;",
       "ratio-zero");
     const paint = sliceBetween(src, "  function paintChanList() {", "  /* 服务端六态");
     assert.throws(() => {
       /* 改坏后 null 分支永远走不到 ⇒ 「探不到画 —」这条路断了。
-         判据：null 分支必须真的把 r 判成 null（= 探不到时进 empty 分支）。 */
+         判据：取值那行必须以 null 收尾（= 探不到时进 empty 分支）。 */
       const nullBranch = /const r = ([^;]+);/.exec(paint);
       assert.ok(nullBranch, "要有 ratio 的取值");
       assert.match(nullBranch[1], /: null;/,
         "★ 探不到时 ratio 必须是 null（当成 0 会被读成「额度用完了」）");
     }, "探不到当 0 的断言必须红");
+  });
+
+  test("⑧g 让未配置的渠道也画用量条 ⇒ ③f 必须红", () => {
+    const src = broken(PANEL,
+      "const notConfigured = st && st.s === \"unconfigured\";",
+      "const notConfigured = false;",
+      "meter-for-unconfigured");
+    const paint = sliceBetween(src, "  function paintChanList() {", "  /* 服务端六态");
+    assert.throws(() => {
+      /* 改坏后 notConfigured 恒为 false ⇒ 未配置的渠道也会画条。
+         判据：notConfigured 必须**真的由状态算出来**（读 st.s），
+         而不是写死 false —— 写死就等于「未配置照样画条」。 */
+      const decl = /const notConfigured = ([^;]+);/.exec(paint);
+      assert.ok(decl, "要有 notConfigured 的判定");
+      assert.match(decl[1], /st\.s === "unconfigured"/,
+        "★ 未配置必须由状态算出来（读 st.s），写死就等于没判");
+    }, "未配置不画条的断言必须红");
   });
 
   test("⑧c 把老 hash 别名去掉 ⇒ ⑤a 必须红", () => {

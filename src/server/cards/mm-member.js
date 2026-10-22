@@ -37,20 +37,38 @@ window.BAI_CARDS["mm-member"] = {
    * @param {string} [o.hint]      服务端给的一句话提示（凭据行那边也用同一句）
    * @param {string} [o.upstream]  上游地址
    * @param {Function} [esc]
+   * @param {object} [o.kit] 共享组件库（window.BAI_KIT）。**传进来才有三态**：
+   *   这个纯函数在单测里被直接求值（vm 里只有一个空 window），那时没有组件库。
    * @returns {string} HTML
    */
   renderMemberPanel(token, o = {}) {
     const esc = o.esc || ((s) => String(s == null ? "" : s).replace(/[&<>"']/g,
       (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])));
+    const kit = o.kit || null;
     const t = token || {};
     const name = o.name || "该渠道";
 
     /* 状态一行。**不显示令牌本身**——只说"读到了没有 / 还剩多久 / 是否已失效"。 */
     let state, stateCls;
+    /* 三态：登录态失效 = 错误态（**必须带下一步**）；没读到 = 空态（**不是出错**）。
+       ⚠ 三态只是一块**补充说明**：下面那几条「这是会员额度、不是按量计费」的事实
+       一次都不能少 —— 它们比状态更影响用户判断。 */
+    let stateBlock = "";
     if (t.invalid === true) {
       state = "登录态已失效"; stateCls = "err";
+      if (kit && kit.errorState) {
+        stateBlock = kit.errorState("登录态已失效", {
+          hint: "先在 MiniMax Code 里重新登录，再点凭据行上的「重新读取登录态」—— 路由台不会自己去读登录态。",
+          detail: t.error || "",
+        });
+      }
     } else if (!t.configured) {
       state = "未读到登录态"; stateCls = "idle";
+      if (kit && kit.emptyState) {
+        stateBlock = kit.emptyState("还没读到本机的登录态", {
+          hint: "先在 MiniMax Code 里登录，再点凭据行上的「重新读取登录态」—— 凭据是从它的登录态拿的，不是手填的 key。",
+        });
+      }
     } else if (t.expiresInSec != null && t.expiresInSec <= 0) {
       state = "已过期，等续期"; stateCls = "warn";
     } else {
@@ -61,6 +79,7 @@ window.BAI_CARDS["mm-member"] = {
       : "";
 
     return `<div class="fieldset">
+      ${stateBlock}
       <div class="fpline"><span class="k">额度性质</span><span class="v ${stateCls}">${esc(state)}</span></div>
       <div class="fpline"><span class="k">计费口径</span><span class="v">会员额度（MiniMax Code 登录的账号自带）· <b>不是</b>开放平台按量计费</span></div>
       <div class="fpline"><span class="k">凭据来源</span><span class="v">本机 <b>MiniMax Code</b> 的登录态（不是手填的 key）</span></div>
@@ -129,23 +148,37 @@ window.BAI_CARDS["mm-member"] = {
       return self.shouldShow(P) ? P : null;
     };
 
-    function paint() {
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+
+    function paint(status) {
       const P = declared();
       if (!P) { panel.style.display = "none"; return; }
       panel.style.display = "";
+      const st = status || ctx.status;
+      /* ⚠ 服务端状态还没到 ⇒ 说「在读」。**不能**当成「没读到登录态」：
+         那个结论要的是「真的读过了、确实没有」，不是「还没读」。 */
+      if (!st) {
+        body.innerHTML = kit
+          ? kit.loadingState("正在读登录态…", { hint: "读完这一块就知道会员额度还能不能用。" })
+          : "";
+        return;
+      }
       const S = ctx.stOf(key()) || {};
       body.innerHTML = self.renderMemberPanel(S.token || null, {
         name: ctx.nameOf(key()),
         hint: S.tokenHint || "",
         upstream: (S.upstream || {}).host || "",
         esc: ctx.esc,
+        kit: kit,
       });
     }
 
     paint();
     return {
-      update() { paint(); },
-      refresh() { paint(); },
+      update(status) { paint(status); },
+      refresh() { paint(ctx.status); },
     };
   },
 };

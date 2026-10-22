@@ -42,6 +42,11 @@ window.BAI_CARDS["traffic-page"] = {
        卡片是运行时动态加载的，它加载时组件库早就在页面上了。 */
     const kit = window.BAI_KIT || null;
     const esc = ctx.esc || (kit && kit.esc) || ((s) => String(s == null ? "" : s));
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
 
     /* ---- 容器：自建面板盒，挂在所在视图末尾 ----
      * 不去抢别人的插槽：接线由清单决定，这张卡自己造盒子。 */
@@ -84,6 +89,7 @@ window.BAI_CARDS["traffic-page"] = {
     let data = null;      // 最近一次成功读到的 /api/traffic
     let lasterr = "";     // 最近一次读失败的原因
     let inflight = false;
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 没有记录）
     let sig = "";         // 上一次画过的数据签名（数据没变就不重画）
 
     /* 清单里认识的渠道 → 显示名；不认识的原样显示 key。 */
@@ -186,13 +192,19 @@ window.BAI_CARDS["traffic-page"] = {
         || days.some((x) => num(x && x.attempts) > 0)
         || sessions.length > 0;
 
+      if (!loaded && !lasterr) {
+        /* 第一次读还没回来：先说「在读」，别拿空态冒充「没有记录」。 */
+        body.innerHTML = S3("loadingState", "正在读流量数据…", { hint: "读完这一块就能看到钱按天花到哪儿去了。" });
+        return;
+      }
+
       if (!hasAnything) {
         /* 空态：**没有记录 ≠ 出错**。这句话必须写清楚 —— 空态被当成报错，
-           用户会以为账本坏了，去翻日志、去看磁盘，越查越慌。 */
-        body.innerHTML = `<div class="hint" style="margin-top:14px;padding:12px 14px;border:1px solid var(--line);border-radius:9px;background:var(--panel2)">
-            还没有用量记录 —— <b>这不是出错</b>。账本是在第一次真实调用之后才开始记的：<br>
-            等客户端跑一轮对话，这里就会按天出现（请求、失败、token、花费），并列出粘住的会话。
-          </div>`;
+           用户会以为账本坏了，去翻日志、去看磁盘，越查越慌。
+           空态还要说清「怎么才会出现」：不然用户不知道要等什么。 */
+        body.innerHTML = S3("emptyState", "还没有用量记录", {
+          hint: "账本是在第一次真实调用之后才开始记的 —— 等客户端跑一轮对话，这里就会按天出现（请求、失败、token、花费），并列出粘住的会话。",
+        });
         return;
       }
 
@@ -348,7 +360,7 @@ window.BAI_CARDS["traffic-page"] = {
         days.length, days.length ? String(days[days.length - 1].day || "") : "",
         chans.length, chans.length ? String(chans[0].key || "") : "",
         sess.length, sess.length ? String(sess[0].session || "") : "",
-      ].join("|");
+      ].join("|") + "|" + (loaded ? "1" : "0") + "|" + lasterr;
       if (next !== sig) { sig = next; renderBody(); }
 
       const note = q('[data-role="tf-note"]');
@@ -357,8 +369,16 @@ window.BAI_CARDS["traffic-page"] = {
           ? `<div class="hint" style="margin-top:12px;color:var(--warn)">上一次刷新失败：${esc(lasterr)}（下面显示的是上一次读到的结果）</div>`
           : "";
       }
+      /* 读不到而且手上**没有**旧数据 ⇒ 整块换成错误态（必须带下一步）。
+         有旧数据时保留旧数据 + 一行说明 —— 数字旧了一天比清空好。 */
       if (!data && lasterr) {
-        if (ctx.showResult) ctx.showResult(q('[data-role="tf-result"]'), "读不到流量数据：" + lasterr, false);
+        const body = q('[data-role="tf-body"]');
+        if (body) {
+          body.innerHTML = S3("errorState", "读不到流量数据", {
+            hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+            detail: lasterr,
+          });
+        }
       }
     }
 
@@ -374,6 +394,7 @@ window.BAI_CARDS["traffic-page"] = {
         lasterr = String((e && e.message) || e);
       } finally {
         inflight = false;
+        loaded = true;
         render();
       }
     }

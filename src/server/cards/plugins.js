@@ -48,9 +48,17 @@ window.BAI_CARDS["plugins"] = {
     }
     const q = (sel) => box.querySelector(sel);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     let data = null;
     let lasterr = "";
     let inflight = false;
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 没有插件）
     let sig = "";
 
     const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -65,6 +73,19 @@ window.BAI_CARDS["plugins"] = {
     function renderBody() {
       const body = q('[data-role="p-body"]');
       if (!body) return;
+      if (!loaded && !lasterr) {
+        /* 第一次读还没回来：先说「在读」，别拿空态冒充「没有插件」。 */
+        body.innerHTML = S3("loadingState", "正在读插件清单…", { hint: "读完这一块就知道插件目录里装了哪些。" });
+        return;
+      }
+      if (lasterr) {
+        /* 读不到 ⇒ 整块换成错误态（必须带下一步）。 */
+        body.innerHTML = S3("errorState", "读不到插件清单", {
+          hint: "点上面的「重新扫描目录」重试；还不行就看诊断抽屉（右上角）。",
+          detail: lasterr,
+        });
+        return;
+      }
       const plugins = Array.isArray(data && data.plugins) ? data.plugins : [];
       const errors = Array.isArray(data && data.errors) ? data.errors : [];
 
@@ -100,12 +121,9 @@ window.BAI_CARDS["plugins"] = {
         </div>`;
       }).join("");
 
-      body.innerHTML = errHtml + (plugins.length ? rows : `
-        <div class="hint" style="margin-top:12px;padding:12px 14px;border:1px solid var(--line);border-radius:9px;background:var(--panel2)">
-          还没有插件渠道 —— <b>这不是出错</b>。<br>
-          把一份 JSON 声明放进上面的插件目录，点「重新扫描目录」即可。
-          声明里**不许带凭据**（那是分发物），凭据在这一张卡里填。
-        </div>`);
+      body.innerHTML = errHtml + (plugins.length ? rows : S3("emptyState", "还没有插件渠道", {
+        hint: "把一份 JSON 声明放进上面的插件目录，点「重新扫描目录」即可 —— 声明里不许带凭据（那是分发物），凭据在这一张卡里填。",
+      }));
     }
 
     function bindRows() {
@@ -275,6 +293,11 @@ window.BAI_CARDS["plugins"] = {
         lasterr = String((e && e.message) || e);
       } finally {
         inflight = false;
+        loaded = true;
+        /* ⚠ 读完就重画：不重画的话这一块会**停在「正在读」**直到下一轮 5 秒轮询
+           （load() 里 `if (inflight) return;` 不会等这次读，update() 也等不到它）。 */
+        renderBody();
+        bindRows();
       }
     }
 
@@ -304,13 +327,22 @@ window.BAI_CARDS["plugins"] = {
       ]);
     }
 
+    /* 首屏先画「在读」并把第一次读发出去：否则这 5 秒里这一块是空白，
+       空白既不是「在读」也不是「没有插件」，用户只能猜。 */
+    renderBody();
+    bindRows();
+    load();
+
     return {
       async update() {
         await load();
         const note = q('[data-role="p-note"]');
         if (note) {
           note.innerHTML = lasterr
-            ? `<div class="hint" style="margin-top:12px">读不到插件清单：${esc(lasterr)}</div>`
+            ? S3("errorState", "读不到插件清单", {
+              hint: "点上面的「重新扫描目录」重试；还不行就看诊断抽屉（右上角）。",
+              detail: lasterr,
+            })
             : "";
         }
         const dir = q('[data-role="p-dir"]');

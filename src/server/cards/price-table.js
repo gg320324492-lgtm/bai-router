@@ -75,6 +75,13 @@ window.BAI_CARDS["price-table"] = {
     }
     const q = (sel) => box.querySelector(sel);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     /* 刷新是**非阻塞**的：POST 立刻回包，刷新在服务端跑，本卡轮 GET 看结果。
      * （models.dev 的 api.json 有几 MB，前端 12 秒的默认预算会把一次成功
      *   的刷新掐成「读取超时」—— 与 POST /api/test、/api/models/scan-all 同一套做法。）*/
@@ -84,6 +91,7 @@ window.BAI_CARDS["price-table"] = {
     let data = null;      // 最近一次成功读到的 /api/pricing
     let lasterr = "";     // 最近一次**读**失败的原因（读失败 ≠ 刷新失败）
     let inflight = null;  // 正在飞的那次读取（并发调用共用它，见 load）
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 表是空的）
     let sig = "";         // 上一次画过的数据签名（数据没变就不重画表）
 
     const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -210,8 +218,16 @@ window.BAI_CARDS["price-table"] = {
       if (!el) return;
       const d = data || {};
       const rows = Array.isArray(d.entries) ? d.entries : [];
+      if (!loaded && !lasterr) {
+        /* 第一次读还没回来：先说「在读」，别拿空态冒充「表里没有单价」。 */
+        el.innerHTML = S3("loadingState", "正在读价格表…", { hint: "读完这一块就知道面板上的费用是按哪张单价表算的。" });
+        return;
+      }
       if (!rows.length) {
-        el.innerHTML = `<div class="hint" style="margin:6px 0 0">这张单价表里一条可用的单价都没有。</div>`;
+        /* 空态要说清「怎么才会出现」：价格表**不会自动更新**，用户得知道去点哪个按钮。 */
+        el.innerHTML = S3("emptyState", "这张单价表里还没有可用的单价", {
+          hint: "点下面的「更新价格表」拉一张最新的 —— 价格表不会自动更新，免得「今天花了多少钱」这句话悄悄变了口径。",
+        });
         return;
       }
       const trs = rows.map((eo) => {
@@ -252,6 +268,9 @@ window.BAI_CARDS["price-table"] = {
     function renderUnpriced() {
       const el = q('[data-role="pt-unpriced"]');
       if (!el) return;
+      /* 还没读到表就**不要**先列「估不出的渠道」—— 那是猜的：
+         表一旦读回来，估得出的那几家就不该出现在这张表里。 */
+      if (!loaded && !data) { el.innerHTML = ""; return; }
       const rows = unpricedRows(data || {});
       if (!rows.length) {
         el.innerHTML = `<div class="hint" style="margin:12px 0 0">清单里的每一家都估得出。</div>`;
@@ -299,9 +318,18 @@ window.BAI_CARDS["price-table"] = {
           : "";
       }
       if (!data && lasterr) {
+        /* 读不到 ⇒ 表体整块换成错误态（必须带下一步）。
+           头部那几行保留：快照日期之类的事实即使读不到表也还摆在那里。 */
+        const body = q('[data-role="pt-body"]');
+        if (body) {
+          body.innerHTML = S3("errorState", "读不到价格表", {
+            hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+            detail: lasterr,
+          });
+        }
         const res = q('[data-role="pt-result"]');
         if (res) {
-          res.textContent = "读不到价格表：" + lasterr;
+          res.textContent = "读不到价格表：" + lasterr + " —— 看诊断抽屉（右上角）确认是中转没起来还是端口不通。";
           res.className = "result show bad";
         }
       }
@@ -314,7 +342,7 @@ window.BAI_CARDS["price-table"] = {
       const next = JSON.stringify([
         d.pricedAt, d.stale, d.ageDays, d.source, d.refreshing, d.lastError, lasterr,
         (d.entries || []).length, (d.unpriced || []).length,
-      ]);
+      ]) + "|" + (loaded ? "1" : "0");
       if (next === sig) return;
       sig = next;
       render();
@@ -338,6 +366,7 @@ window.BAI_CARDS["price-table"] = {
           lasterr = String((e && e.message) || e);
         } finally {
           inflight = null;
+          loaded = true;
           paint();
         }
       })();

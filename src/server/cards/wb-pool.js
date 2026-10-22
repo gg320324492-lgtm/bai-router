@@ -36,9 +36,11 @@ window.BAI_CARDS["wb-pool"] = {
    * @param {object} pool /api/status 的 `<渠道>.pool`
    * @param {{label?:string, rows?:Array}} [paidHint] 最近一次 429 的「同名付费行」
    * @param {Function} [esc]
+   * @param {object} [kit] 共享组件库（window.BAI_KIT）。**传进来才有三态**：
+   *   这个纯函数在单测里被直接求值（vm 里只有一个空 window），那时没有组件库。
    * @returns {string} HTML
    */
-  renderPoolPanel(pool, paidHint, esc) {
+  renderPoolPanel(pool, paidHint, esc, kit) {
     const e = esc || ((s) => String(s == null ? "" : s).replace(/[&<>"']/g,
       (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])));
     const p = pool || {};
@@ -48,6 +50,13 @@ window.BAI_CARDS["wb-pool"] = {
     const total = Number.isFinite(p.total) ? p.total : accounts.length;
 
     if (!total) {
+      /* 空态：池子里一把都没有。**空 ≠ 出错** —— 说清「怎么才会出现」：
+         用户得知道要先在上面填令牌，不是去查故障。 */
+      if (kit && kit.emptyState) {
+        return kit.emptyState("账号池里还没有账号", {
+          hint: p.hint || "先在上面填一把访问令牌 —— 抓到一个账号之后，这里会逐个列出它能不能用、不能用了该做什么。",
+        });
+      }
       return `<div class="fieldset">
         <div class="fpline"><span class="k">账号池</span><span class="v">空</span></div>
         <div class="hint" style="margin-top:8px;white-space:pre-wrap">${e(p.hint || "")}</div>
@@ -76,8 +85,15 @@ window.BAI_CARDS["wb-pool"] = {
     const lastLine = !last ? "" : last.ok
       ? `<div class="fpline"><span class="k">本次选中</span><span class="v ok">${e(last.label || last.accountId || "")}${last.how ? "（" + e(last.how) + "）" : ""}</span></div>
          <div class="fpline"><span class="k">可用/总数</span><span class="v">${e(String(last.eligible))} / ${e(String(last.total))}</span></div>`
-      : `<div class="fpline"><span class="k">上次选号</span><span class="v err">${e(last.reasonLabel || "")}</span></div>
-         <div class="fpline"><span class="k">该做什么</span><span class="v zh">${e(last.remedy || "")}</span></div>`;
+      : (kit && kit.errorState
+        /* 上次选号失败：错误态**必须带下一步** ——「该做什么」就是下一步，
+           少了它用户只能自己猜这个号是不是该重新登录。 */
+        ? kit.errorState("上次选号失败", {
+          hint: last.remedy || "按下面这一条处置说明处理，处理完点「重新获取令牌」再试。",
+          detail: last.reasonLabel || "",
+        })
+        : `<div class="fpline"><span class="k">上次选号</span><span class="v err">${e(last.reasonLabel || "")}</span></div>
+         <div class="fpline"><span class="k">该做什么</span><span class="v zh">${e(last.remedy || "")}</span></div>`);
     const skipped = last && Array.isArray(last.skipped) && last.skipped.length
       ? `<div class="fpline"><span class="k">本次被跳过</span><span class="v">${e(last.skipped.map((s) => (s.label || s.id) + "（" + (s.reason || "") + "）").join("、"))}</span></div>`
       : `<div class="fpline"><span class="k">本次被跳过</span><span class="v">无</span></div>`;
@@ -131,18 +147,31 @@ window.BAI_CARDS["wb-pool"] = {
       return self.shouldShow(P) ? P : null;
     };
 
-    function paint() {
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+
+    function paint(status) {
       const P = declared();
       if (!P) { panel.style.display = "none"; return; }
       panel.style.display = "";
+      const st = status || ctx.status;
+      /* ⚠ 服务端状态还没到 ⇒ 说「在读」。**不能**当成「池子里没有账号」：
+         那个结论要的是「真的读过了、确实一把都没有」，不是「还没读」。 */
+      if (!st) {
+        body.innerHTML = kit
+          ? kit.loadingState("正在读账号池…", { hint: "读完这一块就知道池里有几个账号、现在能不能用。" })
+          : "";
+        return;
+      }
       const S = ctx.stOf(key()) || {};
-      body.innerHTML = self.renderPoolPanel(S.pool || null, S.paidHint || null, ctx.esc);
+      body.innerHTML = self.renderPoolPanel(S.pool || null, S.paidHint || null, ctx.esc, kit);
     }
 
     paint();
     return {
-      update() { paint(); },
-      refresh() { paint(); },
+      update(status) { paint(status); },
+      refresh() { paint(ctx.status); },
     };
   },
 };

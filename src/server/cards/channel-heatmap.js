@@ -41,13 +41,25 @@ window.BAI_CARDS["channel-heatmap"] = {
            「选中」这件事的**结果**在那屏才看得见。停在总览屏只改一个
            看不见的选中态，等于点了没反应 —— 旧结构里点格子会就地展开，
            看得见；现在不跳就断了。 */
-      box.addEventListener("click", (ev) => {
-        const cell = ev.target && ev.target.closest ? ev.target.closest("[data-channel]") : null;
-        if (!cell) return;
-        const key = cell.getAttribute("data-channel");
+      const openChannel = (key) => {
         if (!key) return;
         if (ctx.selectChannel) ctx.selectChannel(key);
         if (ctx.setView) ctx.setView("channels");
+      };
+      box.addEventListener("click", (ev) => {
+        const cell = ev.target && ev.target.closest ? ev.target.closest("[data-channel]") : null;
+        if (!cell) return;
+        openChannel(cell.getAttribute("data-channel"));
+      });
+      /* 键盘也要够得着：格子能点，就不能只给鼠标。
+         ⚠ 光有 tabindex 不够 —— 键盘用户按 Space 不会有反应，
+           那比不可达更糟：它看起来能聚焦，却按不动。所以 Enter 与 Space 都要自己接。 */
+      box.addEventListener("keydown", (ev) => {
+        if (!ev || (ev.key !== "Enter" && ev.key !== " " && ev.key !== "Spacebar")) return;
+        const cell = ev.target && ev.target.closest ? ev.target.closest("[data-channel]") : null;
+        if (!cell) return;
+        if (ev.preventDefault) ev.preventDefault();   // Space 默认会滚页
+        openChannel(cell.getAttribute("data-channel"));
       });
     }
     const q = (sel) => box.querySelector(sel);
@@ -70,12 +82,41 @@ window.BAI_CARDS["channel-heatmap"] = {
         body.innerHTML = `<div class="hint" style="margin-top:12px">共享组件库没加载 —— 这一格画不出来。</div>`;
         return;
       }
+      /* 三态：还在读 / 读不到 / 没有渠道 —— 三件事不许混成一句「没有渠道」。 */
       if (!loaded) {
-        body.innerHTML = `<div class="hint" style="margin-top:12px">正在读渠道状态…</div>`;
+        body.innerHTML = kit.loadingState("正在读渠道状态…", { hint: "读完这一格就知道谁在扛请求、谁歇着。" });
+        return;
+      }
+      if (lasterr) {
+        body.innerHTML = kit.errorState("读不到渠道状态", {
+          hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+          detail: lasterr,
+        });
         return;
       }
       const rows = Array.isArray(data && data.channels) ? data.channels : [];
-      body.innerHTML = kit.heatmap(rows, { empty: "还没有渠道信息 —— 这不是出错。" });
+      if (!rows.length) {
+        body.innerHTML = kit.emptyState("还没有渠道信息", {
+          hint: "清单里还没有可用的渠道 —— 先在设置里接一家。",
+        });
+        return;
+      }
+      body.innerHTML = kit.heatmap(rows, {});
+      markCells();
+    }
+
+    /* 格子能点 ⇒ 必须键盘也够得着：给 role="button" 与 tabindex="0"。
+       共享组件不替卡片决定交互（它只画格子），所以这一步归卡片做。
+       这里是 DOM 操作，桩环境里可能没有 querySelectorAll —— 判一下再动。 */
+    function markCells() {
+      const body = q('[data-role="hm-body"]');
+      if (!body || typeof body.querySelectorAll !== "function") return;
+      for (const cell of body.querySelectorAll("[data-channel]")) {
+        if (!cell || typeof cell.setAttribute !== "function") continue;
+        if (cell.getAttribute("role") === "button") continue;
+        cell.setAttribute("role", "button");
+        cell.setAttribute("tabindex", "0");
+      }
     }
 
     /* 挂载时已经在读的那一次，update() 要**接着等它**而不是跳过 ——
@@ -98,6 +139,8 @@ window.BAI_CARDS["channel-heatmap"] = {
         } finally {
           loaded = true;
           pending = null;
+          /* ⚠ 读完就重画：数据一到就更新，不必等下一轮 5 秒轮询。 */
+          render();
         }
       })();
       return pending;
@@ -117,15 +160,12 @@ window.BAI_CARDS["channel-heatmap"] = {
     return {
       async update() {
         await load();
-        const body = q('[data-role="hm-body"]');
-        if (lasterr) {
-          if (body) body.innerHTML = `<div class="hint" style="margin-top:12px">读不到渠道状态：${esc(lasterr)}</div>`;
-          return;
-        }
-        const s = signature();
+        /* 签名里带上「读到没有」与失败原因 —— 否则读失败那一轮签名不变，
+           错误态就永远画不出来。 */
+        const s = signature() + "|" + (loaded ? "1" : "0") + "|" + lasterr;
         if (s !== sig) { sig = s; render(); }
       },
-      refresh() { return load(); },
+      refresh() { return load().then(() => { render(); }); },
     };
   },
 };

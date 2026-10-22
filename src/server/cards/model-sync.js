@@ -42,6 +42,13 @@ window.BAI_CARDS["model-sync"] = {
     let busy = false;          // 本卡自己的忙标志（withBusy 的那个是它闭包里的，拿不到）
     let btnLabel = "";         // 按钮文案缓存，供 5 秒一次的 update() 比对
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     /* ------------------------------------------------------------------
      * A. 状态带上的按钮。
      *    v17 单页改版后没有 .prov-tab 页签导航了，按钮改挂在状态带的动作行
@@ -66,7 +73,7 @@ window.BAI_CARDS["model-sync"] = {
       btn.addEventListener("click", () => {
         ensurePanel();
         setTitle("正在扫描六家模型目录…");
-        setOverall("依次向上游取目录，逐家与当前配置对比，请稍候…");
+        setOverall(S3("loadingState", "正在扫描六家模型目录…", { hint: "依次向上游取目录，逐家与当前配置对比，请稍候…" }));
         $("msyncRows").innerHTML = "";
         hideNotes();
         busy = true;
@@ -110,6 +117,16 @@ window.BAI_CARDS["model-sync"] = {
         const row = e.target.closest ? e.target.closest(".msync-row[data-k]") : null;
         if (row) showNotes(row.getAttribute("data-k"));
       });
+      /* 键盘也要能展开：Enter 与 Space 都算「点一下」。
+         ⚠ 光有 tabindex 不够 —— 键盘用户按 Space 不会有反应，
+           那比不可达更糟：它看起来能聚焦，却按不动。 */
+      $("msyncRows").addEventListener("keydown", (e) => {
+        if (!e || (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar")) return;
+        const row = e.target && e.target.closest ? e.target.closest(".msync-row[data-k]") : null;
+        if (!row) return;
+        if (e.preventDefault) e.preventDefault();   // Space 默认会滚页
+        showNotes(row.getAttribute("data-k"));
+      });
       $("msyncX").addEventListener("click", () => {
         $("msyncPanel").classList.remove("show");
         hideNotes();
@@ -119,7 +136,7 @@ window.BAI_CARDS["model-sync"] = {
       $("btnMsyncRescan").addEventListener("click", () => {
         ensurePanel();
         setTitle("正在扫描六家模型目录…");
-        setOverall("依次向上游取目录，逐家与当前配置对比，请稍候…");
+        setOverall(S3("loadingState", "正在扫描六家模型目录…", { hint: "依次向上游取目录，逐家与当前配置对比，请稍候…" }));
         $("msyncRows").innerHTML = "";
         hideNotes();
         busy = true;
@@ -167,7 +184,11 @@ window.BAI_CARDS["model-sync"] = {
         }
       } catch (e) {
         setTitle("刷新失败");
-        setOverall("这次没能读完六家的目录，下面的红字是失败原因。");
+        /* 错误态**必须带下一步**：一句「刷新失败」是猜谜。 */
+        setOverall(S3("errorState", "这次没能读完六家的目录", {
+          hint: "看诊断抽屉（右上角）确认是网络不通还是上游在报错；也可以直接点「重新扫描」再试一次。",
+          detail: String((e && e.message) || e),
+        }));
         throw e;            // 交给 withBusy 写进显式传入的 #msyncResult
       } finally {
         busy = false;
@@ -272,6 +293,15 @@ window.BAI_CARDS["model-sync"] = {
       const changed = ps.filter(hasDelta);
       const bad = ps.filter(failed);
 
+      /* 空态：一家都没扫到 —— 说清「怎么才会出现」，别让它看着像「扫描成功了」。 */
+      if (!ps.length) {
+        setTitle("没扫到任何一家");
+        setOverall(S3("emptyState", "一家都没扫到", {
+          hint: "点「重新扫描」再试一次；还不行就看诊断抽屉（右上角）—— 通常是本机网络或上游地址的问题。",
+        }));
+        return;
+      }
+
       setTitle(state.applied
         ? "✔ 已写入配置"
         : (changed.length ? "发现 " + changed.length + " 家模型有变化" : "六家模型目录都没有变化"));
@@ -290,7 +320,13 @@ window.BAI_CARDS["model-sync"] = {
         for (const p of ps) {
           const row = document.createElement("div");
           row.className = "msync-row" + (hasDelta(p) ? " openable" : "");
-          if (hasDelta(p)) row.setAttribute("data-k", p.key);   // 有变化才可点开看明细
+          if (hasDelta(p)) {
+            row.setAttribute("data-k", p.key);   // 有变化才可点开看明细
+            /* 键盘也要够得着：光有 tabindex 不够 —— 键盘用户按 Space 不会有反应，
+               那比不可达更糟：它看起来能聚焦，却按不动。 */
+            row.setAttribute("role", "button");
+            row.setAttribute("tabindex", "0");
+          }
           row.innerHTML = `<span>${esc(p.name)}</span>` + rightSide(p);
           box.appendChild(row);
         }

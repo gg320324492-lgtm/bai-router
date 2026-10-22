@@ -65,9 +65,17 @@ window.BAI_CARDS["remote-sync"] = {
     }
     const q = (sel) => box.querySelector(sel);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     let data = null;
     let lasterr = "";
     let inflight = false;
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 没配目标）
     let sig = "";
 
     const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -99,10 +107,21 @@ window.BAI_CARDS["remote-sync"] = {
       showKind();
       const note = q('[data-role="s-note"]');
       if (note) {
-        note.innerHTML = d.configured
-          ? `<div class="hint" style="margin-top:12px">上次同步：${d.lastSyncAt ? new Date(d.lastSyncAt).toLocaleString("zh-CN") : "（还没有）"}${d.lastAction ? " · " + esc(d.lastAction) : ""}</div>`
-          : `<div class="hint" style="margin-top:12px">还没配同步目标。配一个再点「现在同步」。<br>
-             ⚠ 远端存的是**密文**（用你填的加密口令），但那把口令**不会保存** —— 每次同步都要再输一次。</div>`;
+        if (!loaded && !lasterr) {
+          note.innerHTML = S3("loadingState", "正在读同步状态…", { hint: "读完这一块就知道上次同步是什么时候、推到了哪儿。" });
+        } else if (lasterr) {
+          note.innerHTML = S3("errorState", "读不到同步状态", {
+            hint: "看诊断抽屉（右上角）确认是中转没起来还是远端不可达；修好后面板会自己读回来。",
+            detail: lasterr,
+          });
+        } else if (!d.configured) {
+          /* 空态要说清「怎么才会出现」：不然用户不知道要先配目标。 */
+          note.innerHTML = S3("emptyState", "还没配同步目标", {
+            hint: "选一个目标（本地目录 / WebDAV / GitHub）、填加密口令，再点「保存目标」—— 远端存的是密文，但口令不保存，每次同步都要再输一次。",
+          });
+        } else {
+          note.innerHTML = `<div class="hint" style="margin-top:12px">上次同步：${d.lastSyncAt ? new Date(d.lastSyncAt).toLocaleString("zh-CN") : "（还没有）"}${d.lastAction ? " · " + esc(d.lastAction) : ""}</div>`;
+        }
       }
     }
 
@@ -118,6 +137,10 @@ window.BAI_CARDS["remote-sync"] = {
         lasterr = String((e && e.message) || e);
       } finally {
         inflight = false;
+        loaded = true;
+        /* ⚠ 读完就重画：不重画的话这一块会**停在「正在读」**直到下一轮 5 秒轮询
+           （load() 里 `if (inflight) return;` 不会等这次读，update() 也等不到它）。 */
+        render();
       }
     }
 
@@ -179,8 +202,14 @@ window.BAI_CARDS["remote-sync"] = {
 
     function signature() {
       const d = data || {};
-      return JSON.stringify([d.kind, d.url, d.repo, d.dir, d.lastSyncAt, d.lastAction, d.configured]);
+      return JSON.stringify([d.kind, d.url, d.repo, d.dir, d.lastSyncAt, d.lastAction, d.configured])
+        + "|" + (loaded ? "1" : "0") + "|" + lasterr;
     }
+
+    /* 首屏先画「在读」并把第一次读发出去：否则这 5 秒里这一块是空白，
+       空白既不是「在读」也不是「没配目标」，用户只能猜。 */
+    render();
+    load();
 
     return {
       async update() {
@@ -188,7 +217,7 @@ window.BAI_CARDS["remote-sync"] = {
         const s = signature();
         if (s !== sig) { sig = s; render(); }
       },
-      refresh() { return load(); },
+      refresh() { return load().then(() => { render(); }); },
     };
   },
 };

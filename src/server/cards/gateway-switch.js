@@ -67,6 +67,13 @@ window.BAI_CARDS["gateway-switch"] = {
     }
     const q = (sel) => box.querySelector(sel);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     /* ---- 状态 ---- */
     let mode = null;        // "on" | "off" | null（读不到）
     let port = null;        // 网关端口
@@ -129,19 +136,26 @@ window.BAI_CARDS["gateway-switch"] = {
 
       if (!loaded && lasterr) {
         if (cnt) cnt.textContent = "";
-        list.innerHTML = `<div class="hint">读不到网关状态：${esc(lasterr)}</div>`;
+        /* 读不到 ⇒ 错误态，且**必须带下一步**：一句「读不到」是猜谜。 */
+        list.innerHTML = S3("errorState", "读不到网关状态", {
+          hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+          detail: lasterr,
+        });
         return;
       }
       if (!loaded) {
         if (cnt) cnt.textContent = "";
-        list.innerHTML = `<div class="hint">正在读取网关状态…</div>`;
+        list.innerHTML = S3("loadingState", "正在读网关状态…", { hint: "读完这一块就知道请求先到哪个端口。" });
         return;
       }
 
       const keys = channelKeys();
       if (cnt) cnt.textContent = keys.length ? `${keys.length} 家` : "";
       if (!keys.length) {
-        list.innerHTML = `<div class="hint">网关暂时没有可分流的渠道。</div>`;
+        /* 空态要说清「怎么才会出现」：不然用户以为网关坏了。 */
+        list.innerHTML = S3("emptyState", "网关暂时没有可分流的渠道", {
+          hint: "先在渠道页接一家，或在设置里把上游地址改成带 provider 前缀的 —— 网关按那个前缀分流。",
+        });
         return;
       }
       const rows = keys.map((k) => {

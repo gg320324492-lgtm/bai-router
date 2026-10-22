@@ -41,9 +41,17 @@ window.BAI_CARDS["quota-panel"] = {
     }
     const q = (sel) => box.querySelector(sel);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     let data = null;
     let lasterr = "";
     let inflight = false;
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 没有额度信息）
     let sig = "";
 
     const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -68,10 +76,25 @@ window.BAI_CARDS["quota-panel"] = {
       const body = q('[data-role="qov-body"]');
       if (!body) return;
       const rows = Array.isArray(data && data.providers) ? data.providers : [];
+      if (!loaded && !lasterr) {
+        /* 第一次读还没回来：先说「在读」，别拿空态冒充「没有额度信息」。 */
+        body.innerHTML = S3("loadingState", "正在读额度信息…", { hint: "读完这一块就知道各家还剩多少、还能用多久。" });
+        return;
+      }
+      if (lasterr) {
+        /* 读不到 ⇒ 整块换成错误态（必须带下一步）：
+           「没有额度」与「读不到额度」是两件事，混起来用户会去查一个没发生的事。 */
+        body.innerHTML = S3("errorState", "读不到额度信息", {
+          hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+          detail: lasterr,
+        });
+        return;
+      }
       if (!rows.length) {
-        body.innerHTML = `<div class="hint" style="margin-top:12px;padding:12px 14px;border:1px solid var(--line);border-radius:9px;background:var(--panel2)">
-          还没有渠道的额度信息 —— <b>这不是出错</b>。额度要等真的发生过调用、或者你给某家设了预算之后才有。
-        </div>`;
+        /* 空态要说清「怎么才会出现」：不然用户不知道该去哪儿做点什么。 */
+        body.innerHTML = S3("emptyState", "还没有渠道的额度信息", {
+          hint: "额度要等真的发生过调用、或者你给某家设了预算之后才有 —— 先在故障转移屏设个预算，或跑一轮对话。",
+        });
         return;
       }
       const trs = rows.map((r) => {
@@ -147,6 +170,10 @@ window.BAI_CARDS["quota-panel"] = {
         lasterr = String((e && e.message) || e);
       } finally {
         inflight = false;
+        loaded = true;
+        /* ⚠ 读完就重画：不重画的话这一块会**停在「正在读」**直到下一轮 5 秒轮询
+           （load() 里 `if (inflight) return;` 不会等这次读，update() 也等不到它）。 */
+        render();
       }
     }
 
@@ -156,15 +183,27 @@ window.BAI_CARDS["quota-panel"] = {
         r.key, r.budget ? r.budget.used : 0, r.budget ? r.budget.limit : 0,
         r.resting, r.restUntil, r.cooling,
         r.probe ? r.probe.known : null, r.cost ? r.cost.total : null,
-      ]));
+      ])) + "|" + (loaded ? "1" : "0") + "|" + lasterr;
     }
+
+    /* 首屏先画「在读」并把第一次读发出去：否则这 5 秒里这一块是空白，
+       空白既不是「在读」也不是「没有额度信息」，用户只能猜。 */
+    render();
+    load();
 
     return {
       async update() {
         await load();
         if (lasterr) {
+          /* 读不到 ⇒ 整块换成错误态（必须带下一步）：
+             「没有额度」与「读不到额度」是两件事，混起来用户会去查一个没发生的事。 */
           const body = q('[data-role="qov-body"]');
-          if (body) body.innerHTML = `<div class="hint" style="margin-top:12px">读不到额度信息：${esc(lasterr)}</div>`;
+          if (body) {
+            body.innerHTML = S3("errorState", "读不到额度信息", {
+              hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+              detail: lasterr,
+            });
+          }
           return;
         }
         const s = signature();

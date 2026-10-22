@@ -108,7 +108,15 @@ window.BAI_CARDS["failover"] = {
     const nameOf = (k) => (MANIFEST[k] && (MANIFEST[k].name || MANIFEST[k].shortName)) || k;
     const badgeKindOf = (k) => ((MANIFEST[k] || {}).badge || {}).kind || "";
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     slot.innerHTML = `
+      <div id="foState"></div>
       <div class="jumpalarm" id="foJump" hidden></div>
       <div class="fohead">
         <button class="switch" id="ckFailover" role="switch" aria-checked="false" aria-label="开启自动故障转移"><i></i></button>
@@ -167,10 +175,12 @@ window.BAI_CARDS["failover"] = {
       return base;
     };
 
-    function render() {
+    function render(status) {
       if (!draft) draft = order();
       /* 池子变了（渠道增删）就把草稿对齐一次，避免留下一份对不上的序 */
       if (draft.length !== POOL.length || draft.some((k) => !POOL.includes(k))) draft = order();
+
+      renderState(status);
 
       const sw = $("ckFailover");
       if (sw) sw.setAttribute("aria-checked", String(enabled));
@@ -220,6 +230,32 @@ window.BAI_CARDS["failover"] = {
       }
     }
 
+    /* 三态：还在读 / 读不到 / 链上没有候选 —— 三件事不许混成一句「没候选」。
+       ⚠ 这一块画在**最顶上**：故障转移是这一屏的答案，答案读不到必须一眼看见。 */
+    function renderState(status) {
+      const box = $("foState");
+      if (!box) return;
+      if (!status) {
+        box.innerHTML = S3("loadingState", "正在读故障转移状态…", { hint: "读完这一屏就知道现在谁在扛、失败了会换给谁。" });
+        return;
+      }
+      const f = status.failover;
+      if (!f || typeof f.enabled !== "boolean") {
+        box.innerHTML = S3("errorState", "读不到故障转移状态", {
+          hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+          detail: "服务端状态里没有故障转移这一段",
+        });
+        return;
+      }
+      if (!draft.length) {
+        box.innerHTML = S3("emptyState", "转移链里还没有候选渠道", {
+          hint: "在下面把渠道排进顺序 —— 或点顶部的「一键最优」，让它按当前状态自动排一条。",
+        });
+        return;
+      }
+      box.innerHTML = "";
+    }
+
     /* --- 事件 --- */
     const sw = $("ckFailover");
     if (sw) sw.addEventListener("click", () => {
@@ -255,7 +291,8 @@ window.BAI_CARDS["failover"] = {
       if (r && r.messages && r.messages.length) draft = order();
     }));
 
-    render();
+    /* 首屏还没读到服务端状态 ⇒ 先画「在读」（renderState 认这个）。 */
+    render(null);
 
     return {
       /* 轮询刷新。
@@ -280,9 +317,9 @@ window.BAI_CARDS["failover"] = {
           next[k] = { leftSec: Number(v.cooldownLeftSec) || 0, lastErr: v.lastErr || "" };
         }
         cooling = next;
-        render();
+        render(status);
       },
-      refresh() { render(); },
+      refresh() { render(ctx.status); },
       /* 测试与排查用：读回 dirty。不导出副作用，读不到就白测了。 */
       _isDirty() { return dirty; },
     };

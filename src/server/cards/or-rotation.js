@@ -18,12 +18,19 @@ window.BAI_CARDS["or-rotation"] = {
     const hosts = (typeof ctx.rowsOfKind === "function" ? ctx.rowsOfKind("keys3") : []) || [];
     if (!hosts.length) return { update() { }, refresh() { } };
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     const scoped = hosts.map((host) => {
       const row = host.closest(".credrow");
       const key = row && row.dataset ? row.dataset.k : null;
       host.innerHTML = `
         <div class="cardbody">
-          <div class="tokstat" data-role="rotstat">正在读取轮换状态…</div>
+          <div class="tokstat" data-role="rotstat">${S3("loadingState", "正在读轮换状态…", { hint: "读完这一行就知道现在在用第几把 key、冷却到什么时候。" })}</div>
           <div class="hint" data-role="rotnote" style="margin-top:8px"></div>
           <div class="hint" style="margin-top:8px">
             <b>两层轮换</b>（两种限额含义相反，不能混为一谈）：<br>
@@ -39,7 +46,9 @@ window.BAI_CARDS["or-rotation"] = {
 
     function quotaLine(q) {
       if (!q) return "额度：未读到（key 未配置或上游不可达）";
-      if (q.error) return "额度：读取失败 —— " + q.error;
+      /* 读失败的详情由下面那一块错误态承担（带下一步），这里只点一句，
+           免得同一句失败说两遍、还互相盖住。 */
+      if (q.error) return "额度：读不到（原因见下）";
       const d = q.daily;
       if (!d) return "额度：上游未返回每日免费次数" + (q.stale ? "（下面是上次的缓存）" : "");
       return `今日免费额度：已用 ${d.used} / ${d.limit}，剩余 ${d.remaining}`;
@@ -52,6 +61,27 @@ window.BAI_CARDS["or-rotation"] = {
       const rot = S.rotation || {};
       const tk = S.token || {};
       const keys = Array.isArray(tk.keys) ? tk.keys : [];
+
+      /* ⚠ 服务端状态还没到 ⇒ 说「在读」。**不能**当成「轮换区里没有 key」：
+         那个结论要的是「真的读过了、确实一把都没有」，不是「还没读」。 */
+      if (!status && !ctx.status) {
+        el.innerHTML = S3("loadingState", "正在读轮换状态…", { hint: "读完这一行就知道现在在用第几把 key、冷却到什么时候。" });
+        return;
+      }
+      if (!S.token) {
+        /* 状态到了、但里面没有令牌这一段 ⇒ 读不到（**不是「一把 key 都没有」**）。 */
+        el.innerHTML = S3("errorState", "读不到轮换状态", {
+          hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+        });
+        return;
+      }
+      if (!keys.length) {
+        /* 空态要说清「怎么才会出现」：不然用户以为轮换坏了。 */
+        el.innerHTML = S3("emptyState", "轮换区里还没有 key", {
+          hint: "在上面填一把 API Key —— 三把全在冷却时，才有备用的可换。",
+        });
+        return;
+      }
 
       const parts = [];
       parts.push(`<span>当前 key：<b>${tk.configured ? "第 " + (rot.activeKeyNo || "?") + " 把 / 共 " + (tk.keyCount || keys.length) + " 把" : "未配置"}</b></span>`);
@@ -76,9 +106,18 @@ window.BAI_CARDS["or-rotation"] = {
       const note = sc.$('[data-role="rotnote"]');
       if (note) {
         const sw = rot.lastSwitch;
-        note.textContent = sw
+        /* 额度读不到 ⇒ **只**把额度这一块说成错误态：当前在用第几把、冷却到什么时候
+           都是真的，混成一句「读不到」会把已知的事实一起抹掉。 */
+        const quotaErr = (S.quota && S.quota.error) ? String(S.quota.error) : "";
+        const rotLine = sw
           ? `最近一次轮换：${sw.at}　${sw.kind === "key" ? `第 ${sw.from} 把 key → 第 ${sw.to} 把 key` : `模型 ${sw.from} → ${sw.to}`}${sw.why ? "（" + sw.why + "）" : ""}`
           : "尚未发生轮换（额度够用时不会动）。";
+        note.innerHTML = (quotaErr
+          ? S3("errorState", "读不到额度", {
+            hint: "点凭据行上的「刷新额度」重试 —— 额度读不到不影响对话，只是看不到还剩多少。",
+            detail: quotaErr,
+          })
+          : "") + '<span class="hint">' + esc(rotLine) + "</span>";
       }
     }
 

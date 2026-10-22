@@ -66,9 +66,17 @@ window.BAI_CARDS["config-backup"] = {
     }
     const q = (sel) => box.querySelector(sel);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     let data = null;      // 最近一次读到的 /api/backup
     let lasterr = "";
     let inflight = false;
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 没有备份）
     let selected = "";    // 选中的备份文件名
     let sig = "";
 
@@ -101,8 +109,20 @@ window.BAI_CARDS["config-backup"] = {
 
       const list = q('[data-role="b-list"]');
       if (list) {
-        if (!files.length) {
-          list.innerHTML = `<div class="hint" style="margin-top:12px">还没有备份。导出一份吧——重装一次或换台电脑，凭据与映射能一起带走。</div>`;
+        if (!loaded && !lasterr) {
+          /* 第一次读还没回来：先说「在读」，别拿空态冒充「没有备份」。 */
+          list.innerHTML = S3("loadingState", "正在读备份清单…", { hint: "读完这一块就知道本机存着哪几份备份。" });
+        } else if (lasterr) {
+          /* 读不到 ⇒ 整块换成错误态（必须带下一步）。 */
+          list.innerHTML = S3("errorState", "读不到备份清单", {
+            hint: "看诊断抽屉（右上角）确认数据目录是否可读；修好后面板会自己读回来。",
+            detail: lasterr,
+          });
+        } else if (!files.length) {
+          /* 空态要说清「怎么才会出现」：不然用户不知道要点哪个按钮。 */
+          list.innerHTML = S3("emptyState", "还没有备份", {
+            hint: "填好下面的口令点「导出备份」—— 重装一次或换台电脑，凭据与映射能一起带走。",
+          });
         } else {
           list.innerHTML = `<table class="route" style="table-layout:fixed;margin-top:12px">
             <thead><tr><th style="width:46%">文件</th><th style="width:18%">大小</th><th style="width:36%">时间</th></tr></thead>
@@ -133,6 +153,10 @@ window.BAI_CARDS["config-backup"] = {
         lasterr = String((e && e.message) || e);
       } finally {
         inflight = false;
+        loaded = true;
+        /* ⚠ 读完就重画：不重画的话这一块会**停在「正在读」**直到下一轮 5 秒轮询
+           （load() 里 `if (inflight) return;` 不会等这次读，update() 也等不到它）。 */
+        render();
       }
     }
 
@@ -195,12 +219,30 @@ window.BAI_CARDS["config-backup"] = {
 
     function signature() {
       const files = Array.isArray(data && data.files) ? data.files : [];
-      return JSON.stringify([files.length, files[0] ? files[0].name : "", files[0] ? files[0].at : 0, selected]);
+      return JSON.stringify([files.length, files[0] ? files[0].name : "", files[0] ? files[0].at : 0, selected])
+        + "|" + (loaded ? "1" : "0") + "|" + lasterr;
     }
+
+    /* 首屏先画「在读」并把第一次读发出去：否则这 5 秒里这一块是空白，
+       空白既不是「在读」也不是「没有备份」，用户只能猜。 */
+    render();
+    load();
 
     return {
       async update() {
         await load();
+        if (lasterr && !data) {
+          /* 读不到 ⇒ 整块换成错误态（必须带下一步）：
+             「没有备份」与「读不到备份」是两件事，混起来用户会去查一个没发生的事。 */
+          const list = q('[data-role="b-list"]');
+          if (list) {
+            list.innerHTML = S3("errorState", "读不到备份清单", {
+              hint: "看诊断抽屉（右上角）确认数据目录是否可读；修好后面板会自己读回来。",
+              detail: lasterr,
+            });
+          }
+          return;
+        }
         const s = signature();
         if (s !== sig) { sig = s; render(); }
       },

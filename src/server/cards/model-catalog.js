@@ -20,6 +20,12 @@ window.BAI_CARDS["model-catalog"] = {
     if (!hosts.length) return { update() { }, refresh() { } };
 
     const MANIFEST = window.BAI_PROVIDERS || {};
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
     const scoped = hosts.map((host) => {
       const row = host.closest(".credrow");
       const key = row && row.dataset ? row.dataset.k : null;
@@ -32,7 +38,7 @@ window.BAI_CARDS["model-catalog"] = {
       if (key && MANIFEST[key] && MANIFEST[key].credentialReadonly) return null;
       host.innerHTML = `
         <div class="cardbody">
-          <div class="tokstat" data-role="patchstat">正在检查补丁状态…</div>
+          <div class="tokstat" data-role="patchstat">${S3("loadingState", "正在检查补丁状态…", { hint: "读完这一行就知道补丁装没装、令牌文件新不新。" })}</div>
           <div class="hint" style="margin-top:10px">
             ${esc(name)} 的令牌<b>每次客户端启动都会轮换</b>，所以它不会被存进配置，
             也不会写进客户端的设置文件——中转每次请求现读，客户端换令牌后无需重启中转即自动跟随。
@@ -59,21 +65,42 @@ window.BAI_CARDS["model-catalog"] = {
       const S = ctx.stOf(sc.key) || {};
       const p = S.patch || {};
       const t = S.token || {};
+      /* ⚠ 服务端状态还没到 ⇒ 说「在读」。**不能**当成「没找到客户端安装目录」：
+         那个结论要的是「真的找过了、确实没有」，不是「还没找」。 */
+      if (!status && !ctx.status) {
+        box.innerHTML = S3("loadingState", "正在检查补丁状态…", { hint: "读完这一行就知道补丁装没装、令牌文件新不新。" });
+        return;
+      }
+      if (!S.patch) {
+        /* 状态到了、但里面没有补丁这一段 ⇒ 读不到（**不是「没装补丁」**）。 */
+        box.innerHTML = S3("errorState", "读不到补丁状态", {
+          hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+        });
+        return;
+      }
       const bits = [];
       if (!p.found) {
-        bits.push('<span class="lvl err" style="font-size:10px">没找到客户端安装目录</span>');
-        bits.push("<span>请确认本机已装对应桌面端</span>");
+        /* 错误态必须带下一步：只说「没找到」用户不知道该干什么。 */
+        box.innerHTML = S3("errorState", "没找到客户端安装目录", {
+          hint: "先装好对应的桌面端并启动它，再回到这里点「一键装补丁」—— 补丁是装在客户端里的，客户端不在就无处可装。",
+        });
+        return;
+      }
+      bits.push(p.ready
+        ? `<span class="lvl ok" style="font-size:10px">补丁已装</span><span>${p.patched}/${p.found} 个 worker 副本</span>`
+        : `<span class="lvl warn" style="font-size:10px">补丁未装</span><span>发现 ${p.found} 个 worker 副本</span>`);
+      /* 令牌文件还没刷新 = **还没发生**（客户端没开或没发请求），不是出错。 */
+      let stateBlock = "";
+      if (p.tokenFresh) {
+        bits.push('<span class="lvl ok" style="font-size:10px">令牌文件新鲜</span><span>客户端正在刷新</span>');
       } else {
-        bits.push(p.ready
-          ? `<span class="lvl ok" style="font-size:10px">补丁已装</span><span>${p.patched}/${p.found} 个 worker 副本</span>`
-          : `<span class="lvl warn" style="font-size:10px">补丁未装</span><span>发现 ${p.found} 个 worker 副本</span>`);
-        bits.push(p.tokenFresh
-          ? '<span class="lvl ok" style="font-size:10px">令牌文件新鲜</span><span>客户端正在刷新</span>'
-          : '<span>令牌文件未刷新 —— 客户端没开或没发请求</span>');
+        stateBlock = S3("emptyState", "还没有令牌文件", {
+          hint: "客户端启动并发一次带鉴权的请求就会刷出来 —— 补丁装好后保持客户端运行即可。",
+        });
       }
       if (p.cn) bits.push(`<span>另有国内版 ${p.cn} 份，有意跳过</span>`);
       if (t.tokenFile) bits.push(`<span>令牌文件：<b class="mono">${esc(t.tokenFile)}</b></span>`);
-      box.innerHTML = bits.join("");
+      box.innerHTML = stateBlock + bits.join("");
     }
 
     for (const sc of scoped) paint(sc, ctx.status);

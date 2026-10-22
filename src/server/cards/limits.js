@@ -58,9 +58,17 @@ window.BAI_CARDS["limits"] = {
     }
     const q = (sel) => box.querySelector(sel);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     let data = null;
     let lasterr = "";
     let inflight = false;
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 没有占用数据）
     let sig = "";
 
     const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -94,8 +102,24 @@ window.BAI_CARDS["limits"] = {
       if (!body) return;
       const stats = (data && data.stats) || {};
       const keys = Object.keys(stats);
+      if (!loaded && !lasterr) {
+        /* 第一次读还没回来：先说「在读」，别拿空态冒充「没有占用数据」。 */
+        body.innerHTML = S3("loadingState", "正在读限流状态…", { hint: "读完这一块就知道各家现在被占了多少名额。" });
+        return;
+      }
+      if (lasterr) {
+        /* 读不到 ⇒ 整块换成错误态（必须带下一步）。 */
+        body.innerHTML = S3("errorState", "读不到限流状态", {
+          hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+          detail: lasterr,
+        });
+        return;
+      }
       if (!keys.length) {
-        body.innerHTML = "";
+        /* 空态要说清「怎么才会出现」：空白会让用户以为这张卡坏了。 */
+        body.innerHTML = S3("emptyState", "还没有各家的占用数据", {
+          hint: "发生过请求之后这里才会有在途 / 排队 / 被拒的数字 —— 上面两个上限仍然可以随时填。",
+        });
         return;
       }
       const rows = keys.map((k) => {
@@ -203,6 +227,12 @@ window.BAI_CARDS["limits"] = {
         lasterr = String((e && e.message) || e);
       } finally {
         inflight = false;
+        loaded = true;
+        /* ⚠ 读完就重画：不重画的话这一块会**停在「正在读」**直到下一轮 5 秒轮询
+           （load() 里 `if (inflight) return;` 不会等这次读，update() 也等不到它）。 */
+        renderInputs();
+        renderBody();
+        renderBudget();
       }
     }
 
@@ -243,8 +273,16 @@ window.BAI_CARDS["limits"] = {
       return JSON.stringify([(data && data.limits && data.limits.concurrency) || 0,
         (data && data.limits && data.limits.rpm) || 0,
         Object.keys(s).map((k) => [k, s[k].busy, s[k].waiting, s[k].rejected,
-          s[k].budget ? s[k].budget.used : 0, s[k].budget ? s[k].budget.limit : 0]).flat()]);
+          s[k].budget ? s[k].budget.used : 0, s[k].budget ? s[k].budget.limit : 0]).flat()])
+        + "|" + (loaded ? "1" : "0") + "|" + lasterr;
     }
+
+    /* 首屏先画「在读」并把第一次读发出去：否则这 5 秒里这一块是空白，
+       空白既不是「在读」也不是「没有占用数据」，用户只能猜。 */
+    renderInputs();
+    renderBody();
+    renderBudget();
+    load();
 
     return {
       async update() {
@@ -252,7 +290,10 @@ window.BAI_CARDS["limits"] = {
         const note = q('[data-role="l-note"]');
         if (note) {
           note.innerHTML = lasterr
-            ? `<div class="hint" style="margin-top:12px">读不到限流状态：${esc(lasterr)}</div>`
+            ? S3("errorState", "读不到限流状态", {
+              hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+              detail: lasterr,
+            })
             : "";
         }
         const s = signature();

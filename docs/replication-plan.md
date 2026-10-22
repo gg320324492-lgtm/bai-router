@@ -31,7 +31,7 @@ magpie 是 10.3 万行 Go、5661 个文件。它自己的历史是首周每天 2
 | T11 | **插件体系**（声明式 provider/agent/middleware） | ✅ provider 插件（一份 JSON 加一家渠道）、middleware（`middleware.mjs`，声明式改写）、**代码插件**（`pluginrt.mjs` + `plugin-worker.mjs`：子进程 + Node 权限模型 + 令牌窄协议 + 超时封顶）全部接进真实链路 | `internal/pluginrt/`、`internal/plugin/` |
 | T12 | **并发 / RPM 限流通道** | ✅ 完成（`concurrency.mjs` + `rpm.mjs`，**默认不限**，面板可开） | `internal/gateway/{concurrency,rpm}.go` |
 | T13 | **配置同步备份**（WebDAV/S3/GitHub）+ KeepOwn | ✅ 完成（本地目录 / WebDAV / GitHub 三种目标都已接进真实链路，口令加密、不静默覆盖） | `internal/backup/`、`internal/davsync/` |
-| T14 | **面板改版**（插槽制 + 多页） | 🟡 P0–P2 ✅（额度屏 / 状态计算层 / 共享组件库 / 热力图 / 状态条）；**P3 渠道主从**在做 | `internal/gui/assets/kernel.js` |
+| T14 | **面板改版**（插槽制 + 多页） | 🟡 P0–P3 ✅（额度屏 / 状态计算层 / 共享组件库 / 热力图 / 状态条 / **渠道主从**）；P5 收尾在做 | `internal/gui/assets/kernel.js` |
 
 ---
 

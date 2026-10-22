@@ -64,6 +64,13 @@ window.BAI_CARDS["usage-ledger"] = {
     }
     const q = (sel) => box.querySelector(sel);
 
+    /* 三态（空 / 错 / 加载）统一走共享组件：措辞与结构只在 panel-kit.js 定义一次。
+       组件库不在时降级成一句提示 —— 整块空白比降级更坏。 */
+    const kit = window.BAI_KIT || null;
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
     const RECENT_MAX = 30;     // 最近请求最多列这么多条
     const MODEL_MAX = 15;      // 按模型最多列这么多行（后端已经截到 30，这里再收一档）
     const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -72,6 +79,7 @@ window.BAI_CARDS["usage-ledger"] = {
     let data = null;      // 最近一次成功读到的 /api/usage
     let lasterr = "";     // 最近一次读失败的原因
     let inflight = false;
+    let loaded = false;   // 至少成功读过一回（没读过 ≠ 没有记录）
     let sig = "";         // 上一次画过的数据签名（数据没变就不重画表）
 
     /* 清单里认识的渠道 → 显示名；不认识的原样显示 key。 */
@@ -140,6 +148,11 @@ window.BAI_CARDS["usage-ledger"] = {
     function renderBody() {
       const body = q('[data-role="ul-body"]');
       if (!body) return;
+      if (!loaded && !lasterr) {
+        /* 第一次读还没回来：先说「在读」，别拿空态冒充「没有记录」。 */
+        body.innerHTML = S3("loadingState", "正在读用量账本…", { hint: "读完这一块就能看到钱花到哪儿去了。" });
+        return;
+      }
       const d = data || {};
       const recs = Array.isArray(d.rows) ? d.rows : [];
       const provs = Array.isArray(d.byProvider) ? d.byProvider : [];
@@ -148,11 +161,11 @@ window.BAI_CARDS["usage-ledger"] = {
 
       if (!total && !recs.length && !provs.length) {
         /* 空态：**没有记录 ≠ 出错**。这句话必须写清楚——空态被当成报错，用户会
-         * 以为账本坏了，去翻日志、去看磁盘，越查越慌。 */
-        body.innerHTML = `<div class="hint" style="margin-top:14px;padding:12px 14px;border:1px solid var(--line);border-radius:9px;background:var(--panel2)">
-            还没有用量记录 —— <b>这不是出错</b>。账本是在第一次真实调用之后才开始记的：<br>
-            等客户端跑一轮对话，这里就会逐行出现（时间、渠道、模型、状态、耗时、token、重试次数）。
-          </div>`;
+         * 以为账本坏了，去翻日志、去看磁盘，越查越慌。
+         * 空态还要说清「怎么才会出现」：不然用户不知道要等什么。 */
+        body.innerHTML = S3("emptyState", "还没有用量记录", {
+          hint: "账本是在第一次真实调用之后才开始记的 —— 等客户端跑一轮对话，这里就会逐行出现（时间、渠道、模型、状态、耗时、token、重试次数）。",
+        });
         return;
       }
 
@@ -240,8 +253,11 @@ window.BAI_CARDS["usage-ledger"] = {
       const d = data || {};
       const recs = Array.isArray(d.rows) ? d.rows : [];
       const t = d.totals || {};
+      /* 签名里带上「读到没有」与失败原因 —— 否则读失败那一轮签名不变，
+         错误态就永远画不出来。 */
       const next = [num(t.requests), num(t.failed), recs.length,
-        recs[0] ? String(recs[0].t || "") : "", recs[0] ? num(recs[0].status) : 0].join("|");
+        recs[0] ? String(recs[0].t || "") : "", recs[0] ? num(recs[0].status) : 0].join("|")
+        + "|" + (loaded ? "1" : "0") + "|" + lasterr;
       if (next !== sig) { sig = next; renderBody(); }
 
       const note = q('[data-role="ul-note"]');
@@ -250,8 +266,16 @@ window.BAI_CARDS["usage-ledger"] = {
           ? `<div class="hint" style="margin-top:12px;color:var(--warn)">上一次刷新失败：${esc(lasterr)}（下面显示的是上一次读到的结果）</div>`
           : "";
       }
+      /* 读不到而且手上**没有**旧数据 ⇒ 整块换成错误态（必须带下一步）。
+         有旧数据时保留旧数据 + 一行说明 —— 数字旧了一天比清空好。 */
       if (!data && lasterr) {
-        if (ctx.showResult) ctx.showResult(q('[data-role="ul-result"]'), "读不到用量账本：" + lasterr, false);
+        const body = q('[data-role="ul-body"]');
+        if (body) {
+          body.innerHTML = S3("errorState", "读不到用量账本", {
+            hint: "看诊断抽屉（右上角）确认是中转没起来还是端口不通；修好后面板会自己读回来。",
+            detail: lasterr,
+          });
+        }
       }
     }
 
@@ -267,6 +291,7 @@ window.BAI_CARDS["usage-ledger"] = {
         lasterr = String((e && e.message) || e);
       } finally {
         inflight = false;
+        loaded = true;
         render();
       }
     }
