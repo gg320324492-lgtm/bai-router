@@ -598,32 +598,68 @@ input.custom { width: 100%; margin-top: 4px; }
 .chntable td.dim { text-align: left; }
 
 /* ============================================================================
-   11. 凭据视图的行
+   11. 凭据视图的行（手风琴：折叠时一行一家，展开才看细节）
    ========================================================================== */
+/* 折叠态就是一行：字母 + 名字 + 凭据类型 + 状态药丸 + 箭头。
+   状态药丸**必须**在这一行里 —— 收起时也要一眼看出「哪家好了、哪家没配」，
+   坏消息不许藏在展开之后。 */
 .credrow {
-  display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap;
-  padding: 13px 16px; border-bottom: 1px solid var(--line); position: relative;
+  border-bottom: 1px solid var(--line); position: relative;
 }
 .credrow:last-child { border-bottom: none; }
 .credrow.sel { background: var(--panel2); }
 .credrow.sel::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--brand); }
-.credrow .cl { flex: none; width: 184px; display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
-.credrow .cl .letter { width: 27px; height: 27px; border-radius: 8px; font-size: 10px; }
-.credrow .clname { font-size: 12.5px; font-weight: 650; min-width: 0; }
-.credrow .clname .cpath { display: block; font-family: var(--mono); font-size: 10.5px; color: var(--dim); font-weight: 400; }
-.credrow .ck { flex: 1; min-width: 180px; display: flex; flex-direction: column; gap: 2px; }
-.credrow .kindbadge {
+
+/* 头一行 = 折叠态。整行点一下就展开/收起（键盘：Enter / 空格）。 */
+.credhead {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px;
+  padding: 8px 16px; cursor: pointer; user-select: none;
+}
+.credhead:hover { background: var(--panel2); }
+.credrow.sel .credhead:hover { background: var(--panel3); }
+.credhead:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
+.credhead .cl { display: flex; gap: 9px; align-items: center; flex: none; min-width: 0; }
+.credhead .cl .letter { width: 25px; height: 25px; border-radius: 8px; font-size: 10px; cursor: pointer; }
+.credhead .clname {
+  font-size: 12.5px; font-weight: 650; min-width: 0;
+  max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.credhead .kindbadge {
   font-size: 10.5px; font-weight: 650; color: var(--ink2);
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
-  padding: 2.5px 7px; align-self: flex-start;
+  padding: 2.5px 7px; flex: none; white-space: nowrap;
 }
-.credrow .chint { font-size: 11px; color: var(--dim); line-height: 1.6; }
-.credrow .cs { flex: none; display: flex; flex-direction: column; gap: 3px; align-items: flex-end; text-align: right; min-width: 160px; }
-.credrow .cs .fp { font-size: 11px; color: var(--dim); }
-.credrow .cs .fp.err { color: var(--err); }
-.credrow .ca { flex: none; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
-.credrow .crow { flex: 1 0 100%; margin-top: 10px; }
-.credrow .crow:empty { display: none; }
+.credhead .credpill { margin-left: auto; display: flex; align-items: center; flex: none; }
+.credhead .chev {
+  flex: none; width: 13px; text-align: center; color: var(--dim);
+  font-size: 11px; line-height: 1; transition: transform .16s;
+}
+.credrow.open .credhead .chev { transform: rotate(90deg); }
+
+/* 坏消息的原因：warn/err 时摆在头一行下面，收起时也看得见。
+   展开后行内那块本来就有同一句，所以展开态把它收掉（同一句话说两遍没意思）。 */
+.credwhy {
+  flex: 1 0 100%; font-size: 11px; color: var(--dim); line-height: 1.6;
+  padding-left: 34px;                 /* 与名字左对齐 */
+}
+.credwhy:empty { display: none; }
+.credrow.open .credwhy { display: none; }
+
+/* 展开后的那一块：路径 + 说明 + 证据 + 操作 + 卡片挂点 */
+.credbody { display: none; flex-wrap: wrap; align-items: flex-start; gap: 9px 14px; padding: 0 16px 13px 50px; }
+.credrow.open .credbody { display: flex; }
+.credbody .ck { flex: 1 1 240px; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.credbody .cpath { font-family: var(--mono); font-size: 10.5px; color: var(--dim); font-weight: 400; }
+.credbody .cpath:empty { display: none; }
+.credbody .chint { font-size: 11px; color: var(--dim); line-height: 1.6; }
+/* 证据那一块左对齐：它是一段话，右对齐的折行很难读。
+   （**状态**不在这里 —— 状态药丸在折叠的那一行上，位置没动。） */
+.credbody .cs { flex: 0 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; text-align: left; }
+.credbody .cs .fp { font-size: 11px; color: var(--dim); max-width: 100%; overflow-wrap: anywhere; }
+.credbody .cs .fp.err { color: var(--err); }
+.credbody .ca { flex: none; margin-left: auto; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.credbody .crow { flex: 1 0 100%; }
+.credbody .crow:empty { display: none; }
 
 .keybox { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 .keybox .kn {
@@ -922,8 +958,8 @@ footer .paths { flex: 1; min-width: 200px; }
 @media (max-width: 1100px) {
   .grid2 { grid-template-columns: 1fr; }
   .ditem { grid-template-columns: 14px 1fr; }
-  .credrow .cs { text-align: left; align-items: flex-start; }
-  .credrow .ca { justify-content: flex-start; }
+  .credbody .cs { text-align: left; align-items: flex-start; }
+  .credbody .ca { justify-content: flex-start; margin-left: 0; }
 }
 @media (max-width: 980px) {
   .matrix { grid-template-columns: repeat(2, 1fr); }
@@ -936,6 +972,10 @@ footer .paths { flex: 1; min-width: 200px; }
   .top { height: auto; flex-wrap: wrap; padding-bottom: 10px; gap: 10px; }
   body.app-frame .top { padding-right: 150px; }
   table.route td:nth-child(1) { width: 40%; }
+  /* 窄屏：名字不再截断（让它换行），展开的那块也不必再缩进 */
+  .credhead .clname { max-width: none; white-space: normal; }
+  .credbody { padding-left: 16px; }
+  .credwhy { padding-left: 0; }
 }
 /* 端口表的「走代理」标色：勾了走代理值得留意（多半是直连被拦才勾的） */
 .chntable td.warncell { color: var(--warn); }

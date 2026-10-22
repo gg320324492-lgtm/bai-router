@@ -41,6 +41,7 @@ window.BAI_CARDS["plugins"] = {
           <div data-role="p-note"></div>
           <div data-role="p-body"></div>
           <div data-role="p-mw"></div>
+          <div data-role="p-cp"></div>
         </div>`;
       const viewRoot = (slot.closest && slot.closest(".view")) || slot;
       viewRoot.appendChild(box);
@@ -201,6 +202,67 @@ window.BAI_CARDS["plugins"] = {
       }
     }
 
+    /* ---- 代码插件（pluginrt）：真代码，跑在子进程里 ----
+     *
+     * 与上面两节的分界（用户看到的是三种不同的东西，混起来就会用错）：
+     *   · 插件渠道 —— 声明式加一家上游渠道（一份 JSON）。
+     *   · middleware —— 声明式改写请求（一份 JSON）。
+     *   · 代码插件 —— **真代码**（用户自己写的 JS），跑在子进程里，有权限模型。
+     */
+    let cpSig = "";
+
+    async function loadCodePlugins() {
+      try {
+        const r = await ctx.api("/api/code-plugins");
+        return r && r.ok !== false ? r : { list: [], errors: [], dir: "" };
+      } catch { return { list: [], errors: [], dir: "" }; }
+    }
+
+    function renderCodePlugins(cp) {
+      const box = q('[data-role="p-cp"]');
+      if (!box) return;
+      const list = Array.isArray(cp.list) ? cp.list : [];
+      const errors = Array.isArray(cp.errors) ? cp.errors : [];
+      if (!list.length && !errors.length) { box.innerHTML = ""; return; }
+      const stateOf = (s) => (s === "active" ? "在跑" : s === "dead" ? "已死（上次超时被杀掉）" : String(s || "—"));
+      box.innerHTML = `
+        <div class="sechead" style="margin:16px 0 4px">
+          <h2 style="font-size:12px">代码插件</h2>
+          <span class="note">真代码 · 跑在<b>子进程</b>里（有权限模型与超时封顶）· 装在 <span class="mono">${esc(String(cp.dir || ""))}</span></span>
+        </div>
+        ${list.map((p) => {
+          const perms = Array.isArray(p.permissions) ? p.permissions : [];
+          return `<div class="fpline" style="align-items:flex-start">
+            <span class="k">${esc(String(p.name || p.id))}<br><span class="mono dim" style="font-size:10.5px">${esc(String(p.id || ""))}</span></span>
+            <span class="v">${esc(stateOf(p.status))} · 单次超时 ${num(p.timeoutMs)}ms
+              ${perms.length ? `<div class="hint" style="margin-top:4px">${perms.map((x) => esc(String(x.label || x.kind || ""))).join("<br>")}</div>` : ""}
+            </span>
+          </div>`;
+        }).join("")}
+        ${errors.length ? errors.map((e) => `<div class="hint" style="margin-top:6px;padding:10px 12px;border:1px solid var(--line);border-radius:9px">
+          <b class="mono">${esc(String(e.dir || ""))}</b><br>${esc(String(e.message || ""))}
+        </div>`).join("") : ""}
+        <div style="margin-top:8px">
+          <button type="button" class="btn sm" data-role="p-cp-reload">重新扫描代码插件目录</button>
+        </div>`;
+      const btn = box.querySelector('[data-role="p-cp-reload"]');
+      if (btn) {
+        btn.addEventListener("click", async () => {
+          setResult("正在重新扫描代码插件…");
+          try {
+            const r = await ctx.api("/api/code-plugins/reload", {
+              method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+            });
+            if (r && r.ok === false) throw new Error(r.error || "重载失败");
+            setResult(`✔ 已重载：装上 ${num((r.installed || []).length)} 个代码插件${(r.errors || []).length ? `，${r.errors.length} 个装不上` : ""}`, true);
+            renderCodePlugins(await loadCodePlugins());
+          } catch (e) {
+            setResult("✖ 重载失败：" + String((e && e.message) || e), false);
+          }
+        });
+      }
+    }
+
     async function load() {
       if (inflight) return;
       inflight = true;
@@ -255,6 +317,13 @@ window.BAI_CARDS["plugins"] = {
         if (dir && data) dir.textContent = String(data.dir || "—");
         const s = signature();
         if (s !== sig) { sig = s; renderBody(); bindRows(); renderMiddleware(await loadMiddleware()); }
+        /* 代码插件自己的一份签名：它只在「重载」后变，与插件渠道那条线无关。 */
+        const cp = await loadCodePlugins();
+        const cs = JSON.stringify([
+          (cp.list || []).map((p) => [p.id, p.status, p.timeoutMs]),
+          (cp.errors || []).map((e) => [e.dir, e.message]),
+        ]);
+        if (cs !== cpSig) { cpSig = cs; renderCodePlugins(cp); }
       },
       refresh() { return load(); },
     };

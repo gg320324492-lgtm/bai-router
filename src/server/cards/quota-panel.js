@@ -79,19 +79,34 @@ window.BAI_CARDS["quota-panel"] = {
         const limit = b ? num(b.limit) : 0;
         const used = b ? num(b.used) : 0;
         const pct = limit ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+        /* ⚠ 状态**不许**自己另算一套：这一格必须与总览页、渠道矩阵上说的
+         *   同一件事（改版原则 1：状态是数据，不是装饰）。
+         *   自己算会出这种错：没配凭据的渠道在这里显示「可用」，
+         *   而总览页说「凭据未配」——用户得自己判断哪个是真的。
+         *   额度这一屏**独有**的两格（休息中 / 冷却中）优先，其余交给共享的
+         *   channelState。 */
+        const shared = (typeof ctx.channelState === "function" && r.key)
+          ? ctx.channelState(r.key) : null;
         const state = r.resting
           ? '<span class="led warn"></span> 休息中'
-          : (r.cooling ? '<span class="led warn"></span> 冷却中' : '<span class="led ok"></span> 可用');
+          : (r.cooling
+            ? '<span class="led warn"></span> 冷却中'
+            : (shared
+              ? `<span class="led ${esc(String(shared.s || "idle"))}"></span> ${esc(String(shared.txt || "—"))}`
+              : '<span class="led idle"></span> —'));
         const budgetCell = !b
           ? '<span class="dim">未设预算</span>'
           : `<span class="mono">${int(used)} / ${int(limit)}</span> <span class="dim">（${pct}%）</span>`;
         const limitCell = !b
           ? "—"
           : [b.hourly ? `每小时 ${int(b.hourly)}` : "", b.daily ? `每天 ${int(b.daily)}` : ""].filter(Boolean).join(" · ") || "—";
+        /* ⚠ 探不到时**只写「探不到」**，完整原因放进 title。
+         *   原来把整句原因（一句能有两行）直接印在表里，八行一模一样地铺开 ——
+         *   表格被一堵字墙占满，真正要看的「余额」那一列反而看不见了。 */
         const probe = r.probe
           ? (r.probe.known
             ? `<span class="mono">${int(r.probe.used)} / ${r.probe.limit != null ? int(r.probe.limit) : "—"}</span> <span class="dim">（上游报）</span>`
-            : `<span class="dim">探不到：${esc(String(r.probe.error || "原因不明"))}</span>`)
+            : `<span class="dim" title="${esc(String(r.probe.error || "原因不明"))}">探不到</span>`)
           : '<span class="dim">未探测</span>';
         const cost = r.cost
           ? (r.cost.known ? `<span class="mono">$${num(r.cost.total).toFixed(4)}</span>` : '<span class="dim">估不出</span>')

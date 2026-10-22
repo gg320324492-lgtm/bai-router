@@ -1097,29 +1097,99 @@
   /* ======================================================================
    * 9. 凭据视图：每家一行，按清单 credential.kind 分派
    * ==================================================================== */
+  /* 折叠态是**一行一家**：字母 + 名字 + 凭据类型徽章 + 状态药丸 + 箭头。
+     状态药丸必须住在这行里 —— 收起时也要一眼看出「哪家好了、哪家没配」，
+     坏消息不许藏在展开之后（原则：不藏坏消息）。
+     这一段是纯字符串函数（不碰 DOM），端到端测试可以直接在 vm 里求值它的产物，
+     断言的是**结构**而不是源码文本。 */
+  function credRowHtml(key) {
+    const P = MANIFEST[key] || {};
+    const C = P.credential || {};
+    return `
+      <div class="credhead" data-role="head" role="button" tabindex="0" aria-expanded="false" aria-controls="credbody-${esc(key)}">
+        <span class="cl">
+          <span class="letter" title="选中这一家">${esc(P.letter || "")}</span>
+          <span class="clname">${esc(nameOf(key))}</span>
+        </span>
+        <span class="kindbadge">${esc(C.label || "凭据")}</span>
+        <span class="credpill" data-role="pill"></span>
+        <span class="chev" aria-hidden="true">▸</span>
+        <span class="credwhy" data-role="why"></span>
+      </div>
+      <div class="credbody" data-role="body" id="credbody-${esc(key)}">
+        <div class="ck">
+          <span class="cpath">${esc(P.path || "本台交还区")}</span>
+          <span class="chint">${esc(C.hint || "")}</span>
+        </div>
+        <div class="cs" data-role="state"></div>
+        <div class="ca" data-role="act"></div>
+        <div class="crow" data-role="detail"></div>
+      </div>`;
+  }
+
+  /* 状态药丸：**全页唯一的一份**，措辞与颜色一律来自 credState（状态是数据，不是装饰）。
+     它画在折叠的那一行里，所以行内那块（data-role="state"）只留「证据」：
+     指纹、有效期、令牌文件 —— 那些要展开才看得懂的东西。 */
+  function credPillHtml(st) {
+    return `<span class="pill ${st.s}">${esc(st.txt)}</span>`;
+  }
+
+  /* 坏消息不许藏在收起的行后面：状态是 warn/err 时把**原因**也摆在头一行下面。
+     ok 的 detail 是「证据」（指纹 / 有效期），那属于展开后的那块，不摆在这儿；
+     idle（未配置）也不摆 —— 药丸本身已经写着「未配置」，再补一句凭据类型是噪声。 */
+  function credWhyHtml(st) {
+    if (!st) return "";
+    if (st.s !== "warn" && st.s !== "err") return "";
+    return st.detail ? esc(st.detail) : "";
+  }
+
+  /* 手风琴：同时只开一行。
+     为什么不是各自独立：这一屏要回答的是「哪家好了、哪家没配」，
+     开着的那一行就是「正在动的那一家」；多开几行又把页面撑回今天那么长
+     —— 那正是这次要治的病。 */
+  function toggleCredRow(row) {
+    const open = !row.classList.contains("open");
+    const box = $("credList");
+    if (!box) return;
+    for (const r of qa(".credrow", box)) {
+      const on = (r === row) && open;
+      r.classList.toggle("open", on);
+      const h = q(".credhead", r);
+      if (h) h.setAttribute("aria-expanded", String(on));
+    }
+  }
+
   function buildCredList() {
     const box = $("credList");
     if (!box) return;
     box.innerHTML = "";
     for (const key of ALL_KEYS) {
-      const P = MANIFEST[key] || {};
-      const C = P.credential || {};
       const row = document.createElement("div");
       row.className = "credrow";
       row.dataset.k = key;
-      row.innerHTML = `
-        <div class="cl">
-          <span class="letter">${esc(P.letter || "")}</span>
-          <div class="clname">${esc(nameOf(key))}<span class="cpath">${esc(P.path || "本台交还区")}</span></div>
-        </div>
-        <div class="ck"><span class="kindbadge">${esc(C.label || "凭据")}</span><span class="chint">${esc(C.hint || "")}</span></div>
-        <div class="cs"></div>
-        <div class="ca"></div>
-        <div class="crow" data-role="detail"></div>`;
-      q(".cs", row).setAttribute("data-role", "state");
-      q(".ca", row).setAttribute("data-role", "act");
-      q(".cl", row).addEventListener("click", () => selectChannel(key));
+      row.innerHTML = credRowHtml(key);
+      /* 字母徽章：点它仍然是「选中这一家」（旧行为，一字不改）。
+         名字 / 类型 / 状态 / 箭头那一行则是「展开这一家」—— 点名字是最自然的展开动作，
+         把它让给「选中」反而会让人以为点了没反应。 */
+      q(".letter", row).addEventListener("click", (e) => { e.stopPropagation(); selectChannel(key); });
+      const head = q(".credhead", row);
+      head.addEventListener("click", () => toggleCredRow(row));
+      head.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleCredRow(row); }
+      });
       box.appendChild(row);
+    }
+    /* 行内的按钮被点到时先把这一行展开：折叠状态下那些按钮是看不见的，
+       脚本直接点它们时用户看到的却是「什么都没发生」。
+       挂在**捕获**阶段，所以展开发生在按钮自己的处理函数之前。 */
+    if (!box.dataset.expandOnAct) {
+      box.dataset.expandOnAct = "1";
+      box.addEventListener("click", (e) => {
+        const btn = e.target && e.target.closest ? e.target.closest("[data-act]") : null;
+        if (!btn) return;
+        const r = btn.closest(".credrow");
+        if (r && !r.classList.contains("open")) toggleCredRow(r);
+      }, true);
     }
     paintCredList();
   }
@@ -1135,7 +1205,14 @@
       const st = credState(key);
       const stBox = q('[data-role="state"]', row);
       const act = q('[data-role="act"]', row);
+      const pillBox = q('[data-role="pill"]', row);
+      const whyBox = q('[data-role="why"]', row);
       clsx(row, key === selected, "sel");
+
+      /* 药丸画在**折叠的那一行**里（收起也看得见），措辞与颜色只来自 credState。
+         行内那块（data-role="state"）从此只放**证据**：指纹、有效期、令牌文件。 */
+      pillBox.innerHTML = credPillHtml(st);
+      whyBox.innerHTML = credWhyHtml(st);
 
       /* 凭据**不由用户填写**（自取型）：中转从本机的客户端登录态自取令牌。
        * 画成**只读**：没有输入框、没有「保存」——让用户去填一个用不上的密钥，
@@ -1147,22 +1224,19 @@
        * （kind 只决定"凭据视图给不给输入框"），顺序放错就会出现"声明了自取型却仍画输入框"。 */
       if (P.credentialReadonly && typeof P.credentialReadonly === "object") {
         const ro = P.credentialReadonly;
-        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
-          + (st.detail ? `<span class="fp zh">${esc(st.detail)}</span>` : "");
+        stBox.innerHTML = (st.detail ? `<span class="fp zh">${esc(st.detail)}</span>` : "");
         act.innerHTML = `<button class="btn sm" type="button" data-act="reread">${esc(ro.label || "重新读取登录态")}</button>`;
       } else if (kind === "apiKey") {
         const C = cfgOf(key);
         const shown = C.apiKey ? esc(fp(C.apiKey)) : "";
-        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
-          + (shown ? `<span class="fp mono">${shown}</span>` : "");
+        stBox.innerHTML = (shown ? `<span class="fp mono">${shown}</span>` : "");
         act.innerHTML = `<input type="password" class="keyinput" autocomplete="off" placeholder="${esc(C.hint || "")}" data-role="key">`
           + `<button class="btn sm" type="button" data-act="savekey">保存</button>`
           + `<button class="btn sm ghost" type="button" data-act="toggle">显示</button>`;
       } else if (kind === "jwt") {
         const S = stOf(key);
         const t = S.token || {};
-        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
-          + (S.edition ? `<span class="fp">版别 ${esc(S.edition)}</span>` : "")
+        stBox.innerHTML = (S.edition ? `<span class="fp">版别 ${esc(S.edition)}</span>` : "")
           + (t.expAt ? `<span class="fp">有效期至 ${esc(new Date(t.expAt).toLocaleDateString("zh-CN"))}</span>` : "");
         act.innerHTML = `<button class="btn sm primary" type="button" data-act="capture">一键获取令牌</button>`
           + `<button class="btn sm ghost" type="button" data-act="manual">手动填写</button>`;
@@ -1172,8 +1246,7 @@
         const t = S.token || {};
         /* 徽章走 credState：不能在这里写死"已读到令牌"——令牌文件还在 ≠ 还在用。
            客户端没找到时那是上一次运行留下的陈旧文件，写成"已读到"会与状态带矛盾。 */
-        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
-          + (st.detail ? `<span class="fp">${esc(st.detail)}</span>` : "")
+        stBox.innerHTML = (st.detail ? `<span class="fp">${esc(st.detail)}</span>` : "")
           + (p.found && p.tokenFresh === false ? '<span class="fp">客户端没开或没发过带鉴权的请求</span>' : "")
           + (t.tokenFile ? `<span class="fp">令牌文件：${esc(t.tokenFile)}</span>` : "");
         act.innerHTML = `<button class="btn sm primary" type="button" data-act="patch" ${p.ready ? "disabled" : ""}>一键装补丁</button>`
@@ -1181,16 +1254,15 @@
       } else if (kind === "keys3") {
         const t = (stOf(key).token) || {};
         const keys = Array.isArray(t.keys) ? t.keys : [];
-        stBox.innerHTML = `<span class="pill ${st.s}">${esc(st.txt)}</span>`
-          + (keys.length
-            ? `<span class="fp mono">${keys.map((k) => esc(k.fp) + (k.active ? " ◂ 在用" : "")).join(" · ")}</span>`
-            : `<span class="fp">一把都没有</span>`);
+        stBox.innerHTML = (keys.length
+          ? `<span class="fp mono">${keys.map((k) => esc(k.fp) + (k.active ? " ◂ 在用" : "")).join(" · ")}</span>`
+          : `<span class="fp">一把都没有</span>`);
         if (!q(".keybox", act)) {
           act.innerHTML = `<button class="btn sm" type="button" data-act="keys">编辑三把 key</button>`
             + `<button class="btn sm ghost" type="button" data-act="quota">刷新免费目录与额度</button>`;
         }
       } else {
-        stBox.innerHTML = `<span class="pill idle">不适用</span><span class="fp">不是本台渠道</span>`;
+        stBox.innerHTML = `<span class="fp">不是本台渠道</span>`;
         act.innerHTML = "";
       }
 
