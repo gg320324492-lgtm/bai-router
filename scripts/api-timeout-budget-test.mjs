@@ -318,6 +318,14 @@ const ENDPOINTS = {
     why: "checkClash→probeVia 的 execFile timeout 9000 与 checkCcSwitch 的 5000 并行，取 9000。" +
       "离前端默认 12 秒只剩 3 秒余量，但失败被 catch 吃掉、不会误报成「已停止」，故不改。",
   },
+  "POST /api/pricing/refresh": {
+    handler: ["POST", "/api/pricing/refresh"],
+    steps: [["fetchModelsDev"]],
+    nonBlocking: true,   // 例外**不是自封的**：由 handlerIsNonBlocking() 从源码验
+    why: "拉 models.dev 的 api.json（几 MB，20 秒封顶）。**POST 立刻回包、后台拉**，" +
+      "前端拿 started:true 之后轮 GET /api/pricing 看 refreshing 与结果 —— " +
+      "与 POST /api/test 同一套非阻塞范式。拉不到就继续用旧表，绝不清空费用。",
+  },
   "POST /api/models/probe-zen": {
     handler: ["POST", "/api/models/probe-zen"],
     steps: [["zenReadCatalog"], ["zenProbeSend"]],

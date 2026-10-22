@@ -44,8 +44,11 @@ import { selfStartTimeMs, verifyPidRecord, pidIdentityMessage, VERDICT_SAME } fr
 import {
   wbPoolOf, wbPickAccount, wbNoteFailure, wbNoteRefreshFailure, wbPoolStatus,
   wbPaidSameName, wbMappingRows, wbUnusableStatus, redact as redactWiring,
-  wbNoteSuccess,
+  wbNoteSuccess, wbAffinityEntries,
 } from "./wb-pool-wiring.mjs";
+/* 流量视图的数据源（traffic.mjs）：按天分桶 + 每家流量 + 会话亲和，纯逻辑、零 IO。
+ * ⚠ 它**不算钱** —— 钱要靠价格表，而价格表是「用户点了才更新」的那张。 */
+import { buildTraffic } from "./traffic.mjs";
 /* WorkBuddy 令牌的 JWT 声明解码（wb-token.mjs）：纯逻辑、零 IO。
  * 独立成文件是为了能**被测试直接 import**——server.mjs 一 import 就起服务，
  * 住在这里的解码器就成了「测了替身、没测本体」的重灾区（v1.0.76 漏 `* 1000`
@@ -145,7 +148,11 @@ import { discoverAccounts } from "./account-discovery.mjs";
  * 全局面板都从这里取 —— 「状态是数据，不是装饰」（docs/ui-redesign.md 原则 1）。 */
 import { channelState } from "./channel-state.mjs";
 /* 价格表（pricing.mjs）：token 数折成钱。⚠ 价格会漂移，表带快照日期。 */
-import { estimateCost, priceTable } from "./pricing.mjs";
+import { estimateCost, priceTable, tableFromModelsDev } from "./pricing.mjs";
+/* 价格表的「用户点了才更新」（pricing-refresh.mjs）：远端表 → 合格表 → 谁说了算。
+ * ⚠ **选表规则只有这一份**（chooseTable）—— 别在 server.mjs 里另写一份，
+ *   两套规则迟早漂移，而漂移的方向是「悄悄用错表」。 */
+import { chooseTable } from "./pricing-refresh.mjs";
 /* 配置备份（backup.mjs）：快照 → 加密导出 → 导入还原。magpie 的 internal/backup
  * 与 internal/settings（KeepOwn）移植版。
  * ⚠ 备份里**有**真实凭据（那正是它的用处），所以导出必须带口令加密、
@@ -6019,7 +6026,10 @@ function qdTokenRaw() {
       cost: (() => {
         try {
           const rows = loadUsageRows().filter((r) => String(r.provider || "") === k);
-          const c = estimateCost(rows, { now });
+          /* ⚠ 传**当前生效的那张表**（用户手动更新过就用远端那张）——
+           *   不传的话 estimateCost 一律用内置快照，用户点了「更新价格表」
+           *   却看不到费用变化，那按钮就等于没接。 */
+          const c = estimateCost(rows, { now, table: effectivePricingTable() });
           return { known: !!c.known, total: c.total, pricedAt: c.pricedAt, unknownModels: c.unknownModels };
         } catch { return { known: false, total: null, pricedAt: "", unknownModels: [] }; }
       })(),
@@ -6256,6 +6266,160 @@ async function applyCodePlugins(provider, tier, bodyObj, req) {
   const extraHeaders = {};
   for (const [k, v] of Object.entries(patch.headers || {})) extraHeaders[String(k).toLowerCase()] = String(v);
   return { ok: true, body: out, extraHeaders, removeHeaders: [] };
+}
+
+/* ---------- 价格表的「用户点了才更新」（pricing.mjs 的接线）----------
+ *
+ * ★ **绝不自动更新**：价格是漂移的（厂商随时调价）。自动更新会让
+ *   「今天我花了多少钱」这句话的**含义**在某天悄悄变掉，而用户是拿它
+ *   跟厂商账单对账的。所以更新必须是**用户点了才发生**的事。
+ *   拉到的表不合格、或比内置的那张还旧 → **继续用旧的**。
+ *   ⚠ 绝不许因为拉不到就把费用清空：清空了用户会以为「今天没花钱」。
+ *
+ * ⚠ 刷新是**非阻塞**范式：models.dev 的 api.json 有几 MB，拉一趟好几秒。
+ *   后端肯等、前端只肯等 12 秒 —— 阻塞式刷新会被掐断，还把一次**成功**
+ *   报成「读取超时」。所以 POST 立刻回包、后台拉、前端轮 GET 看结果
+ *   （与 POST /api/test、/api/models/scan-all 同一套做法）。
+ */
+/* ⚠ **可被环境变量改掉**（BAI_PRICING_URL）：只有测试需要它 ——
+ *   实测 models.dev 的 api.json 有 **6 MB**，测试不该真去拉它（既慢又不确定）。
+ *   生产环境没人会设这个变量；设了也只是「从哪儿取价格表」变了。
+ *   照 BAI_WB_AUTH_DIR 的先例：环境变量只用来指位置，不用来改行为。 */
+const MODELS_DEV_URL = String(process.env.BAI_PRICING_URL || "https://models.dev/api.json");
+/** 拉 models.dev 的超时（6 MB，给 30 秒；超了算「探不到」，继续用旧表）。 */
+const PRICING_FETCH_TIMEOUT_MS = 30000;
+/** 上一次刷新的结果 —— 面板要看得见「刚才那次拉失败 Why」。 */
+const pricingState = { refreshing: false, lastError: "", lastRefreshedAt: 0 };
+
+/** 远端表落在哪儿（数据目录下，不进仓库）。 */
+function pricingTablePath() { return path.join(DATA_DIR, "pricing-table.json"); }
+
+/** 读远端表（**原样**读，校验交给 chooseTable —— 那边是唯一的判据）。 */
+function loadPricingOverrideRaw() {
+  try {
+    const p = pricingTablePath();
+    if (!existsSync(p)) return null;
+    return JSON.parse(readFileSync(p, "utf8"));
+  } catch { return null; }
+}
+
+function savePricingOverride(table) {
+  writeFileSync(pricingTablePath(), JSON.stringify(table, null, 2), "utf8");
+}
+
+/**
+ * 当前生效的那张表（连同它是哪一张、为什么是它）。
+ *
+ * ⚠ **选表规则只有一份**：`pricing-refresh.mjs` 的 `chooseTable`。
+ *   早先这里自己写了一份「远端合格且不比内置的旧就用远端」——两套规则迟早漂移，
+ *   而漂移的方向是「悄悄用错表」，那种错**面板上看不出来**。
+ *
+ * ⚠ **表与「它是谁」必须一起返回**：早先这里返回表、别处再单独判断「是不是远端那张」，
+ *   而那是拿**对象身份**比的（`table === remote`）—— 两次读盘拿到的是两个不同的
+ *   对象实例，身份永远不相等 → 明明已经换成远端表，来源却报「builtin」。
+ *   症状：用户点了「更新价格表」、文件也真写了，但面板上写「还是内置快照」。
+ *
+ * ⚠ **读盘有缓存**：估价在请求路径上，每请求读一次盘是白花的 IO。
+ *   30 秒一次足够（价格表是用户手动更新的，不会有秒级变化）。
+ */
+const pricingCache = { at: 0, raw: null };
+function effectivePricing() {
+  const builtin = priceTable();
+  const now = Date.now();
+  if (now - pricingCache.at > 30000 || pricingCache.raw === null) {
+    pricingCache.at = now;
+    pricingCache.raw = loadPricingOverrideRaw();
+  }
+  const remote = pricingCache.raw;
+  if (!remote) return { table: builtin, source: "builtin", reason: "还没更新过，用的是内置快照" };
+  const r = chooseTable(remote, { current: builtin, currentSource: "builtin" });
+  return { table: r.table, source: r.source, reason: r.reason };
+}
+
+/** 只要表（估价与面板都用它）。 */
+function effectivePricingTable() { return effectivePricing().table; }
+
+/** 拉 models.dev 的 api.json（只读 GET；超时算「探不到」）。 */
+async function fetchModelsDev() {
+  const r = await fetch(MODELS_DEV_URL, {
+    headers: { "user-agent": "bai-router-pricing", accept: "application/json" },
+    signal: AbortSignal.timeout(PRICING_FETCH_TIMEOUT_MS),
+  });
+  if (!r.ok) throw new Error(`models.dev 回 HTTP ${r.status}`);
+  return await r.json();
+}
+
+/** 跑一次刷新（后台）。失败只记 `lastError`，**绝不改表**。 */
+async function refreshPricingNow() {
+  pricingState.refreshing = true;
+  pricingState.lastError = "";
+  try {
+    const raw = await fetchModelsDev();
+    const today = new Date().toISOString().slice(0, 10);
+    const built = tableFromModelsDev(raw, undefined, today);
+    const v = normalizeTable(built);
+    if (!v.ok) {
+      pricingState.lastError = `拉回来的表不合格：${v.reason} —— 继续用旧的那张`;
+      return { ok: false, reason: pricingState.lastError };
+    }
+    savePricingOverride(v.table);
+    pricingState.lastRefreshedAt = Date.now();
+    pricingState.lastError = "";
+    return { ok: true, pricedAt: v.table.pricedAt };
+  } catch (e) {
+    pricingState.lastError = `拉不到价格表：${String((e && e.message) || e)} —— 继续用旧的那张`;
+    return { ok: false, reason: pricingState.lastError };
+  } finally {
+    pricingState.refreshing = false;
+  }
+}
+
+/** 给面板看的这张表：条目、快照日期与陈旧程度。 */
+function pricingOverview(now) {
+  const eff = effectivePricing();
+  const table = eff.table;
+  const builtin = priceTable();
+  const source = eff.source;
+  const pricedAt = String(table.pricedAt || "");
+  let ageDays = null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(pricedAt)) {
+    ageDays = Math.max(0, Math.round((now - Date.parse(`${pricedAt}T00:00:00Z`)) / 86400000));
+  }
+  /* ⚠ 条目的四个通道叫 **input / output / cacheRead / cacheWrite**（pricing.mjs 的
+   *   口径），不是 models.dev 那边的 prompt / completion —— 写错了面板上四个价全是
+   *   null，而「null」在一张价格表里意味着「不知道」，用户会以为这家免费。 */
+  const entries = Object.entries(table.entries || {}).map(([key, e]) => {
+    const ch = String(key).split("/")[0];
+    const model = String(key).split("/").slice(1).join("/");
+    return {
+      key,
+      name: `${PROVIDERS[ch] || ch} · ${model}`,
+      input: e && e.input != null ? e.input : null,
+      output: e && e.output != null ? e.output : null,
+      cacheRead: e && e.cacheRead != null ? e.cacheRead : null,
+      cacheWrite: e && e.cacheWrite != null ? e.cacheWrite : null,
+    };
+  });
+  return {
+    pricedAt,
+    currency: table.currency || "USD",
+    unit: table.unit || "perMillion",
+    source,
+    ageDays,
+    stale: ageDays != null ? ageDays > 30 : false,
+    builtinPricedAt: String(builtin.pricedAt || ""),
+    entries,
+    /* ⚠ 远端表**少了哪几个**：models.dev 上一款模型没有了，那款就成了「估不出」
+     *   （费用显示「—」而不是 0）。这会让用户的「今天花了多少钱」忽然变成未知 ——
+     *   所以要把这件事**摆出来**，而不是让用户自己发现费用那一格空了。
+     *   数量少的时候更要说明白：那是源上真的没有了，不是我们弄丢了。 */
+    dropped: source === "remote"
+      ? Object.keys(builtin.entries || {}).filter((k) => !(k in (table.entries || {})))
+      : [],
+    refreshing: pricingState.refreshing,
+    lastError: pricingState.lastError || "",
+    lastRefreshedAt: pricingState.lastRefreshedAt || 0,
+  };
 }
 
 function orderChain(providers, now) {
@@ -9852,11 +10016,61 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const channels = keys.map((k) => channelState(k, ctx));
       return json(res, 200, { ok: true, channels, at: now });
     }
+    /* ---------- 价格表：读当前这张 + 用户点了才更新 ---------- */
+    if (req.method === "GET" && u.pathname === "/api/traffic") {
+      /* 「流量」视图的数据源（traffic.mjs 的纯逻辑）。
+       * ⚠ **费用由调用方算**：traffic.mjs 只管 token 维度，钱要靠价格表 ——
+       *   而价格表是「用户点了才更新」的那张（effectivePricingTable）。
+       *   估不出就是 null（**不是 0**）：一个错数字比没有数字更坏，
+       *   用户要拿它跟厂商账单对账。 */
+      const days = Math.min(365, Math.max(1, Number(u.searchParams.get("days")) || 30));
+      const now = Date.now();
+      const rows = loadUsageRows();
+      const table = effectivePricingTable();
+      const costOf = (recs) => {
+        try {
+          const e = estimateCost(recs, { now, table });
+          return e.known ? e.total : null;
+        } catch { return null; }
+      };
+      /* 亲和表是**按渠道**存的（wb / wbai 各一份），traffic.mjs 要的是按渠道分组的形状。 */
+      const affinity = [];
+      for (const p of allChannelKeys()) {
+        try {
+          const entries = wbAffinityEntries(p);
+          if (entries && entries.length) affinity.push({ channel: p, entries });
+        } catch { /* 这一家没有亲和表（大多数渠道都没有）——跳过，不影响别的 */ }
+      }
+      let t = null;
+      try {
+        t = buildTraffic(rows, { nowMs: now, days, costOf, affinity });
+      } catch (e) {
+        return json(res, 500, { error: "读流量失败：" + String((e && e.message) || e) });
+      }
+      return json(res, 200, { ok: true, days, at: now, ...t });
+    }
+    if (req.method === "GET" && u.pathname === "/api/pricing") {
+      try {
+        return json(res, 200, { ok: true, ...pricingOverview(Date.now()) });
+      } catch (e) {
+        return json(res, 500, { error: "读价格表失败：" + String((e && e.message) || e) });
+      }
+    }
+    if (req.method === "POST" && u.pathname === "/api/pricing/refresh") {
+      /* ⚠ **非阻塞**：立刻回包，刷新在后台跑。
+       *   理由（与 POST /api/test 同一套）：models.dev 的 api.json 有几 MB，
+       *   拉一趟好几秒；阻塞式的前端 12 秒预算会把一次**成功**报成「读取超时」。
+       *   前端拿 started:true 之后轮 GET /api/pricing 看 refreshing 与结果。 */
+      if (pricingState.refreshing) {
+        return json(res, 200, { ok: true, started: false, reason: "已经在刷了，等它跑完" });
+      }
+      void refreshPricingNow();
+      return json(res, 200, { ok: true, started: true });
+    }
     if (req.method === "GET" && u.pathname === "/api/quota/overview") {
       /* 「额度」视图的数据源：预算（用户设的，被动）+ 上游余额（真探测）。
        * ⚠ 探测是**异步**的（要发请求），而面板每 5 秒轮询一次 ——
-       *   所以探测结果在服务端缓存 5 分钟（见 probeQuotaOf），不让面板把上游打爆。 */
-      const cfg = loadCfg();
+       *   所以探测结果在服务端缓存 5 分钟（见 probeQuotaOf），不让面板把上游打爆。 */      const cfg = loadCfg();
       const now = Date.now();
       let rows = [];
       try {
@@ -10120,7 +10334,8 @@ async function unknownMappingTargets(p, mapping, cfg) {
        * ⚠ **估不出来就是 null**（不是 0）—— 一个错数字比没有数字更坏：
        *   用户会拿它跟厂商账单对账。估不出的模型列在 unknownModels 里。 */
       const cost = (() => {
-        try { return estimateCost(rows, { now: Date.now() }); } catch { return null; }
+        /* 同上：传当前生效的那张表（用户更新过就用远端那张）。 */
+        try { return estimateCost(rows, { now: Date.now(), table: effectivePricingTable() }); } catch { return null; }
       })();
       const totals2 = {
         ...totals,
