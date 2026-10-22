@@ -122,6 +122,9 @@ import { tierOfModel, tierKeyFor } from "./gateway-failover.mjs";
 import { createAudit } from "./audit.mjs";
 /* 配额预算（quota.mjs）：用户设上限 + 账本里的 token → 超了主动休息。 */
 import { quotaState, budgetOf, budgetRestDecision, applyQuotaToSeat, applyProbeToSeat } from "./quota.mjs";
+/* 代码插件运行时（pluginrt.mjs）：用户自己写的 JS，跑在**子进程**里，
+ * 有权限模型与超时封顶。与 middleware（声明式 JSON）分工不同，见下面的接线注释。 */
+import { createRuntime, PLUGINRT_DIRNAME } from "./pluginrt.mjs";
 /* middleware 插件（middleware.mjs）：声明式的请求/应答改写。
  * ⚠ **只做数据不做代码** —— magpie 的中间件是真 JS（跑在网关进程里，能读能写能发网络请求）。
  *   能跑任意代码的分发物是另一个量级的风险（要另配沙箱、权限模型、审计）；
@@ -1191,6 +1194,12 @@ function onActivated() {
   // 额度探测循环：把「上游自己报的余额」喂进缓存，供转移链的排序读
   // （那条路是同步的，只能读缓存；缓存没人喂，排序就永远拿不到信号）。
   try { startQuotaProbeLoop(); } catch (e) { log(`额度探测循环没起来：${String((e && e.message) || e)}`); }
+  /* 代码插件：把根目录下的那些装上。
+   * ⚠ **不 await**：装插件要起子进程（每个插件一个），卡住启动不划算 ——
+   *   装不上/装得慢的插件，用户在面板上点「重载」就能看到结果。 */
+  void reloadCodePlugins().catch((e) => {
+    try { log(`代码插件装载出错：${String((e && e.message) || e)}`); } catch { }
+  });
 }
 
 // ---------- 中转服务 ----------
@@ -6122,6 +6131,133 @@ function applyMiddleware(provider, tier, bodyObj, req, sliceCfg) {
   return { ok: true, body: out, extraHeaders, removeHeaders, applied };
 }
 
+/* ---------- 代码插件运行时（pluginrt.mjs 的接线）----------
+ *
+ * 与 middleware 的分工（两条都改请求，但**可信度与代价**不同）：
+ *   · middleware（middleware.mjs）—— **声明式**：一份 JSON 描述「改什么」，
+ *     跑在**宿主进程里**，不碰用户代码。改坏了也只是改坏了一条规则。
+ *   · 代码插件（pluginrt.mjs）—— **真代码**：用户自己写的 JS，跑在**子进程**里，
+ *     有 Node 的权限模型（--permission）、有超时封顶、有令牌（插件伪造不了协议消息）。
+ *     代价是每个请求多一次进程间往返。
+ *
+ * ⚠⚠ **端点名字不许撞**：面板里早就有的 `/api/plugins` 与 `/api/plugins/reload`
+ *   指的是「**插件渠道**」（声明式地加一家上游渠道，见 cards/plugins.js），
+ *   与代码插件是两回事。所以代码插件一律用 `/api/code-plugins*`。
+ *
+ * ⚠ **插件出错不许连累用户的正常请求**（onError:"pass"）：一个写坏的插件
+ *   挡住所有请求，比插件坏掉本身还糟。真要「插件说了算」（拒绝请求），
+ *   那是插件**明确 deny** —— 那是它的本分，走 deny 那条路。
+ */
+let codePluginRuntime = null;
+let codePluginCount = 0;
+/** 装不上的插件与原因（面板要能看到「为什么没装上」，而不只是一句「加载失败」）。 */
+const codePluginErrors = [];
+
+/** 代码插件的根目录（相对数据目录）。 */
+function codePluginDir() { return path.join(DATA_DIR, PLUGINRT_DIRNAME); }
+
+async function ensureCodePluginRuntime() {
+  if (codePluginRuntime) return codePluginRuntime;
+  codePluginRuntime = createRuntime({
+    /* 时刻一律由宿主给（插件不许自己取时钟，它在子进程里，取到的是另一台机器的钟）。 */
+    now: () => Date.now(),
+    /* 宿主给插件的**超时封顶**：清单里写的只能比它小。 */
+    timeoutMs: 2000,
+    /* fail open：插件失灵 → 这次请求照常发。挡住所有请求比插件坏掉更糟。 */
+    onError: "pass",
+    rootDir: codePluginDir(),
+    log: (e) => { try { log(`代码插件 ${e.pluginId || "?"}：${e.message}`); } catch { } },
+  });
+  return codePluginRuntime;
+}
+
+/**
+ * 装上（或重装）代码插件根目录下的所有插件。
+ *
+ * ⚠⚠ **两次重载必须串行**：装插件是**异步**的（要起子进程、等 init 回来）。
+ *   两个重载同时跑时，先跑的那个可能在后跑的 close() **之后**才把插件登记进去，
+ *   于是后跑的那个撞上「插件已经装上了：先 remove 再装」。
+ *   症状：用户点两下「重载」，第二个说装不上 —— 而插件其实装好了。
+ *   （启动时那次自动装载与用户手动点「重载」正好撞上，最容易触发。）
+ */
+let codePluginReloadChain = Promise.resolve();
+
+function reloadCodePlugins() {
+  const run = async () => {
+    const rt = await ensureCodePluginRuntime();
+    rt.close();                     // 重载 = 把旧的停掉重来一遍
+    codePluginErrors.length = 0;
+    let r = null;
+    try { r = await rt.installFromDir(codePluginDir()); }
+    catch (e) {
+      r = { installed: [], errors: [{ dir: "", errors: [{ field: "", message: String((e && e.message) || e) }] }] };
+    }
+    codePluginCount = (r.installed || []).length;
+    for (const e of r.errors || []) {
+      codePluginErrors.push({ dir: e.dir, message: (e.errors || []).map((x) => x.message).join("；") });
+    }
+    return { installed: r.installed || [], errors: r.errors || [] };
+  };
+  /* 串行化：前一个失败也要让后一个照跑（then(run, run)）。 */
+  codePluginReloadChain = codePluginReloadChain.then(run, run);
+  return codePluginReloadChain;
+}
+
+/**
+ * 让代码插件过一遍这一次尝试。
+ *
+ * ⚠ **顺序在 middleware 之后**：声明式规则在前（便宜、用户自己写的），
+ *   代码插件看到的是改写后的请求 —— 它要改的话改的是最终形状。
+ *
+ * @returns {Promise<{ok:boolean, body?:object, extraHeaders?:object,
+ *                    denied?:boolean, reason?:string, note?:string}>}
+ */
+async function applyCodePlugins(provider, tier, bodyObj, req) {
+  /* ⚠ 一个插件都没有 → **立刻返回**，一个字都不做。
+   *   这条在请求路径上：绝大多数用户根本没装代码插件，
+   *   不许为「不存在的东西」付一次进程间往返。 */
+  if (!codePluginCount) return { ok: true };
+  const rt = codePluginRuntime;
+  if (!rt) return { ok: true };
+  const src = bodyObj && typeof bodyObj === "object" ? bodyObj : {};
+  const params = {};
+  for (const k of MW_PARAMS) if (src[k] !== undefined) params[k] = src[k];
+  let r = null;
+  try {
+    /* 交给运行时去**摘要**（凭据类的头名与参数键在那边就被剔掉了 ——
+     * 插件拿到的是「有哪些头」，不是「头是什么」）。 */
+    r = await rt.apply({
+      channel: String(provider || ""),
+      tier: String(tier || ""),
+      model: String(src.model || ""),
+      protocol: "anthropic",
+      path: String((req && req.url) || "").split("?")[0],
+      stream: !!src.stream,
+      headers: (req && req.headers) || {},
+      params,
+    });
+  } catch (e) {
+    /* 运行时自己炸了（不该发生：它内部都兜住了）→ 放行。 */
+    return { ok: true, note: String((e && e.message) || e) };
+  }
+  if (!r || !r.ok) {
+    /* 插件失灵：onError:"pass" 时运行时会自己跳过；走到这里说明决策不合法，
+     * 那就当这个插件不存在，放行 —— 但把原因记下来（面板上要看得见）。 */
+    return { ok: true, note: (r && r.error && r.error.message) || "插件返回了不合法的东西" };
+  }
+  if (r.action === "deny") {
+    return { ok: false, denied: true, reason: String(r.reason || "代码插件拒绝了这次请求（没给原因）。") };
+  }
+  if (r.action !== "modify" || !r.patch) return { ok: true };
+  const out = { ...src };
+  const patch = r.patch || {};
+  if (patch.model) out.model = String(patch.model);
+  for (const [k, v] of Object.entries(patch.params || {})) out[k] = v;
+  const extraHeaders = {};
+  for (const [k, v] of Object.entries(patch.headers || {})) extraHeaders[String(k).toLowerCase()] = String(v);
+  return { ok: true, body: out, extraHeaders, removeHeaders: [] };
+}
+
 function orderChain(providers, now) {
   const list = (providers || []).filter(Boolean);
   if (list.length < 2) return list;
@@ -6256,6 +6392,25 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
         extraHeaders: mw.extraHeaders || {}, removeHeaders: mw.removeHeaders || [],
       };
     }
+    /* 代码插件：在 middleware 之后过一遍。
+     * ⚠ **deny 是策略决定，不是这一家坏了** → 整个请求就地结束，
+     *   不去试下一家（试下一家等于绕过插件的策略）。 */
+    const cp = await applyCodePlugins(fo.provider, tier0, mwRewritten, req);
+    if (cp.denied) {
+      return wbAnthroError(res, 403, `代码插件拒绝了这次请求：${cp.reason}`);
+    }
+    if (cp.body) {
+      mwRewritten = cp.body;
+      mwBody = Buffer.from(JSON.stringify(cp.body));
+    }
+    if (cp.extraHeaders && Object.keys(cp.extraHeaders).length) {
+      req[MIDDLEWARE_CTX] = {
+        ...(req[MIDDLEWARE_CTX] || {}),
+        provider: fo.provider, tier: tier0, model: String((mwRewritten || {}).model || ""),
+        extraHeaders: { ...((req[MIDDLEWARE_CTX] || {}).extraHeaders || {}), ...cp.extraHeaders },
+        removeHeaders: (req[MIDDLEWARE_CTX] || {}).removeHeaders || [],
+      };
+    }
     const g = await dispatchGated(fo.provider, fo, req, res, cfg, mwBody, mwRewritten, isProbe,
       () => dispatchOne(fo, req, res, cfg, mwBody, mwRewritten, isProbe));
     if (g.gated) { gatedError(res, g.reason, g.retryAfterSec); return; }
@@ -6339,6 +6494,26 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
         ...(req[MIDDLEWARE_CTX] || {}),
         provider, tier: tier0, model: String((sub.rewritten || {}).model || ""),
         extraHeaders: mw.extraHeaders || {}, removeHeaders: mw.removeHeaders || [],
+      };
+    }
+    /* 代码插件：在 middleware 之后过一遍（每个目标家各过一次 —— 改写必须
+     * 发生在 bodyFor 之后，理由与 middleware 那条一样）。
+     * ⚠ **deny 就地结束整个请求**：不去试下一家 —— 换一家等于绕过插件的策略。 */
+    const cp = await applyCodePlugins(provider, tier0, sub.rewritten, req);
+    if (cp.denied) {
+      tries.push({ provider, skipped: "代码插件拒绝" });
+      return wbAnthroError(res, 403, `代码插件拒绝了这次请求：${cp.reason}`);
+    }
+    if (cp.body) {
+      sub.rewritten = cp.body;
+      sub.body = Buffer.from(JSON.stringify(cp.body));
+    }
+    if (cp.extraHeaders && Object.keys(cp.extraHeaders).length) {
+      req[MIDDLEWARE_CTX] = {
+        ...(req[MIDDLEWARE_CTX] || {}),
+        provider, tier: tier0, model: String((sub.rewritten || {}).model || ""),
+        extraHeaders: { ...((req[MIDDLEWARE_CTX] || {}).extraHeaders || {}), ...cp.extraHeaders },
+        removeHeaders: (req[MIDDLEWARE_CTX] || {}).removeHeaders || [],
       };
     }
     /* 这次尝试的用量出口。上游报出来的 token 数会写进来，账本据此记账。
@@ -9759,6 +9934,34 @@ async function unknownMappingTargets(p, mapping, cfg) {
     if (req.method === "POST" && u.pathname === "/api/middleware/reload") {
       const n = loadMiddleware();
       return json(res, 200, { ok: true, loaded: n, errors: middlewareErrors });
+    }
+    /* ---------- 代码插件（pluginrt）----------
+     * ⚠ 路径是 `/api/code-plugins*`，**不是** `/api/plugins*` ——
+     *   后者是「插件渠道」（声明式加一家上游渠道），与代码插件是两回事。 */
+    if (req.method === "GET" && u.pathname === "/api/code-plugins") {
+      const rt = codePluginRuntime;
+      return json(res, 200, {
+        ok: true,
+        dir: codePluginDir(),
+        list: rt ? rt.list() : [],
+        errors: codePluginErrors,
+        /* 这一格是给人看的实话：没装插件就一个都不许显示成「装好了」。 */
+        count: codePluginCount,
+      });
+    }
+    if (req.method === "POST" && u.pathname === "/api/code-plugins/reload") {
+      const r = await reloadCodePlugins();
+      return json(res, 200, { ok: true, installed: r.installed, errors: r.errors });
+    }
+    if (req.method === "POST" && u.pathname === "/api/code-plugins/remove") {
+      const b = await readBody(req);
+      const id = String(b.id || "").trim();
+      const rt = await ensureCodePluginRuntime();
+      const gone = rt.remove(id);
+      codePluginCount = rt.list().length;
+      return json(res, gone ? 200 : 404, gone
+        ? { ok: true, removed: id }
+        : { error: `没有装着的代码插件「${id}」` });
     }
     if (req.method === "POST" && u.pathname === "/api/plugins/credential") {
       const b = await readBody(req);

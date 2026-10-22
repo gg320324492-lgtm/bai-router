@@ -25,13 +25,13 @@ magpie 是 10.3 万行 Go、5661 个文件。它自己的历史是首周每天 2
 | T5 | **协议矩阵补全**：Responses / Gemini + 桥换 IR | ✅ 完成（两个协议入口已接进网关，活体用例覆盖流式/非流式/Gemini） | `internal/gateway/{responses,gemini}.go` |
 | T6 | **会话身份与亲和**（通用层） | ✅ 完成（`session-id.mjs` + `session-store.mjs`，持久化） | `internal/gateway/sessionHeaders` |
 | T7 | **用量账本** `usage.jsonl` + 面板 | ✅ 完成（`usage-ledger.mjs` + `usage-writer.mjs` + token 扫描） | `internal/usage/` |
-| T8 | **账号发现改读登录态**（替代 hook 注入） | ⬜ 未开始 | `internal/provider/account.go` |
-| T9 | **配额探测与配额感知路由** | ⬜ 未开始 | `internal/provider/quotas.go` |
+| T8 | **账号发现改读登录态**（替代 hook 注入） | ✅ 完成（`account-discovery.mjs` + `GET /api/accounts` + 面板「账号」卡） | `internal/provider/account.go` |
+| T9 | **配额探测与配额感知路由** | ✅ 完成（`quota-probe.mjs` 真探测 + `quota.mjs` 预算 + **上游真报的余额接进转移链排序** + 面板「额度」屏） | `internal/provider/quotas.go` |
 | T10 | **脱敏与审计台账** | ✅ 完成（`redact.mjs` + `audit.mjs`，已接进转移链与面板） | `internal/redact/`、`internal/maskrec/` |
-| T11 | **插件体系**（声明式 provider/agent/middleware） | 🟡 **provider 插件已完成**（一份 JSON 加一家渠道）；agent / middleware 插件未做 | `internal/pluginrt/`、`internal/plugin/` |
+| T11 | **插件体系**（声明式 provider/agent/middleware） | 🟡 provider 插件 ✅、middleware ✅（`middleware.mjs`，声明式改写）；**代码插件运行时**（`pluginrt.mjs`，子进程 + 权限模型 + 超时封顶）已接线，待子进程与用例交付 | `internal/pluginrt/`、`internal/plugin/` |
 | T12 | **并发 / RPM 限流通道** | ✅ 完成（`concurrency.mjs` + `rpm.mjs`，**默认不限**，面板可开） | `internal/gateway/{concurrency,rpm}.go` |
-| T13 | **配置同步备份**（WebDAV/S3/GitHub）+ KeepOwn | 🟡 本地备份已接线；**远端同步待接线**（要远端目标与凭据 UI） | `internal/backup/`、`internal/davsync/` |
-| T14 | **面板改版**（插槽制 + 多页） | ⬜ 未开始 | `internal/gui/assets/kernel.js` |
+| T13 | **配置同步备份**（WebDAV/S3/GitHub）+ KeepOwn | ✅ 完成（本地目录 / WebDAV / GitHub 三种目标都已接进真实链路，口令加密、不静默覆盖） | `internal/backup/`、`internal/davsync/` |
+| T14 | **面板改版**（插槽制 + 多页） | 🟡 P0–P2 ✅（额度屏 / 状态计算层 / 共享组件库 / 热力图 / 状态条）；**P3 渠道主从**在做 | `internal/gui/assets/kernel.js` |
 
 ---
 
@@ -184,6 +184,53 @@ magpie 只能靠「像不像备份」的启发式区分「不是备份」与「�
 
 **还没接线的**：T13 的**远端同步**（WebDAV / GitHub）—— 模块（`sync.mjs`）已就位且
 84 条断言全绿，但接线要远端目标与凭据的 UI，本轮没做。本地备份已接线并有活体用例。
+
+---
+
+## 2026-10-22 晚 · T8 / T9 / T14 一轮 + 两条真问题
+
+这一轮并行跑了三个 agent（账号发现 / 价格表 / 渠道状态层 + 面板接线），
+另有两个 agent 分别做「代码插件运行时」与「面板 P3 渠道主从」。
+
+**① 查表要「逐级降级」，不许只认精确档位名**（真问题，用户侧真实影响）
+
+客户端（Claude Code）送来的模型 id 带**小版本号**：`claude-sonnet-5-5`、
+`claude-opus-5-5`；而映射表的 key 是**档位名**：`claude-sonnet-5`、`claude-opus-5`。
+差最后一段就查不到 → **静默回落到本渠道默认模型** → 用户点 opus、跑的是默认那个。
+实测中转日志里 `claude-sonnet-5-5` 回落过 41 次、`claude-opus-5-5` 7 次，
+只有 haiku 侥幸对得上（`claude-haiku-4-5` 恰好逐字等于档位名）。
+
+修法**不是**把映射表的 key 改成带小版本的写法（小版本会继续涨：5-5 → 5-6 → 6-0，
+下次又对不上），而是**查表时逐级降级**：先精确，再去日期后缀，再去小版本。
+`server.mjs` 的 `resolveModelTarget` 与 `gateway-failover.mjs` 的 `tierKeyFor`
+**必须用同一套降级序列** —— 一边认得、另一边不认，就会出现「查表认得、转移不认」
+的鬼故事（档位在入口解析对了，转移时又当成不知道的模型名）。
+
+顺带修掉一个**优先级漂移**：降级最初写成「每一级里先查映射表再查清单」，
+那会让**清单里的一条**（比如上游目录里正好有 `claude-opus-5-20251001`）
+压过**用户在映射表里写死的对应关系**。降级前后的语义必须是「映射表整体优先于清单」。
+
+**② 探测缓存那张「5 分钟」当时是写在注释里、没生效的**
+
+`probeCache` 原来写成 `{ at: 0, map }`，而 `at` **从来没被赋过值** →
+`now - probeCache.at` 恒等于 now → **缓存永远不命中** → 面板每 5 秒轮询一次
+「额度」屏，就把八家上游各打一遍。现在逐条记时刻（谁先探到谁先过期）。
+
+**③ 价格表的更新策略：不自动更新**（一条决定，不是疏漏）
+
+价格是**漂移**的：厂商随时调价。所以价格表**必须**带快照日期（当前 2026-10-22），
+面板要能显示「单价表是哪天的快照」。自动更新看着省事，实际后果是
+「今天我花了多少钱」这句话的**含义**会在某天悄悄变掉 —— 而用户是拿它跟厂商账单
+对账的。所以：`pricing.mjs` 是**纯逻辑、零联网**的（远端表由调用方显式拉来后
+经 `fromModelsDev` 翻成同一张表），更新必须是**用户点了才发生**的事。
+
+**④ 探不到 ≠ 0，也 ≠ 100**
+
+上游真报的余额折进转移链的排序时，「探不到」必须**一个字节都不改**：
+当成 0% → 那家显得「额度富余」被排到最前（真相可能是欠费了）；
+当成 100% → 一家好渠道因为网络不通被踢到最后。**没有信号就是没有信号。**
+同理，额度用完的那家**留在候选里**、只是排到最后 —— 直接踢掉的话，
+「所有渠道都冷却」会变成「没有渠道」，用户看到的是一句没有出处的失败。
 
 ---
 
