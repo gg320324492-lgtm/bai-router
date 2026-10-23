@@ -59,7 +59,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getPath, setPath, delPath } from "../edit-json.mjs";
+import { getPath, setPath, delPath, splitPath } from "../edit-json.mjs";
 
 /* ------------------------------------------------------------------ *
  * 格式读写器
@@ -76,7 +76,16 @@ import { getPath, setPath, delPath } from "../edit-json.mjs";
  * 没注册的格式 ⇒ 接到那个客户端时**如实报「这个格式还没接上」**，不猜、不崩。
  */
 const FORMATS = {
-  json: { getPath, setPath, delPath },
+  /* ⚠ `splitPath` 不是可有可无的：**键里可以带点**（有的客户端把模型 id 当表名，
+   *   而模型 id 形如 `sn/glm-5.2` —— 带点）。用 `p.split(".")` 切，
+   *   `models."sn/glm-5.2".provider` 会被切成
+   *   `["models", "\"sn/glm-5", "2\"", "provider"]` ⇒ 中间那个「父路径」引号不闭合
+   *   ⇒ 取值时抛错 ⇒ **整个客户端接不上**，而且报的还是「键路径里有没闭合的引号」，
+   *   看不出真因。
+   *   ⇒ 用**格式自己的**分路径器（edit-json.mjs 的 splitPath 支持反斜杠转义；
+   *   TOML/YAML 用 clients/paths.mjs 的 splitPathParts，支持引号段；
+   *   dotenv 是单段，不需要）。 */
+  json: { getPath, setPath, delPath, splitPath },
 };
 
 /**
@@ -226,7 +235,10 @@ export function applyClient(def, ctx, opts = {}) {
        *   那个空壳是我们留下的痕迹 —— 断开时必须连它一起收掉，否则用户的文件
        *   里多出一个 `{}`（他原来可能压根没有 `providers` 这一节）。
        *   记下父路径的原值 ⇒ 还原时能**精确**复原：原来有就留着，原来没有就删掉。 */
-      const parts = p.split(".");
+      /* ⚠ 分路径**必须用格式自己的**分路径器**（见 FORMATS 那段注释）：
+       *   键里可以带点（模型 id 当表名），`p.split(".")` 会把引号段切坏，
+       *   算出来的「父路径」不合法 ⇒ 还原时抛错 ⇒ 整个客户端接不上。 */
+      const parts = typeof fmt.splitPath === "function" ? fmt.splitPath(p) : p.split(".");
       for (let k = parts.length - 1; k >= 1; k--) {
         const pp = parts.slice(0, k).join(".");
         if (parents.some((x) => x.path === pp)) continue;

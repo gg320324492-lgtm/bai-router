@@ -278,6 +278,66 @@ describe("④b 装没装：看目录，不只看那个配置文件在不在", ()
 });
 
 /* ====================================================================== *
+ * ④c 键里带点（模型 id 当表名）—— 路径的转义语法随格式而变
+ * ====================================================================== */
+describe("④c 键里带点：写进去的是一个键，还原得逐字相同", () => {
+  /* ⚠ **键里可以带点**：有的客户端把模型 id 当表名（`models."bai/wb/glm-5.2"`），
+   *   而本仓档位目录里就有 `glm-5.2` / `deepseek-v4.1-flash` / `qwen3.8-flash`
+   *   这类带点的 id。
+   *   ⚠ **路径的转义语法随格式而变**：
+   *     · JSON   → **反斜杠**转义（edit-json.mjs 的 splitPath/unescapeKey）：
+   *                 `models.bai\/wb\/glm-5\.2.provider`
+   *     · TOML/YAML → **引号段**（clients/paths.mjs 的 splitPathParts）：
+   *                 `models."bai/wb/glm-5.2".provider`
+   *   用错了就是「键被切成三段」⇒ 写出一坨嵌套的怪东西。
+   *   这一条测 JSON 的写法（TOML/YAML 的由那个格式自己的测试管）。 */
+  const KEY = "bai/wb/glm-5.2";
+  const dotted = (leaf) => "models." + KEY.replace(/([.\\])/g, "\\$1") + (leaf ? "." + leaf : "");
+
+  const dottedClient = (home) => ({
+    id: "dotted",
+    name: "带点的",
+    protocol: "chat",
+    files: () => [{
+      path: cfgPath(home),
+      format: "json",
+      writes: (ctx) => [
+        { path: dotted("provider"), value: "bai" },
+        { path: dotted("baseUrl"), value: ctx.baseUrl },
+      ],
+      wired: (text, fmt) => {
+        const r = fmt.getPath(text, dotted("provider"));
+        return !!(r && r.ok && r.found);
+      },
+    }],
+  });
+
+  test("④c-1 带点的键被写成**一个**键（不是被切成三段的嵌套）", () => {
+    const home = tmpDir();
+    writeCfg(home, JSON.stringify({ models: { [KEY]: { note: "用户自己的" } }, theme: "dark" }));
+    const r = applyClient(dottedClient(home), { ...CTX, home }, { dataDir: home });
+    assert.equal(r.ok, true, `接线失败：${r.detail}`);
+    const j = JSON.parse(fs.readFileSync(cfgPath(home), "utf8"));
+    assert.ok(j.models && j.models[KEY], `★ 带点的键没被写成**一个**键：${JSON.stringify(j.models)}`);
+    assert.equal(j.models[KEY].provider, "bai");
+    assert.equal(j.models[KEY].baseUrl, CTX.baseUrl);
+    assert.equal(j.models[KEY].note, "用户自己的", "用户自己那个键必须保住");
+    assert.equal(j.theme, "dark");
+  });
+
+  test("④c-2 断开后逐字还原", () => {
+    const home = tmpDir();
+    const before = JSON.stringify({ models: { [KEY]: { note: "用户自己的" } }, theme: "dark" });
+    writeCfg(home, before);
+    const def = dottedClient(home);
+    applyClient(def, { ...CTX, home }, { dataDir: home });
+    const back = revertClient(def, { dataDir: home });
+    assert.equal(back.ok, true, back.detail);
+    assert.equal(fs.readFileSync(cfgPath(home), "utf8"), before, "★ 还原后与原来不逐字相同");
+  });
+});
+
+/* ====================================================================== *
  * ⑤ 格式注册表
  * ====================================================================== */
 describe("⑤ 格式注册表", () => {
