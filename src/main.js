@@ -19,7 +19,13 @@ app.commandLine.appendSwitch("disable-gpu-compositing");
 //       用户数据（config.json/backups/server.log）在 %APPDATA%\bai-router —— 升级不会覆盖
 const APP_DIR = __dirname;
 // 数据目录固定为 %APPDATA%\bai-router —— 不跟 productName 走，跨机器/改名/重装都稳定
-try { app.setPath("userData", path.join(app.getPath("appData"), "bai-router")); } catch { }
+// ⚠ **BAI_DATA_DIR 可以把它指到别处**（2026-10-23 加）：有人不想让本项目在系统盘
+//   留文件（配置、日志、备份，还有上百兆的缓存）⇒ 设成别的盘上的目录即可。
+//   没设时行为**一字不变**（仍是 %APPDATA%\bai-router）⇒ 分发给别人的机器不受影响。
+try {
+  const custom = String(process.env.BAI_DATA_DIR || "").trim();
+  app.setPath("userData", custom || path.join(app.getPath("appData"), "bai-router"));
+} catch { }
 const DATA_DIR = app.getPath("userData");
 const SERVER_JS = app.isPackaged
   ? path.join(process.resourcesPath, "server", "server.mjs")

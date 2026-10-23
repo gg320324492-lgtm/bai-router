@@ -31,3 +31,5 @@ src/server/cli-apply.json
 src/server/agent-plugins/
 # 开发模式下模型真值表的运行时覆盖层（落盘在数据目录里）
 src/server/model-facts.json
+# 本项目的运行时数据目录（配置/日志/备份/凭据）—— 不进版本库
+.data/

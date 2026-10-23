@@ -366,8 +366,8 @@ const DEFAULTS = {
     availableModels: ["lite", "auto", "performance", "ultimate", "qmodel", "kmodel", "dmodel", "mmodel", "gmodel"],
     mapping: defaultMapping("lite", "Qoder Lite"),
     token: "",
-    tokenFile: path.join(os.tmpdir(), "qoder-token.json"),
-    modelsFile: path.join(os.tmpdir(), "qoder-models.json"),
+    tokenFile: path.join(DATA_DIR, "qoder-token.json"),
+    modelsFile: path.join(DATA_DIR, "qoder-models.json"),
     useProxy: false,
   },
   // WorkBuddy 国内版（腾讯 WorkBuddy 客户端附带的免费模型）—— 第三个可路由提供方。
@@ -754,9 +754,11 @@ function loadCfg() {
     // 绝对路径（C:\Users\admin\…\Temp\qoder-token.json）。换一台电脑时这个路径既不属于
     // 该机的临时目录、也可能根本不存在，导致补丁写的文件与中转读的文件不是同一份，
     // 面板永远显示「未读到」。这里：空值、或「盘符/用户目录明显不是本机」的路径，
-    // 一律改回本机 os.tmpdir()（与补丁写入位置一致）。
+    // 一律改回**数据目录**（与补丁写入位置一致）。
+    // ⚠ 落点从 os.tmpdir() 挪到了 DATA_DIR（2026-10-23）：本项目不在系统盘的临时
+    //   目录里留文件（用户的要求）⇒ 临时目录会被系统清掉，那些快照活不过重启。
     const fixQdFile = (v, name) => {
-      const def = path.join(os.tmpdir(), name);
+      const def = path.join(DATA_DIR, name);
       if (typeof v !== "string" || !v.trim()) return def;
       const norm = path.normalize(v.trim());
       // 已经是本机临时目录下的同名文件 → 尊重用户设置
@@ -2942,7 +2944,9 @@ let wbCapState = { active: false, startedAt: null, error: null, p: "wb" };   // 
 // 脚本永久卡在打补丁状态，而备份只在内存 wbCapState.backup 里，进程死了就没了
 // （真实发生过，逆回原状花了 5 次尝试）。原文件基准：11407 字节，md5 d3d1378b8efccc9dba2af9061cb3508d。
 // 修法：注入前把干净备份**写到磁盘临时文件**；下次启动发现脚本还带钩子就用它还原。
-const WB_BACKUP_FILE = path.join(os.tmpdir(), "bai-router-wb-codebuddy.bak.json");
+// ⚠ 落点从 os.tmpdir() 挪到 DATA_DIR（2026-10-23）：本项目不在系统盘留文件
+//   （用户的要求）⇒ 临时目录会被系统清掉 ⇒ 备份丢了就**逆不回原状**了。
+const WB_BACKUP_FILE = path.join(DATA_DIR, "bai-router-wb-codebuddy.bak.json");
 function wbMd5(s) { return createHash("md5").update(Buffer.from(String(s), "utf8")).digest("hex"); }
 function wbCaptureSelfHeal(p) {
   try {
