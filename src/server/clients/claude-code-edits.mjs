@@ -51,13 +51,24 @@ export function claudeCodeEdits(f) {
   const delEnv = (k) => edits.push({ path: "env." + k, delete: true });
 
   setEnv("ANTHROPIC_BASE_URL", gw ? f.gatewayBaseUrl : f.cliBaseUrl);
-  /* ⚠ 网关模式**不**改令牌：请求先到统一网关，网关按模型 id 的 provider 前缀
-   *   分流 ⇒ 客户端送来的这个 token 对网关**没有意义** ⇒ 保留用户自己那份
-   *   （他可能有别的用途），别用占位符把它盖掉。
-   *   协议桥渠道（wb/qd/or/zen/mm）自己用凭据、不看客户端送来的 token，
-   *   老路下照旧写占位符。 */
+  /* ⚠ 网关模式**也要**有 token —— 但理由不是「网关需要它」。
+   *
+   *   原来的推理是：「请求先到统一网关，网关按模型 id 的 provider 前缀分流 ⇒
+   *   客户端送来的这个 token 对网关**没有意义** ⇒ 保留用户自己那份」。
+   *   ⚠ **那个推理漏了一步**：「网关不校验客户端的 token」**≠**「客户端可以没有 token」。
+   *   Claude Code 自己**没有 token 就不发请求** —— 它直接报
+   *   「Not logged in · Please run /login」，一个请求都不发出来。
+   *   ⇒ 2026-10-23 的端到端实测（真 claude CLI + 假上游）抓到了这个洞：
+   *   出厂默认是**网关模式**，而网关模式**不写**这个键 ⇒ **新接线的客户端
+   *   一个请求都发不出去**（用户老配置里本来就有这个键，所以他自己没察觉）。
+   *
+   *   写**占位符**（不是真 key）：网关不校验它，真 key 留在用户主目录是
+   *   「里程碑 4b」明确要避免的（明文副本）。
+   *   ⚠ **用户自己已经设过就留着**（他可能有别的用途）⇒ onlyIfAbsent。 */
   if (!gw) {
     setEnv("ANTHROPIC_AUTH_TOKEN", f.viaLocalRelay ? f.proxyManagedToken : (f.key || "wb-local"));
+  } else {
+    edits.push({ path: "env.ANTHROPIC_AUTH_TOKEN", value: f.proxyManagedToken, onlyIfAbsent: true });
   }
   const modelId = (tier, target) => (gw ? `${f.providerId}/${tier}` : String(target));
   setEnv("ANTHROPIC_MODEL", modelId("claude-haiku-4-5",
