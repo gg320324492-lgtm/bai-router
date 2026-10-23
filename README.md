@@ -55,7 +55,7 @@ qd 15762 / or 15772 / wbai 15782 / mm 15792），Claude Code 连的是某一家�
 - 面板「故障转移」视图里有一张「统一网关」卡：当前模式、请求去向、网关端口、
   开关，以及各家能分到哪些档位。
 
-## 入口协议：Anthropic / Responses / Gemini（v1.0.95-beta.1 起）
+## 入口协议：Anthropic / Responses / Chat / Gemini（v1.0.95-beta.1 起，Chat 自 v1.0.102-beta.1）
 
 统一网关不只听得懂 Anthropic 的话。客户端说哪种话，网关就把它翻成 Anthropic 形状
 交给那家的中转 —— **翻完之后与 Anthropic 那条路完全一样**（一样的模型解析、一样的
@@ -65,14 +65,29 @@ qd 15762 / or 15772 / wbai 15782 / mm 15792），Claude Code 连的是某一家�
 | --- | --- | --- |
 | Claude Code / Claude 桌面版 | Anthropic Messages | `POST /v1/messages` |
 | Codex / 新版 OpenAI SDK | OpenAI **Responses** | `POST /v1/responses` |
+| **Qoder / ZCode / Kimi Code / MiniMax Code / Cline / Droid / OpenCode / 大部分 CLI** | **OpenAI Chat Completions** | `POST /v1/chat/completions`（**不带 `/v1` 的 `/chat/completions` 也答**） |
 | Gemini CLI / Google SDK | Gemini `generateContent` | `POST /v1beta/models/{model}:generateContent` |
 
-**模型 id 三条路一样**：`provider/档位`（如 `sn/claude-opus-5`）。
+**模型 id 四条路一样**：`provider/档位`（如 `sn/claude-opus-5`）。
 Gemini 的模型名在路径里，所以那一段要 URL 编码（`sn%2Fclaude-opus-5`）。
 
 明确不支持的字段一律**报错**（Responses 的 `previous_response_id` / `store`、
-Gemini 的 `cachedContent` / `safetySettings` 等）—— 静默丢字段会让模型看不到上一轮，
-还答得像模像样。
+Chat 的 `n>1` / `logprobs` / `audio`、Gemini 的 `cachedContent` / `safetySettings` 等）
+—— 静默丢字段会让模型看不到上一轮，还答得像模像样。
+
+## 客户端接线：把 B.AI 接进装好的 CLI（v1.0.102-beta.1 起）
+
+面板新增「**客户端**」一屏：列出能接 B.AI 的客户端（ZCode、Qoder、Kimi Code、
+Qwen Code、MiniMax Code、CodeBuddy、WorkBuddy、Codex、Gemini CLI、Cline、Droid、
+Goose、jcode、Hermes、omp… 共 25 个），每一条写清它的配置文件在哪、说哪种方言、
+现在接上了没有。点「**接上**」就替你把配置写好，点「**断开**」就把它摘掉。
+
+- **断开只还原我们写过的那几处** —— 你文件里其它内容一个字不动（写之前先备份
+  那几个键的原值）。
+- **读不懂就不写**：配置文件存在但解析失败 ⇒ 报错、中止，**绝不**把它当空配置
+  覆盖掉。
+- 模型清单在 `GET /v1/models`（`provider/档位`），客户端从那里抄 id 就能用。
+- 客户端**没装**也会列出来（标「没装这个客户端」）—— 装了再点「接上」就行。
 
 ## 插件渠道：一份 JSON 声明加一家渠道（v1.0.95-beta.1 起）
 

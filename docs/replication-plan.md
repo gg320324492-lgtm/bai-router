@@ -263,6 +263,47 @@ Claude Code / Claude Desktop / Codex / MiniMax Code / OpenCode 五个是启用�
 Hermes 装了但它没启用。**`~/.cursor` 是编辑器不是 CLI**（CLI 的配置是
 `~/.cursor/cli-config.json`）；`~/.mimocode/`、`~/.copilot/` **只有空目录** ⇒ 没装。
 
+### T15-g 「一份 JSON 加一个客户端」（📋 后续规划，**未做**）
+
+magpie 除了内置那 66 个，还给了**一个扩展口子**：**agent plugin**（docs/reference.md 的
+「Agent plugins」一节）—— 用户写一个 `*.agent.js`（或 `package.json` 里指向它），
+magpie 就多认识一个客户端：
+
+```js
+export const agent = {
+  id: "aider", name: "Aider", bin: "aider",
+  config: "~/.aider.conf.yml",   // json / yaml / env
+  model: "model",                // 要写的那个键
+  prefix: "openai/",             // 写在模型 id 前面
+  ua: ["aider", "litellm"],
+}
+export function connect({ gateway, model, models }) {
+  return { "openai-api-base": gateway.v1, "openai-api-key": gateway.key }
+}
+```
+
+**这个形状极简**：配置文件在哪 + 要写哪几个键 + connect 返回什么。
+
+⚠ **我们的 `clients/` 层几乎就是同一个东西**，只是形状更杂（provider 块千差万别）：
+
+| | magpie 的 agent plugin | 我们的 `clients/` 声明 |
+| --- | --- | --- |
+| 配置文件 | `config: "~/.aider.conf.yml"` | `files: (ctx) => [{ path, format }]` |
+| 写什么 | `connect(ctx)` 返回键值对 | `writes: (ctx) => [{ path, value }]` |
+| 模型 id | `model` + `prefix` | `ctx.models`（已是 `provider/档位`） |
+| 还原 | 插件自己负责 | 底座按路径级备份统一管 |
+
+**⇒ 下一批可以做的**：把「配置简单、只写 base_url + key + 模型」的那批客户端
+（Goose、Crush、fx、Command Code、Devin、omp…）做成**用户可自己加**的声明 ——
+一份 JSON 放进插件目录，就多一个能接的客户端，**不用改代码**。
+
+⚠ 我们的 `pluginrt.mjs`（代码插件运行时）是**子进程 + Node 权限模型 + 超时封顶**，
+比 magpie 的进程内 moejs **更严** ⇒ 拿它当客户端插件的宿主正合适（用户写的声明
+只在子进程里跑，权限可收）。
+
+⚠ 与「插件渠道」是同一路子（那份是加一家**上游**，这份是加一个**客户端**）——
+两者都该是「一份声明，不改代码」。
+
 ### T15-f 面板那一屏还差三个最常用的（📋 下一批）
 
 「客户端」屏现在列 25 个（`src/server/clients/` 下的声明），但**用户最常用的三个
