@@ -31,7 +31,7 @@ magpie 是 10.3 万行 Go、5661 个文件。它自己的历史是首周每天 2
 | T11 | **插件体系**（声明式 provider/agent/middleware） | ✅ provider 插件（一份 JSON 加一家渠道）、middleware（`middleware.mjs`，声明式改写）、**代码插件**（`pluginrt.mjs` + `plugin-worker.mjs`：子进程 + Node 权限模型 + 令牌窄协议 + 超时封顶）全部接进真实链路 | `internal/pluginrt/`、`internal/plugin/` |
 | T12 | **并发 / RPM 限流通道** | ✅ 完成（`concurrency.mjs` + `rpm.mjs`，**默认不限**，面板可开） | `internal/gateway/{concurrency,rpm}.go` |
 | T13 | **配置同步备份**（WebDAV/S3/GitHub）+ KeepOwn | ✅ 完成（本地目录 / WebDAV / GitHub 三种目标都已接进真实链路，口令加密、不静默覆盖） | `internal/backup/`、`internal/davsync/` |
-| T14 | **面板改版**（插槽制 + 多页） | 🟡 P0–P3 ✅（额度屏 / 状态计算层 / 共享组件库 / 热力图 / 状态条 / **渠道主从**）；P5 收尾在做 | `internal/gui/assets/kernel.js` |
+| T14 | **面板改版**（插槽制 + 多页） | ✅ P0–P3（额度屏 / 状态计算层 / 共享组件库 / 热力图 / 状态条 / **渠道主从**）+ P5 收尾（21 张卡补齐空/错/加载三态 + 键盘可达 + 窄屏零溢出） | `internal/gui/assets/kernel.js` |
 | T15 | **客户端接线**（harness 铺开） | ✅ 协议层（Chat 入向 = 一个模块换 40+ 客户端）+ 接线层 28 个客户端声明 + 面板「客户端」一屏 + 网关侧端点；🟡 深度定制按设计稿分阶段做 | `internal/agent/`（每客户端一个 `.go`） |
 | T16 | **字体一轮升级**（参照 magpie，做减法） | 📋 后续规划（等宽只给代码本身 + 补中文回退 + 数字用 tabular-nums） | `internal/gui/assets/app.css` 的 `--font` / `--code` |
 
@@ -196,7 +196,7 @@ provider 跳。模型寻址靠本地四档映射表（`TIERS` + `resolveModelTar
 地址与模型清单写进去。上下文窗口、输出上限、reasoning 档位这些**先不管** ——
 客户端自己会用默认值。
 
-### T15-c 接线层 · 深度定制（📋 后续规划，**设计已完成，未实现**）
+### T15-c 接线层 · 深度定制（🟡 阶段 0 已完成，1–4 未实现；设计稿见 `docs/client-wiring-deep-plan.md`）
 
 magpie 的每个客户端是**深度定制**的 —— `internal/agent/zcode.go` 就 600 多行：
 两个配置文件（`config.json` 的 provider 形状 + 3.14 起的 `provider_config.json`
