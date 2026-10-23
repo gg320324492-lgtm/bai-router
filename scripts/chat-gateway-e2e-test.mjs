@@ -348,6 +348,26 @@ describe("Chat 入向 · 端到端（真 server + 统一网关 + 假上游）", 
     assert.equal(none.status, 404, `实际 ${none.status}`);
   });
 
+  test("⑦d Muse Code 的清单（它从 /muse-code/models 拉，不是 /v1/models）", async () => {
+    const r = await fetch(`http://127.0.0.1:${P.gateway}/muse-code/models`, {
+      signal: AbortSignal.timeout(30000),
+    });
+    assert.equal(r.status, 200, `实际 ${r.status}`);
+    const j = await r.json();
+    assert.equal(j.object, "list", "外壳要与 magpie 的 museModels 逐字同构");
+    assert.ok(Array.isArray(j.data) && j.data.length > 0, "清单不能是空的");
+    const one = j.data[0];
+    assert.equal(one.object, "model");
+    assert.match(one.id, /^[a-z0-9]+\/.+/, "模型 id 必须是 provider/档位");
+    assert.ok(one.owned_by, "owned_by 要有（Muse 靠它认家）");
+    const meta = one.metadata && one.metadata["muse-code"];
+    assert.ok(meta, "★ 没有 metadata['muse-code'] —— Muse 读不到就当没有这个模型");
+    /* ⚠ **limit 必须有**：Muse 会**隐藏**没有 limit 的模型 ⇒ 没有 limit 等于白写。 */
+    assert.ok(meta.limit && meta.limit.context > 0 && meta.limit.output > 0,
+      `limit 缺失或非正 —— Muse 会把这个模型藏起来：${JSON.stringify(meta)}`);
+    assert.deepEqual(meta.modalities, { input: ["text"], output: ["text"] });
+  });
+
   test("⑦ 反向对照：把「URL 也换成 /v1/messages」改坏 ⇒ ① 必须抓到", async () => {
     /* 手法（与 scripts/gateway-test.mjs 同一路子）：把 src/server **复制**到临时目录，
        在**副本**的 gateway.mjs 上把「URL 也换」那一行改坏（URL 保持客户端原来那个），

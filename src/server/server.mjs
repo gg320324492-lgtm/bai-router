@@ -123,6 +123,9 @@ import { chatModelsPayload } from "./chat-protocol.mjs";
  * 加一个客户端不用改表）。 */
 import { applyClient, revertClient, clientStatus } from "./clients/base.mjs";
 import { allClients, clientById } from "./clients/registry.mjs";
+/* Muse Code 的模型清单（clients/muse-models.mjs）：Muse 从 `<base_url 主机>/muse-code/models`
+ * 拉清单，不是从 /v1/models ⇒ 没有这个端点，它的清单里就没有我们的模型。 */
+import { buildMuseModels } from "./clients/muse-models.mjs";
 /* 网关的故障转移（gateway-failover.mjs）：把「档位」从最终模型名反查回来，
  * 转移时才能按**目标家**重解析（各家同一档位是不同模型）。 */
 import { tierOfModel, tierKeyFor } from "./gateway-failover.mjs";
@@ -7704,6 +7707,7 @@ const gatewayServer = http.createServer((req, res) => {
   const ep = p.length > 1 ? p.replace(/\/+$/, "") : p;
   if (req.method === "GET" && (ep === "/" || ep === "/v1")) return gatewayInfo(req, res);
   if (req.method === "GET" && (ep === "/v1/models" || ep === "/models")) return gatewayModels(req, res);
+  if (req.method === "GET" && ep === "/muse-code/models") return gatewayMuseModels(req, res);
   if (req.method === "GET" && ep.startsWith("/v1/models/")) return gatewayOneModel(req, res, ep.slice("/v1/models/".length));
   if (pickProtocol(ep, req.method)) return gatewayProtocolHandler(req, res);
   return gatewayAnthropicHandler(req, res);
@@ -7734,6 +7738,19 @@ function gatewayInfo(req, res) {
       "/v1/models",
     ],
   });
+}
+
+/**
+ * 统一网关的 Muse Code 模型清单（GET /muse-code/models）。
+ *
+ * ⚠ Muse 从 **`<base_url 主机>/muse-code/models`** 拉清单（不是 /v1/models）
+ *   ⇒ 没有这个端点，它的清单里就没有我们的模型 ⇒ 接上了也不能用。
+ *   magpie 也答这个路径（internal/gateway/muse.go:24）。
+ *
+ * 形状由 clients/muse-models.mjs 造（与 magpie 的 museModels 逐字同构）。
+ */
+function gatewayMuseModels(req, res) {
+  json(res, 200, buildMuseModels(gatewayModelEntries(loadCfg()), { via: "B.AI" }));
 }
 
 /**
