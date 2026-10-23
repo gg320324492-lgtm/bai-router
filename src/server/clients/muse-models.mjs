@@ -22,7 +22,7 @@
 //     "id":"sn/claude-opus-5","object":"model","created":0,"owned_by":"sn",
 //     "metadata":{"muse-code":{
 //       "name":"Claude Opus 5","family":"sn","is_hidden":false,
-//       "attachment":false,"reasoning":false,"temperature":false,"tool_call":true,
+//       "tool_call":true,
 //       "modalities":{"input":["text"],"output":["text"]},
 //       "options":{"include":[]},"variants":{},
 //       "description":"Claude Opus 5 via B.AI",
@@ -41,10 +41,15 @@
 //      max_input_tokens 之类），用 `opts.limits` 传进来顶掉兜底。
 //      ⚠ **limit 不能没有**：Muse 会**隐藏**没有 limit（或 limit 缺一半）的模型 ——
 //        隐藏了用户就选不到它，这一整层就白做了。这是本模块存在的理由。
-//   ② **attachment / reasoning 恒为 false。**
-//      magpie 从目录里读「这个模型收不收图 / 有没有思考档」，我们没有这份信息。
-//      宁可说没有（Muse 于是不给这两项开关），也不要说有 —— 说有会让 Muse
-//      往一个不认的参数上撞。
+//   ② **attachment / reasoning / temperature 这三个键我们**不写**。**
+//      magpie 从目录里读「这个模型收不收图 / 有没有思考档」（`e.Images`、
+//      `len(e.Efforts) > 0`），我们没有这份信息 —— 我们的模型 id 是**档位**
+//      （provider 无关），而能力由**映射到哪家上游**决定（`claude-opus-5` 在 sn
+//      映射到 glm-5.2、在 wb 映射到 hy3，逐家不同）⇒ 写有是撒谎，写没有
+//      是在**断言**「不支持」—— 而我们只是**不知道**。
+//      ⇒ 不写这个键：Muse 读不到就是零值 false（效果与写 false 一样），
+//        但那个**位置空着** —— 将来有了真值是「加一个键」，而不是把假值改成真值。
+//      ⚠ 更不能写有：那会让 Muse 往一个不认的参数上撞，当场报错。
 //   ③ **description 署我们的名**（"via B.AI"；magpie 写 "via magpie"）。
 //
 // ## 纪律
