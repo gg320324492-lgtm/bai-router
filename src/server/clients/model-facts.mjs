@@ -623,10 +623,22 @@ function entryIds(entries) {
  *   · `nonDefault` —— **值不是兜底值**的个数 ⇒ 这才是「真接到真值了」的条数。
  *     ⚠ **`ids > 0` 而 `nonDefault === 0`** ⇒ 全退回兜底 ⇒ **接错了**。
  *
+ * ⚠ **新加的四个字段（接线处直接能用）**：
+ *   · `total`    —— 同 `ids`（总条数），换个名字好读。
+ *   · `fallback` —— `total - nonDefault` ⇒ **兜底条数**（约定值 + 查不到的）。
+ *   · `status`   —— `"ok"` / `"empty"`（清单是空的）/ `"all-fallback"`（全是兜底）。
+ *   · `suspicious` —— **该不该让人看一眼**：`status === "all-fallback"`。
+ *     ⚠ **只报「一条真值都没有」，不报「比例偏低」** —— 比例会误报
+ *       （用户全用 sn ⇒ 真实比例就是 0）。
+ *   · `reason`   —— 人可读的说明（`suspicious` 时有内容）。
+ *   ⇒ 要一行能贴进日志的账，用 {@link summarizeFactLookup}。
+ *
  * @param {object} cfg
  * @param {Array} entries 模型清单条目或 id 字符串
  * @param {object} [opts] · runtime
- * @returns {{ids:number, found:number, nonDefault:number, byKind:object, missing:string[], facts:object}}
+ * @returns {{ids:number, total:number, found:number, nonDefault:number, fallback:number,
+ *            byKind:object, missing:string[], facts:object, status:string,
+ *            suspicious:boolean, reason:string}}
  */
 export function describeFactLookup(cfg, entries, opts) {
   const ids = entryIds(entries);
@@ -641,14 +653,79 @@ export function describeFactLookup(cfg, entries, opts) {
     byKind[k] = (byKind[k] || 0) + 1;
     if (f.context !== CONVENTION_CONTEXT || f.output !== CONVENTION_OUTPUT) nonDefault++;
   }
+  const total = ids.length;
+  const found = total - missing.length;
+  /* ⚠ **fallback = total - nonDefault** —— 「没拿到真值」的条数。
+   *   它比 `found` 诚实：`found` 数的是「表里**有**这一条」（**含约定值**），
+   *   而约定值就是兜底值 ⇒ 说「查到了」会骗人。
+   *   ⚠ `missing`（表里根本没有 / 是 single 点证据 shared）也算在 fallback 里。 */
+  const fallback = total - nonDefault;
+  /* ⚠ **status 分清三种坏法**（分不清就会把「全退回兜底」看成「接好了」）：
+   *   · "empty"        —— 模型清单本身是空的 ⇒ 查 `gatewayModelEntries` 那一步。
+   *   · "all-fallback" —— 有 id、有条目，但**一条真值都没有** ⇒ **接错了**
+   *     （变量名写错 / cfg 取错 / 覆盖层坏了）。**这是最阴的一种**。
+   *   · "ok"           —— 至少有一条真值。 */
+  const status = total === 0 ? "empty" : (nonDefault === 0 ? "all-fallback" : "ok");
+  const reason = total === 0
+    ? "模型清单是空的（没有可查的模型 id）"
+    : (nonDefault === 0
+      ? (found === 0
+        ? "一个模型都没查到（cfg 取错，或表里没有这些模型）"
+        : "全都退回兜底值（一个真值都没查到）")
+      : "");
   return {
-    ids: ids.length,
-    found: ids.length - missing.length,
+    ids: total,
+    total,
+    found,
     nonDefault,
+    fallback,
     byKind,
     missing,
     facts,
+    status,
+    /* ⚠ **只报「一条真值都没有」，不报「比例偏低」** —— 比例会误报：
+     *   健康比例随用户配置变（用户全用 sn ⇒ 真实比例就是 0）⇒ 阈值报警会变成噪音。 */
+    suspicious: status === "all-fallback",
+    reason,
   };
+}
+
+/**
+ * summarizeFactLookup —— 把一次查表说成**一行人话**（面板上显示 / 日志里记一行）。
+ *
+ * ⚠ **为什么要有它**：接线接错时**不报错**，只是所有模型退回兜底值，
+ *   从外面看「一切正常，只是窗口全是 128K」⇒ 必须有一行**能看见的**账。
+ *   这一行的形状就是「这次有 N 条是真值、M 条是兜底」。
+ *
+ * ⚠ **真值的口径是 `nonDefault`**（值 ≠ 兜底值），**不是 `found`** ——
+ *   `found` 含约定值 ⇒ 常常等于总条数 ⇒ 拿它当真值条数就是自欺。
+ *
+ * @param {object} r `describeFactLookup` 的返回值
+ * @returns {string} 人可读的一行
+ */
+export function summarizeFactLookup(r) {
+  const s = r && typeof r === "object" ? r : {};
+  const total = Number(s.total != null ? s.total : (s.ids || 0));
+  const real = Number(s.nonDefault || 0);
+  const fallback = Number(s.fallback != null ? s.fallback : Math.max(0, total - real));
+  if (!total) return "模型真值表：0 个模型（清单是空的）";
+  /* ⚠ 按**真值那一部分**的 kind 分类 —— `byKind` 数的是全部条目（含约定值），
+   *   拿它说「8 条本家实测」会把约定值也算进去 ⇒ 数字会虚高。 */
+  const kinds = {};
+  const facts = s.facts && typeof s.facts === "object" ? s.facts : {};
+  for (const id of Object.keys(facts)) {
+    const f = facts[id];
+    if (!f || typeof f !== "object") continue;
+    if (f.context === CONVENTION_CONTEXT && f.output === CONVENTION_OUTPUT) continue;
+    const k = String(f.kind || "");
+    kinds[k] = (kinds[k] || 0) + 1;
+  }
+  const parts = [];
+  for (const k of ["measured", "measured-elsewhere"]) if (kinds[k]) parts.push(`${k} ${kinds[k]}`);
+  const kindPart = parts.length ? `（${parts.join(" / ")}）` : "";
+  const head = `模型真值表：${total} 个模型 · ${real} 条真值${kindPart} · ${fallback} 条兜底`;
+  if (s.suspicious) return `${head} ⚠ ${s.reason || "一个真值都没查到"}`;
+  return head;
 }
 
 /**

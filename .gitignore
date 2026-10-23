@@ -29,3 +29,5 @@ src/server/cli-apply.json
 
 # 开发模式下 agent plugin 声明的落点（安装版在 %APPDATA% 里）
 src/server/agent-plugins/
+# 开发模式下模型真值表的运行时覆盖层（落盘在数据目录里）
+src/server/model-facts.json

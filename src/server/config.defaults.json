@@ -6,6 +6,7 @@
   "panelPort": 15723,
   "gatewayPort": 15799,
   "gatewayMode": "on",
+  "legacyPortAsGateway": "off",
   "defaultModel": "qwen3.8-flash",
   "availableModels": [
     "claude-fable-5",

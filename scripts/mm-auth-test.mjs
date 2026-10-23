@@ -1053,8 +1053,11 @@ describe("mm 工具定义形状转换", () => {
     assert.match(chLine[0], /prepareBody:\s*mmPrepareBody/,
       "渠道表的 mm 那一行必须挂 prepareBody —— 少了它，带工具的请求会被上游 400 拒掉");
 
-    const mk = SERVER_SRC.match(/makeRelay\(\s*"mm"[\s\S]*?\);/);
-    assert.ok(mk, "必须有 makeRelay(\"mm\", …) 这一次调用");
+    /* ⚠ 旧中转端口现在是**兼容入口**（`mountLegacyPort`）⇒ 锚点认两种写法。
+     *   ⚠ 但下面那条「必须用 RELAY_PARAMS.mm」的断言**不许放松** ——
+     *   那才是这条测试真正要守的东西（opts 用错就等于没挂 prepareBody）。 */
+    const mk = SERVER_SRC.match(/(?:makeRelay|mountLegacyPort)\(\s*"mm"[\s\S]*?\);/);
+    assert.ok(mk, "必须有 mm 的落点那一次调用（makeRelay(\"mm\", …) 或 mountLegacyPort(\"mm\", …)）");
     /* 第二处注册点：mm 中转**真的被造出来时**用的是带 prepareBody 的那套 opts。
      *
      * 参数被搬进 RELAY_PARAMS 之后，这里要**跟着接线走**，不能跟着旧写法走：
@@ -1065,8 +1068,8 @@ describe("mm 工具定义形状转换", () => {
     assert.ok(params, "参数表里必须有 mm 那一项（认 recentCallsMm 那一行，别认错同名的 mm）");
     assert.match(params[0], /prepareBody:\s*mmPrepareBody/,
       "参数表里 mm 那一项的 opts 必须挂 prepareBody");
-    assert.match(mk[0], /RELAY_PARAMS\.mm\.opts/,
-      "makeRelay(\"mm\", …) 必须用参数表里 mm 那一项的 opts —— 用错了就等于没挂 prepareBody");
+    assert.match(mk[0], /RELAY_PARAMS\.mm/,
+      "mm 的落点必须用参数表里 mm 那一项 —— 用错了就等于没挂 prepareBody");
 
     assert.match(SERVER_SRC, /function mmPrepareBody\(/,
       "必须有 mmPrepareBody 这个函数");

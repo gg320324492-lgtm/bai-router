@@ -125,7 +125,7 @@ import { applyClient, revertClient, clientStatus } from "./clients/base.mjs";
 import { allClients, clientById, rescanClients, agentPluginsDir } from "./clients/registry.mjs";
 /* 模型真值表（窗口 / 输出上限 / 来源与日期）—— T15-c 阶段 1。
  * ⚠ 只读内置表，请求路径上零 IO；渠道目录是后台刷的（阶段 3）。 */
-import { factsForEntries } from "./clients/model-facts.mjs";
+import { factsForEntries, describeFactLookup, summarizeFactLookup } from "./clients/model-facts.mjs";
 /* Claude Code 的 env 键怎么算（纯函数）：server.mjs 的 applyToCli 与 clients/ 层
  * 共用同一份逻辑 —— 那段里有不少有历史教训的讲究（占位符、档位 vs 最终模型名），
  * 重写一遍等于把教训重新踩一遍。 */
@@ -7344,6 +7344,159 @@ function makeRelay(p, store, getSlice, useProxy, opts = {}) {
   return http.createServer(makeRelayHandler(p, store, getSlice, useProxy, opts));
 }
 
+/* ------------------------------------------------------------------ *
+ * 兼容入口：旧中转端口 → 统一网关（T2 单网关化的收尾）
+ *
+ * ## 为什么要有它
+ *
+ * 统一网关是**一个**端口（15799），模型 id 写成 `provider/档位`。
+ * 而**老配置**（CC Switch 写的、用户手写的、别人脚本里的）写的是**最终模型名**
+ * （如 `hy3`）⇒ 直接打到网关会 400「没有 provider 前缀」。
+ *
+ * ⇒ 旧中转端口（15721/15722/15732/…）**不再自己中转**，而是**转发给网关**：
+ * 先把模型名补成 `provider/档位`，再转过去。
+ * ⇒ **对外**：老配置照旧能用（指着 15722 的继续能跑）。
+ * ⇒ **对内**：只剩一个中转（网关）—— 这才是「单网关化」的完整形态。
+ *
+ * ## ⚠ 两个行为变化（要知道）
+ *
+ * ① **故障转移变成跨渠道的**：网关看得见所有家 ⇒ 某家挂了会转别家
+ *    （magpie 形态的正解；老路是「只在这一家里转移」）。
+ * ② **模型清单从旧端口拿不到了**：清单是「某一家有哪些模型」，与「走哪一家」有关
+ *    ⇒ 网关不代理它 ⇒ 旧的 `GET /v1/models` **仍由旧中转自己答**（见下）。
+ *
+ * ## ⚠ 这两个端点**仍走旧路**（转发过去反而是退化）
+ *
+ * · `/v1/messages/count_tokens` —— 网关**不认**它；旧中转自己答（本地算，不打上游）。
+ * · 非 POST（探测类，如 `GET /v1/models`）—— 网关只承接 POST 模型调用。
+ */
+
+/**
+ * prefixModelForProvider —— 把请求体里的模型名补成 `provider/档位`。
+ *
+ * ⚠⚠ **为什么不能只是「补个前缀」**：老路的模型名语义是「**最终模型名**」
+ *   （`hy3`）—— 查表命中就用它，**查不到就静默回落到这一家的 defaultModel**
+ *   （`resolveModel`，并**留痕**，见 `noteModelFallback`）。
+ *   而网关的语义是「**档位名**」（`claude-opus-5`）—— 查不到就 400。
+ *   ⇒ 同一个 `model` 字段，两种语义 ⇒ **不翻译就会把「静默回落」变成硬错误**
+ *   （2026-10-23 实测：老路回落成功 200，转发后 400「没有 provider 前缀」）。
+ *
+ * ⇒ 所以这里**先按老路的方式解析**（命中 ⇒ 它的 target；查不到 ⇒ 回落 + 留痕），
+ *   再**反查成档位**补上前缀 ⇒ 网关剥掉前缀后打给上游的模型名，
+ *   与老路**逐字相同**。
+ *
+ * ⚠ **已经带前缀的不动**（`sn/claude-opus-5` 那种是新的写法）。
+ * ⚠ **反查命中多个**：那些档位**指向同一个最终模型** ⇒ 上游收到的东西一样 ⇒
+ *   选第一个**等价**（不是「猜错」—— 猜错是选了指向**别的**模型的档位）。
+ * ⚠ **反查不到**（回落到的 defaultModel 不在映射表里）⇒ 原样转发 ⇒
+ *   网关会说「这家没这个档位」⇒ **罕见**（defaultModel 通常在映射表里）。
+ *
+ * ⚠ 解析靠**该渠道当前的 mapping**（每次请求实时读 ⇒ 改了立即生效，与中转同一口径）。
+ *
+ * @param {Buffer} body 原始请求体
+ * @param {string} provider 渠道键（`bai`/`sn`/…）
+ * @param {function} getSlice `(cfg) => { mapping, defaultModel, ... }`
+ * @returns {Buffer} 改过的请求体
+ */
+function prefixModelForProvider(body, provider, getSlice) {
+  let j;
+  try { j = JSON.parse(body.toString("utf8")); } catch { return body; }
+  if (!j || typeof j !== "object" || Array.isArray(j)) return body;
+  const m = j.model;
+  if (typeof m !== "string" || !m) return body;
+  if (m.includes("/")) return body;   // 已是 provider/档位
+  let S = {};
+  try { S = (getSlice && getSlice(loadCfg())) || {}; } catch { S = {}; }
+  const mapping = S.mapping || {};
+  /* ① 老路语义：这一家**会**用哪个最终模型名
+     （命中 ⇒ 它的 target；查不到 ⇒ 静默回落到该家 defaultModel，**并留痕**）。 */
+  let finalName = null;
+  try { finalName = resolveModel(m, S, provider); } catch { finalName = null; }
+  if (!finalName) finalName = m;
+  /* ② 反查成档位（指向那个最终模型名的档位） */
+  const hits = [];
+  for (const [tier, spec] of Object.entries(mapping)) {
+    const target = (spec && typeof spec === "object") ? spec.target : spec;
+    if (target === finalName) hits.push(tier);
+  }
+  if (!hits.length) return body;   // 认不出（罕见）⇒ 原样转发
+  j.model = `${provider}/${hits[0]}`;
+  return Buffer.from(JSON.stringify(j), "utf8");
+}
+
+/**
+ * makeCompatRelay —— 旧中转端口的**兼容入口**（见上面那段说明）。
+ *
+ * ⚠ **开关是每请求实时判的**（`gatewayOn()` 每次读 cfg）⇒ 面板上把「网关模式」
+ *   一关，**立刻**就回到「旧端口自己中转」的老路，不用重启 —— 回退路径完整。
+ * ⚠ 网关端口也实时读（老机器的 config.json 里没这个字段 ⇒ 回落 15799）。
+ *
+ * @param {string} p 渠道键
+ * @param {function} getSlice `(cfg) => { mapping, ... }`
+ * @param {function} oldHandler 旧中转的 handler（答那两个「本机自己答」的端点；
+ *   以及**网关模式关掉时**的整条老路）
+ */
+function makeCompatRelay(p, getSlice, oldHandler) {
+  return http.createServer((req, res) => {
+    const rawUrl = String(req.url || "");
+    const at = rawUrl.indexOf("?");
+    const epPath = (at >= 0 ? rawUrl.slice(0, at) : rawUrl).replace(/\/+$/, "") || "/";
+    const query = at >= 0 ? rawUrl.slice(at) : "";
+    /* ⚠ 走旧路的情形：
+     *   · **兼容入口这个开关关着**（默认！）⇒ 老路 —— 默认行为**一字不变**；
+     *   · **网关模式关着** ⇒ 老路（回退路径）；
+     *   · 非 POST（探测类，如 `GET /v1/models`）—— 网关只承接 POST 模型调用；
+     *   · `/v1/messages/count_tokens` —— 网关**不认**它，旧中转自己答。
+     *   转发过去反而是退化 ⇒ 这几种留在旧路。 */
+    if (!legacyPortAsGatewayOn() || !gatewayOn()
+      || req.method !== "POST" || epPath === "/v1/messages/count_tokens") {
+      return oldHandler(req, res);
+    }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks);
+      const body = prefixModelForProvider(raw, p, getSlice);
+      const headers = {};
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (k === "host" || k === "content-length" || k === "connection" || k === "transfer-encoding") continue;
+        headers[k] = v;
+      }
+      headers["content-length"] = String(body.length);
+      let gwPort = 15799;
+      try { gwPort = Number(loadCfg().gatewayPort) || 15799; } catch { /* 回落 */ }
+      const up = http.request({
+        host: "127.0.0.1", port: gwPort, path: epPath + query,
+        method: req.method, headers,
+      }, (r2) => {
+        res.writeHead(r2.statusCode || 502, r2.headers);
+        r2.pipe(res);
+      });
+      up.on("error", (e) => {
+        try {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: `旧端口转发到统一网关失败：${String((e && e.message) || e)}` }));
+        } catch { /* 响应已经出去了 */ }
+      });
+      up.end(body);
+    });
+  });
+}
+
+/**
+ * mountLegacyPort —— 造一个旧中转端口的落点（兼容入口）。
+ *
+ * ⚠ handler 与老路**逐字同一个**（`makeRelayHandler`）⇒ 「网关模式关掉」时走的就是
+ *   一字未改的老路 ⇒ **回退路径完整**（面板上一关开关就立刻回老路，不用重启）。
+ *
+ * @param {string} p 渠道键
+ * @param {object} q RELAY_PARAMS 里的那一份（store/slice/useProxy/opts）
+ */
+function mountLegacyPort(p, q) {
+  const oldHandler = makeRelayHandler(p, q.store, q.slice, q.useProxy, q.opts);
+  return makeCompatRelay(p, q.slice, oldHandler);
+}
+
 // 一次尝试：把请求送到本渠道的上游并把响应写进 res（可能是影子 res）。
 // 从 makeRelay 里原样抽出，只把闭合的 p/S/useProxy/opts 换成 fo.*。
 async function handleUpstream(fo, req, res, cfg, body, rewritten, isProbe) {
@@ -7616,7 +7769,7 @@ function mountPluginChannel(id) {
     opts: entry.relayOpts || {},
   };
   const q = RELAY_PARAMS[id];
-  pluginRelays[id] = makeRelay(id, q.store, q.slice, q.useProxy, q.opts);
+  pluginRelays[id] = mountLegacyPort(id, q);
 }
 
 /**
@@ -7650,22 +7803,22 @@ function reloadPlugins() {
 
 // 三个中转：B.AI 走代理（出海）、SenseNova 走直连（境内，可被 sn.useProxy 覆盖）、
 // WorkBuddy 走直连（www.workbuddy.ai 直连可达，可被 wb.useProxy 覆盖；协议桥见 opts.openai）
-const relay = makeRelay("bai", RELAY_PARAMS.bai.store, RELAY_PARAMS.bai.slice, RELAY_PARAMS.bai.useProxy, RELAY_PARAMS.bai.opts);
-const snRelay = makeRelay("sn", RELAY_PARAMS.sn.store, RELAY_PARAMS.sn.slice, RELAY_PARAMS.sn.useProxy, RELAY_PARAMS.sn.opts);
-const wbRelay = makeRelay("wb", RELAY_PARAMS.wb.store, RELAY_PARAMS.wb.slice, RELAY_PARAMS.wb.useProxy, RELAY_PARAMS.wb.opts);
+const relay = mountLegacyPort("bai", RELAY_PARAMS.bai);
+const snRelay = mountLegacyPort("sn", RELAY_PARAMS.sn);
+const wbRelay = mountLegacyPort("wb", RELAY_PARAMS.wb);
 // WorkBuddy 国际版：同一个协议桥、同一套请求头构造，只换上游/端口/令牌三样（里程碑 1b）
-const wbaiRelay = makeRelay("wbai", RELAY_PARAMS.wbai.store, RELAY_PARAMS.wbai.slice, RELAY_PARAMS.wbai.useProxy, RELAY_PARAMS.wbai.opts);
+const wbaiRelay = mountLegacyPort("wbai", RELAY_PARAMS.wbai);
 // OpenCode Zen：OpenAI 协议，复用同一套桥（apiKey 认证，无令牌续期）
-const zenRelay = makeRelay("zen", RELAY_PARAMS.zen.store, RELAY_PARAMS.zen.slice, RELAY_PARAMS.zen.useProxy, RELAY_PARAMS.zen.opts);
+const zenRelay = mountLegacyPort("zen", RELAY_PARAMS.zen);
 // Qoder：OpenAI 协议，复用同一套桥。认证是轮换的 jt- jobToken（每次请求现读令牌文件），无静态密钥
-const qdRelay = makeRelay("qd", RELAY_PARAMS.qd.store, RELAY_PARAMS.qd.slice, RELAY_PARAMS.qd.useProxy, RELAY_PARAMS.qd.opts);
+const qdRelay = mountLegacyPort("qd", RELAY_PARAMS.qd);
 // MiniMax 会员托管通道（mm）：上游是 **Anthropic 原生协议**，所以**不走 openai 桥**；
 // 但请求头要整份换掉（Bearer + 浏览器 UA + Origin + Referer，缺一个就是 401），
 // 由 opts.prepareHeaders 完成；准入门（只承接 POST /v1/*）由 opts.gateV1 完成。
-const mmRelay = makeRelay("mm", RELAY_PARAMS.mm.store, RELAY_PARAMS.mm.slice, RELAY_PARAMS.mm.useProxy, RELAY_PARAMS.mm.opts);
+const mmRelay = mountLegacyPort("mm", RELAY_PARAMS.mm);
 // OpenRouter（第 6 家）：OpenAI 协议 + 通用桥；凭据是 keys[] 轮换区，由 openaiExchange 内的
 // orPick/orAdvance 每请求现选（这里传的 slice 只提供 upstream/mapping/availableModels）。
-const orRelay = makeRelay("or", RELAY_PARAMS.or.store, RELAY_PARAMS.or.slice, RELAY_PARAMS.or.useProxy, RELAY_PARAMS.or.opts);
+const orRelay = mountLegacyPort("or", RELAY_PARAMS.or);
 
 /* 插件渠道的中转：每家一个端口（声明里写的 relayPort）。
  * 与出厂八家用**同一批** handler 逻辑（makeRelay），只是参数不同 ——
@@ -7760,9 +7913,23 @@ function gatewayInfo(req, res) {
  *
  * 形状由 clients/muse-models.mjs 造（与 magpie 的 museModels 逐字同构）。
  */
+/* 「静默空表」那一行账的**上次值** ⇒ 只在变化时记日志（不然每次请求都刷屏） */
+let lastMuseFactsLine = "";
 function gatewayMuseModels(req, res) {
   const cfg = loadCfg();
   const entries = gatewayModelEntries(cfg);
+  /* ⚠ **「静默空表」的那一行账**（T15-c 阶段 1）：
+   *   以前查不到真值时是**静默**退化成全兜底 ⇒ 面板上看不出来、用户以为拿到的
+   *   都是真值。⇒ 现在每次都算一次账，**只在变化时**记一行日志（不然每次请求都刷屏）：
+   *   「模型真值表：32 个模型 · 14 条真值（measured 8 / measured-elsewhere 6）· 18 条兜底」。
+   *   ⚠ `status` 分三种坏法（empty / all-fallback / ok）——「全退回兜底」是**最阴的一种**
+   *   （接错了却看不出来）⇒ summarizeFactLookup 会单独点出来。 */
+  const r = describeFactLookup(cfg, entries);
+  const line = summarizeFactLookup(r);
+  if (line !== lastMuseFactsLine) {
+    lastMuseFactsLine = line;
+    log(line);
+  }
   json(res, 200, buildMuseModels(entries, {
     via: "B.AI",
     /* ⚠ **窗口与输出上限的真值**（T15-c 阶段 1：model-facts.mjs 的真值表）。
@@ -7772,8 +7939,9 @@ function gatewayMuseModels(req, res) {
      *   是最容易接错的地方（`entries` 变量名写错 ⇒ 拿到空数组 ⇒ **静默**退化成
      *   全兜底，看不出来）⇒ 把这步收进模块。
      *   ⚠ 查不到真值的 id **不在这个映射里** ⇒ 那边的兜底照旧（并且标明是约定）。
-     *   ⚠ 请求路径上**零 IO**：这里只读内置表；渠道目录是后台刷的（阶段 3）。 */
-    facts: factsForEntries(cfg, entries),
+     *   ⚠ 请求路径上**零 IO**：这里只读内置表；渠道目录是后台刷的（阶段 3，
+     *   那一层还没接 —— 触发方式待定，见 model-facts-handoff.md 第九节）。 */
+    facts: r.facts,
   }));
 }
 
@@ -8163,6 +8331,23 @@ const cliBaseUrlFor = (S) => {
 function gatewayOn(cfg) {
   const c = cfg || loadCfg();
   return String(c.gatewayMode || "off").trim().toLowerCase() === "on";
+}
+/**
+ * legacyPortAsGatewayOn —— 旧中转端口**要不要**改成统一网关的兼容入口。
+ *
+ * ⚠ **默认关**（"off"）—— 这是刻意的：T2 是**请求主路径**，而兼容入口改的是
+ *   「请求先到哪个端口」⇒ 一旦打开，老配置（指着自己那家的端口）的**故障转移
+ *   语义会变**（网关看得见所有家 ⇒ 跨渠道转移），这在默认开着是危险的。
+ *   ⇒ 按 T2 段自己写的纪律（「先加法、与旧路径并存、证明等价，**再切默认**」），
+ *   这一版**只把能力做出来、默认不开** ⇒ 默认行为**一字不变**。
+ *   想用的人自己打开（面板/配置里都有）。
+ *
+ * @param {object} [cfg]
+ * @returns {boolean}
+ */
+function legacyPortAsGatewayOn(cfg) {
+  const c = cfg || loadCfg();
+  return String(c.legacyPortAsGateway || "off").trim().toLowerCase() === "on";
 }
 function gatewayBaseUrl(cfg) {
   const c = cfg || loadCfg();
