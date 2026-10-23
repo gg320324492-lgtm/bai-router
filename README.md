@@ -77,10 +77,11 @@ Chat 的 `n>1` / `logprobs` / `audio`、Gemini 的 `cachedContent` / `safetySett
 
 ## 客户端接线：把 B.AI 接进装好的 CLI（v1.0.102-beta.1 起）
 
-面板新增「**客户端**」一屏：列出能接 B.AI 的客户端（ZCode、Qoder、Kimi Code、
-Qwen Code、MiniMax Code、CodeBuddy、WorkBuddy、Codex、Gemini CLI、Cline、Droid、
-Goose、jcode、Hermes、omp… 共 25 个），每一条写清它的配置文件在哪、说哪种方言、
-现在接上了没有。点「**接上**」就替你把配置写好，点「**断开**」就把它摘掉。
+面板新增「**客户端**」一屏：列出能接 B.AI 的客户端（**28 个**：Claude Code、
+Claude 桌面版、OpenCode、ZCode、Qoder、Kimi Code、Qwen Code、MiniMax Code、
+CodeBuddy、WorkBuddy、Codex、Gemini CLI、Cline、Droid、Goose、jcode、Hermes、
+omp…），每一条写清它的配置文件在哪、说哪种方言、现在接上了没有。
+点「**接上**」就替你把配置写好，点「**断开**」就把它摘掉。
 
 - **断开只还原我们写过的那几处** —— 你文件里其它内容一个字不动（写之前先备份
   那几个键的原值）。
@@ -88,6 +89,12 @@ Goose、jcode、Hermes、omp… 共 25 个），每一条写清它的配置文�
   覆盖掉。
 - 模型清单在 `GET /v1/models`（`provider/档位`），客户端从那里抄 id 就能用。
 - 客户端**没装**也会列出来（标「没装这个客户端」）—— 装了再点「接上」就行。
+  ⚠ **「没装」与「装了但还没生成过配置」分开说**：客户端装了但还没运行过时，
+  那个配置文件还没生成（ZCode 就是这样），这时说的是「装了，先运行一次它」，
+  不是「你没装」。
+- ⚠ **Claude Code 挑不了模型**（它的配置里写死一个），所以那一屏多一行
+  「接哪一家」：选哪家，它的模型 id 就写 `哪一家/档位`，网关才分流得了。
+- ⚠ **桌面版接线完要重启桌面版** —— 它只在**启动时**读一次配置库。
 
 ## 插件渠道：一份 JSON 声明加一家渠道（v1.0.95-beta.1 起）
 
