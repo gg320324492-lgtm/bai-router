@@ -31,6 +31,7 @@ import path from "node:path";
 import { applyClient, revertClient, formatOf, registerFormat } from "../src/server/clients/base.mjs";
 import { codexClient } from "../src/server/clients/codex.mjs";
 import { geminiCliClient } from "../src/server/clients/gemini-cli.mjs";
+import { opencodeClient } from "../src/server/clients/opencode.mjs";
 
 /* TOML 读写器是**并行会话**交付的（src/server/clients/formats-toml.mjs）。
  * 它在就注册（那几条强断言才跑），不在就跳过强断言 —— 但**接线本身**的
@@ -85,6 +86,28 @@ describe("① 声明的形状", () => {
     assert.equal(files[0].format, "json");
     assert.equal(files[1].path, path.join(home, ".gemini", ".env"));
     assert.equal(files[1].format, "dotenv");
+  });
+});
+
+/* ====================================================================== *
+ * ①′ OpenCode：必须写模型 id
+ * ====================================================================== */
+describe("①′ OpenCode：模型 id 那一格不能漏", () => {
+  test("①′ provider.<id>.model 在，且是 provider/档位 的完整写法", () => {
+    /* ⚠ magpie 的 OpenCode 写 `provider.<id>.model`（provider 块里的模型 id）
+     *   ⇒ **不写它，客户端只有一份清单可选、却不知道选哪个** ⇒ 2026-10-23 发现
+     *   我们漏了这一格，补上并用这条钉住。
+     *   ⚠ 默认用**清单里的第一个**（magpie 是让用户在面板上选的；我们还没有
+     *   「用户选了哪一档」这个概念）。 */
+    const home = tmpDir();
+    const r = applyClient(opencodeClient, CTX(home), { dataDir: home });
+    assert.equal(r.ok, true, `接线失败：${r.detail}`);
+    const file = path.join(home, ".config", "opencode", "opencode.json");
+    const j = JSON.parse(fs.readFileSync(file, "utf8"));
+    const pid = "bai";
+    assert.ok(j.provider && j.provider[pid], `provider 块没写出来：${JSON.stringify(j)}`);
+    assert.ok(j.provider[pid].model, "★ 没写 model ⇒ 客户端不知道用哪个模型");
+    assert.match(j.provider[pid].model, /^[a-z]+\//, "模型 id 少了 provider 前缀");
   });
 });
 

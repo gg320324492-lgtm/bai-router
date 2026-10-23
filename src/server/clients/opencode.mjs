@@ -51,6 +51,9 @@
 
 import path from "node:path";
 import os from "node:os";
+/* pickModel —— 选一个模型（清单里的第一个）。util.mjs 是这一层共用的工具，
+   它导出 pickModel 与 envDir（重写它要保留这两个名字）。 */
+import { pickModel } from "./util.mjs";
 
 /** OpenCode 的配置目录：$OPENCODE_CONFIG_DIR → $XDG_CONFIG_HOME/opencode → ~/.config/opencode */
 function opencodeDir(ctx) {
@@ -78,6 +81,17 @@ export const opencodeClient = {
         for (const m of c.models || []) {
           models[m.id] = { name: m.label || m.id };
         }
+        /* ⚠ **模型 id 那一档**（`model`）—— 原来漏了：magpie 的 OpenCode 写
+         *   `provider.<id>.model`（provider 块里的模型 id）⇒ 不写它，
+         *   **客户端根本不知道用哪个模型**（它只有一份清单可选）。
+         *   ⇒ 补上。
+         *   ⚠ **用哪个当默认**：magpie 是让**用户在面板上选**的（它有模型选择器），
+         *   我们还没有「用户选了哪一档」这个概念 ⇒ 暂用**清单里的第一个**
+         *   （`pickModel`，与其它声明一致）⇒ 稳定、可预期。
+         * ⚠ **不写** magpie 的 `small_model`：我们清单里最小的就是 haiku ⇒
+         *   再没有更小的可当「小模型」⇒ 写它没有意义（magpie 的 small 是
+         *   「它清单里更小的那个」）。 */
+        const pick = pickModel(c);
         return [
           /* ⚠ 键是 `provider.<id>.<路径>` —— 键名里带点要转义（见文件头）。 */
           { path: `provider.${pid}.npm`, value: "@ai-sdk/openai-compatible" },
@@ -89,6 +103,8 @@ export const opencodeClient = {
           /* 地址与 key 是机器该管的（设计稿 §2.2(a)）—— 不参与比对、照写。 */
           { path: `provider.${pid}.options.baseURL`, value: `${String(c.baseUrl || "").replace(/\/+$/, "")}/v1` },
           { path: `provider.${pid}.options.apiKey`, value: c.apiKey || "" },
+          /* 模型 id：机器该管的（设计稿 §2.2(a)）⇒ 照写、不比对。 */
+          { path: `provider.${pid}.model`, value: pick.id },
           /* models 是**对象表**（模型 id 当表名）：用户改过的**模型名**归用户
              （通配 `*.name`），模型 id（表名）与别的键是机器该管的 / 保留用户的。
              ⚠ 路径是**相对 value 根**的 —— value 根**就是**这张表 ⇒ 写 `*.name`
