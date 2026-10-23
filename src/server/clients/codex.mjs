@@ -76,13 +76,25 @@ export const codexClient = {
     {
       path: path.join(ctx.home, ".codex", "config.toml"),
       format: "toml",
-      writes: () => [
-        /* 顶层两个键：先写它们，后写 provider 表 —— 顺序无所谓，
-           但表得在最后（它是一个新段）。 */
-        { path: "model_provider", value: PID },
-        { path: "model", value: (ctx.models && ctx.models[0] && ctx.models[0].id) || "" },
-        { path: `model_providers.${PID}`, value: providerTable(ctx) },
-      ],
+      /* ⚠⚠ **provider 表逐键写**，不整块写（这是 TOML 的一个硬约束）：
+       *   用户自己的 config.toml 里很可能已经有 `[model_providers.other]` ——
+       *   它**隐式定义**了表 `model_providers`。这时再写一个 `[model_providers]`
+       *   段 + 内联表 = **同一张表被定义两次 = 非法 TOML** ⇒ 解析器报错 ⇒
+       *   **Codex 读不了整个配置文件**（连他的 MCP 配置一起废掉）。
+       *   逐键写产出的是 `[model_providers.bai]` **子表段**，父表只被隐式定义
+       *   一次 ⇒ 无论用户文件里有什么都是合法的。
+       *   （这条也写进了 docs/replication-plan.md 的教训里。） */
+      writes: () => {
+        const t = providerTable(ctx);
+        const out = [
+          { path: "model_provider", value: PID },
+          { path: "model", value: (ctx.models && ctx.models[0] && ctx.models[0].id) || "" },
+        ];
+        for (const [k, v] of Object.entries(t)) {
+          out.push({ path: `model_providers.${PID}.${k}`, value: v });
+        }
+        return out;
+      },
       wired: (text, fmt) => {
         const r = fmt.getPath(text, "model_provider");
         return !!(r && r.ok && r.found && String(r.value) === PID);

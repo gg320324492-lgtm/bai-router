@@ -7702,10 +7702,58 @@ const gatewayServer = http.createServer((req, res) => {
    * ⚠ 分派**只看路径与方法**，不看请求体 —— 请求体还没读呢。 */
   const p = String(req.url || "").split("?")[0];
   const ep = p.length > 1 ? p.replace(/\/+$/, "") : p;
-  if (req.method === "GET" && ep === "/v1/models") return gatewayModels(req, res);
+  if (req.method === "GET" && (ep === "/" || ep === "/v1")) return gatewayInfo(req, res);
+  if (req.method === "GET" && (ep === "/v1/models" || ep === "/models")) return gatewayModels(req, res);
+  if (req.method === "GET" && ep.startsWith("/v1/models/")) return gatewayOneModel(req, res, ep.slice("/v1/models/".length));
   if (pickProtocol(ep, req.method)) return gatewayProtocolHandler(req, res);
   return gatewayAnthropicHandler(req, res);
 });
+
+/**
+ * 统一网关的信息（GET / 与 GET /v1）。
+ *
+ * ⚠ **为什么要有**：有些客户端（Empryo）只把「baseURL 有应答」的 provider 列出来
+ *   —— 它打的就是 baseURL 本身。magpie 的网关 `GET /{$}` 与 `GET /v1` **都**答
+ *   info（internal/gateway/gateway.go:657-661），我们两个都 405 ⇒ 那些客户端
+ *   一个 provider 都列不出来 —— 「配置写好了，客户端却看不见我们」。
+ *   这是**通用**的网关信息端点，不是给某个客户端开后门。
+ *
+ * 形状照 magpie（name/version/models/apis），多一个字段都不给。
+ */
+function gatewayInfo(req, res) {
+  const entries = gatewayModelEntries(loadCfg());
+  json(res, 200, {
+    name: "bai-router",
+    version: APP_VERSION,
+    models: entries.length,
+    apis: [
+      "/v1/messages",
+      "/v1/chat/completions",
+      "/v1/responses",
+      "/v1beta/models/{model}:generateContent",
+      "/v1/models",
+    ],
+  });
+}
+
+/**
+ * 统一网关的**单个**模型（GET /v1/models/{id}）。
+ *
+ * ⚠ 模型 id 里**带斜杠**（`sn/claude-opus-5`），所以路径后面那一段要整个当 id
+ *   （magpie 用 `{id...}` 通配，见 gateway.go:664）。这里按「先精确、再前缀匹配」
+ *   找 —— 找不到就 404（**不猜**：宁可说没有，也不要给一个不对的模型）。
+ */
+function gatewayOneModel(req, res, rawId) {
+  let id = String(rawId || "");
+  try { id = decodeURIComponent(id); } catch { /* 不是合法编码就按原样找 */ }
+  const entries = gatewayModelEntries(loadCfg());
+  const one = entries.find((e) => e.id === id);
+  if (!one) {
+    return json(res, 404, { error: { message: `统一网关没有这个模型：${id}`, type: "not_found_error" } });
+  }
+  const body = chatModelsPayload([one]);
+  json(res, 200, body.data[0]);
+}
 
 /**
  * 统一网关的模型清单（GET /v1/models）。

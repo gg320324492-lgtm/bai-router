@@ -237,6 +237,51 @@ magpie 的每个客户端是**深度定制**的 —— `internal/agent/zcode.go`
 `GET /` 与 `GET /v1` → 网关信息（照 magpie 的 info）；`GET /models` → 模型清单
 （`/v1/models` 的别名）。`/muse-code/models` 较复杂（要伪造 limit），放后面。
 
+### T15-e 形状要按「用户本机这一版」核（📋 纪律，2026-10-23 核出两个坑）
+
+**照抄 magpie 的字段路径是不够的** —— magpie 是「它自己支持的客户端版本」的权威，
+**不等于用户装的那一版**。2026-10-23 核出两个会**弄坏用户配置**的坑：
+
+1. **Hermes 的键名有版本差异**：magpie 写 `providers:`（映射），
+   **用户这版是 `custom_providers:`（数组，元素里还自带 `model:` 字段）**
+   ⇒ 照抄 ⇒ 用户的 Hermes 读不到我们写的那块。
+   ⇒ **按用户文件里已有的形状走**（WorkBuddy 那边 magpie 自己就「保留原形状」）。
+2. **TOML 里同一张表不能被定义两次**：写嵌套对象会产出 `[model_providers]` + 内联表；
+   而用户的 `config.toml` 里往往已有 `[model_providers.other]`（它**隐式定义**了
+   表 `model_providers`）⇒ 重复定义 = **非法 TOML** ⇒ **Codex 读不了整个配置文件**
+   （连他的 MCP 配置一起废掉）。
+   ⇒ **写嵌套对象要逐键写**（产出 `[model_providers.bai]` 子表段）。
+
+**怎么核**：接一个客户端，除了读 `internal/agent/<name>.go`，还要看**用户本机那个
+客户端的真实配置文件** —— 但**只取键名与层级**（写个只提键名的脚本），
+**绝不 `cat` 整个文件**（那些文件里常有真凭据，抄进夹具或提交就是泄漏）。
+核出来的差异写进那个客户端的注释里：哪个是 magpie 的、哪个是用户这版的、我们按哪个来。
+
+**本机装了哪些客户端**：权威来源是 **CC Switch 的 `~/.cc-switch/settings.json` 的
+`visibleApps`**（它专门做多客户端切换，它认的就是本机这些）——
+Claude Code / Claude Desktop / Codex / MiniMax Code / OpenCode 五个是启用的，
+Hermes 装了但它没启用。**`~/.cursor` 是编辑器不是 CLI**（CLI 的配置是
+`~/.cursor/cli-config.json`）；`~/.mimocode/`、`~/.copilot/` **只有空目录** ⇒ 没装。
+
+### T15-f 面板那一屏还差三个最常用的（📋 下一批）
+
+「客户端」屏现在列 25 个（`src/server/clients/` 下的声明），但**用户最常用的三个
+不在列表里**：Claude Code、Claude Desktop、OpenCode —— 它们走的是老路
+（`server.mjs` 的 `applyToCli` / `applyToDesktop` / `oc-wiring`），不在 `clients/` 层。
+
+**为什么不直接照抄成声明**：
+- Claude Code 写 `~/.claude/settings.json` 的 **`env` 块**（`ANTHROPIC_BASE_URL` /
+  `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_*_MODEL`）+ 权限、hooks ⇒ 点分路径能写，
+  但细节多。
+- Claude Desktop 写 `configLibrary/<id>.json` 的 **`inferenceModels[]`（数组）**
+  ⇒ 要等 JSON 的**数组级**读写能力（`formats-json-list` 那条线）。
+
+**下一批怎么做**（二选一，或都做）：
+1. **把它们也做成 `clients/` 里的声明**（形状对、路径级备份统一）—— 更干净，但要搬
+   `applyToCli` 的全部细节。
+2. **在「客户端」屏里给它们三行**，「接上/断开」**转调**现有的 `applyToCli` /
+   `applyToDesktop` / `oc-wiring` —— 不重复实现、用户先能看到。
+
 
 
 ---

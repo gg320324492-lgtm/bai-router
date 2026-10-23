@@ -28,9 +28,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { applyClient, revertClient, formatOf } from "../src/server/clients/base.mjs";
+import { applyClient, revertClient, formatOf, registerFormat } from "../src/server/clients/base.mjs";
 import { codexClient } from "../src/server/clients/codex.mjs";
 import { geminiCliClient } from "../src/server/clients/gemini-cli.mjs";
+
+/* TOML 读写器是**并行会话**交付的（src/server/clients/formats-toml.mjs）。
+ * 它在就注册（那几条强断言才跑），不在就跳过强断言 —— 但**接线本身**的
+ * 断言（①②③）不受影响。 */
+let hasToml = false;
+try {
+  const m = await import("../src/server/clients/formats-toml.mjs");
+  registerFormat("toml", m);
+  hasToml = true;
+} catch { /* 还没交付 */ }
 
 const TMPROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bai-majorcli-"));
 process.on("exit", () => { try { fs.rmSync(TMPROOT, { recursive: true, force: true }); } catch { } });
@@ -85,10 +95,17 @@ describe("② base_url：Codex 带 /v1，Gemini CLI 不带", () => {
   test("②a Codex 的 base_url 带 /v1（它自己拼 /responses）", () => {
     const home = tmpDir();
     const w = codexClient.files(CTX(home))[0].writes(CTX(home));
-    const tbl = w.find((x) => x.path === "model_providers.bai").value;
+    /* ⚠ provider 表是**逐键**写的（TOML 的硬约束：同一张表不能被定义两次，
+     *   用户的 config.toml 里很可能已有 `[model_providers.other]`）。 */
+    const tbl = {};
+    for (const x of w) {
+      const m = /^model_providers\.bai\.(.+)$/.exec(x.path);
+      if (m) tbl[m[1]] = x.value;
+    }
     assert.equal(tbl.base_url, "http://127.0.0.1:15799/v1",
       "★ 少了 /v1，Codex 会去问 /responses（网关只答 /v1/responses）");
     assert.equal(tbl.wire_api, "responses");
+    assert.equal(tbl.name, "B.AI");
   });
 
   test("②b Gemini CLI 的 base_url 不带 /v1（它自己拼 /v1beta/…）", () => {
@@ -103,7 +120,7 @@ describe("② base_url：Codex 带 /v1，Gemini CLI 不带", () => {
     const home = tmpDir();
     const c = codexClient.files(CTX(home))[0].writes(CTX(home));
     const g = geminiCliClient.files(CTX(home))[1].writes(CTX(home));
-    const cBase = c.find((x) => x.path === "model_providers.bai").value.base_url;
+    const cBase = c.find((x) => x.path === "model_providers.bai.base_url").value;
     const gBase = g.find((x) => x.path === "GOOGLE_GEMINI_BASE_URL").value;
     assert.ok(cBase.endsWith("/v1"), "Codex 的要带 /v1");
     assert.ok(!gBase.endsWith("/v1"), "Gemini CLI 的不能带 /v1");
@@ -185,7 +202,69 @@ describe("④ 接线不静默失败", () => {
   });
 
   test("④c 格式注册表：没注册的格式返回 null（不崩）", () => {
-    assert.equal(formatOf("toml"), formatOf("toml"));   // 幂等
     assert.equal(formatOf("根本没有这个格式"), null);
+  });
+
+  test("④d Codex：用户自己配了 [model_providers.other] 时，写出来**不能重复定义父表**", () => {
+    if (!hasToml) return;   // 读写器还没交付 ⇒ 这条强断言跳过（接线本身的断言在上面）
+    const home = tmpDir();
+    /* 用户自己的配置（**本机真实形状**：他配过一个别的 provider，还配了 MCP）。 */
+    const file = path.join(home, ".codex", "config.toml");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const userToml = `model = "gpt-5"
+
+[model_providers.other]
+name = "Other"
+base_url = "https://example.com/v1"
+
+[mcp_servers.playwright]
+command = "npx"
+`;
+    fs.writeFileSync(file, userToml, "utf8");
+
+    const r = applyClient(codexClient, CTX(home), { dataDir: home });
+    assert.equal(r.ok, true, `接线失败：${r.detail}`);
+    const out = fs.readFileSync(file, "utf8");
+
+    /* ★ 判据：同一张表**不能被定义两次**。
+     *   `[model_providers.other]` 已经隐式定义了表 `model_providers`，
+     *   后面再出现 `[model_providers]` = 重复定义 = **非法 TOML**
+     *   ⇒ Codex 读不了整个配置文件（连他的 MCP 配置一起废掉）。 */
+    const parentSections = out.split(/\r?\n/).filter((l) => /^\s*\[model_providers\]\s*$/.test(l));
+    assert.equal(parentSections.length, 0,
+      `★ 输出里出现了重复的父表段 [model_providers] —— 这是非法 TOML：\n${out}`);
+    assert.ok(/^\s*\[model_providers\.bai\]\s*$/m.test(out),
+      `应该写子表段 [model_providers.bai]：\n${out}`);
+
+    /* 段不能重复（同名段两次 = 非法） */
+    const secs = out.split(/\r?\n/).filter((l) => /^\s*\[/.test(l)).map((l) => l.trim());
+    assert.equal(new Set(secs).size, secs.length, `有段被写了两次：${secs.join(" | ")}`);
+
+    /* 用户的其它内容一个字没动 —— **除了顶层的 `model`**：
+     *   Codex 的 `model` 是「当前用哪个模型」，不改成我们的档位的话，
+     *   Codex 会拿他的 "gpt-5" 来问我们的网关 ⇒ 400（网关按 provider 前缀分流）。
+     *   magpie 也是这么做的；**断开时原样还原**（底座按路径备份了原值）。 */
+    assert.ok(out.includes("[model_providers.other]"), "用户的 provider 段被弄丢了");
+    assert.ok(out.includes("[mcp_servers.playwright]"), "用户的 MCP 段被弄丢了");
+    assert.match(out, /model\s*=\s*"sn\/claude-opus-5"/,
+      "顶层 model 要指向我们的档位（否则 Codex 拿他的模型来问 ⇒ 400）");
+
+    /* 断开 ⇒ 顶层 model 原样回到 "gpt-5" */
+    const back = revertClient(codexClient, { dataDir: home });
+    assert.equal(back.ok, true, back.detail);
+    assert.ok(fs.readFileSync(file, "utf8").includes('model = "gpt-5"'),
+      "★ 断开后用户的 model 没还原");
+  });
+
+  test("④e Codex：写进去的能读回来（往返）", () => {
+    if (!hasToml) return;
+    const home = tmpDir();
+    const r = applyClient(codexClient, CTX(home), { dataDir: home });
+    assert.equal(r.ok, true, r.detail);
+    const file = path.join(home, ".codex", "config.toml");
+    const out = fs.readFileSync(file, "utf8");
+    assert.match(out, /base_url\s*=\s*"http:\/\/127\.0\.0\.1:15799\/v1"/,
+      `base_url 要带 /v1：\n${out}`);
+    assert.match(out, /wire_api\s*=\s*"responses"/);
   });
 });

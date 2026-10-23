@@ -316,6 +316,38 @@ describe("Chat 入向 · 端到端（真 server + 统一网关 + 假上游）", 
     assert.equal(up2.body.model, SN_OPUS, "Gemini 的模型名要搬到 body 里（它在路径里）");
   });
 
+  test("⑦c 网关的信息与清单端点（有些客户端靠它们才知道连上没有）", async () => {
+    const getJson = (p) => fetch(`http://127.0.0.1:${P.gateway}${p}`, {
+      signal: AbortSignal.timeout(30000),
+    }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }));
+
+    /* GET / 与 GET /v1 ⇒ 网关信息（magpie 也答这两个：gateway.go:657-661）。
+     *   Empryo 这类客户端「只把 baseURL 有应答的 provider 列出来」—— 它打的就是
+     *   baseURL 本身；我们原先一律 405 ⇒ 它一个 provider 都列不出来。 */
+    for (const p of ["/", "/v1"]) {
+      const r = await getJson(p);
+      assert.equal(r.status, 200, `GET ${p} 实际 ${r.status}`);
+      assert.equal(r.json.name, "bai-router", `GET ${p} 的 name 不对`);
+      assert.ok(typeof r.json.models === "number" && r.json.models > 0, `GET ${p} 的 models 不对`);
+      assert.ok(Array.isArray(r.json.apis) && r.json.apis.length > 0, `GET ${p} 的 apis 不对`);
+    }
+
+    /* GET /models（不带 /v1 的别名）⇒ 同一份清单。 */
+    const rm = await getJson("/models");
+    assert.equal(rm.status, 200, `GET /models 实际 ${rm.status}`);
+    assert.equal(rm.json.object, "list");
+    assert.ok(rm.json.data.length > 0);
+
+    /* GET /v1/models/{id} ⇒ 单个模型（id 里带斜杠，所以后面那一段整个当 id）。 */
+    const one = await getJson("/v1/models/" + encodeURIComponent("sn/claude-opus-5"));
+    assert.equal(one.status, 200, `GET 单个模型 实际 ${one.status}`);
+    assert.equal(one.json.id, "sn/claude-opus-5");
+
+    /* 找不到 ⇒ 404（**不猜**：宁可说没有，也不要给一个不对的模型）。 */
+    const none = await getJson("/v1/models/" + encodeURIComponent("sn/没有这个档位"));
+    assert.equal(none.status, 404, `实际 ${none.status}`);
+  });
+
   test("⑦ 反向对照：把「URL 也换成 /v1/messages」改坏 ⇒ ① 必须抓到", async () => {
     /* 手法（与 scripts/gateway-test.mjs 同一路子）：把 src/server **复制**到临时目录，
        在**副本**的 gateway.mjs 上把「URL 也换」那一行改坏（URL 保持客户端原来那个），
