@@ -222,9 +222,70 @@ function msg(e) {
   return String(m).split("\n")[0].slice(0, 120);
 }
 
+/**
+ * gitNetVariants —— **远端核对**（git ls-remote 打 github.com）该试哪几条路。
+ *
+ * ⚠ 为什么单独抽出来：这条路的探测目标是 **github.com**，而上传那条路的探测目标
+ *   是 **api.github.com** —— 两者不是同一条路（2026-10-22 实测：直连 api 0.8 秒、
+ *   直连 github 16.7 秒，git 的连接预算撑不住那次握手）。
+ *   ⇒ 「探测量的是一条路，决定的却是另一条路」⇒ 远端核对**自己**挑一条能通的。
+ *
+ * 候选顺序：**显式指定的（BAI_GIT_PROXY）→ 环境里本来就有的 → 上传那份 →
+ * 不带代理**。⚠「环境里有没有代理变量」是**偶然**的（换个终端、换个工具就可能
+ * 没有）⇒ 所以第一档是「显式指定」，它不依赖运气。
+ *
+ * @param {object} env        进程环境（一般传 process.env）
+ * @param {object} [ghEnv]    上传那份 env（decideProxyUse 定的那份）
+ * @param {object} [noProxyEnv] 不带代理的那份
+ * @returns {object[]} 去重后的候选 env（按优先级）
+ */
+function gitNetVariants(env, ghEnv, noProxyEnv) {
+  const src = env || {};
+  const sig = (e) => PROXY_ENV_KEYS.map((k) => `${k}=${e[k] || ""}`).join("|");
+  const out = [];
+  const push = (e) => {
+    if (!e) return;
+    if (!out.some((v) => sig(v) === sig(e))) out.push(e);
+  };
+  const explicit = String(src.BAI_GIT_PROXY || "").trim();
+  if (explicit) {
+    const e = { ...src };
+    for (const k of PROXY_ENV_KEYS) e[k] = explicit;
+    push(e);
+  }
+  push(src);
+  push(ghEnv);
+  push(noProxyEnv);
+  return out;
+}
+
+/**
+ * gitRemoteError —— 所有路都试过之后的**说人话**的错。
+ *
+ * ⚠ 为什么不能把原始错误原样抛出：2026-10-23 那次发布挂在
+ *   `spawnSync git ETIMEDOUT` —— 看不出「这是远端核对那步」「这台机器 github.com
+ *   直连不通」「带代理重跑就行」这三件事。⇒ 报错要说清**是哪一步、为什么、怎么办**。
+ *
+ * @param {Error|string} last 最后一次失败的错误
+ * @returns {Error} 带解法的错误
+ */
+function gitRemoteError(last) {
+  const msg = String((last && last.message) || last || "");
+  const timedOut = /ETIMEDOUT|timeout|timed out/i.test(msg);
+  return new Error([
+    "发布已中止：远端核对连不上 GitHub（所有候选路都试过了）。",
+    "  打的地址：github.com —— 很多机器上它**直连不通**（api.github.com 通、github.com 不通）。",
+    "  ⇒ 带上代理变量重跑（按你的实际代理改端口）：",
+    "     HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 node scripts/publish.cjs \"<更新说明>\"",
+    "  ⇒ 或只给 git 那一段指定：BAI_GIT_PROXY=http://127.0.0.1:7897 node scripts/publish.cjs \"<更新说明>\"",
+    "  最后一次错误：" + (timedOut ? "连不上（超时）" : msg),
+  ].join("\n"));
+}
+
 module.exports = {
   PROXY_ENV_KEYS, PROBE_EXTRA_STRIP_KEYS, PROBE_TARGET, PROBE_TIMEOUT_MS, PROBE_HARD_TIMEOUT_MS,
   foundProxyKeys, decideProxyUse, buildGhEnv, stripProbeEnv, runDirectProbe, probeDirectAsync,
+  gitNetVariants, gitRemoteError,
 };
 
 if (require.main === module && process.argv.includes("--probe-direct")) {

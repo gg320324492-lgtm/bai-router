@@ -331,3 +331,69 @@ describe("反向对照：坏实现必须被同一套断言打红", () => {
     for (const c of CASES) assertCase(decideProxyUse, c);
   });
 });
+
+/* ====================================================================== *
+ * 远端核对（git ls-remote 打 github.com）该试哪几条路、全失败怎么报错
+ *
+ * ⚠ 为什么要单独测：上传那条路探的是 api.github.com（直连通），远端核对打的是
+ *   github.com（直连常常不通）—— **两者不是同一条路**。
+ *   ⇒ 「环境里有没有代理变量」是**偶然**的（换个终端就没了）⇒ 不能靠运气，
+ *   得有一个**显式**的入口 + 一个说人话的报错。
+ * ====================================================================== */
+describe("远端核对：候选路与「说人话」的报错", () => {
+  const V = PP.gitNetVariants;
+  const E = PP.gitRemoteError;
+  const sig = (e) => PP.PROXY_ENV_KEYS.map((k) => `${k}=${e[k] || ""}`).join("|");
+
+  test("① 显式指定的 BAI_GIT_PROXY 排第一档（不靠运气）", () => {
+    const list = V({ BAI_GIT_PROXY: "http://127.0.0.1:7897" }, null, null);
+    assert.ok(list.length >= 1, "一条候选路都没有");
+    assert.equal(list[0][PP.PROXY_ENV_KEYS[0]], "http://127.0.0.1:7897",
+      "★ 显式指定的代理没排在第一档");
+  });
+
+  test("② 环境里一个代理变量都没有时，也还有候选路（不会一条都没有）", () => {
+    const list = V({}, null, { FOO: "bar" });
+    assert.ok(list.length >= 1, "★ 没有代理变量 ⇒ 候选路空了 ⇒ 远端核对直接没路可走");
+  });
+
+  test("③ 候选路去重（同样的一批代理变量不重复试）", () => {
+    const a = { HTTPS_PROXY: "http://127.0.0.1:7897" };
+    const list = V(a, a, a);
+    const sigs = list.map(sig);
+    assert.equal(new Set(sigs).size, sigs.length, "★ 候选路里有重复 ⇒ 白试一遍");
+  });
+
+  test("④ 全部失败 ⇒ 报错说清「哪一步 / 为什么 / 怎么办」", () => {
+    const err = E(new Error("spawnSync git ETIMEDOUT"));
+    const m = String(err.message || "");
+    assert.match(m, /远端核对/, "★ 没说清是哪一步");
+    assert.match(m, /github\.com/, "★ 没说清打的是哪个地址");
+    /* ⚠ 断言的是**短语**而不是「消息里出现过 HTTPS_PROXY」——
+       后面那行可复制的命令里本来就有 HTTPS_PROXY，断言它会被命令满足 ⇒ 判据恒真。 */
+    assert.match(m, /带上代理变量重跑/, "★ 没说清怎么办（带代理重跑）");
+    assert.match(m, /node scripts\/publish\.cjs/, "★ 没说清重跑的命令长什么样");
+    assert.match(m, /BAI_GIT_PROXY/, "★ 没说清另一个办法（只给 git 那段指定）");
+  });
+
+  test("⑤ 反向对照：把「怎么办」那句删掉 ⇒ ④ 必须红", () => {
+    /* 手法：把 publish-proxy.cjs 复制到临时目录，在**副本**上删掉报错里
+       「⇒ 带上代理变量重跑」那一行，再 import 副本跑 ④ 的判据 ——
+       它必须抓不到「说了怎么办」。
+       ⚠ 改的是副本，仓库源码一个字不动。 */
+    const src = readFileSync(PROXY_SRC, "utf8");
+    const anchor = '    "  ⇒ 带上代理变量重跑（按你的实际代理改端口）：",';
+    const hits = src.split(anchor).length - 1;
+    assert.equal(hits, 1, `锚点在 publish-proxy.cjs 里必须恰好命中 1 次，实得 ${hits} 次（源码变了，这条对照作废）`);
+    const dir = mkdtempSync(path.join(os.tmpdir(), "bai-publish-err-sabotage-"));
+    const file = path.join(dir, "publish-proxy.cjs");
+    writeFileSync(file, src.replace(anchor, ""), "utf8");
+    try {
+      const bad = require_(file).gitRemoteError(new Error("spawnSync git ETIMEDOUT"));
+      assert.doesNotMatch(String(bad.message || ""), /带上代理变量重跑/,
+        "★ 坏实现仍然说清了怎么办 —— 那 ④ 的判据是恒真的，测了个寂寞");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

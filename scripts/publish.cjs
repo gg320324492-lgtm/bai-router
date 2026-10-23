@@ -4,7 +4,7 @@
 const { execSync, execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const { decideProxyUse, buildGhEnv, runDirectProbe, PROXY_ENV_KEYS } = require("./publish-proxy.cjs");
+const { decideProxyUse, buildGhEnv, runDirectProbe, gitNetVariants, gitRemoteError } = require("./publish-proxy.cjs");
 const { assertCleanSource, assertRemoteSource } = require("./publish-source.cjs");
 const { syncSeed } = require("./publish-seed.cjs");
 const { isPrereleaseVersion } = require("../src/update-channel.js");
@@ -49,22 +49,20 @@ const readGit = (args, env = process.env) => execFileSync("git", args, {
  *   远端核对自己挑一条能通的就行 —— 与上传那条路**解耦**。
  */
 const noProxyEnv = buildGhEnv(process.env, { useProxy: false });
-let ghEnv = null;   // 发布时再定（见下方 decideProxyUse）
+let ghEnv = null;   // 发布时再定（见下方 decideProxyUse)
+
+/* 远端核对该试哪几条路、全部试过之后怎么报错 —— 都在 publish-proxy.cjs 里
+   （纯函数，能被测试钉住）。⚠ 「显式指定 BAI_GIT_PROXY」排第一档：
+   「环境里有没有代理变量」是**偶然**的，不能靠运气。 */
 function netEnvVariants() {
-  const sig = (e) => PROXY_ENV_KEYS.map((k) => `${k}=${e[k] || ""}`).join("|");
-  const out = [];
-  for (const e of [process.env, ghEnv, noProxyEnv]) {
-    if (!e) continue;
-    if (!out.some((v) => sig(v) === sig(e))) out.push(e);
-  }
-  return out;
+  return gitNetVariants(process.env, ghEnv, noProxyEnv);
 }
 function readGitRemote(args) {
   let last = null;
   for (const env of netEnvVariants()) {
     try { return readGit(args, env); } catch (e) { last = e; }
   }
-  throw last;
+  throw gitRemoteError(last);
 }
 const releaseHead = assertCleanSource(readGit);
 assertRemoteSource(readGitRemote, { repository: releaseRepository, head: releaseHead, tag: `v${v}` });
