@@ -304,6 +304,26 @@ export function makeProtocolHandler({ handlers, isProvider = defaultIsProvider, 
         return gatewayError(res, 400, `${proto.label} 的请求翻不出 Anthropic 形状：${String((e && e.message) || e)}`);
       }
       req[GATEWAY_BODY] = Buffer.from(JSON.stringify(anth));
+      /* ⚠⚠⚠ **URL 也必须换** —— 不换的话，body 已经是 Anthropic 形状了、路径却还是
+       *   客户端那个（/v1/chat/completions、/v1/responses、/v1beta/models/…），
+       *   中转会把 `upstream + req.url` 原样拼出去 ⇒ 打过去的是**上游不认的路径**
+       *   ⇒ 404「上游返回了非 API 响应」。
+       *
+       *   ⚠ 这个洞一直藏着：协议桥写好之后，**没有任何客户端真的接过**（Codex 说
+       *   Responses、Gemini CLI 说 Gemini，但两者都没接线），所以没人走过这条路。
+       *   2026-10-23 把 Codex 与 Gemini CLI 接上，第一个真实使用者立刻撞上它。
+       *
+       *   为什么统一是 `/v1/messages`：协议桥把三种方言都翻成了**同一份 Anthropic
+       *   形状**（同一个中转、同样的模型解析、一样的故障转移），Anthropic 规范就
+       *   这一个路径。⚠ Gemini 的模型名原本在**路径**里（`/v1beta/models/x:generateContent`），
+       *   协议桥已经把它取出来放进 body 的 `model` 字段了 ⇒ 路径不再需要带它。
+       *
+       *   ⚠ query 保留：客户端带的参数（有的客户端会用）不能丢。
+       *   ⚠ openai 桥那几家（wb/qd/or/zen）不受影响 —— 它们的上游路径是
+       *   openaiExchange 自己拼的（`base + "/v2/chat/completions"`），不看 req.url。 */
+      const rawUrl = String(req.url || "");
+      const atQ = rawUrl.indexOf("?");
+      req.url = "/v1/messages" + (atQ >= 0 ? rawUrl.slice(atQ) : "");
       const cfg = typeof getCfg === "function" ? getCfg() : null;
       const { tier, literal } = resolveTier(parsed.provider, parsed.model, cfg, tierKeyFor, tierOf);
       if (literal) req[GATEWAY_MODEL] = parsed.model;

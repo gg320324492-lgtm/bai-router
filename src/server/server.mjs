@@ -10555,7 +10555,9 @@ async function unknownMappingTargets(p, mapping, cfg) {
           status: st,
         });
       }
-      return json(res, 200, { ok: true, list: out });
+      /* ⚠ 统一网关地址要一起给出去：用户要看得见「客户端会被指到哪儿」，
+       *   那一行不是装饰 —— 它是「接上」之后客户端里会写着的那个地址。 */
+      return json(res, 200, { ok: true, baseUrl: ctx.baseUrl, list: out });
     }
     if (req.method === "POST" && u.pathname === "/api/clients/apply") {
       const b = await readBody(req);

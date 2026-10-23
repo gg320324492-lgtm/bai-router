@@ -1,0 +1,269 @@
+/* cards/clients.js —— 客户端屏的卡（把 B.AI 接到装好的 CLI / 桌面端上）。
+ *
+ * 这张卡回答的是「**我装的那个客户端能不能用上 B.AI？**」：
+ *   ① 有哪些客户端能接（magpie 支持 66 个，B.AI 正在一个个铺）
+ *   ② 每一个：它的配置文件在哪、说哪种方言、现在接上了没有
+ *   ③ 一键接上 / 一键断开
+ *
+ * ── 名字一个字都不写死 ──────────────────────────────────────────────
+ *   客户端的名字、说明、方言全从 /api/clients 拿（那是 clients/registry.mjs
+ *   扫目录得到的真实清单）。这里写死任何名字，第二天加了新客户端就会
+ *   有一半在屏幕上对不上 —— 而且**渲染层不该知道有哪些客户端**：
+ *   加客户端是服务端的事，前端不该跟着改。
+ *
+ * ── 颜色只承载状态 ────────────────────────────────────────────────
+ *   LED 的 class（ok / idle / err）由 CSS 去 var() 取值，深浅两套主题都验过。
+ *   写死色值就等于只支持一套主题。
+ *
+ * ── 「接上」会改用户的文件 ──────────────────────────────────────────
+ *   接线会写客户端的配置文件（写之前先备份我们改的那几处，断开时原样还原）。
+ *   这一句必须在按钮旁边说清楚 —— 用户有权知道自己点了会发生什么。
+ *
+ * ── 刷新节奏 ────────────────────────────────────────────────────────
+ *   共享层每 5 秒轮询一次（panel-common.js → cards.update()），本卡**不**
+ *   自己另起定时器：两个节奏会打架，画面上的数会来回跳。
+ */
+window.BAI_CARDS = window.BAI_CARDS || {};
+window.BAI_CARDS["clients"] = {
+  mount(ctx) {
+    const $ = ctx.$ || ((id) => document.getElementById(id));
+    const slot = ctx.slot || $("slot-extra");
+    if (!slot) return { update() { }, refresh() { } };
+
+    const kit = window.BAI_KIT || null;
+    const esc = ctx.esc || (kit && kit.esc) || ((s) => String(s == null ? "" : s));
+    const S3 = (kind, text, opts) => (kit
+      ? kit[kind](text, opts)
+      : '<div class="hint">' + esc(text) + "</div>");
+
+    let box = $("clientsPanel");
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "panelbox";
+      box.id = "clientsPanel";
+      box.innerHTML = `
+        <div class="pb-head">
+          <h3>客户端</h3>
+          <span class="sub">把 B.AI 接进装好的 CLI / 桌面端 · 断开时原样还原</span>
+        </div>
+        <div class="fieldset">
+          <div class="fpline">
+            <span class="k">统一网关地址</span>
+            <span class="v mono" data-role="c-base">—</span>
+          </div>
+          <div style="margin-top:8px">
+            <button type="button" class="btn sm" data-role="c-reload">重新扫描</button>
+            <span class="v dim" style="margin-left:8px" data-role="c-count"></span>
+          </div>
+          <div class="result" data-role="c-result"></div>
+          <div data-role="c-body"></div>
+        </div>`;
+      const viewRoot = (slot.closest && slot.closest(".view")) || slot;
+      viewRoot.appendChild(box);
+    }
+    const q = (sel) => box.querySelector(sel);
+
+    let data = null;
+    let lasterr = "";
+    let inflight = false;
+    let loaded = false;
+    let sig = "";
+
+    function setResult(text, ok) {
+      const el = q('[data-role="c-result"]');
+      if (!el) return;
+      el.textContent = text || "";
+      el.className = "result" + (ok === false ? " err" : ok === true ? " ok" : "");
+    }
+
+    /* 一个客户端的**状态灯**：接上了是 ok，没接是 idle，装不上/读不懂是 err。 */
+    function ledOf(st) {
+      if (!st) return "idle";
+      if (st.wired) return "ok";
+      if (st.missing) return "idle";
+      if (st.configured) return "idle";
+      return "idle";
+    }
+
+    /* 状态的一句话。**说清是哪一种**：「没装」与「没接」是两件事。 */
+    function statusText(st) {
+      if (!st) return "—";
+      if (st.wired) return "已接上";
+      if (st.missing) return "没装这个客户端";
+      if (st.configured) return "配置里有，但不是本机接的";
+      return "没接";
+    }
+
+    function renderBody() {
+      const body = q('[data-role="c-body"]');
+      if (!body) return;
+      /* 统一网关地址：接上之后客户端里写的就是它 —— 用户要看得见。
+       * ⚠ 在**这里**设（不是只放在 update() 里）：首屏是 renderBody 画的，
+       *   update() 要等共享层下一轮轮询才来 —— 那之前它会一直显示「—」，
+       *   看着像「没有地址」。 */
+      const baseEl = q('[data-role="c-base"]');
+      if (baseEl) baseEl.textContent = String((data && data.baseUrl) || "—");
+      const list0 = Array.isArray(data && data.list) ? data.list : [];
+      const cntEl = q('[data-role="c-count"]');
+      if (cntEl) {
+        const wired0 = list0.filter((c) => c.status && c.status.wired).length;
+        cntEl.textContent = list0.length ? `${wired0} / ${list0.length} 已接上` : "";
+      }
+      if (!loaded && !lasterr) {
+        body.innerHTML = S3("loadingState", "正在读客户端清单…", { hint: "读完就知道哪些客户端能接、哪些已经接上了。" });
+        return;
+      }
+      if (lasterr) {
+        body.innerHTML = S3("errorState", "读不到客户端清单", {
+          hint: "点上面的「重新扫描」重试；还不行就看诊断抽屉（右上角）。",
+          detail: lasterr,
+        });
+        return;
+      }
+      const list = Array.isArray(data && data.list) ? data.list : [];
+      if (!list.length) {
+        body.innerHTML = S3("emptyState", "还没有可接的客户端", {
+          hint: "这一屏列的是「能接 B.AI 的客户端」。清单是空的，说明服务端一个都没登记上。",
+        });
+        return;
+      }
+
+      /* ⚠ **排序在本地做**：已装的排前面、接上的排更前。服务端按名字排，
+       *   而「装没装」会变 —— 每 5 秒重排一次的话，画面上的行会跳。 */
+      const rank = (c) => {
+        const st = c.status || {};
+        if (st.wired) return 0;
+        if (st.missing) return 2;
+        return 1;
+      };
+      const rows = list.slice().sort((a, b) => rank(a) - rank(b)
+        || String(a.name || a.id).localeCompare(String(b.name || b.id)));
+
+      body.innerHTML = rows.map((c) => {
+        const st = c.status || {};
+        const broken = !!c.broken;
+        return `<div class="fieldset" style="margin-top:10px">
+          <div class="fpline" style="align-items:flex-start">
+            <span class="k">
+              <span class="led ${ledOf(st)}"></span>
+              ${esc(String(c.name || c.id))}
+              <br><span class="mono dim" style="font-size:10.5px">${esc(String(c.id || ""))}</span>
+            </span>
+            <span class="v">
+              ${esc(statusText(st))}
+              ${c.protocol ? `<span class="dim"> · ${esc(String(c.protocol))}</span>` : ""}
+              ${c.note ? `<div class="hint" style="margin-top:2px">${esc(String(c.note))}</div>` : ""}
+              ${st.file ? `<div class="hint mono" style="margin-top:2px;word-break:break-all">${esc(String(st.file))}</div>` : ""}
+            </span>
+          </div>
+          ${broken ? "" : `<div style="margin-top:8px;display:flex;gap:7px;flex-wrap:wrap">
+            ${st.wired
+              ? `<button type="button" class="btn sm ghost" data-role="c-rev-${esc(String(c.id))}">断开</button>`
+              : `<button type="button" class="btn sm" data-role="c-app-${esc(String(c.id))}">接上</button>`}
+            ${st.detail ? `<span class="v dim">${esc(String(st.detail))}</span>` : ""}
+          </div>`}
+        </div>`;
+      }).join("");
+
+      bindRows();
+    }
+
+    function bindRows() {
+      const body = q('[data-role="c-body"]');
+      if (!body) return;
+      for (const c of (data && data.list) || []) {
+        const id = String(c.id || "");
+        const app = body.querySelector(`[data-role="c-app-${id}"]`);
+        if (app) {
+          app.addEventListener("click", async () => {
+            setResult("正在接上…");
+            try {
+              const r = await ctx.api("/api/clients/apply", {
+                method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify({ id }),
+                timeoutMs: 30000,
+              });
+              if (r && r.ok === false) throw new Error(r.error || r.detail || "接不上");
+              setResult("✔ " + String((r && r.detail) || "已接上"), true);
+              await load(); renderBody();
+            } catch (e) {
+              setResult("✖ 接不上：" + String((e && e.message) || e), false);
+            }
+          });
+        }
+        const rev = body.querySelector(`[data-role="c-rev-${id}"]`);
+        if (rev) {
+          rev.addEventListener("click", async () => {
+            /* 断开是**恢复**（把我们写的那几处还原回去），但它仍然要改用户文件 ——
+               确认一下比较稳。 */
+            if (typeof window.confirm === "function"
+              && !window.confirm("断开会把 B.AI 从这个客户端的配置里摘掉（只还原我们写过的那几处，其余不动）。继续？")) return;
+            setResult("正在断开…");
+            try {
+              const r = await ctx.api("/api/clients/revert", {
+                method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify({ id }),
+                timeoutMs: 30000,
+              });
+              if (r && r.ok === false) throw new Error(r.error || r.detail || "断不开");
+              setResult("✔ " + String((r && r.detail) || "已断开"), true);
+              await load(); renderBody();
+            } catch (e) {
+              setResult("✖ 断不开：" + String((e && e.message) || e), false);
+            }
+          });
+        }
+      }
+    }
+
+    async function load() {
+      if (inflight) return;
+      inflight = true;
+      try {
+        const r = await ctx.api("/api/clients");
+        if (r && r.ok === false) throw new Error(r.error || "读不到客户端清单");
+        data = r || null;
+        lasterr = "";
+      } catch (e) {
+        lasterr = String((e && e.message) || e);
+      } finally {
+        inflight = false;
+        loaded = true;
+        renderBody();
+      }
+    }
+
+    const reloadBtn = q('[data-role="c-reload"]');
+    if (reloadBtn) {
+      reloadBtn.addEventListener("click", async () => {
+        setResult("正在重新扫描…");
+        await load();
+        setResult("✔ 扫完了", true);
+      });
+    }
+
+    /* 首屏先画「在读」并把第一次读发出去。 */
+    renderBody();
+    load();
+
+    const hidden = () => {
+      const vr = box.closest && box.closest(".view");
+      if (!vr || !vr.classList || typeof vr.classList.contains !== "function") return false;
+      return !vr.classList.contains("on");
+    };
+
+    return {
+      async update() {
+        if (hidden()) return;
+        await load();
+        const s = JSON.stringify(((data && data.list) || []).map((c) => [c.id, c.status && c.status.wired, c.status && c.status.missing]));
+        if (s !== sig) { sig = s; renderBody(); bindRows(); }
+        const n = ((data && data.list) || []).length;
+        const wired = ((data && data.list) || []).filter((c) => c.status && c.status.wired).length;
+        const cnt = q('[data-role="c-count"]');
+        if (cnt) cnt.textContent = n ? `${wired} / ${n} 已接上` : "";
+      },
+      refresh() { if (!hidden()) return load(); },
+    };
+  },
+};

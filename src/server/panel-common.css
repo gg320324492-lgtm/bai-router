@@ -270,8 +270,14 @@ body.no-frame .winCtrls { display: none; }
 .gauge .sub { font-size: 11px; color: var(--dim); margin-top: 3px; font-family: var(--mono); }
 .gauge .sub:empty { display: none; }
 
-/* 状态灯：语义色的发光圆点 */
-.led { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--idle); }
+/* 状态灯：语义色的发光圆点。
+   ⚠ `display:inline-block` 不是装饰：**width/height 对 inline 元素无效**，
+   灯点放进任何**不是** flex 容器的上下文（.fpline .k 里就是）就会**整个看不见**
+   （实测：宽 0 高 14，肉眼什么都没有）。它在 flex 容器里照旧是 flex item
+   （display 被 blockify），所以这行不影响原有的每一处用法。 */
+.led { display: inline-block; width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--idle); }
+/* 灯点放在标题格（.k）里时，与文字之间要留一点缝。 */
+.fpline .k .led { margin-right: 6px; vertical-align: middle; }
 /* 灯点的光晕跟着**当前主题的语义色**走（color-mix）。
    原来光晕的 rgba 是写死的深色主题那套亮色（亮绿/亮黄/亮红）——
    浅色主题里，一个深绿的点外面套一圈亮绿的光晕，看着发虚、边界也不清楚。

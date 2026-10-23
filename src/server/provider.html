@@ -68,6 +68,7 @@
     <nav class="tabs" id="navViews" role="tablist">
       <button type="button" role="tab" id="tab-console" aria-controls="viewConsole" data-view="console">总览</button>
       <button type="button" role="tab" id="tab-channels" aria-controls="viewChannels" data-view="channels">渠道</button>
+      <button type="button" role="tab" id="tab-clients" aria-controls="viewClients" data-view="clients">客户端</button>
       <button type="button" role="tab" id="tab-fo" aria-controls="viewFo" data-view="fo">故障转移</button>
       <button type="button" role="tab" id="tab-settings" aria-controls="viewSettings" data-view="settings">设置</button>
       <button type="button" role="tab" id="tab-quota" aria-controls="viewQuota" data-view="quota">额度</button>
@@ -273,7 +274,15 @@
       </div>
     </section>
 
-    <!-- ===================== 视图 3：故障转移 ===================== -->
+    <!-- ===================== 视图 3：客户端 ===================== -->
+    <section class="view" id="viewClients" role="tabpanel" aria-labelledby="tab-clients" tabindex="-1">
+      <div class="sechead">
+        <h2>客户端</h2>
+        <span class="note">把 B.AI 接进装好的 CLI / 桌面端 · 断开时只还原我们写过的那几处</span>
+      </div>
+    </section>
+
+    <!-- ===================== 视图 4：故障转移 ===================== -->
     <section class="view" id="viewFo" role="tabpanel" aria-labelledby="tab-fo" tabindex="-1">
       <div class="sechead">
         <h2>自动故障转移</h2>

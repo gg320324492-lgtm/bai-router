@@ -547,6 +547,7 @@ window.BAI_PROVIDERS = {
 window.BAI_VIEWS = [
   { id: "console", nav: "总览", dom: "viewConsole", hint: "状态条 · 渠道热力图 · 诊断抽屉", cards: ["model-sync", "usage-ledger", "audit-ledger", "status-strip", "channel-heatmap"] },
   { id: "channels", nav: "渠道", dom: "viewChannels", hint: "左栏一家 · 右栏改它", cards: ["oc-transport", "token-capture", "model-catalog", "or-rotation", "wb-pool", "mm-member", "plugins", "account-list"] },
+  { id: "clients", nav: "客户端", dom: "viewClients", hint: "装好的 CLI 接上 B.AI", cards: ["clients"] },
   { id: "fo", nav: "故障转移", dom: "viewFo", hint: "开关 · 顺序 · 冷却", cards: ["failover", "gateway-switch", "limits"] },
   { id: "settings", nav: "设置", dom: "viewSettings", hint: "代理 · 端口 · 更新 · 数据目录", cards: ["config-backup", "remote-sync"] },
   { id: "quota", nav: "额度", dom: "viewQuota", hint: "各家还剩多少 · 还能用多久", cards: ["quota-panel", "price-table"] },

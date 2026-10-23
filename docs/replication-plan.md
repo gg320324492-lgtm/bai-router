@@ -32,6 +32,8 @@ magpie 是 10.3 万行 Go、5661 个文件。它自己的历史是首周每天 2
 | T12 | **并发 / RPM 限流通道** | ✅ 完成（`concurrency.mjs` + `rpm.mjs`，**默认不限**，面板可开） | `internal/gateway/{concurrency,rpm}.go` |
 | T13 | **配置同步备份**（WebDAV/S3/GitHub）+ KeepOwn | ✅ 完成（本地目录 / WebDAV / GitHub 三种目标都已接进真实链路，口令加密、不静默覆盖） | `internal/backup/`、`internal/davsync/` |
 | T14 | **面板改版**（插槽制 + 多页） | 🟡 P0–P3 ✅（额度屏 / 状态计算层 / 共享组件库 / 热力图 / 状态条 / **渠道主从**）；P5 收尾在做 | `internal/gui/assets/kernel.js` |
+| T15 | **客户端接线**（harness 铺开） | 🟡 协议层 ✅（Chat 入向 = 一个模块换 40+ 客户端）；接线层薄适配器在做；深度定制列为后续 | `internal/agent/`（每客户端一个 `.go`） |
+| T16 | **字体一轮升级**（参照 magpie，做减法） | 📋 后续规划（等宽只给代码本身 + 补中文回退 + 数字用 tabular-nums） | `internal/gui/assets/app.css` 的 `--font` / `--code` |
 
 ---
 
@@ -153,6 +155,135 @@ provider 跳。模型寻址靠本地四档映射表（`TIERS` + `resolveModelTar
 所有 provider 骑在同一套上；`failover.mjs` 的 provider 级逻辑退成它的特例。
 
 **这是「差距不在能力，在抽象层级」的落点。**
+
+---
+
+## T15 · 客户端接线（harness 铺开）
+
+**为什么要做**：magpie 支持 **66 个**客户端（它内部叫 agent，`internal/agent/agents.go`
+的 `builtins()`），而本仓原来只接 Claude Code + Claude Desktop + OpenCode 三个。
+用户装一个 CLI 就想用它 —— 这个洞比「少一个模型」大得多。
+
+**关键判断：这些客户端只说 4 种方言。**
+
+| 方言 | magpie 入向路径 | 覆盖的客户端（摘） |
+| --- | --- | --- |
+| Anthropic | `/v1/messages` | Claude Code、Claude Desktop、Zed、VS Code Chat、JetBrains Air、Raycast、Pencil… |
+| OpenAI Responses | `/v1/responses` | Codex、Mister Morph |
+| **OpenAI Chat** | `/v1/chat/completions` | **40 多个**：Qoder、ZCode、Kimi Code、Qwen Code、MiniMax Code、CodeBuddy、WorkBuddy、Droid、Cline、jcode、Goose、Crush、Pi、omp、OpenCode、Cursor CLI、Grok、AtomCode… |
+| Gemini | `/v1beta/models/*` | Gemini CLI |
+
+**所以 T15 分两层，第二层是第一层的十倍价钱。**
+
+### T15-a 协议层（✅ 已完成）
+
+统一网关现在认 `POST /v1/chat/completions` **与** `/chat/completions`（magpie 也是两个
+都答 —— 客户端的 base_url 常是不带 `/v1` 的根地址，它自己拼 `/chat/completions`）。
+顺带补了统一网关的 `GET /v1/models`（Chat 客户端启动第一件事就是拉清单，
+早先一律 405 ⇒「协议通了但连不上」）。
+
+零件其实**早就在**：`ir.mjs` 里的 `parseChat` / `chatDecoder` / `chatEncoder` /
+`renderChat` 是「上游说 chat」那一侧用得着的，只是从没有人给它们配一个**入向**。
+补协议不是写新模块，是给现成的零件接一根线。
+
+### T15-b 接线层 · 薄适配器（🟡 在做）
+
+`src/server/clients/`：`base.mjs`（备份 → 写 → 还原，**断开时只还原我们写过的那几处**，
+用户文件里其它内容一个字不动）+ `registry.mjs`（扫目录，加客户端不改表）+
+每个客户端一份声明。面板接口 `GET/POST /api/clients*`。
+
+**这一层只做三件事**：客户端的配置文件在哪、provider 块长什么样、把 B.AI 的
+地址与模型清单写进去。上下文窗口、输出上限、reasoning 档位这些**先不管** ——
+客户端自己会用默认值。
+
+### T15-c 接线层 · 深度定制（📋 后续规划，**未做**）
+
+magpie 的每个客户端是**深度定制**的 —— `internal/agent/zcode.go` 就 600 多行：
+两个配置文件（`config.json` 的 provider 形状 + 3.14 起的 `provider_config.json`
+的 rules 形状）、模型的上下文窗口与输出上限、reasoning 档位与变体、原生联网
+开关（还要一个 stash 记「我们开过哪些」）、**用户在客户端里手改过的值要保留**。
+
+本仓的薄适配器**做不到**这些。后续要做的是：
+
+1. **模型元数据下发**：把 B.AI 已有的上下文窗口 / 输出上限 / reasoning 档位写进
+   客户端的模型表（magpie 的 `magpieModels()` → 各客户端的模型条目）。
+2. **保留用户手改的值**：magpie 有 `mergeKept` / `keptEffort` 那套「用户在客户端里
+   改过的东西我们不动」。本仓的 `base.mjs` 目前是**整块替换** provider 块
+   （只保住了键路径级别的原值，不保 provider 块内部的细分字段）。
+3. **每个客户端的第二份文件**：ZCode 的 `provider_config.json`、Qwen Code 的
+   `MAGPIE_QWEN_API_KEY` 环境变量、MothX 的 `providers` 对象…
+
+**取舍**：T15-c 是几十个客户端 × 每个 100–600 行 = 数月的量。
+先按 T15-b 铺完（几十个客户端一次能铺完），再挑用户真在用的那几个做深。
+
+### 本机现状（2026-10-23）
+
+已装 **8 个**客户端（`~/.minimax`、`~/.cline`、`~/.zcode`、`~/.codebuddy`、
+`~/.workbuddy`、`~/.workbuddy-ai`、`~/.hermes`、`~/.config/opencode`）——
+薄适配器一轮就能全接上。**Cursor CLI 没装**（`~/.cursor` 是编辑器的目录，
+不是 CLI 的 `cli-config.json`）。
+
+### T15-d 网关侧要补的三个端点（📋 待做）
+
+接线写好了 ≠ 客户端真的会走到 B.AI。三个「接上了但没真打通」里，**两个归网关这一侧**：
+
+| 客户端 | 它要什么 | 网关现在 | magpie 怎么答 |
+| --- | --- | --- | --- |
+| **Empryo** | 只列「baseURL 有应答」的 provider ⇒ 它打 `GET /`（或 baseURL 带 `/v1` 时的 `GET /v1`） | 两个都 **405**（非 POST 一律 405） | `GET /{$}` 与 `GET /v1` **都**答 info（name/version/models/apis） |
+| **Muse Code** | 模型清单从 `<base_url 主机>/muse-code/models` 拉 | 404 | `GET /muse-code/models` 答一份带 `limit` 的清单（它隐藏没有 limit 的模型 ⇒ 得给窗口/输出上限；magpie 从 catalog 拿，我们没有 ⇒ 只能给它的兜底值并在注释里说明） |
+| **Cursor CLI** | 要它自己认自定义端点 | —— | magpie 在这一行也只写模型 id、**不改 base URL** ⇒ 要真打通得找 Cursor CLI 的自定义端点字段名（**没找到**） |
+
+**要补的端点（通用改动，不是给某个客户端开后门）**：
+`GET /` 与 `GET /v1` → 网关信息（照 magpie 的 info）；`GET /models` → 模型清单
+（`/v1/models` 的别名）。`/muse-code/models` 较复杂（要伪造 limit），放后面。
+
+
+
+---
+
+## T16 · 字体一轮升级（📋 后续规划，**未做**）
+
+**要什么**：全软件的字体做一轮升级优化，参照 magpie，**做减法**——
+与用户关系不大的那部分字体（等宽字体泛滥到界面文字上）**不用再显示**，
+目标：简单、直观、好用。
+
+### 现在的问题（实测 2026-10-23）
+
+| 现象 | 证据 |
+| --- | --- |
+| **等宽字体几乎无处不在** | `panel-common.css` 里 `var(--mono)` 28 处、卡片里 `.mono` 44 处；而 `var(--sans)` 只有 1 处（body）。`.fpline .v` 是**通用值格** ⇒ 说明文字、状态词、描述全被迫等宽 |
+| **`--mono` 没有中文回退** | `"Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace` —— 等宽字体没有中文字形时，浏览器落到默认中文字体，长中文串会与英文段落**不是一套字** |
+| **`--sans` 少了 Windows 11 的可变字体** | magpie 的 Windows 首选 `"Segoe UI Variable Text"`，我们只有 `"Segoe UI"` |
+| 字号阶梯碎 | 10.5 / 11 / 11.5 / 12 / 13 混用，同一屏里字号差半档 |
+
+### magpie 的判据（照它做）
+
+magpie 有两个字体变量，**界线很清楚**：
+
+- `--font` / `--ui-font`（**界面文字**）：说明、状态、按钮、标签 —— 即便内容长得像代码
+  （`.key.free` 那个「免费」标签、`.call-body code.empty` 那个空代码块，都用 UI 字体）
+- `--code` / `--code-font`（**代码本身**）：模型 id、路径、密钥**值**、JSON、版本号
+
+Windows 上它还给了中文回退：`--code: "Cascadia Mono", Consolas, "Microsoft YaHei UI",
+"Microsoft YaHei", monospace`；`--font: "Segoe UI Variable Text", "Segoe UI",
+"Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif`。
+
+**数字对齐另有更省的办法**：magpie 用 `font-variant-numeric: tabular-nums`
+（`.led-chart svg`）—— 计数/金额**对齐**靠等宽数字，不必把整行都换成等宽字体。
+
+### 要做的四件事
+
+1. **两个字体变量补齐**：加 `--ui-font`（Windows 首选 `"Segoe UI Variable Text"`）、
+   给 `--mono` 补 `"Microsoft YaHei UI"` 中文回退。
+2. **收窄等宽使用面（做减法）**：`.fpline .v` 从「一律等宽」改成「默认 UI 字体，
+   `.v.mono` 才等宽」；逐处审那 28 + 44 处，把**其实不是代码**的（说明、状态词、
+   描述、按钮文字）换成 UI 字体；**只给**模型 id / 路径 / 密钥值 / JSON / 版本号留等宽。
+3. **数字对齐改用 `tabular-nums`**：计数、金额、token 数用等宽数字，不换整行字体。
+4. **字号阶梯收成一套**（比如 10.5 / 11.5 / 13 三档 + 行高与字重），去掉半档混用。
+
+**取舍**：这轮是**减法**，不是加法 —— 目标不是「更好看的字体」，是**该等宽的地方等宽、
+不该的地方别等宽**。做完要让用户一眼看出：哪些是「机器读的东西」（可复制、对齐）、
+哪些是「人读的话」。
 
 ---
 
