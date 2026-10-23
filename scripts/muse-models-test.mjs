@@ -70,15 +70,22 @@ describe("① 清单的形状逐字照 magpie", () => {
     }
   });
 
-  test("①c metadata['muse-code'] 里那十来个键一个不少、值对", () => {
+  test("①c metadata['muse-code'] 里我们知道的键都在；不知道的键**不写**", () => {
     const m = metaOf(payload, 0);
     assert.equal(m.name, "Claude Opus 5");
     assert.equal(m.family, "sn", "family 是渠道 id（magpie: e.Provider.ID）");
     assert.equal(m.is_hidden, false);
-    assert.equal(m.attachment, false, "我们不知道哪个模型收图 ⇒ 恒 false（说 true 会让 Muse 往不认的参数上撞）");
-    assert.equal(m.reasoning, false, "我们没有思考档信息 ⇒ 恒 false");
-    assert.equal(m.temperature, false);
-    assert.equal(m.tool_call, true);
+    /* ⚠ **「我们不知道」⇒ 那个键干脆不写**（不是写 false）。
+     *   我们的模型 id 是**档位**（provider 无关），能力由映射到哪家上游决定
+     *   （claude-opus-5 在 sn 映射到 glm-5.2、在 wb 映射到 hy3，逐家不同）⇒
+     *   写 true 是撒谎；写 false 是在**断言**「不支持」—— 而我们只是不知道。
+     *   Go 写的客户端读不到就是零值 false ⇒ 效果与写 false 一样，但那个**位置
+     *   空着**：将来有了真值是「加一个键」，而不是逐个把假值改成真值。
+     *   ⚠ 更不能写 true —— 那会让用户真去发一张上游收不下的图，当场报错。 */
+    assert.equal("attachment" in m, false, "★ 写了 attachment（我们在断言「不支持」，其实只是不知道）");
+    assert.equal("reasoning" in m, false, "★ 写了 reasoning（同上）");
+    assert.equal("temperature" in m, false, "★ 写了 temperature（同上）");
+    assert.equal(m.tool_call, true, "工具调用是**真知道**的（档位都是聊天模型）");
     assert.deepEqual(m.modalities, { input: ["text"], output: ["text"] });
     assert.deepEqual(m.options, { include: [] });
     assert.deepEqual(m.variants, {});
