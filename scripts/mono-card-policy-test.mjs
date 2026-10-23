@@ -84,6 +84,11 @@ const MONO_CARD_ALLOWLIST = [
     why: "客户端 id" },
   { file: "clients.js", fp: "hint mono|${esc(String(st.file))}", count: 1,
     why: "客户端配置文件路径 —— 路径" },
+  /* 「保留了你手改的」那一格（2026-10-23 接线阶段 2 收尾时加的） */
+  { file: "clients.js", fp: "mono|${esc(String(k.path || \"\"))}", count: 1,
+    why: "保留了你手改的那一处的键路径（带文件名）—— 标识符" },
+  { file: "clients.js", fp: "mono|${esc(n)}", count: 1,
+    why: "你自己那些键的键名 —— 标识符" },
 
   /* ---- config-backup.js ---- */
   { file: "config-backup.js", fp: "v mono|—", count: 1,
@@ -228,11 +233,11 @@ function allCardFiles() {
  *   ① 白名单外的一律红（新加的不正当用法）。
  *   ② 白名单里的次数对不上也红（失效条目 / 被复制出来的一份）。 */
 function checkUnlisted(scan) {
-  const allowed = new Set(MONO_CARD_ALLOWLIST.map((e) => e.file + " " + e.fp));
+  const allowed = new Set(MONO_CARD_ALLOWLIST.map((e) => e.file + "\0" + e.fp));
   const bad = [];
   for (const [file, fps] of Object.entries(scan)) {
     for (const fp of fps) {
-      if (!allowed.has(file + " " + fp)) bad.push({ file, fp });
+      if (!allowed.has(file + "\0" + fp)) bad.push({ file, fp });
     }
   }
   return bad;

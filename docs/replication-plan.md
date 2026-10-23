@@ -203,6 +203,13 @@ provider 跳。模型寻址靠本地四档映射表（`TIERS` + `resolveModelTar
 - **阶段 1**（内置表）—— `src/server/clients/model-facts.mjs`：25 条真值，每条带
   **来源与日期**；**证据强度分四档**（本家目录实测 / 两家一致 / 单家 / 无），
   只有够格的下发给客户端。已接到 Muse（`/muse-code/models` 的 `limit`）。
+- **阶段 2**（保留用户手改）—— **28 个客户端全覆盖**：通用合并层
+  （`clients/merge-policy.mjs`）＋ 每个客户端一张**归属表**（哪些键归用户、
+  哪些归我们）；面板上分组显示「保留了你手改的 N 处」（路径 + 你的值 + 我们记的值）
+  与「还留着你自己的 N 个键」（只给键名）。
+  ⇒ **两条性质**：①「保留」与「说得清」是两件事 —— 弱保留层保住了用户的东西却从不
+  报告 ⇒ 面板一个字不说 ⇒ 用户以为没生效（补 `kind` 标记才补上）；
+  ② **令牌永远归我们**（用户那份留着 ⇒ 文件里可能留一把旧 key，比覆盖更危险）。
 - **阶段 3**（渠道目录作真源）—— `src/server/clients/facts-sources.mjs`：
   wb/wbai 的 `/v3/config`、qd 的 `qoder-models.json` 都**实测拉通**（模块做出来了）；
   本机 32 条档位里 14 条拿到真值（8 条本家实测 + 6 条两家一致），18 条仍兜底。
@@ -211,10 +218,10 @@ provider 跳。模型寻址靠本地四档映射表（`TIERS` + `resolveModelTar
   交接笔记在 `…/side-session-notes/…/model-facts-handoff.md` 第三节，代码现成。
 
 **还没做**：
-- **阶段 2**（保留用户手改）—— 已做**通用合并层**（`clients/merge-policy.mjs`），
-  但只落在部分客户端上（WorkBuddy / Qwen Code / OpenCode 一批），其余逐个接。
 - **阶段 4**（models.dev 后台补充）—— 刻意不做（设计稿已定：id 不同源，映射错了
   比不写更坏）。
+- **窗口的真值到位后**，窗口那一格要从「归用户」改成「归我们」（切换条件写在
+  `keep-user-edits-rollout2-handoff.md` 的待办里）。
 
 magpie 的每个客户端是**深度定制**的 —— `internal/agent/zcode.go` 就 600 多行：
 两个配置文件（`config.json` 的 provider 形状 + 3.14 起的 `provider_config.json`
@@ -479,12 +486,19 @@ Windows 上它还给了中文回退：`--code: "Cascadia Mono", Consolas, "Micro
 判据只有一条，别自己发明：**这段字是「机器读的东西」吗？**（模型 id / 路径 /
 密钥值 / JSON / 版本号 ⇒ 是，用等宽；说明 / 状态词 ⇒ 不是，用 UI 字体。）
 
-### ⚠ 已知缺口（这一轮没做，记着）
+### 卡片里的 `.mono` 也守住了（2026-10-23 补）
 
-**守卫只管样式表里的 `var(--mono)`，管不到卡片里挂 `.mono` 类的用法**
-（`src/server/cards/*.js` 里 35 处）—— 有人给一段说明文字挂上 `.mono` 类，
-它抓不住。要拦那类，得另做一份「哪些地方的 `.mono` 是正当的」清单
-（按文件 + 上下文，脆一些），本轮没做。
+上一轮的守卫只管**样式表**里的 `var(--mono)`，管不到卡片里挂 `.mono` 类的用法
+—— 有人给一段说明文字挂上 `.mono` 它抓不住。**这一轮补上了**：
+
+· 卡片里一共 **37 处**等宽用法（34 处 `class='…mono…'` + 3 处行内
+  `font-family:var(--mono)`）⇒ 逐个判：**36 处正当**（都是标识符：模型 id /
+  路径 / 文件名 / 密钥值 / 指纹 / 会话 id / 版本号 / JSON 片段），
+  **1 处不正当**（account-list 里 id 与 label 混用等宽）⇒ 拆开。
+· 守卫 `scripts/mono-card-policy-test.mjs`：卡片是拼 HTML 的，`.mono` 出现在
+  **模板字符串**里而不是 CSS 选择器 ⇒ 不能照抄「选择器白名单」那套
+  ⇒ 6 项，含 **4 条反向对照**（其中一条是「组件库若开始 import 组件 ⇒ 必须红」
+  —— 守卫自己也得有失效检测，否则等于没守）。
 
 ---
 

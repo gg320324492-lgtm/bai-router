@@ -8,6 +8,10 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const { assertCleanSource, assertRemoteSource } = require("./publish-source.cjs");
+/* 真模块里的那两个**纯函数**（gitNetVariants / gitRemoteError）—— 桩里直接转发它们，
+   不另写一份（另写就会与真实现漂移）。⚠ 真模块在 require 时不会自己跑探测
+   （探测在 `require.main === module` 那个分支里）⇒ 安全。 */
+const REAL_PROXY = require("./publish-proxy.cjs");
 const HEAD = "a".repeat(40);
 const OLD = "b".repeat(40);
 const TAG_OBJECT = "c".repeat(40);
@@ -133,6 +137,12 @@ function simulatePublish(options = {}) {
         buildGhEnv: (env) => ({ ...env }),
         runDirectProbe: () => ({ ok: true }),
         PROXY_ENV_KEYS: ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "ALL_PROXY", "all_proxy"],
+        /* ⚠ 这两个是**纯函数**（不碰文件、不联网、不读环境变量）⇒ 直接用真模块
+         *   的那份，不要在这儿另写一遍（另写一份就会与真实现漂移）。
+         *   ⚠ 2026-10-23 踩过：桩里少了它们 ⇒ publish.cjs 一 require 就
+         *   `gitNetVariants is not a function` ⇒ 「真实发布入口」那组全红。 */
+        gitNetVariants: REAL_PROXY.gitNetVariants,
+        gitRemoteError: REAL_PROXY.gitRemoteError,
       };
       throw new Error("unexpected dependency");
     },
