@@ -32,7 +32,7 @@ magpie 是 10.3 万行 Go、5661 个文件。它自己的历史是首周每天 2
 | T12 | **并发 / RPM 限流通道** | ✅ 完成（`concurrency.mjs` + `rpm.mjs`，**默认不限**，面板可开） | `internal/gateway/{concurrency,rpm}.go` |
 | T13 | **配置同步备份**（WebDAV/S3/GitHub）+ KeepOwn | ✅ 完成（本地目录 / WebDAV / GitHub 三种目标都已接进真实链路，口令加密、不静默覆盖） | `internal/backup/`、`internal/davsync/` |
 | T14 | **面板改版**（插槽制 + 多页） | 🟡 P0–P3 ✅（额度屏 / 状态计算层 / 共享组件库 / 热力图 / 状态条 / **渠道主从**）；P5 收尾在做 | `internal/gui/assets/kernel.js` |
-| T15 | **客户端接线**（harness 铺开） | 🟡 协议层 ✅（Chat 入向 = 一个模块换 40+ 客户端）；接线层薄适配器在做；深度定制列为后续 | `internal/agent/`（每客户端一个 `.go`） |
+| T15 | **客户端接线**（harness 铺开） | ✅ 协议层（Chat 入向 = 一个模块换 40+ 客户端）+ 接线层 28 个客户端声明 + 面板「客户端」一屏 + 网关侧端点；🟡 深度定制按设计稿分阶段做 | `internal/agent/`（每客户端一个 `.go`） |
 | T16 | **字体一轮升级**（参照 magpie，做减法） | 📋 后续规划（等宽只给代码本身 + 补中文回退 + 数字用 tabular-nums） | `internal/gui/assets/app.css` 的 `--font` / `--code` |
 
 ---
@@ -186,7 +186,7 @@ provider 跳。模型寻址靠本地四档映射表（`TIERS` + `resolveModelTar
 `renderChat` 是「上游说 chat」那一侧用得着的，只是从没有人给它们配一个**入向**。
 补协议不是写新模块，是给现成的零件接一根线。
 
-### T15-b 接线层 · 薄适配器（🟡 在做）
+### T15-b 接线层 · 薄适配器（✅ 已完成）
 
 `src/server/clients/`：`base.mjs`（备份 → 写 → 还原，**断开时只还原我们写过的那几处**，
 用户文件里其它内容一个字不动）+ `registry.mjs`（扫目录，加客户端不改表）+
@@ -228,7 +228,7 @@ Qwen Code 的 `MAGPIE_QWEN_API_KEY` 环境变量、MothX 的 `providers` 对象�
 薄适配器一轮就能全接上。**Cursor CLI 没装**（`~/.cursor` 是编辑器的目录，
 不是 CLI 的 `cli-config.json`）。
 
-### T15-d 网关侧要补的三个端点（📋 待做）
+### T15-d 网关侧要补的三个端点（✅ 已完成，2026-10-23）
 
 接线写好了 ≠ 客户端真的会走到 B.AI。三个「接上了但没真打通」里，**两个归网关这一侧**：
 
@@ -241,6 +241,12 @@ Qwen Code 的 `MAGPIE_QWEN_API_KEY` 环境变量、MothX 的 `providers` 对象�
 **要补的端点（通用改动，不是给某个客户端开后门）**：
 `GET /` 与 `GET /v1` → 网关信息（照 magpie 的 info）；`GET /models` → 模型清单
 （`/v1/models` 的别名）。`/muse-code/models` 较复杂（要伪造 limit），放后面。
+
+**✅ 2026-10-23 落地情况**：`GET /` 与 `GET /v1` 答 info、`GET /v1/models` 与
+`GET /models` 答清单、`GET /v1/models/{id}` 答单个、`GET /muse-code/models` 答 Muse
+那份带 `limit` 的清单（`src/server/clients/muse-models.mjs`）。
+⚠ **Cursor CLI 仍未打通** —— magpie 自己也没找到它认自定义端点的字段名
+（magpie 只写模型 id、不改 base URL）⇒ 这一格两边都空着，等它的文档或源码给出口径。
 
 ### T15-e 形状要按「用户本机这一版」核（📋 纪律，2026-10-23 核出两个坑）
 
@@ -309,7 +315,7 @@ export function connect({ gateway, model, models }) {
 ⚠ 与「插件渠道」是同一路子（那份是加一家**上游**，这份是加一个**客户端**）——
 两者都该是「一份声明，不改代码」。
 
-### T15-f 面板那一屏还差三个最常用的（📋 下一批）
+### T15-f 面板那一屏还差三个最常用的（✅ 已完成，2026-10-23）
 
 「客户端」屏现在列 25 个（`src/server/clients/` 下的声明），但**用户最常用的三个
 不在列表里**：Claude Code、Claude Desktop、OpenCode —— 它们走的是老路
@@ -327,6 +333,17 @@ export function connect({ gateway, model, models }) {
    `applyToCli` 的全部细节。
 2. **在「客户端」屏里给它们三行**，「接上/断开」**转调**现有的 `applyToCli` /
    `applyToDesktop` / `oc-wiring` —— 不重复实现、用户先能看到。
+
+**✅ 2026-10-23 落地情况：选了方案 1** —— 三个都做成了 `clients/` 里的声明
+（`claude-code.mjs` / `claude-desktop.mjs` / `opencode.mjs`），
+「客户端」屏现在列 **28 个**。
+· Claude Code：把 `applyToCli` 的全部细节搬进 `clients/claude-code-edits.mjs`
+  （**纯函数**，那段逻辑有历史教训：占位符令牌、**档位而不是最终模型名**、
+  `onlyIfAbsent`…），声明只调它 —— 逻辑一行没重写，教训一条没重踩。
+  顺带把 `applyToCli` 从 async 改成**同步**（clients/ 层的 `writes` 是同步的）。
+· Claude 桌面版：写 `configLibrary/<id>.json` + `_meta.json`，
+  **数组级**读写（`formats-json-list.mjs`）—— 原来那套「整份覆盖写」已经换掉。
+· OpenCode：写 `provider.<id>.{npm,name,options.baseURL,options.apiKey,models}`。
 
 
 
