@@ -93,7 +93,17 @@ window.BAI_CARDS["account-list"] = {
       const trs = rows.map((r) => {
         const accounts = Array.isArray(r.accounts) ? r.accounts : [];
         const acct = accounts.length
-          ? accounts.map((a) => `<span class="mono">${esc(String(a.id || a.label || ""))}</span>${a.usable === false ? '<span class="dim">（不可用）</span>' : ""}`).join("、")
+          ? accounts.map((a) => {
+              /* id 是标识符（密钥指纹）⇒ 等宽；label 是**给人读的**
+                 （「第 1 把 key」「OpenCode 传输层」）⇒ UI 字体。
+                 两者混在一个元素里，这段字算不算标识符就说不清了 ⇒ 分开。 */
+              const accId = String((a && a.id) || "");
+              const accLabel = String((a && a.label) || "");
+              const who = accId
+                ? `<span class="mono">${esc(accId)}</span>`
+                : `<span>${esc(accLabel)}</span>`;
+              return who + (a.usable === false ? '<span class="dim">（不可用）</span>' : "");
+            }).join("、")
           : '<span class="dim">—</span>';
         const state = r.configured
           ? '<span class="led ok"></span> 可用'
