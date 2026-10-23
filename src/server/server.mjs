@@ -10236,6 +10236,55 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const r = await reloadCodePlugins();
       return json(res, 200, { ok: true, installed: r.installed, errors: r.errors });
     }
+    if (req.method === "POST" && u.pathname === "/api/code-plugins/scaffold") {
+      /* 「给我一个能直接改的样板插件」。
+       *
+       * ⚠ **为什么要有这个**：代码插件是用户自己写的 JS，可它的门槛是
+       *   「建目录 + 写 plugin.json + 写入口文件」—— 三步都得知道格式。
+       *   没有这一步，用户面对的是一个**看不见入口**的功能（面板上没装插件时
+       *   那一整块都不画），装了才知道有这东西。
+       *
+       * ⚠ **只写用户自己点出来的那一个目录**，绝不覆盖已有的：
+       *   目录已存在就说「已经有了，换个名字或自己改」，不碰用户写的东西。
+       */
+      const b = await readBody(req);
+      const raw = String(b.name || "example").trim() || "example";
+      /* 目录名只许小写字母数字与短横线（插件 id 的同一套规矩）：
+       *   这一层挡掉 "../" 与绝对路径 —— 它会拼进文件路径里。 */
+      if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(raw)) {
+        return json(res, 400, { error: "插件目录名只许小写字母、数字与短横线（且以字母或数字开头）" });
+      }
+      const dir = path.join(codePluginDir(), raw);
+      if (existsSync(dir)) {
+        return json(res, 409, { error: `「${raw}」已经在了（${dir}）—— 换个名字，或者直接改那个目录里的文件` });
+      }
+      try {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(path.join(dir, "plugin.json"), JSON.stringify({
+          manifestVersion: 1,
+          id: raw,
+          name: `示例插件 · ${raw}`,
+          entry: "main.mjs",
+          timeoutMs: 1000,
+          permissions: { fsRead: [], net: false },
+        }, null, 2) + "\n", "utf8");
+        writeFileSync(path.join(dir, "main.mjs"), [
+          "/* 示例代码插件：默认什么都不做，放行这次请求。",
+          " *",
+          " *   想改请求？返回 { action: \"modify\", params: { temperature: 0.2 } }；",
+          " *   想拒绝这次请求？返回 { action: \"deny\", reason: \"一句话说明\" }。",
+          " *   request 是**摘要**（头只有名字、没有值）；api.log(\"…\") 写进面板日志。 */",
+          "export default function (request, api) {",
+          "  api.log(`看到 ${request.channel} 的 ${request.model}`);",
+          "  return { action: \"allow\" };",
+          "}",
+          "",
+        ].join("\n"), "utf8");
+      } catch (e) {
+        return json(res, 500, { error: "写样板失败：" + String((e && e.message) || e) });
+      }
+      return json(res, 200, { ok: true, dir, id: raw, entry: path.join(dir, "main.mjs") });
+    }
     if (req.method === "POST" && u.pathname === "/api/code-plugins/remove") {
       const b = await readBody(req);
       const id = String(b.id || "").trim();

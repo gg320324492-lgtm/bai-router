@@ -241,13 +241,22 @@ window.BAI_CARDS["plugins"] = {
       if (!box) return;
       const list = Array.isArray(cp.list) ? cp.list : [];
       const errors = Array.isArray(cp.errors) ? cp.errors : [];
-      if (!list.length && !errors.length) { box.innerHTML = ""; return; }
+      /* ⚠⚠ **一个都没装时也要画这一块**（早先直接 return 掉整块）：
+       *   那等于把「代码插件」这个功能**藏起来**了 —— 用户看不到它存在，
+       *   更看不到「怎么装」。一个看不见入口的功能等于没有。
+       *   所以空的时候画成一段**引导**（目录在哪 + 怎么装 + 一键建样板）。 */
       const stateOf = (s) => (s === "active" ? "在跑" : s === "dead" ? "已死（上次超时被杀掉）" : String(s || "—"));
+      const dir = String(cp.dir || "");
       box.innerHTML = `
         <div class="sechead" style="margin:16px 0 4px">
           <h2 style="font-size:12px">代码插件</h2>
-          <span class="note">真代码 · 跑在<b>子进程</b>里（有权限模型与超时封顶）· 装在 <span class="mono">${esc(String(cp.dir || ""))}</span></span>
+          <span class="note">真代码 · 跑在<b>子进程</b>里（有权限模型与超时封顶）· 装在 <span class="mono">${esc(dir)}</span></span>
         </div>
+        ${list.length ? "" : `<div class="hint" style="margin:2px 0 8px">
+          一个都还没装。代码插件是你自己写的 JS：每个插件一个目录，里面放一份
+          <span class="mono">plugin.json</span>（清单）与一个入口文件（.mjs）。
+          写好后点「重新扫描代码插件目录」就会装上。
+        </div>`}
         ${list.map((p) => {
           const perms = Array.isArray(p.permissions) ? p.permissions : [];
           return `<div class="fpline" style="align-items:flex-start">
@@ -260,9 +269,12 @@ window.BAI_CARDS["plugins"] = {
         ${errors.length ? errors.map((e) => `<div class="hint" style="margin-top:6px;padding:10px 12px;border:1px solid var(--line);border-radius:9px">
           <b class="mono">${esc(String(e.dir || ""))}</b><br>${esc(String(e.message || ""))}
         </div>`).join("") : ""}
-        <div style="margin-top:8px">
+        <div style="margin-top:8px;display:flex;gap:7px;flex-wrap:wrap">
           <button type="button" class="btn sm" data-role="p-cp-reload">重新扫描代码插件目录</button>
-        </div>`;
+          <button type="button" class="btn sm ghost" data-role="p-cp-how">怎么装？</button>
+          <button type="button" class="btn sm ghost" data-role="p-cp-scaffold">建一个样板插件</button>
+        </div>
+        <div data-role="p-cp-how-box"></div>`;
       const btn = box.querySelector('[data-role="p-cp-reload"]');
       if (btn) {
         btn.addEventListener("click", async () => {
@@ -276,6 +288,40 @@ window.BAI_CARDS["plugins"] = {
             renderCodePlugins(await loadCodePlugins());
           } catch (e) {
             setResult("✖ 重载失败：" + String((e && e.message) || e), false);
+          }
+        });
+      }
+      /* 「怎么装」：把三步与两份文件的**内容**摆出来（能直接照抄），
+       * 而不是只给一个目录路径 —— 路径不告诉人格式。 */
+      const how = box.querySelector('[data-role="p-cp-how"]');
+      const howBox = box.querySelector('[data-role="p-cp-how-box"]');
+      if (how && howBox) {
+        how.addEventListener("click", () => {
+          if (howBox.innerHTML) { howBox.innerHTML = ""; how.textContent = "怎么装？"; return; }
+          how.textContent = "收起";
+          howBox.innerHTML = `
+            <div class="hint" style="margin-top:8px;padding:10px 12px;border:1px solid var(--line);border-radius:9px">
+              <b>三步</b>：① 在 <span class="mono">${esc(dir)}</span> 下建一个目录（名字只许小写字母、数字、短横线）；
+              ② 里面放一份 <span class="mono">plugin.json</span> 与一个入口文件 <span class="mono">main.mjs</span>；
+              ③ 回上面点「重新扫描代码插件目录」。
+              <div style="margin-top:8px">最省事的是点「建一个样板插件」—— 它会在那个目录里写好这两份文件，改一改就能用。</div>
+            </div>`;
+        });
+      }
+      /* 「建一个样板插件」：让用户一步拿到能改的两份文件，而不是照着文档抄。 */
+      const sc = box.querySelector('[data-role="p-cp-scaffold"]');
+      if (sc) {
+        sc.addEventListener("click", async () => {
+          setResult("正在建样板插件…");
+          try {
+            const r = await ctx.api("/api/code-plugins/scaffold", {
+              method: "POST", headers: { "content-type": "application/json" },
+              body: JSON.stringify({ name: "example" }),
+            });
+            if (r && r.ok === false) throw new Error(r.error || "建样板失败");
+            setResult(`✔ 样板已建好：${r.entry || r.dir} —— 改完点「重新扫描代码插件目录」`, true);
+          } catch (e) {
+            setResult("✖ 建样板失败：" + String((e && e.message) || e), false);
           }
         });
       }
