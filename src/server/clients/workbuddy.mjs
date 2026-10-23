@@ -69,10 +69,10 @@ export function buddyEntry(ctx, m, pid) {
     /* WorkBuddy 问的是**完整地址**（它不自己拼路径） */
     url: `${ctx.baseUrl}/v1/chat/completions`,
     supportsToolCall: true,
-    /* 图像与思考：我们不知道这个档位支不支持 —— 说明说「不支持」，
-       宁可少给能力，也别让客户端去问网关不认的字段。 */
-    supportsImages: false,
-    supportsReasoning: false,
+    /* ⚠ 图像与思考**不写**这两个键：「我们不知道」≠「不支持」——
+       写 false 是在断言（我们只是不知道），写 true 是撒谎（用户真去发一张
+       上游收不下的图，当场报错）。键不写 ⇒ 客户端按自己的默认走（保守），
+       将来有了真值再加这两个键。 */
   };
 }
 

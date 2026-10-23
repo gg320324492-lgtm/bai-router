@@ -63,9 +63,13 @@ function entry(ctx, m, pid) {
     apiKey: ctx.apiKey || "",
     /* Chat Completions ⇒ 统一网关的 /chat/completions */
     provider: "generic-chat-completion-api",
-    /* Droid 默认认为 Chat 的模型能看图 —— 我们的档位支不支持图像我们不知道，
-       所以明说「不支持」：宁可让它少发图，也别发一个网关不收的字段。 */
-    noImageSupport: true,
+    /* ⚠ **不写** `noImageSupport`：「我们不知道」≠「不支持」——
+       我们的模型 id 是**档位**（provider 无关），而支不支持图像由**映射到哪家
+       上游**决定（claude-opus-5 在 sn 映射到 glm-5.2、在 wb 映射到 hy3，逐家不同）
+       ⇒ 说「这个档位不能看图」是对**所有**上游的断言，我们没有依据。
+       写 false 是断言（我们只是不知道），写 true 是撒谎（用户真去发一张上游收不下的
+       图，当场报错）。键不写 ⇒ Droid 按自己的默认走（保守），将来有了真值
+       （T15-c 的「模型元数据下发」）再加这个键。 */
   };
 }
 

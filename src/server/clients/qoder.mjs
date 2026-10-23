@@ -67,9 +67,11 @@ export function qoderDecl({ id, name, note, env, dirName }) {
             const models = (ctx.models || []).map((m) => ({
               model: m.id,
               displayName: m.label || m.id,
-              /* 我们不知道这个档位支不支持图像/思考 —— **不写**：
-                 Qoder 缺这两个键时用自己的默认（off），写一个假的「支持思考」
-                 只会让它去问一个网关不认的字段。 */
+              /* ⚠ 图像与思考**不写**这两个键：「我们不知道」≠「不支持」——
+                 我们的模型 id 是**档位**（provider 无关），支不支持图像/思考由**映射到
+                 哪家上游**决定（逐家不同）⇒ 写 false 是断言，写 true 是撒谎
+                 （用户真去发一个上游不认的思考参数，当场报错）。键不写 ⇒ Qoder 用
+                 自己的默认（保守），将来有了真值（T15-c 的「模型元数据下发」）再加。 */
               capabilities: { tools: true },
             }));
             const provider = {

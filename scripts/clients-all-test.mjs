@@ -111,7 +111,9 @@ const APPENDS = {
   stepcode: "/chat/completions",
   workbuddy: { complete: true },
   "workbuddy-ai": { complete: true },
-  zcode: "/chat/completions",
+  /* ZCode 两份文件都写 anthropic-messages（magpie 的默认）⇒ Anthropic 的 SDK
+   * 自己拼那个 /v1（网关答 /v1/messages ✓）。 */
+  zcode: "/v1/messages",
 };
 
 /** 某个路径是不是网关答的。 */
