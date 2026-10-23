@@ -85,11 +85,12 @@ window.BAI_CARDS["clients"] = {
       return "idle";
     }
 
-    /* 状态的一句话。**说清是哪一种**：「没装」与「没接」是两件事。 */
+    /* 状态的一句话。**说清是哪一种**：「没装」「装了但没配置」「没接」是三件事。 */
     function statusText(st) {
       if (!st) return "—";
       if (st.wired) return "已接上";
       if (st.missing) return "没装这个客户端";
+      if (st.notConfigured) return "装了，还没生成过配置";
       if (st.configured) return "配置里有，但不是本机接的";
       return "没接";
     }
@@ -129,12 +130,15 @@ window.BAI_CARDS["clients"] = {
       }
 
       /* ⚠ **排序在本地做**：已装的排前面、接上的排更前。服务端按名字排，
-       *   而「装没装」会变 —— 每 5 秒重排一次的话，画面上的行会跳。 */
+       *   而「装没装」会变 —— 每 5 秒重排一次的话，画面上的行会跳。
+       *   「装了但还没生成配置」排在「没接」前面（离能接更近），
+       *   「没装」排最后。 */
       const rank = (c) => {
         const st = c.status || {};
         if (st.wired) return 0;
-        if (st.missing) return 2;
-        return 1;
+        if (st.notConfigured) return 1;
+        if (st.missing) return 3;
+        return 2;
       };
       const rows = list.slice().sort((a, b) => rank(a) - rank(b)
         || String(a.name || a.id).localeCompare(String(b.name || b.id)));

@@ -357,9 +357,16 @@ export function revertClient(def, opts = {}) {
 /**
  * clientStatus —— 这个客户端现在接的是不是我们。
  *
- * 返回 `{ wired, detail, file, provider }`：
+ * 返回 `{ wired, detail, file, missing, notConfigured }`：
  *   · `wired` —— 备份文件在 **且** 配置里我们的那块在 ⇒ 是我们接的
  *   · 只有配置在、没有备份 ⇒ 用户（或别的工具）自己写的，如实说明
+ *   · `missing` —— **这个客户端压根没装**（它的目录都不在）
+ *   · `notConfigured` —— **装了，但还没生成过那个配置文件**（第一次运行才有）
+ *
+ * ⚠ 这两件事必须分开说：早先一律按「配置文件不在」报「这个客户端可能没装」，
+ *   而**用户明明装了、只是客户端还没运行过**（ZCode 就是这样：装好了，
+ *   `~/.zcode/v2/config.json` 还没生成）—— 那句话会让人以为要去下载。
+ *   判据用「配置文件的**父目录**在不在」：**通用**，不用每个客户端各写一套。
  */
 export function clientStatus(def, ctx, opts = {}) {
   const list = fileListOf(def, ctx);
@@ -368,7 +375,24 @@ export function clientStatus(def, ctx, opts = {}) {
   const r = readFileText(f.path);
   if (!r.ok) return { wired: false, detail: `读不了 ${f.path}：${r.error}`, file: f.path };
   if (!r.exists) {
-    return { wired: false, detail: `没找到 ${f.path}（这个客户端可能没装）`, file: f.path, missing: true };
+    const dir = path.dirname(f.path);
+    const installed = fs.existsSync(dir);
+    if (installed) {
+      return {
+        wired: false,
+        detail: `装了，但还没生成过这个配置文件（${f.path}）—— 先把 ${def.name} 运行一次，它就会自己写出来`,
+        file: f.path,
+        notConfigured: true,
+        dir,
+      };
+    }
+    return {
+      wired: false,
+      detail: `没装这个客户端（连 ${dir} 都不在）`,
+      file: f.path,
+      missing: true,
+      dir,
+    };
   }
   let on = false;
   try {

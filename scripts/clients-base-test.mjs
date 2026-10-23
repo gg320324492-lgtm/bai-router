@@ -50,6 +50,15 @@ const CTX = {
   providerName: "B.AI",
 };
 
+/* ⚠ 真实客户端的配置在**两级**目录下（~/.zcode/v2/config.json、~/.cline/data/settings/…），
+ *   而「装没装」的判据是**配置文件的父目录在不在** ⇒ 夹具也必须有两级，
+ *   否则「父目录在不在」这个判据在测试里没有区分度。 */
+const cfgPath = (home) => path.join(home, "app", "cfg.json");
+/** 写配置文件（自动建父目录）。 */
+function writeCfg(home, text) {
+  fs.mkdirSync(path.dirname(cfgPath(home)), { recursive: true });
+  fs.writeFileSync(cfgPath(home), text, "utf8");
+}
 /** 一个最小的假客户端：往 `<home>/cfg.json` 的 `providers.bai` 写一块。 */
 function fakeClient(home, opts = {}) {
   return {
@@ -58,7 +67,7 @@ function fakeClient(home, opts = {}) {
     protocol: "chat",
     files: () => [
       {
-        path: path.join(home, "cfg.json"),
+        path: cfgPath(home),
         format: opts.format || "json",
         writes: () => [
           { path: "providers.bai", value: { baseUrl: CTX.baseUrl, models: CTX.models.map((m) => m.id) } },
@@ -81,7 +90,7 @@ describe("① 接线：说好的键路径真的写进去了", () => {
     const def = fakeClient(home);
     const r = applyClient(def, { ...CTX, home }, { dataDir: home });
     assert.equal(r.ok, true, `接线失败：${r.detail}`);
-    const file = path.join(home, "cfg.json");
+    const file = cfgPath(home);
     assert.ok(fs.existsSync(file), "配置文件没写出来");
     const j = JSON.parse(fs.readFileSync(file, "utf8"));
     assert.equal(j.providers.bai.baseUrl, "http://127.0.0.1:15799");
@@ -92,7 +101,7 @@ describe("① 接线：说好的键路径真的写进去了", () => {
     const home = tmpDir();
     const r = applyClient(fakeClient(home), { ...CTX, home }, { dataDir: home });
     assert.equal(r.ok, true, r.detail);
-    assert.ok(fs.existsSync(path.join(home, "cfg.json")));
+    assert.ok(fs.existsSync(cfgPath(home)));
   });
 
   test("①c 状态：接完就是「已接到 B.AI」", () => {
@@ -103,11 +112,16 @@ describe("① 接线：说好的键路径真的写进去了", () => {
     assert.equal(st.wired, true, `状态不对：${JSON.stringify(st)}`);
   });
 
-  test("①d 没接过的客户端 ⇒ 「还没接」，且不报错", () => {
+  test("①d 装了但没接（配置文件在、里面没有我们那块）⇒ 「还没接」", () => {
+    /* ⚠ 这是最常见的状态：客户端装了、跑过、配置也在，但没接 B.AI。
+     *   它**不是**「没装」—— 说成「没装」会让用户以为要去下载。 */
     const home = tmpDir();
+    writeCfg(home, JSON.stringify({ theme: "dark", provider: { other: { baseUrl: "https://example.com" } } }));
     const st = clientStatus(fakeClient(home), { ...CTX, home }, { dataDir: home });
-    assert.equal(st.wired, false);
-    assert.equal(st.missing, true, "文件不存在要说清是「可能没装」");
+    assert.equal(st.wired, false, "没接就是没接");
+    assert.equal(st.configured, false, "里面没有我们那块");
+    assert.equal(st.missing, undefined, "★ 说成了「没装」—— 用户会以为要去下载客户端");
+    assert.match(String(st.detail || ""), /还没接/, "要说清是「还没接」");
   });
 });
 
@@ -117,8 +131,8 @@ describe("① 接线：说好的键路径真的写进去了", () => {
 describe("② 断开：只还原我们写过的那几处", () => {
   test("②a 我们写的那块回到原值", () => {
     const home = tmpDir();
-    const file = path.join(home, "cfg.json");
-    fs.writeFileSync(file, JSON.stringify({ providers: { bai: { baseUrl: "旧的", models: ["old"] } } }), "utf8");
+    const file = cfgPath(home);
+    writeCfg(home, JSON.stringify({ providers: { bai: { baseUrl: "旧的", models: ["old"] } } }), "utf8");
     const def = fakeClient(home);
     applyClient(def, { ...CTX, home }, { dataDir: home });
     const r = revertClient(def, { dataDir: home });
@@ -130,14 +144,14 @@ describe("② 断开：只还原我们写过的那几处", () => {
 
   test("②b **用户文件里的其它内容一个字没动**", () => {
     const home = tmpDir();
-    const file = path.join(home, "cfg.json");
+    const file = cfgPath(home);
     const original = {
       theme: "dark",
       providers: { bai: { baseUrl: "旧的", models: ["old"] } },
       other: { keep: [1, 2, 3], nested: { deep: true } },
     };
     const before = JSON.stringify(original);
-    fs.writeFileSync(file, before, "utf8");
+    writeCfg(home, before, "utf8");
     const def = fakeClient(home);
     applyClient(def, { ...CTX, home }, { dataDir: home });
     revertClient(def, { dataDir: home });
@@ -147,8 +161,8 @@ describe("② 断开：只还原我们写过的那几处", () => {
 
   test("②c 原来**没有**那块 ⇒ 断开后那块被删掉（不是留个空壳）", () => {
     const home = tmpDir();
-    const file = path.join(home, "cfg.json");
-    fs.writeFileSync(file, JSON.stringify({ theme: "dark" }), "utf8");
+    const file = cfgPath(home);
+    writeCfg(home, JSON.stringify({ theme: "dark" }), "utf8");
     const def = fakeClient(home);
     applyClient(def, { ...CTX, home }, { dataDir: home });
     assert.ok(fs.readFileSync(file, "utf8").includes("providers"), "接线后那块应该在");
@@ -160,7 +174,7 @@ describe("② 断开：只还原我们写过的那几处", () => {
 
   test("②d 断开两次：第二次如实说「没有备份」，不碰文件", () => {
     const home = tmpDir();
-    const file = path.join(home, "cfg.json");
+    const file = cfgPath(home);
     const def = fakeClient(home);
     applyClient(def, { ...CTX, home }, { dataDir: home });
     assert.equal(revertClient(def, { dataDir: home }).ok, true);
@@ -178,9 +192,9 @@ describe("② 断开：只还原我们写过的那几处", () => {
 describe("③ 读不懂的配置 ⇒ 中止，用户文件一个字节都没被改", () => {
   test("③a 文件在但 JSON 坏了 ⇒ 报错、不写", () => {
     const home = tmpDir();
-    const file = path.join(home, "cfg.json");
+    const file = cfgPath(home);
     const broken = '{ this is not json ';
-    fs.writeFileSync(file, broken, "utf8");
+    writeCfg(home, broken, "utf8");
     const r = applyClient(fakeClient(home), { ...CTX, home }, { dataDir: home });
     assert.equal(r.ok, false, "坏文件不该被接线");
     assert.match(r.detail, /读不懂|读不了/);
@@ -189,7 +203,7 @@ describe("③ 读不懂的配置 ⇒ 中止，用户文件一个字节都没被�
 
   test("③b 失败时**不留下备份**（免得下次还原时拿它当原值）", () => {
     const home = tmpDir();
-    fs.writeFileSync(path.join(home, "cfg.json"), "{ broken", "utf8");
+    writeCfg(home, "{ broken", "utf8");
     applyClient(fakeClient(home), { ...CTX, home }, { dataDir: home });
     const bf = path.join(home, "client-backups", "fake.json");
     assert.equal(fs.existsSync(bf), false, "★ 失败的接线留下了备份 —— 还原时会拿错误的原值覆盖用户文件");
@@ -197,7 +211,7 @@ describe("③ 读不懂的配置 ⇒ 中止，用户文件一个字节都没被�
 
   test("③c 空文件不是「坏文件」⇒ 正常接线", () => {
     const home = tmpDir();
-    fs.writeFileSync(path.join(home, "cfg.json"), "", "utf8");
+    writeCfg(home, "", "utf8");
     const r = applyClient(fakeClient(home), { ...CTX, home }, { dataDir: home });
     assert.equal(r.ok, true, `空文件不该报错：${r.detail}`);
   });
@@ -209,12 +223,57 @@ describe("③ 读不懂的配置 ⇒ 中止，用户文件一个字节都没被�
 describe("④ 没有备份 ⇒ 如实说，不碰用户文件", () => {
   test("④a 没有备份文件 ⇒ 报错且文件没动", () => {
     const home = tmpDir();
-    const file = path.join(home, "cfg.json");
+    const file = cfgPath(home);
     const before = '{"theme":"dark"}';
-    fs.writeFileSync(file, before, "utf8");
+    writeCfg(home, before, "utf8");
     const r = revertClient(fakeClient(home), { dataDir: home });
     assert.equal(r.ok, false);
     assert.equal(fs.readFileSync(file, "utf8"), before);
+  });
+});
+
+/* ====================================================================== *
+ * ④b「没装」与「装了但没配置」必须分开说
+ * ====================================================================== */
+describe("④b 装没装：看目录，不只看那个配置文件在不在", () => {
+  test("④b-1 配置文件不在、**父目录也不在** ⇒ missing（真没装）", () => {
+    const home = tmpDir();
+    const st = clientStatus(fakeClient(home), { ...CTX, home }, { dataDir: home });
+    assert.equal(st.missing, true, "连目录都不在 ⇒ 就是没装");
+    assert.equal(st.notConfigured, undefined, "不该同时说「没生成过配置」");
+  });
+
+  test("④b-2 配置文件不在、**父目录在** ⇒ 装了但没配置（不是「没装」）", () => {
+    /* 真实场景：用户装了 ZCode，但**还没运行过** ⇒ `~/.zcode/v2/config.json`
+     * 还没生成。早先一律报「这个客户端可能没装」⇒ 用户以为要去下载。 */
+    const home = tmpDir();
+    fs.mkdirSync(path.join(home, "cfg.json", ".."), { recursive: true });
+    fs.mkdirSync(path.join(home, "app"), { recursive: true });
+    const st = clientStatus(fakeClient(home), { ...CTX, home }, { dataDir: home });
+    assert.equal(st.notConfigured, true, "父目录在 ⇒ 是「装了没配置」");
+    assert.equal(st.missing, undefined, "★ 说成了「没装」—— 用户会以为要去下载客户端");
+    assert.match(String(st.detail || ""), /还没生成|运行一次/, "要说清下一步：先运行一次客户端");
+  });
+
+  test("④b-3 反向对照：把判据改回「只看文件在不在」⇒ ④b-2 必须失效", async () => {
+    const dir = path.join(TMPROOT, "broken-status");
+    fs.mkdirSync(dir, { recursive: true });
+    const src = path.join(REPO, "src", "server", "clients", "base.mjs");
+    const text = fs.readFileSync(src, "utf8");
+    const broken = text.replace(
+      "    const installed = fs.existsSync(dir);",
+      "    const installed = false;   // SABOTAGE：只看文件在不在",
+    );
+    assert.notEqual(broken, text, "改坏的副本没改成 —— 这条反向对照失效了（锚点与源码脱节）");
+    fs.writeFileSync(path.join(dir, "base.mjs"), broken, "utf8");
+    fs.copyFileSync(path.join(REPO, "src", "server", "edit-json.mjs"), path.join(TMPROOT, "edit-json.mjs"));
+    const { pathToFileURL } = await import("node:url");
+    const mod = await import(pathToFileURL(path.join(dir, "base.mjs")).href + `?v=${Date.now()}`);
+    const home = tmpDir();
+    fs.mkdirSync(path.join(home, "app"), { recursive: true });
+    const st = mod.clientStatus(fakeClient(home), { ...CTX, home }, { dataDir: home });
+    assert.equal(st.notConfigured, undefined,
+      "★ 改坏之后仍判成「装了没配置」—— 那 ④b-2 的判据是恒真的，测了个寂寞");
   });
 });
 
@@ -279,8 +338,8 @@ describe("⑥ 反向对照：改坏 ⇒ 判据必须红", () => {
     );
     const mod = await import(pathToFileURL(path.join(dir, "base.mjs")).href + `?v=${Date.now()}`);
     const home = tmpDir();
-    const file = path.join(home, "cfg.json");
-    fs.writeFileSync(file, JSON.stringify({ providers: { bai: { baseUrl: "旧的" } } }), "utf8");
+    const file = cfgPath(home);
+    writeCfg(home, JSON.stringify({ providers: { bai: { baseUrl: "旧的" } } }), "utf8");
     const def = fakeClient(home);
     mod.applyClient(def, { ...CTX, home }, { dataDir: home });
     mod.revertClient(def, { dataDir: home });
