@@ -448,16 +448,27 @@ describe("⑤ 没有出处的那些 —— 候选端点与「就是探不到」"
   });
 
   test("⑤f 默认候选表里，没出处的那些都标着「候选」", () => {
-    for (const p of ["mm", "qd", "wb", "wbai", "sn", "bai"]) {
+    /* ⚠ **qd 不在这份名单里**：它 2026-10-23 实测过了，端点与字段名都有出处，
+     *   所以它的 source 写「实测」—— 硬按「候选」去判反而会把真话判成假。
+     *   但它仍有几条没验过的（国内版），所以单列一条断言：每条都要写明
+     *   「实测」还是「候选」，且至少有一条是实测。 */
+    for (const p of ["mm", "wb", "wbai", "sn", "bai"]) {
       const spec = PROBE_SPECS[p];
       assert.ok(spec && spec.candidates && spec.candidates.length, `${p} 应当有候选表`);
       for (const c of spec.candidates) {
         assert.match(String(c.source || ""), /候选/, `${p} 的候选端点必须在 source 里写明是候选`);
       }
     }
-    // 有出处的两家：source 里必须有出处，不许含糊
+    // 已实测的几家：source 里必须有出处，不许含糊
     assert.match(PROBE_SPECS.or.candidates[0].source, /\/api\/v1\/credits/);
     assert.match(PROBE_SPECS.zen.candidates[0].source, /\/zen\/go\/v1\/usage/);
+    const qd = PROBE_SPECS.qd;
+    assert.ok(qd && qd.candidates && qd.candidates.length, "qd 应当有候选表");
+    for (const c of qd.candidates) {
+      assert.match(String(c.source || ""), /实测|候选/, "qd 的每条候选都要写明是实测还是候选");
+    }
+    assert.ok(qd.candidates.some((c) => /实测/.test(String(c.source || ""))),
+      "qd 至少要有一条实测端点（实测过就不能再写成候选）");
   });
 });
 

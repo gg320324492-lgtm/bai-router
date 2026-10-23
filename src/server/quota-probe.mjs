@@ -38,7 +38,16 @@
  *     免费档**没有**这个接口：magpie 实测 /zen/v1/usage 与 /inference/v1/usage 都是 404，
  *     额度只在 OpenCode 控制台（https://opencode.ai/console → Overview → Credits）。
  *
- *   mm / qd / wb / wbai / sn / bai —— **候选端点**（表里逐条标了「候选」）。
+ *   qd（Qoder）—— **探得到，已实测**（2026-10-23）：
+ *     GET https://openapi.qoder.sh/api/v2/quota/usage → addOnQuota.used/.total、
+ *     userQuota.used/.total。两个额度桶，单位是**积分（credits）**，不是 token。
+ *     ⚠ 端点在**另一个域**（openapi.qoder.sh），与推理基址 api2-v2.qoder.sh 不是一路 ——
+ *       拼 {base} 会打到 /model/v1/api/v2/quota/usage 去（404）。
+ *     ⚠ **401 不能证明端点存在**：鉴权层先于路由，旧猜的 /sash/api/v1/me/quota
+ *       用过期令牌回 401（看着像「地址对、缺凭据」），换有效令牌再打就是 **404**。
+ *       下一个人别再被 401 骗一次 —— 路由存不存在，要用**有效凭据**去验。
+ *
+ *   mm / wb / wbai / sn / bai —— **候选端点**（表里逐条标了「候选」）。
  *     这些厂商没有公开文档；端点是从**本仓已在用的基址与鉴权方式**推断的，
  *     字段名同样是候选。所以本模块**只有真的读到了那个字段才算数** ——
  *     读不到就标 unknown，**绝不**拿别的数（别家的、账本的）顶替。
@@ -161,6 +170,9 @@ function toNum(v) {
  *   pick   —— 可选。路径里用了 "*"（拿到一组值）时取哪个："first"(默认)/
  *             "max"/"min"/"sum"。
  *   percent—— 可选。true 表示这个数**本身就是百分比**（0–100），不是绝对量。
+ *   minLimit—— 可选（**窗口级**，写在 window 上而不是 slot 上）。上限小于它就算
+ *             这个窗口不存在。用来挡「上限 = 0」的桶：那不是额度池，报出去会显示
+ *             成 0/0，看着像「额度用完了」。不写就不设这道闸。
  *
  * ⚠ 为什么用「数据」而不是函数：候选表要能进配置文件（见文件头 ①）。
  *   一旦读法写成函数，用户就没法在配置里改端点与字段名了。
@@ -459,34 +471,81 @@ export const PROBE_SPECS = Object.freeze({
 
   qd: {
     base: "https://api2-v2.qoder.sh/model/v1",
+    /* ⚠ 额度端点在**另一个域**：openapi.qoder.sh（账号 API）。base 是**推理**基址
+     *   api2-v2.qoder.sh/model/v1，两者不是一路 —— 所以下面写绝对地址，
+     *   拼 {base} 会打到 /model/v1/api/v2/quota/usage（404）。
+     *   ⚠ 凭据只认 authorization：实测这个端点只要 Bearer 令牌，
+     *     带不带 x-gw-user-id 都回同一份应答（带 x-gw-user-id 还多一个失败点）。 */
+    authHeaders: ["authorization"],
     candidates: [
       {
-        id: "me-quota",
-        url: "https://openapi.qoder.sh/sash/api/v1/me/quota",
-        source: "候选端点 GET /sash/api/v1/me/quota → （字段名待实测）",
-        unit: UNIT_UNKNOWN,
-        used: GENERIC_USED,
-        limit: GENERIC_LIMIT,
-        note: "候选：magpie 实测过同族的 /sash/api/v1/me/campaigns（签到），"
-          + "但 me/quota 是推断的",
+        id: "quota-usage",
+        url: "https://openapi.qoder.sh/api/v2/quota/usage",
+        source: "实测 GET https://openapi.qoder.sh/api/v2/quota/usage → addOnQuota.used/.total、userQuota.used/.total（2026-10-23）",
+        unit: UNIT_CREDITS,
+        windows: [
+          {
+            name: "加购额度",
+            used: [{ path: "addOnQuota.used" }],
+            limit: [{ path: "addOnQuota.total" }],
+            minLimit: 1,
+          },
+          {
+            name: "套餐额度",
+            used: [{ path: "userQuota.used" }],
+            limit: [{ path: "userQuota.total" }],
+            minLimit: 1,
+          },
+        ],
+        note: "实测（2026-10-23，Free 档账号）：addOnQuota={total:600,used:0,remaining:600,unit:'credits'}、"
+          + "userQuota={total:0,used:0,remaining:0,unit:'credits'}；两个桶的形状都是 "
+          + "{total,used,remaining,percentage,unit}；单位是**积分**不是 token；"
+          + "应答里没有重置时刻（顶层 expiresAt 是 9999 年的哨兵值，不是真重置时间）",
       },
       {
-        id: "me-usage",
-        url: "https://openapi.qoder.sh/sash/api/v1/me/usage",
-        source: "候选端点 GET /sash/api/v1/me/usage → （字段名待实测）",
-        unit: UNIT_UNKNOWN,
-        used: GENERIC_USED,
-        limit: GENERIC_LIMIT,
-        note: "候选：同上",
+        id: "sash-me-usage",
+        url: "https://openapi.qoder.sh/sash/api/v2/me/usage",
+        source: "实测 GET https://openapi.qoder.sh/sash/api/v2/me/usage → qoderUsage.addOnQuota.used/.total（2026-10-23）",
+        unit: UNIT_CREDITS,
+        windows: [
+          {
+            name: "加购额度",
+            used: [{ path: "qoderUsage.addOnQuota.used" }],
+            limit: [{ path: "qoderUsage.addOnQuota.total" }],
+            minLimit: 1,
+          },
+          {
+            name: "套餐额度",
+            used: [{ path: "qoderUsage.userQuota.used" }],
+            limit: [{ path: "qoderUsage.userQuota.total" }],
+            minLimit: 1,
+          },
+        ],
+        note: "同一份数据的 sash 版（外层多包一层 displayMode / qoderUsage），"
+          + "留着当上一条失灵时的替补 —— 两个路由族不同，一边改了另一边还在",
       },
       {
-        id: "me-quota-cn",
-        url: "https://openapi.qoder.com.cn/sash/api/v1/me/quota",
-        source: "候选端点 GET /sash/api/v1/me/quota（国内版）→ （字段名待实测）",
-        unit: UNIT_UNKNOWN,
-        used: GENERIC_USED,
-        limit: GENERIC_LIMIT,
-        note: "候选：magpie 的国内版签到端点是 openapi.qoder.com.cn",
+        id: "quota-usage-cn",
+        url: "https://openapi.qoder.com.cn/api/v2/quota/usage",
+        source: "候选端点 GET https://openapi.qoder.com.cn/api/v2/quota/usage（国内版）→ （字段名待实测）",
+        unit: UNIT_CREDITS,
+        windows: [
+          {
+            name: "加购额度",
+            used: [{ path: "addOnQuota.used" }],
+            limit: [{ path: "addOnQuota.total" }],
+            minLimit: 1,
+          },
+          {
+            name: "套餐额度",
+            used: [{ path: "userQuota.used" }],
+            limit: [{ path: "userQuota.total" }],
+            minLimit: 1,
+          },
+        ],
+        note: "候选：国内版是另一个域（magpie 的国内版签到端点是 openapi.qoder.com.cn）；"
+          + "**路径与字段名都是从国际版推的，没实测过** —— 本仓的补丁只支持国际版"
+          + "（qoder-patch.mjs 有意不打国内版），所以这只在用户手工填了国内版令牌时才可能命中",
       },
     ],
   },
@@ -589,6 +648,27 @@ export const PROBE_SPECS = Object.freeze({
     ],
   },
 });
+
+/* ══════════════════════════════════════════════════════════════════════
+ * ④b Qoder 的鉴权头（实测 2026-10-23）
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Qoder 额度接口的鉴权头。
+ *
+ * ⚠ **只要 Authorization 一条**：实测带不带 x-gw-user-id 都回同一份应答 ——
+ *   所以别再去令牌文件里取 userId，少一个「令牌文件没写 userId 就探不到」的失败点。
+ * ⚠ 前缀是 `Bearer `：客户端自己就是这么发的（抓包里的 Authorization = "Bearer " + 令牌）。
+ * ⚠ 令牌是**裸串**（jt- 开头、几十个字符），**不是 JWT** —— 别按 JWT 去解它的载荷。
+ *
+ * @param {string} token Qoder 客户端登录态里那把 jt- 令牌
+ * @returns {object} 请求头；没有令牌就是空对象（调用方据此「一个请求都不发」）
+ */
+export function qdQuotaHeaders(token) {
+  const t = String(token == null ? "" : token).trim();
+  if (!t) return {};
+  return { authorization: "Bearer " + t };
+}
 
 /* ══════════════════════════════════════════════════════════════════════
  * ⑤ 规格解析：默认表 + 配置覆盖
@@ -764,6 +844,12 @@ function evalWindow(body, w, now) {
   if (percent && limit === null) limit = 100;   // 百分数的分母，不是绝对额度
   if (used === null) return null;
   if (limit === null && !percent) return null;
+  /* ⚠ **上限为 0 的桶不是「额度池」**（窗口规格里的 minLimit；不写就不设这道闸）：
+   *   报它，面板会显示成「0 / 0（0%）」——那看着像「额度已经用完」，
+   *   真相却是「上游压根没给这个桶」（实测：Qoder Free 档的 userQuota 就是 0/0）。
+   *   这种桶宁可当没读到，也不要显示一个算不出比例的假数。 */
+  const minLimit = num(w.minLimit);
+  if (!percent && minLimit !== null && limit < minLimit) return null;
   return {
     name: w.name || "",
     used,

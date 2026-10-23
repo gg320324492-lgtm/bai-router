@@ -150,7 +150,7 @@ import {
 import { runSync, compareState } from "./sync.mjs";
 import { createTarget } from "./sync-targets.mjs";
 /* 配额真探测（quota-probe.mjs）：问上游「你还剩多少额度」。 */
-import { probeQuota } from "./quota-probe.mjs";
+import { probeQuota, qdQuotaHeaders } from "./quota-probe.mjs";
 /* 账号发现（account-discovery.mjs）：每家的凭据从哪来、有几个可用账号、缺什么。 */
 import { discoverAccounts } from "./account-discovery.mjs";
 /* 渠道状态计算层（channel-state.mjs）：一个渠道 → 六态之一 + 原因 + 数字。
@@ -5930,12 +5930,26 @@ async function probeQuotaOf(provider, cfg, now) {
     if (provider === "mm") {
       try { mmToken = String((await mmTokens.ensure()) || ""); } catch { mmToken = ""; }
     }
+    /* ⚠⚠ **qd 的凭据也是不在 cfg 里的**：它是 Qoder 桌面端写的令牌文件
+     *   （%TEMP%\qoder-token.json，裸串 `jt-…`，**不是 JWT**），由补丁读出来。
+     *   实测（2026-10-23）：真端点是 `openapi.qoder.sh/api/v2/quota/usage`
+     *   （另一个域，与推理基址不是一路），`Authorization: Bearer <jt-令牌>` 即可，
+     *   `x-gw-user-id` 与 `Cosy-*` 头对它**不必要**。
+     *   ⚠ qd 必须**整个替换**头：`probeHeadersOf` 给的是占位符 "qd-local"，
+     *     叠加上去只会再换一个 401 回来。 */
+    let qdToken = "";
+    if (provider === "qd") {
+      try { qdToken = String(qdEnsureToken(cfg, false) || ""); } catch { qdToken = ""; }
+    }
     out = await probeQuota(provider, {
       now,
       bases,
-      headers: (id) => (id === "mm" && mmToken)
-        ? { authorization: "Bearer " + mmToken }
-        : probeHeadersOf(id, cfg),
+      headers: (id) => {
+        if (id === "qd" && qdToken) return qdQuotaHeaders(qdToken);
+        if (id === "mm" && mmToken) return { authorization: "Bearer " + mmToken };
+        return probeHeadersOf(id, cfg);
+      },
+      secrets: (id) => (id === "qd" && qdToken ? [qdToken] : []),
       get,
     });
   } catch (e) {
