@@ -26,9 +26,11 @@
 //   · 没做：magpie 把用户原来的 endpoint_transport / model **stash** 起来、
 //     断开时放回去的那套（底座 base.mjs 备份的正是这两处的原值，断开时原样
 //     还回去 —— 等价）。
-//   · ⚠ **没做：Muse 的模型清单**。Muse 的模型是从 <base_url 的主机>/muse-code/models
-//     拉的那一份 —— 统一网关不提供这个路径，所以 Muse 自己的清单里**没有**
-//     我们的模型。用户得自己在 Muse 里把模型名填上（我们写的 model 已经填好）。
+//   · **做了：Muse 的模型清单**（2026-10-23 补）。Muse 的模型是从
+//     <base_url 的主机>/muse-code/models 拉的那一份 —— 那个路径原先网关不提供，
+//     于是 Muse 自己的清单里**没有**我们的模型。现在网关答它
+//     （src/server/clients/muse-models.mjs 造清单，形状与 magpie 的 museModels
+//     逐字同构；⚠ limit 是**兜底值**不是真实上限，Muse 会隐藏没有 limit 的模型）。
 //
 // ## 纪律
 //
