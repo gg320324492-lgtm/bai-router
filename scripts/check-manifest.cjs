@@ -1238,20 +1238,63 @@ setCheck("C15");
     const IMPORT_RX = /(?:^|[^\w$])(?:import|export)\s[^;]*?from\s*["'](\.[^"']+)["']|import\s*\(\s*["'](\.[^"']+)["']\s*\)/g;
     const missing = [];
     let scanned = 0;
+    /* ⚠⚠ **子目录也算**：早先这闸门只认同目录的兄弟文件（./x.mjs），于是
+     *   `./clients/base.mjs` 这种**带斜杠的** import 整个落在闸门之外 ——
+     *   而「src/server/clients/ 整目录打包」那条 extraResources 条目一旦被删，
+     *   闸门**一声不响**，装出来的版本启动即崩（v1.0.101 加 clients/ 时踩到）。
+     *   现在补上：带斜杠的 import 要能找到对应的**目录条目**；
+     *   `../x.mjs` 要能解析回 src/server/ 下、且在 filter 里。 */
+    const dirEntries = new Set();
+    try {
+      const er = (JSON.parse(fs.readFileSync(pkgPath, "utf8")).build || {}).extraResources || [];
+      for (const e of er) {
+        if (!e || typeof e.from !== "string") continue;
+        if (e.from === "src/server") continue;
+        if (!e.from.startsWith("src/server/")) continue;
+        dirEntries.add(e.from.slice("src/server/".length));
+      }
+    } catch { /* 读不到就当没有目录条目（下面的检查会报出来） */ }
+
+    /* 会被打包的文件：filter 里的，加上每个目录条目下的。 */
+    const packagedFiles = [];
     for (const rel of filter) {
       if (!SRC_EXT.test(rel)) continue;
+      packagedFiles.push(rel);
+    }
+    for (const d of dirEntries) {
+      let names = [];
+      try { names = fs.readdirSync(path.join(SRV, d)); } catch { continue; }
+      for (const n of names) {
+        if (!SRC_EXT.test(n)) continue;
+        packagedFiles.push(d + "/" + n);
+      }
+    }
+
+    for (const rel of packagedFiles) {
       const abs = path.join(SRV, rel);
       let src;
       try { src = fs.readFileSync(abs, "utf8"); } catch { continue; }  // 文件不在 → 交给②腿报
       scanned++;
+      const fromDir = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
       for (;;) {
         const m = IMPORT_RX.exec(src);
         if (!m) break;
         const spec = m[1] || m[2];
-        // 只认同目录的兄弟文件（./x.mjs）。带 ../ 的、以及目录导入都不在本闸门范围。
-        if (!/^\.\/[^/]+$/.test(spec)) continue;
-        const target = spec.slice(2);
-        if (!filter.includes(target)) {
+        if (!/^\.\.?\//.test(spec)) continue;
+        /* 把 spec 相对**这个文件所在的目录**解析成 src/server/ 下的相对路径。 */
+        const absTarget = path.posix.normalize(path.posix.join(fromDir, spec));
+        /* 越出 src/server/ 的（../../../ 之类）不在本闸门范围。 */
+        if (absTarget.startsWith("..")) continue;
+        if (absTarget.includes("/")) {
+          /* 指向某个子目录 ⇒ 那个目录必须**整目录打包** */
+          const dir = absTarget.split("/")[0];
+          if (!dirEntries.has(dir)) {
+            missing.push(`${rel} → ${spec}（子目录「${dir}」没有整目录打包条目）`);
+          }
+          continue;
+        }
+        /* 指向 src/server/ 下的一个文件 ⇒ 必须在 filter 里 */
+        if (!filter.includes(absTarget)) {
           missing.push(`${rel} → ${spec}`);
         }
       }
@@ -1259,12 +1302,14 @@ setCheck("C15");
     if (!scanned) err("filter 里一个 .mjs/.js 源文件都没扫到，本闸门实际没跑");
     if (missing.length) {
       for (const x of missing) {
-        err(`${x.split(" → ")[0]} import 了一个不在 extraResources filter 里的模块「${x.split(" → ")[1].slice(2)}」`
+        const at = x.split(" → ");
+        err(`${at[0]} import 了一个没被打包的模块「${at[1].slice(2)}」`
           + ` —— 源码跑得通但**装出来的版本启动即崩**（filter 是显式白名单，不是整目录拷贝）。`
-          + `请把该文件加进 package.json 的 build.extraResources[src/server].filter`);
+          + `请把它加进 package.json 的 build.extraResources[src/server].filter，`
+          + `或给它所在的子目录加一条整目录拷贝的条目`);
       }
     } else {
-      ok(`scanned ${scanned} packaged module(s); every relative sibling import is in the filter`);
+      ok(`scanned ${scanned} packaged module(s); every relative import resolves to something packaged`);
     }
 
     // ② 正向：filter 里的条目在源目录里不存在（多半是文件被删/改名，白名单没跟上）

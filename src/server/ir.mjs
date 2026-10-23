@@ -1582,13 +1582,26 @@ export function usageToAnthropic(u) {
   return out;
 }
 
-/** usageToChat —— IR 的用量转成 Chat 的形状。 */
+/** usageToChat —— IR 的用量转成 Chat 的形状。
+ *
+ * ⚠⚠ **口径必须与 `chatUsage` 互逆**：IR 的 `input` 是**不含**缓存命中的那部分
+ *   （Anthropic 口径，见 `anthropicUsage`），而 Chat 的 `prompt_tokens` 是
+ *   **含**缓存命中的那部分（OpenAI 口径，见 `chatUsage`）。
+ *   所以这里是 `input + cacheRead`—— 少加那一截，客户端账本上的「输入 token」
+ *   会比真实提示词小一截；更糟的是「输入 + 缓存读」两格加起来也**不等于**
+ *   真实提示词，面板上那个「加起来超过」的坑就出在这里。
+ *   （早先这里写的是 `u.input`，与 `chatUsage` 不互逆 —— 往返一圈数字会缩水。）
+ */
 export function usageToChat(u) {
+  const input = u.input || 0;
+  const cached = u.cacheRead || 0;
+  const output = u.output || 0;
   return {
-    prompt_tokens: u.input || 0,
-    completion_tokens: u.output || 0,
-    total_tokens: (u.input || 0) + (u.output || 0),
-    prompt_tokens_details: { cached_tokens: u.cacheRead || 0 },
+    prompt_tokens: input + cached,
+    completion_tokens: output,
+    total_tokens: input + cached + output,
+    prompt_tokens_details: { cached_tokens: cached },
+    completion_tokens_details: { reasoning_tokens: u.reasoning || 0 },
   };
 }
 

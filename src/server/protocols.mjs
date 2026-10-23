@@ -28,6 +28,7 @@
  */
 import { parseResponses, buildResponses, responsesDecoder } from "./responses.mjs";
 import { parseGemini, buildGemini, geminiDecoder } from "./gemini.mjs";
+import { chatProtocol } from "./chat-protocol.mjs";
 import { buildAnthropic } from "./ir.mjs";
 
 /** Responses：模型名在请求体的 `model` 字段里。 */
@@ -79,8 +80,15 @@ export const geminiProtocol = {
   }),
 };
 
-/** 全部支持的入向协议（顺序 = 匹配顺序；路径互不重叠，顺序其实无所谓）。 */
-export const PROTOCOLS = [responsesProtocol, geminiProtocol];
+/** 全部支持的入向协议（顺序 = 匹配顺序；路径互不重叠，顺序其实无所谓）。
+ *
+ *  ④ chat —— OpenAI Chat Completions。这一族客户端最广（magpie 的 66 个 agent
+ *     里 40 多个说这种话：Qoder、ZCode、Kimi Code、Qwen Code、MiniMax Code、
+ *     CodeBuddy、WorkBuddy、Droid、Cline、jcode、Goose、Crush、Pi、omp、
+ *     OpenCode、Cursor CLI、Grok、AtomCode…）。它排在最后：**路径互不重叠**，
+ *     谁先谁后无所谓；放最后是为了读起来「按字母/常见度」时它是新增的那条。
+ */
+export const PROTOCOLS = [responsesProtocol, geminiProtocol, chatProtocol];
 
 /** 按路径与方法挑一个协议；不认得就 null（**不猜**）。 */
 export function pickProtocol(path, method) {

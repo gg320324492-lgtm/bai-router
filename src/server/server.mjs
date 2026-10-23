@@ -114,6 +114,15 @@ import { makeUsageScanner } from "./usage-scan.mjs";
 import {
   GATEWAY_MODEL, GATEWAY_BODY, GATEWAY_TIER, makeGatewayHandler, makeProtocolHandler, pickProtocol,
 } from "./gateway.mjs";
+/* Chat 入向协议桥（chat-protocol.mjs）：OpenAI Chat Completions 这一族客户端
+ * （Qoder、ZCode、Kimi Code、Qwen Code、Cline、Droid、OpenCode…）说话的方式。
+ * 也带来统一网关的模型清单形状（一份响应两种客户端都能读）。 */
+import { chatModelsPayload } from "./chat-protocol.mjs";
+/* 客户端接线（clients/）：替用户把客户端（Qoder、ZCode、Kimi Code、Cline…）的
+ * 配置文件写好。底座在 clients/base.mjs，名录在 clients/registry.mjs（扫目录，
+ * 加一个客户端不用改表）。 */
+import { applyClient, revertClient, clientStatus } from "./clients/base.mjs";
+import { allClients, clientById } from "./clients/registry.mjs";
 /* 网关的故障转移（gateway-failover.mjs）：把「档位」从最终模型名反查回来，
  * 转移时才能按**目标家**重解析（各家同一档位是不同模型）。 */
 import { tierOfModel, tierKeyFor } from "./gateway-failover.mjs";
@@ -7675,13 +7684,82 @@ const gatewayParams = {
 const gatewayAnthropicHandler = makeGatewayHandler(gatewayParams);
 const gatewayProtocolHandler = makeProtocolHandler(gatewayParams);
 const gatewayServer = http.createServer((req, res) => {
-  /* 按路径分派：协议路径走协议入口，其余走 Anthropic 入口。
+  /* 按路径分派：协议路径走协议入口，模型清单走清单入口，其余走 Anthropic 入口。
    * ⚠ 分派**只看路径与方法**，不看请求体 —— 请求体还没读呢。 */
   const p = String(req.url || "").split("?")[0];
   const ep = p.length > 1 ? p.replace(/\/+$/, "") : p;
+  if (req.method === "GET" && ep === "/v1/models") return gatewayModels(req, res);
   if (pickProtocol(ep, req.method)) return gatewayProtocolHandler(req, res);
   return gatewayAnthropicHandler(req, res);
 });
+
+/**
+ * 统一网关的模型清单（GET /v1/models）。
+ *
+ * ⚠ 早先统一网关对非 POST 一律 405，说「模型清单请直连对应提供方的中转端口」。
+ *   那对 Anthropic 客户端无所谓（它们连的是某一家的中转端口），但**对 Chat 一族
+ *   客户端是死路**：它们启动第一件事就是 GET /v1/models 拉清单，拉不到就报错或
+ *   空列表 —— 于是「协议通了但连不上」，白忙。
+ *
+ * 清单内容 = 出厂八家 × 各自的档位。模型 id 写成 `provider/档位` —— 与网关
+ * 入向的模型 id 约定**逐字相同**（客户端从清单里抄一个 id 直接用）。
+ *
+ * ⚠ 插件渠道**不在**这份清单里：插件渠道不出现在出厂渠道矩阵里（那是面板的
+ *   口径），它们的模型由插件自己的声明决定，用户自己知道 id。
+ *
+ * 形状用 chatModelsPayload：**一份响应两种客户端都能读**（OpenAI 读
+ * `object`/`created`，Anthropic 读 `type`/`created_at`，多写的字段没人管）。
+ */
+function gatewayModels(req, res) {
+  json(res, 200, chatModelsPayload(gatewayModelEntries(loadCfg())));
+}
+
+/**
+ * gatewayModelEntries —— 统一网关的模型清单条目（出厂八家 × 各自的档位）。
+ *
+ * ⚠ 插件渠道不在里面（理由见上面 gatewayModels 的注释）。
+ */
+function gatewayModelEntries(cfg) {
+  const c = cfg || loadCfg();
+  const entries = [];
+  for (const p of CHANNELS) {
+    const S = sliceOf(c, p);
+    const mapping = (S && S.mapping) || {};
+    const keys = Object.keys(mapping).length ? Object.keys(mapping) : TIER_KEYS;
+    for (const k of keys) {
+      entries.push({
+        id: `${p}/${k}`,
+        ownedBy: p,
+        displayName: (mapping[k] && mapping[k].label) || k,
+      });
+    }
+  }
+  return entries;
+}
+
+/**
+ * clientCtx —— 接线时给客户端声明的那份上下文。
+ *
+ * `baseUrl` 是**不带 /v1** 的统一网关根地址（它同时答 `/chat/completions`
+ * 与 `/v1/chat/completions`）。`apiKey` 是**占位串** —— 本地网关不校验 key，
+ * 但客户端多半要求非空才肯保存；这是个明显不是真 key 的占位。
+ *
+ * ⚠ `home` 是**要改的目录**（客户端的配置在那儿）。它可以用环境变量
+ *   `BAI_CLIENT_HOME` 改 —— 与 `BAI_DATA_DIR` 同一类：接线会写文件，
+ *   「写文件」这件事必须能被测试隔离开，否则测试就会动用户的真配置。
+ *   生产环境不设这个变量，就是真实的用户目录。
+ */
+function clientCtx(cfg) {
+  const c = cfg || loadCfg();
+  return {
+    home: process.env.BAI_CLIENT_HOME || os.homedir(),
+    baseUrl: gatewayBaseUrl(c),
+    apiKey: "bai-local",
+    models: gatewayModelEntries(c).map((e) => ({ id: e.id, label: e.displayName })),
+    providerId: "bai",
+    providerName: "B.AI",
+  };
+}
 
 // ---------- 文件级操作 ----------
 function readJson(file) {
@@ -10443,6 +10521,41 @@ async function unknownMappingTargets(p, mapping, cfg) {
         byProvider: Array.from(byProvider.values()).sort((a, b) => b.requests - a.requests),
         byModel: Array.from(byModel.values()).sort((a, b) => b.requests - a.requests).slice(0, 30),
       });
+    }
+    /* ---- 客户端接线（Qoder / ZCode / Kimi Code / Cline…） ----
+     *
+     * 面板上「接到某个客户端」：替用户把那个客户端的配置文件写好。
+     * 底座在 clients/base.mjs（备份/还原/判状态），名录在 clients/registry.mjs。
+     */
+    if (req.method === "GET" && u.pathname === "/api/clients") {
+      const ctx = clientCtx();
+      const list = await allClients();
+      const out = [];
+      for (const c of list) {
+        let st = { wired: false, detail: "", file: "" };
+        /* ⚠ 判状态失败**如实报**，不让一个客户端的异常把整张列表变成空白。 */
+        try { st = clientStatus(c, ctx, { dataDir: DATA_DIR }); }
+        catch (e) { st = { wired: false, detail: "读状态时出错：" + String((e && e.message) || e) }; }
+        out.push({
+          id: c.id, name: c.name, protocol: c.protocol || "", note: c.note || "",
+          status: st,
+        });
+      }
+      return json(res, 200, { ok: true, list: out });
+    }
+    if (req.method === "POST" && u.pathname === "/api/clients/apply") {
+      const b = await readBody(req);
+      const def = await clientById(b.id);
+      if (!def) return json(res, 404, { error: `没有这个客户端：${String(b.id || "")}` });
+      const r = applyClient(def, clientCtx(), { dataDir: DATA_DIR });
+      return json(res, r.ok ? 200 : 400, r);
+    }
+    if (req.method === "POST" && u.pathname === "/api/clients/revert") {
+      const b = await readBody(req);
+      const def = await clientById(b.id);
+      if (!def) return json(res, 404, { error: `没有这个客户端：${String(b.id || "")}` });
+      const r = revertClient(def, { dataDir: DATA_DIR });
+      return json(res, r.ok ? 200 : 400, r);
     }
     if (req.method === "POST" && u.pathname === "/api/apply") {
       const b = await readBody(req);
