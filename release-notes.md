@@ -37,7 +37,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://github.com/g
 
 ### 二、面板多了一屏「客户端」：装好的 CLI 一键接上
 
-「客户端」页列出能接 B.AI 的客户端 —— **27 个**（Claude Code、Claude 桌面版、
+「客户端」页列出能接 B.AI 的客户端 —— **28 个**（Claude 桌面版、Claude Code、
 Cline、CodeBuddy Code、Codex、Cursor CLI、Droid、Empryo、Gemini CLI、Goose、
 Grok Build、Hermes Agent、jcode、Kimi Code、MiniMax Code、Mister Morph、
 Muse Code、OpenCode、omp (oh-my-pi)、Pi、Qoder、Qoder CN、Qwen Code、
@@ -51,6 +51,9 @@ Reasonix Studio、StepCode、WorkBuddy、WorkBuddy AI、ZCode），
 - **「没装」与「装了但还没生成过配置」分开说** —— 客户端装了但还没运行过时，
   它的配置文件还没生成（ZCode 就是这样），这时说的是「装了，先运行一次它」，
   不是「你没装」。
+- ⚠ **桌面版接线完要重启桌面版** —— 它只在**启动时**读一次配置库。
+- 客户端里的「图片 / 思考」那几个能力项目前是**保守值**（我们只知道档位，
+  不知道它映射到哪家上游）⇒ 宁可先不给，不说谎。
 
 - **断开只还原我们写过的那几处** —— 你文件里其它内容一个字不动。
 - **读不懂就不写**：配置文件在但解析失败 ⇒ 报错、中止，**绝不**把它当空配置覆盖掉。
