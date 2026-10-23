@@ -127,6 +127,10 @@ import { allClients, clientById } from "./clients/registry.mjs";
  * 共用同一份逻辑 —— 那段里有不少有历史教训的讲究（占位符、档位 vs 最终模型名），
  * 重写一遍等于把教训重新踩一遍。 */
 import { claudeCodeEdits } from "./clients/claude-code-edits.mjs";
+/* Claude 桌面版的接线（clients/claude-desktop.mjs）：走**底座**（路径级备份、可还原），
+ * 不再用旧的 applyToDesktop —— 那个是**整份覆盖写**，会把用户桌面版配置里的其它
+ * 内容抹掉。 */
+import { claudeDesktopClient } from "./clients/claude-desktop.mjs";
 /* Muse Code 的模型清单（clients/muse-models.mjs）：Muse 从 `<base_url 主机>/muse-code/models`
  * 拉清单，不是从 /v1/models ⇒ 没有这个端点，它的清单里就没有我们的模型。 */
 import { buildMuseModels } from "./clients/muse-models.mjs";
@@ -8692,43 +8696,6 @@ function applyToCli(S, opts = {}) {
   recordCliApply(S.p);   // 留指纹：之后能分辨这份配置还是不是我们写的
 }
 // 通用：把一个提供方写进桌面版 configLibrary（都经由本地中转，桌面版不感知上游差异）
-function applyToDesktop(S) {
-  const f = desktopConfigFile();
-  if (!f) throw new Error("找不到桌面版配置文件（configLibrary/_meta.json）");
-  /* 网关模式：桌面版也指向统一网关，且模型名要带 `provider/档位` 前缀——
-   * 桌面版把 inferenceModels[].name 原样当模型发出去，网关靠这个前缀分流。
-   *
-   * ⚠ 写**档位**而不是最终模型名：档位是 provider 无关的抽象，写它才不丢信息
-   *   （多档同模型时，最终模型名反推不出档位 —— 详见 applyToCli 里那段注释）。
-   *   老路（不走网关）桌面版本来就写档位（`t.key`），两路一致。
-   * ⚠ 令牌**不改**：桌面版送来的 authorization 会被 bai/sn 的 handler 透传给上游，
-   * 换成占位符就等于把假令牌发给上游了。 */
-  const gw = gatewayOn();
-  const modelName = (t) => (gw ? `${S.p}/${t.key}` : t.key);
-  writeAtomic(
-    f,
-    JSON.stringify(
-      {
-        coworkEgressAllowedHosts: ["*"],
-        disableDeploymentModeChooser: true,
-        inferenceGatewayApiKey: S.key,
-        inferenceGatewayAuthScheme: "bearer",
-        inferenceGatewayBaseUrl: gw ? gatewayBaseUrl() : `http://127.0.0.1:${S.relayPort}`,
-        inferenceModels: TIERS.map((t) => ({
-          labelOverride: S.mapping[t.key]?.label || t.zh,
-          name: modelName(t),
-          supports1m: true,
-        })),
-        inferenceProvider: "gateway",
-      },
-      null,
-      2
-    ) + "\n"
-  );
-}
-// 兼容旧调用名
-async function applyBaiToCli(cfg) { await applyToCli(sliceOf(cfg, "bai")); }
-function applyBaiToDesktop(cfg) { applyToDesktop(sliceOf(cfg, "bai")); }
 
 // CC Switch 方案的兜底还原数据（取自用户机器上真实生效过的配置）
 const FALLBACK_CC_CLI = {
@@ -9571,7 +9538,7 @@ const panel = http.createServer(async (req, res) => {
       const applied = [];
       const curCli = cliMode(cfg).mode, curDesk = desktopMode(cfg).mode;
       if (done.includes(curCli)) { await applyToCli(sliceOf(cfg, curCli)); applied.push("cli"); }
-      if (done.includes(curDesk)) { applyToDesktop(sliceOf(cfg, curDesk)); applied.push("desktop"); }
+      if (done.includes(curDesk)) { applyClient(claudeDesktopClient, clientCtx(cfg, curDesk), { dataDir: DATA_DIR }); applied.push("desktop"); }
       log(`批量模型列表已写入:`, done.join(",") + (skipped.length ? `（跳过:${skipped.join(",")}）` : ""), "重应用到:", applied.join(",") || "无");
       return json(res, 200, {
         ok: true,
@@ -9989,7 +9956,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const applied = [];
       const curCli = cliMode(cfg).mode, curDesk = desktopMode(cfg).mode;
       if (curCli === P) { await applyToCli(sliceOf(cfg, P)); applied.push("cli"); }
-      if (curDesk === P) { applyToDesktop(sliceOf(cfg, P)); applied.push("desktop"); }
+      if (curDesk === P) { applyClient(claudeDesktopClient, clientCtx(cfg, P), { dataDir: DATA_DIR }); applied.push("desktop"); }
       log(`配置已保存(${P})，重应用到:`, applied.join(",") || "无", needRestart ? "(需重启)" : "");
       return json(res, 200, {
         ok: true,
@@ -10051,7 +10018,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
           const S = sliceOf(cfg, cur);
           warns.push(...snapshotExternal());
           await applyToCli(S);
-          applyToDesktop(S);
+          applyClient(claudeDesktopClient, clientCtx(cfg, S.p), { dataDir: DATA_DIR });
         } else {
           warns.push("当前没有接任何一家；改动已保存，下次接线时生效");
         }
@@ -10744,7 +10711,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const applied = [];
       try {
         if (doCli) { await applyToCli(S); applied.push("cli"); }
-        if (doDesk) { applyToDesktop(S); applied.push("desktop"); }
+        if (doDesk) { applyClient(claudeDesktopClient, clientCtx(cfg, S.p), { dataDir: DATA_DIR }); applied.push("desktop"); }
       } catch (e) {
         const repair = (e && e.repair) || null;
         log(`接线到 ${name} 失败：`, (e && e.message) || e);

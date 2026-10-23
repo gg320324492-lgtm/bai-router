@@ -85,6 +85,7 @@ const SERVED_PREFIX = ["/v1beta/"];
  */
 const APPENDS = {
   "claude-code": "/v1/messages",
+  "claude-desktop": "/v1/messages",
   cline: "/chat/completions",
   codebuddy: { complete: true },
   codex: "/responses",
