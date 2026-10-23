@@ -1,0 +1,28 @@
+{
+  "manifestVersion": 1,
+  "id": "aider-full",
+  "name": "Aider（完整示例）",
+  "protocol": "chat",
+  "note": "示例：带模型 id 与模型清单",
+  "config": "~/.aider.conf.yml",
+  "format": "yaml",
+  "model": "model",
+  "writes": {
+    "openai-api-base": "${baseUrlV1}",
+    "openai-api-key": "${apiKey}",
+    "model": "${modelId}"
+  },
+  "modelList": {
+    "path": "models",
+    "as": "array",
+    "item": {
+      "id": "${id}",
+      "name": "${name}",
+      "provider": "${providerId}"
+    }
+  },
+  "wired": {
+    "path": "openai-api-base",
+    "value": "${baseUrlV1}"
+  }
+}

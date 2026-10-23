@@ -1,0 +1,17 @@
+{
+  "manifestVersion": 1,
+  "id": "aider",
+  "name": "Aider",
+  "protocol": "chat",
+  "note": "示例：最小的一份声明（只写地址与 key）",
+  "config": "~/.aider.conf.yml",
+  "format": "yaml",
+  "writes": {
+    "openai-api-base": "${baseUrlV1}",
+    "openai-api-key": "${apiKey}"
+  },
+  "wired": {
+    "path": "openai-api-base",
+    "value": "${baseUrlV1}"
+  }
+}
