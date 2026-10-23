@@ -34,9 +34,10 @@
 //   · 没做：magpie 的 Sync（目录变了刷新那份清单）与「用户手动关掉的模型
 //     保持关着」那套（disabled 标记是 WorkBuddy 自己写的，我们保留用户那份
 //     原样，但我们新写的条目不带 disabled —— 新写的默认是开的）。
-//   · 没做：maxInputTokens / maxOutputTokens / reasoning（我们的接线上下文里
-//     没有「这个档位的上下文窗口、能写多少 token、支持哪些 effort」这一项 ——
-//     写一个假的数字会让 WorkBuddy 提前截断）。
+//   · 没做（两件不同的事，别混）：maxInputTokens / maxOutputTokens —— 它们的真值
+//     来自 m.context 与输出上限，**还没到位**（阶段 1 的元数据表）⇒ 现在写就是假
+//     数字（写假的会让 WorkBuddy 提前截断）⇒ 等真值；而 reasoning（思考档位）与
+//     图片是**能力项** ⇒ 永远没有真值 ⇒ 同样不写，但等不到。
 //
 // ## 纪律
 //

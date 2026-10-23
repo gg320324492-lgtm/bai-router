@@ -27,8 +27,10 @@
 // ## 我们这层做了什么 / 没做什么
 //
 //   · 做了：models.json 里我们的那几条 + settings.json 的 model（当前用哪个）。
-//   · 没做：maxInputTokens / maxOutputTokens / reasoning（我们的接线上下文里
-//     没有「这个档位的上下文窗口、能写多少 token」这一项 —— 不写假的）。
+//   · 没做（两件不同的事，别混）：maxInputTokens / maxOutputTokens —— 它们的真值
+//     来自 m.context 与输出上限，**还没到位**（阶段 1 的元数据表）⇒ 现在写就是假
+//     数字 ⇒ 等真值；而 reasoning（思考档位）是**能力项** ⇒ 永远没有真值 ⇒ 同样
+//     不写，但等不到。
 //   · 没做：magpie 的 Sync（目录变了刷新清单）。
 //
 // ## 纪律
