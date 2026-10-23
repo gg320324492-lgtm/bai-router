@@ -72,6 +72,7 @@ window.BAI_CARDS["clients"] = {
           </div>
           <div class="hint" style="margin-top:4px" data-role="c-plugins"></div>
           <div class="result" data-role="c-result"></div>
+          <div data-role="c-kept"></div>
           <div data-role="c-body"></div>
         </div>`;
       const viewRoot = (slot.closest && slot.closest(".view")) || slot;
@@ -93,6 +94,58 @@ window.BAI_CARDS["clients"] = {
       if (!el) return;
       el.textContent = text || "";
       el.className = "result" + (ok === false ? " err" : ok === true ? " ok" : "");
+    }
+
+    /**
+     * showKept —— 把「保留了你手改的 N 处」**列出来**（不只是说个数）。
+     *
+     * ⚠ **两类要分开说**（它们是两回事）：
+     * · `theirs`（缺省）—— 那个键**我们本来就会写**，但用户改过 ⇒ 让给他
+     *   ⇒ 显示「路径 · 你的值 · 我们记的值」；
+     * · `unmanaged` —— **我们压根没写**的键，用户自己加的 ⇒ 弱保留层留下的
+     *   ⇒ 只列**键名**（它们是「用户自己的一堆东西」，一个个列值太长）。
+     * ⚠ **值可以显示**：kept 里的值**已过凭据脱敏**（长串会被换成
+     *   「（长度 N 的长串…）」）⇒ 面板上直接显示即可，**不要**再往外发。
+     * ⚠ 路径**带文件名**（`cfg.json:providers.bai.name`）—— 多文件的客户端里
+     *   同一个点分路径会出现好几次（base.mjs 里拼的），不带文件名分不清是哪一份。
+     * ⚠ 只列前 8 条：用户手改十几处的话，一屏铺开反而看不清。
+     */
+    function showKept(kept) {
+      const box = q('[data-role="c-kept"]');
+      if (!box) return;
+      const list = Array.isArray(kept) ? kept : [];
+      if (!list.length) { box.innerHTML = ""; return; }
+      const theirs = list.filter((k) => k.kind !== "unmanaged");
+      const unmanaged = list.filter((k) => k.kind === "unmanaged");
+      const parts = [];
+      if (theirs.length) {
+        const rows = theirs.slice(0, 8).map((k) => (
+          `<div class="dim" style="font-size:11px;margin-top:4px">` +
+          `<span class="mono">${esc(String(k.path || ""))}</span>` +
+          ` · 你的：${esc(String(k.theirs == null ? "（没这一项）" : k.theirs))}` +
+          ` · 我们记的：${esc(String(k.ours == null ? "（没这一项）" : k.ours))}` +
+          `</div>`
+        )).join("");
+        parts.push(
+          `<details style="margin-top:6px">` +
+          `<summary class="dim" style="cursor:pointer">保留了你手改的 ${theirs.length} 处（点开看是哪几处）</summary>` +
+          rows +
+          (theirs.length > 8 ? `<div class="dim" style="font-size:11px">…等 ${theirs.length} 处</div>` : "") +
+          `</details>`
+        );
+      }
+      if (unmanaged.length) {
+        const names = unmanaged.slice(0, 12).map((k) => String(k.path || ""));
+        parts.push(
+          `<details style="margin-top:4px">` +
+          `<summary class="dim" style="cursor:pointer">还留着你自己的 ${unmanaged.length} 个键（我们没写它们）</summary>` +
+          `<div class="dim" style="font-size:11px;margin-top:4px">` +
+          names.map((n) => `<span class="mono">${esc(n)}</span>`).join("、") +
+          (unmanaged.length > 12 ? ` 等 ${unmanaged.length} 个` : "") +
+          `</div></details>`
+        );
+      }
+      box.innerHTML = parts.join("");
     }
 
     /* 一个客户端的**状态灯**：接上了是 ok，没接是 idle，装不上/读不懂是 err。 */
@@ -240,6 +293,7 @@ window.BAI_CARDS["clients"] = {
               });
               if (r && r.ok === false) throw new Error(r.error || r.detail || "接不上");
               setResult("✔ " + String((r && r.detail) || "已接上"), true);
+              showKept(r && r.kept);
               await load(); renderBody();
             } catch (e) {
               setResult("✖ 接不上：" + String((e && e.message) || e), false);
@@ -262,6 +316,7 @@ window.BAI_CARDS["clients"] = {
               });
               if (r && r.ok === false) throw new Error(r.error || r.detail || "断不开");
               setResult("✔ " + String((r && r.detail) || "已断开"), true);
+              showKept(null);   // 断开了 ⇒ 那份「保留了你手改的」清单不再成立
               await load(); renderBody();
             } catch (e) {
               setResult("✖ 断不开：" + String((e && e.message) || e), false);

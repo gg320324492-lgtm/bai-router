@@ -276,7 +276,14 @@ export function applyClient(def, ctx, opts = {}) {
          *   不是写一个对象进去 —— 形状不对客户端会当配置坏了）。 */
         const m = mergeValue(before.existed ? before.value : undefined, w.value, w.merge);
         value = m.value;
-        kept = m.kept.map((k) => ({ ...k, path: k.path ? `${p}.${k.path}` : p }));
+        /* ⚠ 路径要带**文件名**：多文件的客户端里同一个点分路径会出现好几次
+         *   （Cline 的 `providers.json` 与 `models.json` 都写
+         *   `providers.openai-compatible`）⇒ 不带文件名分不清是哪一份。 */
+        const tag = path.basename(f.path);
+        kept = m.kept.map((k) => ({
+          ...k,
+          path: k.path ? `${tag}:${p}.${k.path}` : (p ? `${tag}:${p}` : tag),
+        }));
       }
       edits.push({
         path: p, before, value,

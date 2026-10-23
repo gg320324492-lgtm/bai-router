@@ -291,7 +291,18 @@ function splitKey(line, indent) {
     }
     if (j >= line.length) return null;
     keyRaw = line.slice(i, j + 1);
-    key = q === '"' ? plainValue(line.slice(i, j + 1)) : line.slice(i + 1, j).replace(/''/g, "'");
+    /* ⚠ **键要去引号**（2026-10-23 修的既有毛病，不是本轮引入）：
+     *   原来双引号分支把**键**也交给 `plainValue` —— 而那是处理**值**的
+     *   （`true`/`null`/数字），对 `"sn/claude-opus-5"` 这种带引号的字符串
+     *   它**原样返回**（连引号一起）⇒ 树里的键是 `"sn/claude-opus-5"`（带引号）
+     *   ⇒ 用路径 `models."sn/claude-opus-5".name` 找**永远找不到**
+     *   ⇒ 写回去还会**多写一个不带引号的同名键**（YAML 语义相同、字面不同），
+     *     客户端只认其中一种 ⇒ 用户在带引号那个里改的值**被盖掉**。
+     *   ⇒ 键按 YAML 语义去引号（双引号里 `\"` `\\` 是转义）；单引号里 `''` 是转义。
+     *   ⚠ 写回时仍用 `keyRaw`（原样）⇒ 沿用用户文件里那个键的字面形式。 */
+    key = q === '"'
+      ? line.slice(i + 1, j).replace(/\\(.)/g, "$1")
+      : line.slice(i + 1, j).replace(/''/g, "'");
     i = j + 1;
     if (line[i] !== ":") return null;
   } else {
