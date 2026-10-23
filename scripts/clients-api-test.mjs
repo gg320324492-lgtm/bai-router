@@ -126,7 +126,11 @@ describe("客户端接线的面板接口", () => {
     const z = r.list.find((x) => x.id === "zcode");
     assert.ok(z, `列表里没有 zcode：${JSON.stringify(r.list.map((x) => x.id))}`);
     assert.equal(z.name, "ZCode");
-    assert.equal(z.protocol, "chat");
+    /* ⚠ ZCode 说的是 **anthropic**（不是 chat）：照 magpie —— 我们给 ZCode 新建的
+     *   provider 块走 Anthropic Messages（internal/agent/zcode.go:23 的形状
+     *   `kind:"anthropic"`），因为统一网关三个方言都答（/v1/messages、
+     *   /v1/chat/completions、/v1/responses 在同一个地址上）。 */
+    assert.equal(z.protocol, "anthropic");
   });
 
   test("①b 坏掉的声明不许炸掉整张列表（它是一条看得见的坏条目）", async () => {
@@ -143,7 +147,8 @@ describe("客户端接线的面板接口", () => {
     assert.ok(fs.existsSync(file), `配置文件没写出来：${file}`);
     const j = JSON.parse(fs.readFileSync(file, "utf8"));
     assert.ok(j.provider && j.provider.bai, "provider 块没写进去");
-    assert.equal(j.provider.bai.kind, "openai-compatible");
+    /* ⚠ 同上：ZCode 新建的 provider 块走 Anthropic Messages（照 magpie 的形状）。 */
+    assert.equal(j.provider.bai.kind, "anthropic");
     assert.match(j.provider.bai.options.baseURL, /^http:\/\/127\.0\.0\.1:\d+$/);
     const ids = Object.keys(j.provider.bai.models || {});
     assert.ok(ids.length > 0, "模型清单没写进去");
