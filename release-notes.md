@@ -37,8 +37,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://github.com/g
 
 ### 二、面板多了一屏「客户端」：装好的 CLI 一键接上
 
-「客户端」页列出能接 B.AI 的客户端，每个写清它的配置文件在哪、说哪种方言、
-现在接上了没有。点「接上」替你写好，点「断开」把它摘掉。
+「客户端」页列出能接 B.AI 的客户端 —— **25 个**（Cline、CodeBuddy Code、Codex、
+Cursor CLI、Droid、Empryo、Gemini CLI、Goose、Grok Build、Hermes Agent、jcode、
+Kimi Code、MiniMax Code、Mister Morph、Muse Code、omp (oh-my-pi)、Pi、Qoder、
+Qoder CN、Qwen Code、Reasonix Studio、StepCode、WorkBuddy、WorkBuddy AI、ZCode），
+每个写清它的配置文件在哪、说哪种方言、现在接上了没有。
+点「接上」替你写好，点「断开」把它摘掉。
 
 - **断开只还原我们写过的那几处** —— 你文件里其它内容一个字不动。
 - **读不懂就不写**：配置文件在但解析失败 ⇒ 报错、中止，**绝不**把它当空配置覆盖掉。
