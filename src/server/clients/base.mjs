@@ -60,6 +60,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getPath, setPath, delPath, splitPath } from "../edit-json.mjs";
+import { mergeValue, sameValue } from "./merge-policy.mjs";
 
 /* ------------------------------------------------------------------ *
  * 格式读写器
@@ -258,7 +259,30 @@ export function applyClient(def, ctx, opts = {}) {
       if (before.error) {
         return { ok: false, detail: `读不懂 ${f.path}（${before.error}）—— 宁可不接，也不能把用户写坏` };
       }
-      edits.push({ path: p, before, value: w.value, del: !!w.delete, onlyIfAbsent: !!w.onlyIfAbsent });
+      /* ⚠ **合并层**：写进去之前先问「这个字段归谁」。
+       *   用户在客户端里手改过的值（名字、关掉的开关、自己加的键、改过的模型名）
+       *   要留下；地址/key/方言/模型 id 这类「机器该管的」照写 ——
+       *   否则用户文件里残留的旧地址会把我们接回旧网关。
+       *   判据与取舍见 merge-policy.mjs 与 docs/client-wiring-deep-plan.md §2.2。
+       *
+       *   ⚠ **备份完全不受这一层影响**：备份记的仍是 `before`（**写盘前**的现值）
+       *     ⇒ 用户改过的值既被保留在文件里，也被记进备份 ⇒ 断开后原样写回。
+       *     这一条是「还原判据一个字不改」的前提（base.mjs:285-307 / :373-379）。 */
+      let value = w.value;
+      let kept = [];
+      if (w.merge) {
+        /* ⚠ **一律走合并层**，哪怕用户压根没这个键（`before.existed` 为假）——
+         *   合并层知道「从零开始」该长什么样（数组形状的从一个空数组起，
+         *   不是写一个对象进去 —— 形状不对客户端会当配置坏了）。 */
+        const m = mergeValue(before.existed ? before.value : undefined, w.value, w.merge);
+        value = m.value;
+        kept = m.kept.map((k) => ({ ...k, path: k.path ? `${p}.${k.path}` : p }));
+      }
+      edits.push({
+        path: p, before, value,
+        del: !!w.delete, onlyIfAbsent: !!w.onlyIfAbsent,
+        merged: !!w.merge, kept,
+      });
       /* ⚠ **父路径的原值也要记**：我们删掉 `providers.bai` 之后，`providers`
        *   会剩下一个**空壳**（edit-json.mjs 的 delPath 只删那个键，不删空父级）。
        *   那个空壳是我们留下的痕迹 —— 断开时必须连它一起收掉，否则用户的文件
@@ -318,6 +342,11 @@ export function applyClient(def, ctx, opts = {}) {
        *   （原来有就留着用户的值）—— Claude Code 的 `API_TIMEOUT_MS` 走这条：
        *   用户自己设过就不动它。 */
       if (e.onlyIfAbsent && e.before.existed) continue;
+      /* ⚠ 合并后与现值**一样** ⇒ 这一处不用写（magpie 的 syncJSON：
+       *   sameJSON ⇒ 不写）。这不只是省一次写 —— 写同样的值也可能让
+       *   edit-json.mjs 把那个路径重新序列化一遍，把用户手写的排版换掉。
+       *   ⚠ 备份里**仍然记着**这一条（原值）⇒ 还原语义不变（写回同一个值）。 */
+      if (e.merged && e.before.existed && sameValue(e.value, e.before.value)) continue;
       const r = e.del ? p.fmt.delPath(text, e.path) : p.fmt.setPath(text, e.path, e.value);
       if (!r.ok) {
         return { ok: false, detail: `写 ${p.file.path} 的 ${e.path} 失败：${r.error}` };
@@ -332,11 +361,26 @@ export function applyClient(def, ctx, opts = {}) {
     written.push(p.file.path);
   }
 
+  /* 「保留了你手改」的清单 —— 设计稿 §2.2(b)：**用户赢 + 说一句**，
+   * 不静默、不弹窗（接线是后台动作，弹窗会打断）。
+   * 面板那一格要显示什么，由 server.mjs 那边取 `kept`（这里只负责算出来）。 */
+  const kept = [];
+  for (const p of plan) {
+    for (const e of p.edits) {
+      for (const k of e.kept || []) kept.push(k);
+    }
+  }
+  const shown = kept.slice(0, 5).map((k) => k.path).join("、");
+  const keptNote = kept.length
+    ? `；保留了你手改的 ${kept.length} 处${shown ? `（${shown}${kept.length > 5 ? " 等" : ""}）` : ""}`
+    : "";
+
   return {
     ok: true,
     changed: true,
     files: written,
-    detail: `已接好：${written.join("、")}（原值已备份，断开时原样还原）`,
+    kept,
+    detail: `已接好：${written.join("、")}（原值已备份，断开时原样还原）${keptNote}`,
   };
 }
 

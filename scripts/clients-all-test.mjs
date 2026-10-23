@@ -333,7 +333,11 @@ function hasDottedKey(def, ctx) {
  * 逐个客户端
  * ------------------------------------------------------------------ */
 
-const clients = await allClients();
+/* ⚠ **插件客户端不在这里测**：agent plugin 声明的客户端是**用户自己放的**
+   （`<数据目录>/agent-plugins/*.json`）⇒ 本套件断言「名录里的客户端 APPENDS 表里
+   都得有它」，而插件客户端的拼法由**声明自己**决定 ⇒ 不在这儿断言。
+   ⇒ 插件那条线由 scripts/agent-plugin-test.mjs 负责。 */
+const clients = (await allClients()).filter((c) => !c.plugin);
 
 /** 汇总表：每个客户端实际写出来的地址 —— 报告里那张「/v1 带不带」的表。 */
 const summary = [];

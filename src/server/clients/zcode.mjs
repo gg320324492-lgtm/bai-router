@@ -41,10 +41,16 @@
 // ## 数组怎么写（**不整份覆盖**）
 //
 // providerRules 是个**数组**：ZCode 自己往里写别的 provider，我们不能把它整份
-// 盖掉。做法是**按元素匹配**：认出我们那一条（providerId 是我们的）就改它，
-// 没有就追加；**用户自己的条目原样留着**。我们把合并后的**整个数组**当成一个
-// 值写进去 —— 底座按「键路径 → 一个值」备份 ⇒ 断开时整个数组原样写回 ⇒
-// 用户的条目一个字不丢。
+// 盖掉。做法是**按元素匹配**：认出我们那一条（providerId 是我们的）就**就地**
+// 合并它，没有就追加；**用户自己的条目原样留着、位置不变**。
+//
+// ⚠ 这层用的是**通用合并层**（clients/merge-policy.mjs，底座 base.mjs 调用）：
+//   我们在 `writes` 里只给出**我们那一条** + 一份字段归属声明（`merge`），
+//   底座在写盘前把它与文件里的现值合并。归属声明见下面的 RULE_MERGE / LEGACY_MERGE。
+//   ⇒ ZCode 与别的客户端**共用同一套机制**，不必各写一套合并。
+//
+// 合并后的**整个数组**当成一个值写进去 —— 底座按「键路径 → 一个值」备份 ⇒
+// 断开时整个数组原样写回 ⇒ 用户的条目一个字不丢。
 //
 // ## 模型规则（providerModelRules）：**整套不写** —— 但两条理由不一样，别混
 //
@@ -68,7 +74,8 @@
 //
 //   · 做了：上面两个文件（rules 的 provider 那一条 + 旧形状的 provider 块）。
 //   · 做了 magpie 的**保留**：用户在 ZCode 里改过的 providerName / 关掉过的
-//     enabled / 自己加的键，我们改了它也留着（地址、key、格式、模型列表是我们的）。
+//     enabled / 自己加的键 / 改过的模型名，我们改了它也留着（地址、key、格式、
+//     模型 id 集合是我们的）。逐字段的归属见 RULE_MERGE / LEGACY_MERGE。
 //   · 没做：模型的 rules（providerModelRules）、manualProviderModelRules
 //     （用户手填的，一律不碰）、ZCode 自己在 provider 设置里选的 api 格式
 //     （我们没有那份信息 ⇒ 两份都写 anthropic-messages）。
@@ -79,7 +86,7 @@
 //   · 读不懂就不写：文件在但解析失败 ⇒ 底座报错、中止，用户的文件不动。
 
 import path from "node:path";
-import { curValue, pickModel } from "./json-util.mjs";
+import { pickModel } from "./json-util.mjs";
 
 /** 我们用的 provider id（providerRules 里的 providerId / config.json 里的键）。 */
 function pidOf(ctx) {
@@ -138,24 +145,48 @@ function ruleBlock(ctx) {
 }
 
 /**
- * mergeRules —— 把我们那一条并进 ZCode 自己的 providerRules。
+ * RULE_MERGE —— providerRules 里**我们那一条**的字段归属。
  *
- * 认出我们那一条（providerId 是我们的）就改它，没有就追加；**用户自己的条目
- * 原样留着**（magpie 的规矩：地址、key、格式与模型列表是它的，其余是用户的）。
- * 用户在 ZCode 里把这条关了 ⇒ 保持关。
+ * 通用合并层（merge-policy.mjs）的 spec：
+ *
+ * | 字段 | 归谁 | 为什么 |
+ * | --- | --- | --- |
+ * | `providerId` | 我们的 | 认出「我们那一条」的钥匙（magpie 同） |
+ * | `providerName` | **用户的** | 用户在 ZCode 里改过的名字留着（magpie zcode.go:495 同） |
+ * | `enabled` | **用户的** | 用户在 ZCode 里关掉的 provider 保持关（magpie zcode.go:486 同） |
+ * | `config.group` | 我们的 | magpie 的 `own` 列表里有它（zcode.go:499） |
+ * | `config.personalModelIds` | 我们的 | 模型 id 集合是机器该管的（设计稿 §2.2(a)） |
+ * | `config.modelOrder` | 我们的 | 同上 —— 它是「显示顺序」，随 id 集合走 |
+ * | `config.access` / `config.api` | 我们的（但用户加的键留着） | 地址与 key 机器该管；键名、格式我们说了算 |
+ * | 其它顶层键（logo、visibility…） | 保留用户的 | 我们压根没写（magpie zcode.go:503 的 `mergeKept(old, rule, nil)`） |
+ *
+ * ⚠ **位置**：合并层认出我们那一条后**留在原位**（magpie zcode.go:508 的
+ *   `slices.Insert(providers, at, rule)`）⇒ 用户排的顺序不变。
+ *
+ * ⚠ `config.modelOrder` 归我们管（magpie 也归它），但**用户自己在模型清单
+ *   里加的条目、改的相对顺序仍然保留** —— 那是数组合并那一层的事，不是这个键。
  */
-function mergeRules(list, ours) {
-  const kept = [];
-  let old = null;
-  for (const r of list) {
-    if (r && r.providerId === ours.providerId) { old = r; continue; }
-    kept.push(r);
-  }
-  const merged = { ...(old || {}), ...ours };
-  merged.config = { ...((old && old.config) || {}), ...ours.config };
-  if (old && typeof old.enabled === "boolean") merged.enabled = old.enabled;
-  return [...kept, merged];
-}
+const RULE_MERGE = {
+  mode: "array",
+  key: "providerId",
+  theirs: ["providerName", "enabled"],
+  whole: ["config.group", "config.personalModelIds", "config.modelOrder"],
+};
+
+/**
+ * LEGACY_MERGE —— 旧形状（config.json）里 `provider.<pid>` 块的字段归属。
+ *
+ * | 字段 | 归谁 | 为什么 |
+ * | --- | --- | --- |
+ * | `name` | **用户的** | 用户改过的 provider 名字留着（设计稿 §2.2(a)：「模型名」） |
+ * | `enabled` | **用户的** | 用户关掉的保持关（magpie zcode.go:150 同） |
+ * | `models.*.name` | **用户的** | 用户改过的模型名留着 |
+ * | `options`（apiKey / baseURL）、`kind`、`source` | 我们的 | 机器该管的（地址、key、方言） |
+ * | `models` 里我们没写的模型 id | 保留用户的 | 用户自己加的模型留着 |
+ */
+const LEGACY_MERGE = {
+  theirs: ["name", "enabled", "models.*.name"],
+};
 
 export const zcodeClient = {
   id: "zcode",
@@ -176,8 +207,6 @@ export const zcodeClient = {
           /* 一个模型都没有就别写 —— 写一份没有模型的 provider 对用户没意义。 */
           pickModel(ctx);
           const ours = ruleBlock(ctx);
-          const cur = curValue(rules, "json", "config.providerConfigRules.providerRules");
-          const list = cur.existed && Array.isArray(cur.value) ? cur.value : [];
           return [
             /* schemaVersion 缺才补（用户若是 2 就留着）。 */
             { path: "schemaVersion", value: 1, onlyIfAbsent: true },
@@ -188,9 +217,17 @@ export const zcodeClient = {
               value: { providerModelRules: [], manualProviderModelRules: [] },
               onlyIfAbsent: true,
             },
-            /* 整个数组当一个值写：用户自己的条目在里面原样留着，
-               断开时底座把整个数组原样写回。 */
-            { path: "config.providerConfigRules.providerRules", value: mergeRules(list, ours) },
+            /* 只写**我们那一条**（写成一项的数组，形状与那个键该有的样子一致）；
+               通用合并层在用户的清单里认出它、**就地**合并：
+               用户自己的条目原样留着、位置不变，我们那一条也留在原位。
+               字段归属见 RULE_MERGE。
+               ⚠ 断开时底座把**整个数组**原样写回（备份记的是写盘前的原值）⇒
+                 用户的条目一个字不丢。 */
+            {
+              path: "config.providerConfigRules.providerRules",
+              value: [ours],
+              merge: RULE_MERGE,
+            },
           ];
         },
         wired: (text, fmt) => {
@@ -205,7 +242,9 @@ export const zcodeClient = {
         writes: () => {
           pickModel(ctx);
           return [
-            { path: `provider.${pid}`, value: providerBlock(ctx) },
+            /* 字段归属见 LEGACY_MERGE：名字与开关归用户，地址/key/方言归我们，
+               用户自己加的模型留着、用户改过的模型名留着。 */
+            { path: `provider.${pid}`, value: providerBlock(ctx), merge: LEGACY_MERGE },
           ];
         },
         wired: (text, fmt) => {

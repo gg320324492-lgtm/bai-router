@@ -122,7 +122,10 @@ import { chatModelsPayload } from "./chat-protocol.mjs";
  * 配置文件写好。底座在 clients/base.mjs，名录在 clients/registry.mjs（扫目录，
  * 加一个客户端不用改表）。 */
 import { applyClient, revertClient, clientStatus } from "./clients/base.mjs";
-import { allClients, clientById } from "./clients/registry.mjs";
+import { allClients, clientById, rescanClients, agentPluginsDir } from "./clients/registry.mjs";
+/* 模型真值表（窗口 / 输出上限 / 来源与日期）—— T15-c 阶段 1。
+ * ⚠ 只读内置表，请求路径上零 IO；渠道目录是后台刷的（阶段 3）。 */
+import { factsForEntries } from "./clients/model-facts.mjs";
 /* Claude Code 的 env 键怎么算（纯函数）：server.mjs 的 applyToCli 与 clients/ 层
  * 共用同一份逻辑 —— 那段里有不少有历史教训的讲究（占位符、档位 vs 最终模型名），
  * 重写一遍等于把教训重新踩一遍。 */
@@ -7758,7 +7761,20 @@ function gatewayInfo(req, res) {
  * 形状由 clients/muse-models.mjs 造（与 magpie 的 museModels 逐字同构）。
  */
 function gatewayMuseModels(req, res) {
-  json(res, 200, buildMuseModels(gatewayModelEntries(loadCfg()), { via: "B.AI" }));
+  const cfg = loadCfg();
+  const entries = gatewayModelEntries(cfg);
+  json(res, 200, buildMuseModels(entries, {
+    via: "B.AI",
+    /* ⚠ **窗口与输出上限的真值**（T15-c 阶段 1：model-facts.mjs 的真值表）。
+     *   factsForEntries 返回 `{ [模型 id]: {context, output, kind, source, at} }`
+     *   —— 正是 muse-models.mjs 的 `opts.facts` 要的形状（那边按 `o.facts[id]` 取）。
+     *   ⚠ **用 factsForEntries 而不是 factsFor(cfg, entries.map(...))**：那个 map
+     *   是最容易接错的地方（`entries` 变量名写错 ⇒ 拿到空数组 ⇒ **静默**退化成
+     *   全兜底，看不出来）⇒ 把这步收进模块。
+     *   ⚠ 查不到真值的 id **不在这个映射里** ⇒ 那边的兜底照旧（并且标明是约定）。
+     *   ⚠ 请求路径上**零 IO**：这里只读内置表；渠道目录是后台刷的（阶段 3）。 */
+    facts: factsForEntries(cfg, entries),
+  }));
 }
 
 /**
@@ -10622,11 +10638,37 @@ async function unknownMappingTargets(p, mapping, cfg) {
         out.push({
           id: c.id, name: c.name, protocol: c.protocol || "", note: c.note || "",
           status: st,
+          /* ⚠ **坏条目要看得见**：装载失败的声明（内置声明坏了、或用户放的插件声明
+           *   写错了）⇒ 面板上不该给「接上/断开」按钮（点了必然失败），
+           *   要说清它为什么坏（note 里已经写了原因）。 */
+          broken: !!c.broken,
+          /* 插件声明的客户端（<数据目录>/agent-plugins/*.json）⇒ 面板上标出来，
+           *   免得用户以为那是内置的。 */
+          plugin: !!c.plugin,
         });
       }
       /* ⚠ 统一网关地址要一起给出去：用户要看得见「客户端会被指到哪儿」，
        *   那一行不是装饰 —— 它是「接上」之后客户端里会写着的那个地址。 */
-      return json(res, 200, { ok: true, baseUrl: ctx.baseUrl, list: out });
+      return json(res, 200, {
+        ok: true, baseUrl: ctx.baseUrl, list: out,
+        /* 插件声明放哪儿 ⇒ 面板要能告诉用户「把文件放这儿」，
+           否则「一份 JSON 加一个客户端」这条功能用户压根不知道从哪下手。 */
+        pluginsDir: agentPluginsDir(DATA_DIR),
+      });
+    }
+    if (req.method === "POST" && u.pathname === "/api/clients/rescan") {
+      /* ⚠ **重扫名录**：agent plugin 那条线里，用户往 <数据目录>/agent-plugins/
+       *   放了一份声明、或改了一份 ⇒ 名录有缓存 ⇒ 不重扫就看不到。
+       *   面板的「重新扫描」按钮**必须**先调它（否则只是把缓存又拉了一遍）。
+       *   ⚠ rescanClients() 返回的是**新的名单数组**（不是 {count,dir}）⇒ 这里组装。 */
+      const list = await rescanClients();
+      const plugins = list.filter((c) => c.plugin).length;
+      return json(res, 200, {
+        ok: true,
+        count: list.length,
+        plugins,
+        dir: agentPluginsDir(DATA_DIR),
+      });
     }
     if (req.method === "POST" && u.pathname === "/api/clients/apply") {
       const b = await readBody(req);

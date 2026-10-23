@@ -33,12 +33,22 @@
 //
 // ## 与 magpie **有意不同**的三处
 //
-//   ① **limit 是兜底值，不是真实上限。**
-//      我们不知道每个模型的上下文窗口与输出上限 —— magpie 知道（`e.Context` /
+//   ① **limit 的来源**（2026-10-23 起不再是「一律兜底」）。
+//      magpie 知道每个模型的上下文窗口与输出上限（`e.Context` /
 //      `e.PublishedOutput()`），所以它给真值；它不知道时才用兜底（128000 / 32000）。
-//      我们**一律用兜底**。⚠ 用户看到 128K 会以为「这模型只能吃 128K、
-//      最多输出 32K」—— 那是假的。真实上限一旦有来源（渠道目录里的
-//      max_input_tokens 之类），用 `opts.limits` 传进来顶掉兜底。
+//      我们现在也有真值了 —— `model-facts.mjs` 的**真值表**（按最终模型名归一，
+//      每条带来源与日期）。⚠ 本模块**零 import**（见纪律段）⇒ 真值由**调用方**
+//      经 `opts` 递进来。优先级：
+//
+//        ① `opts.limits` —— 调用方**显式**给的（最权威；按当前 cfg 解析出的值）
+//        ② `opts.facts`  —— 调用方给的事实表（形状同上，多带来源与日期）
+//        ③ **兜底值** 128000 / 32000（什么都不知道时）
+//
+//      ⚠ **兜底值必须标明是约定不是实测值**：真值表里每条都带 `kind`
+//        （measured / measured-elsewhere / shared / convention）与 `source` + 日期戳；用
+//        `describeMuseLimits()` 取那行说明 —— ⚠ **不塞进 Muse 的 JSON**
+//        （那个形状逐字照 magpie，多一个字段就是不合形状）。
+//      ⚠ 用户看到 128K 会以为「这模型只能吃 128K、最多输出 32K」—— 那是假的。
 //      ⚠ **limit 不能没有**：Muse 会**隐藏**没有 limit（或 limit 缺一半）的模型 ——
 //        隐藏了用户就选不到它，这一整层就白做了。这是本模块存在的理由。
 //   ② **attachment / reasoning / temperature 这三个键我们**不写**。**
@@ -54,13 +64,22 @@
 //
 // ## 纪律
 //
-//   · 纯 ESM、零依赖、零 IO、零时钟（不 import 本仓任何别的模块）。
+//   · 纯 ESM、零依赖、零 IO、零时钟、**零 import**（不许 import 本仓任何别的模块）。
+//     ⚠ 「零 import」不是洁癖：`scripts/muse-models-test.mjs` 的 ④a 断言了它，
+//       ⑤ 段的反向对照还要**把本文件单独复制到临时目录再 import** —— 一旦
+//       import 别的模块，副本里就找不到那个模块，反向对照会假红。
+//       ⇒ 真值表住在 `model-facts.mjs`，**由调用方通过 `opts` 递进来**。
 //   · 不改调用方给进来的 entries（纯读）。
 
 /**
  * 不知道窗口时告诉 Muse 的兜底值。
  *
  * ⚠ **兜底，不是真实上限**（见文件头 ①）。出处：magpie internal/gateway/muse.go:12-15。
+ *
+ * ⚠ 与 `model-facts.mjs` 的 `CONVENTION_CONTEXT` / `CONVENTION_OUTPUT`
+ *   **必须是同一对数** —— 不一致的话，「表里没有这一条」与「表里说这一条
+ *   是约定值」会给出不同的数字，用户会看到同一个模型前后不一样。
+ *   （`scripts/model-facts-test.mjs` 有一条断言钉住这两个常量相等。）
  */
 export const MUSE_CONTEXT_FALLBACK = 128000;
 export const MUSE_OUTPUT_FALLBACK = 32000;
@@ -69,21 +88,80 @@ export const MUSE_OUTPUT_FALLBACK = 32000;
 const DEFAULT_VIA = "B.AI";
 
 /**
- * 一个模型的窗口与输出上限。
+ * 把一条「已知上限」规整成 `{ context, output }`（任一半可以是 0 = 不知道）。
+ *
+ * @param {unknown} v
+ * @returns {{context:number, output:number, kind:string, source:string, at:string}|null}
+ */
+function factEntry(v) {
+  if (!v || typeof v !== "object") return null;
+  const c = Number(v.context);
+  const o = Number(v.output);
+  return {
+    context: Number.isFinite(c) && c > 0 ? Math.round(c) : 0,
+    output: Number.isFinite(o) && o > 0 ? Math.round(o) : 0,
+    kind: String(v.kind || ""),
+    source: String(v.source || ""),
+    at: String(v.at || ""),
+  };
+}
+
+/**
+ * resolveKnown —— 这个 id 的上限**最终**是哪一级给的。
+ *
+ * 优先级（见文件头 ①）：
+ *   ① `opts.limits`（调用方显式给的，最权威）
+ *   ② `opts.facts`（调用方给的事实表）
+ *   ③ 什么都不知道 ⇒ 兜底
  *
  * @param {string} id 模型 id（`provider/档位`）
- * @param {object} limits 已知的真实上限：{ [id]: { context, output } }
+ * @param {object} o 选项
+ * @returns {{context:number, output:number, kind:string, source:string, at:string, level:string}}
+ */
+function resolveKnown(id, o) {
+  const explicit = factEntry(o.limits && o.limits[id]);
+  if (explicit) return { ...explicit, level: "explicit" };
+
+  const given = factEntry(o.facts && o.facts[id]);
+  if (given) {
+    /* ⚠ `shared`（**只有一家**别家渠道测过的，单点证据）**不下发**。
+     *   ⚠ 依据是「宁可报大也不能报小」：报大 ⇒ 上游诚实报错（看得见）；
+     *     报小 ⇒ 客户端自动压缩上下文，用户无谓丢历史且**毫无报错**。
+     *     `measured-elsewhere`（两家实测一致）**照发** —— 它的 `source`
+     *     会写明「非本家目录」。
+     *   调用方（`model-facts.mjs`）本来就只递「可发」的条目 —— 这里是防呆。 */
+    if (given.kind === "shared") {
+      return {
+        context: 0, output: 0, kind: given.kind, source: given.source, at: given.at,
+        level: "shared",
+        /* 参考值留着**给人看**（describeMuseLimits 会写出来），不进 limit。 */
+        ref: { context: given.context, output: given.output },
+      };
+    }
+    return { ...given, level: "facts" };
+  }
+
+  return { context: 0, output: 0, kind: "", source: "", at: "", level: "fallback" };
+}
+
+/**
+ * 一个模型的窗口与输出上限。
+ *
+ * ⚠ **limit 永远有两个数** —— Muse 会**隐藏** limit 缺一半的模型（见文件头 ①）。
+ *   不知道的那一半用兜底值补上（magpie 同样 min(museOutput, ctx)：
+ *   输出上限比窗口还大，那个数就是假的）。
+ *
+ * @param {string} id 模型 id（`provider/档位`）
+ * @param {object} known 已知上限 `{ context, output }`（0 = 不知道）
  * @returns {{context:number, output:number}}
  */
-function limitFor(id, limits) {
-  const known = limits && typeof limits[id] === "object" && limits[id] !== null ? limits[id] : null;
-  const ctx = known && Number.isFinite(known.context) && known.context > 0
-    ? Math.round(known.context)
+function limitFor(id, known) {
+  const k = known && typeof known === "object" ? known : null;
+  const ctx = k && Number.isFinite(k.context) && k.context > 0
+    ? Math.round(k.context)
     : MUSE_CONTEXT_FALLBACK;
-  /* 不知道输出上限时：不超过窗口本身（magpie 同样 min(museOutput, ctx)）——
-   * 输出上限比窗口还大，那这个数就是假的。 */
-  const out = known && Number.isFinite(known.output) && known.output > 0
-    ? Math.round(known.output)
+  const out = k && Number.isFinite(k.output) && k.output > 0
+    ? Math.round(k.output)
     : Math.min(MUSE_OUTPUT_FALLBACK, ctx);
   return { context: ctx, output: out };
 }
@@ -97,13 +175,17 @@ function limitFor(id, limits) {
  * @param {object} [opts]
  *   · via    —— description 里的署名（默认 "B.AI"）
  *   · limits —— 已知的真实上限：{ [id]: { context, output } }；
- *               没有的模型用兜底值（见文件头 ①）
+ *               **最高优先级**（调用方按当前 cfg 解析出来的值）。
+ *   · facts  —— 事实表：{ [id]: { context, output, kind, source, at } }；
+ *               形状与 limits 相同，但带来源与日期（面板上要显示就用它）。
+ *   · 两者都没有 ⇒ **兜底值**（128000 / 32000）。
+ *     ⚠ 真值表在 `model-facts.mjs` —— 本模块**零 import**（见纪律段）⇒
+ *       由调用方用 `limitsFor(cfg, ids)` / `factsFor(cfg, ids)` 递进来。
  * @returns {{object:"list", data:object[]}} Muse 要的 JSON
  */
 export function buildMuseModels(entries, opts) {
   const o = opts && typeof opts === "object" ? opts : {};
   const via = typeof o.via === "string" && o.via.trim() ? o.via.trim() : DEFAULT_VIA;
-  const limits = o.limits && typeof o.limits === "object" ? o.limits : {};
   const list = Array.isArray(entries) ? entries : [];
   const data = [];
   for (const e of list) {
@@ -114,6 +196,12 @@ export function buildMuseModels(entries, opts) {
     /* ownedBy / displayName 缺了就从 id 里推 —— id 的形状是 provider/档位。 */
     const provider = String(e.ownedBy == null || String(e.ownedBy).trim() === "" ? id.split("/")[0] : e.ownedBy).trim();
     const name = String(e.displayName == null || String(e.displayName).trim() === "" ? id.split("/").pop() : e.displayName).trim() || id;
+    /* 这一行的已知上限（值来自哪一级 ⇒ 见 resolveKnown）。
+     * ⚠ 变量名 `limits` 是沿用旧版的 —— 旧版它是一张「所有 id 的映射」，
+     *   现在是「这一行的那一条」。名字留着是为了 `scripts/muse-models-test.mjs`
+     *   的反向对照（⑤a）把这一行改坏时，锚点仍然唯一 —— 所以**注释里不许
+     *   再写一遍那行代码的字面**（`replace` 只会改到第一处，改到注释就白改）。 */
+    const limits = resolveKnown(id, o);
     data.push({
       id,
       object: "model",
@@ -134,8 +222,10 @@ export function buildMuseModels(entries, opts) {
            *   （Go 客户端读不到就是零值 false，所以效果与写 false 一样，
            *     但那个位置**空着** —— 将来有了真值是「加一个键」，
            *     而不是每个客户端逐个把假值改成真值）。
-           *   ⚠ 真值随 T15-c 的「模型元数据下发」到位（docs/client-wiring-deep-plan.md
-           *     的阶段 1）。 */
+           *   ⚠ **窗口与输出上限的真值已经到位**（T15-c 阶段 1：`model-facts.mjs`
+           *     的真值表，2026-10-23）—— 但那是**另一类**东西：窗口是模型自身的
+           *     属性，而「收不收图 / 有没有思考档」**永远没有真值**（逐家不同），
+           *     所以这三个键仍然不写。 */
           tool_call: true,
           modalities: { input: ["text"], output: ["text"] },
           options: { include: [] },
@@ -147,4 +237,47 @@ export function buildMuseModels(entries, opts) {
     });
   }
   return { object: "list", data };
+}
+
+/**
+ * describeMuseLimits —— 每个模型的窗口/上限**是哪一级给的**（人可读一行）。
+ *
+ * ⚠ **不塞进 Muse 的 JSON**：那个形状逐字照 magpie 的 `museModels`
+ *   （多一个字段就是不合形状）—— 面板上要显示「来源与日期」时用这个。
+ *
+ * ⚠ `shared`（别的渠道对同一模型的实测）那一条会写成「参考：… 本渠道未实测，
+ *   按兜底给」—— 它**不下发**（报大比报小危险，见 `model-facts.mjs` 的 kind 说明）。
+ *
+ * @param {Array<{id:string}>} entries 模型清单条目
+ * @param {object} [opts] 与 `buildMuseModels` 同一组选项
+ * @returns {Object<string,string>} `{ [id]: 说明 }`
+ */
+export function describeMuseLimits(entries, opts) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const list = Array.isArray(entries) ? entries : [];
+  const out = {};
+  for (const e of list) {
+    if (!e || typeof e !== "object") continue;
+    const id = String(e.id == null ? "" : e.id).trim();
+    if (!id) continue;
+    const k = resolveKnown(id, o);
+    const lim = limitFor(id, k);
+    if (k.level === "fallback") {
+      out[id] = `兜底值（约定，不是实测）· ${lim.context}/${lim.output}`;
+      continue;
+    }
+    if (k.level === "shared") {
+      const ref = k.ref ? `${k.ref.context}/${k.ref.output}` : "未知";
+      out[id] = `参考：${ref}（${k.source}${k.at ? `，记于 ${k.at}` : ""}）`
+        + ` —— 本渠道未实测，按兜底给 · ${lim.context}/${lim.output}`;
+      continue;
+    }
+    const kind = k.kind === "convention" ? "约定"
+      : (k.kind === "measured" ? "实测"
+        : (k.kind === "measured-elsewhere" ? "实测（他渠道，非本家目录）" : "给定"));
+    const src = k.source || "来源由调用方给出";
+    const at = k.at ? ` · 记于 ${k.at}` : "";
+    out[id] = `${kind} · ${src}${at} · ${lim.context}/${lim.output}`;
+  }
+  return out;
 }

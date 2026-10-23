@@ -70,6 +70,7 @@ window.BAI_CARDS["clients"] = {
             不知道它映射到哪家上游（同一档位逐家能力不同），所以宁可先不给。
             真值随「模型元数据下发」到位。
           </div>
+          <div class="hint" style="margin-top:4px" data-role="c-plugins"></div>
           <div class="result" data-role="c-result"></div>
           <div data-role="c-body"></div>
         </div>`;
@@ -146,6 +147,15 @@ window.BAI_CARDS["clients"] = {
       const baseEl = q('[data-role="c-base"]');
       if (baseEl) baseEl.textContent = String((data && data.baseUrl) || "—");
       const list0 = Array.isArray(data && data.list) ? data.list : [];
+      /* 插件声明放哪儿 ⇒ 告诉用户「从哪下手」，否则「一份 JSON 加一个客户端」这条
+       * 功能用户压根不知道存在。 */
+      const pdEl = q('[data-role="c-plugins"]');
+      if (pdEl) {
+        const dir = data && data.pluginsDir;
+        pdEl.innerHTML = dir
+          ? `想加一个<b>你自己的</b>客户端？往 <span class="mono">${esc(String(dir))}</span> 放一份 JSON 声明，再点「重新扫描」。`
+          : "";
+      }
       const cntEl = q('[data-role="c-count"]');
       if (cntEl) {
         const wired0 = list0.filter((c) => c.status && c.status.wired).length;
@@ -192,7 +202,7 @@ window.BAI_CARDS["clients"] = {
             <span class="k">
               <span class="led ${ledOf(st)}"></span>
               ${esc(String(c.name || c.id))}
-              <br><span class="mono dim" style="font-size:10.5px">${esc(String(c.id || ""))}</span>
+              <br><span class="mono dim" style="font-size: 11px">${esc(String(c.id || ""))}</span>
             </span>
             <span class="v">
               ${esc(statusText(st))}
@@ -282,8 +292,21 @@ window.BAI_CARDS["clients"] = {
     if (reloadBtn) {
       reloadBtn.addEventListener("click", async () => {
         setResult("正在重新扫描…");
+        /* ⚠ **必须先让服务端重扫**（丢掉名录缓存）：只 reload 面板拿到的是**缓存** ⇒
+         *   用户刚放进 <数据目录>/agent-plugins/ 的声明不会出现在列表里，
+         *   按钮看上去「点了没反应」。 */
+        try {
+          const r = await ctx.api("/api/clients/rescan", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: "{}", timeoutMs: 30000,
+          });
+          const n = r && r.count;
+          setResult(n ? `✔ 扫完了（${n} 个客户端）` : "✔ 扫完了", true);
+        } catch (e) {
+          setResult("✖ 重扫失败：" + String((e && e.message) || e), false);
+        }
         await load();
-        setResult("✔ 扫完了", true);
+        renderBody();
       });
     }
 

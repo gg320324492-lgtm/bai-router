@@ -266,6 +266,13 @@ describe("④b 装没装：看目录，不只看那个配置文件在不在", ()
     );
     assert.notEqual(broken, text, "改坏的副本没改成 —— 这条反向对照失效了（锚点与源码脱节）");
     fs.writeFileSync(path.join(dir, "base.mjs"), broken, "utf8");
+    /* 副本要能 import 到它的同目录依赖：base.mjs 现在还 import 了
+       ./merge-policy.mjs（合并层）—— 不复制过去就是「模块找不到」，
+       报错会盖住这条反向对照真正要验的东西。 */
+    fs.copyFileSync(
+      path.join(REPO, "src", "server", "clients", "merge-policy.mjs"),
+      path.join(dir, "merge-policy.mjs"),
+    );
     fs.copyFileSync(path.join(REPO, "src", "server", "edit-json.mjs"), path.join(TMPROOT, "edit-json.mjs"));
     const { pathToFileURL } = await import("node:url");
     const mod = await import(pathToFileURL(path.join(dir, "base.mjs")).href + `?v=${Date.now()}`);
@@ -427,7 +434,12 @@ describe("⑥ 反向对照：改坏 ⇒ 判据必须红", () => {
     assert.notEqual(broken, text, "改坏的副本没改成 —— 这条反向对照失效了（锚点与源码脱节）");
     fs.writeFileSync(path.join(dir, "base.mjs"), broken, "utf8");
     /* 副本要能 import 到 edit-json.mjs：副本在 TMPROOT/broken-base/，
-       它的 "../edit-json.mjs" 落在 **TMPROOT/edit-json.mjs**（文件，不是目录）。 */
+       它的 "../edit-json.mjs" 落在 **TMPROOT/edit-json.mjs**（文件，不是目录）。
+       ⚠ 同目录的 ./merge-policy.mjs（合并层）也得复制过去。 */
+    fs.copyFileSync(
+      path.join(REPO, "src", "server", "clients", "merge-policy.mjs"),
+      path.join(dir, "merge-policy.mjs"),
+    );
     fs.copyFileSync(
       path.join(REPO, "src", "server", "edit-json.mjs"),
       path.join(TMPROOT, "edit-json.mjs"),

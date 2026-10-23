@@ -249,7 +249,12 @@ async function mutant(replacements) {
   const clients = path.join(root, "clients");
   fs.mkdirSync(clients, { recursive: true });
   fs.copyFileSync(path.join(SERVER_DIR, "edit-json.mjs"), path.join(root, "edit-json.mjs"));
-  for (const f of ["base.mjs", "json-util.mjs", "util.mjs"]) {
+  /* ⚠ 拷**整个** clients 目录，不是写死的几个文件 ——
+   *   base.mjs 的依赖会变（2026-10-23 加了 ./merge-policy.mjs），
+   *   写死的清单每加一个依赖就漏一个 ⇒ 报的是「模块找不到」，
+   *   **真正的判据根本没跑到**（连断言都没执行，看起来像「反向对照失效」）。 */
+  for (const f of fs.readdirSync(CLIENTS_DIR)) {
+    if (!f.endsWith(".mjs")) continue;
     fs.copyFileSync(path.join(CLIENTS_DIR, f), path.join(clients, f));
   }
   const file = path.join(clients, "claude-desktop.mjs");

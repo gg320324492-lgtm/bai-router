@@ -26,3 +26,6 @@ src/server/cli-apply.json
 
 # 临时探针/调试脚本目录（真机排查用，不进仓库）
 .tmp-*/
+
+# 开发模式下 agent plugin 声明的落点（安装版在 %APPDATA% 里）
+src/server/agent-plugins/
