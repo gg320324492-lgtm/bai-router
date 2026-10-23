@@ -7,14 +7,25 @@
  * 它与「额度」屏上面那张**渠道级**的表（各家一共还剩多少）**分开摆**：
  * 含义不同的两个数不能共用一格（改版原则 1：状态是数据，不是装饰）。
  *
+ * ## 两种状态，两个口径
+ *
+ *   · **走过这一家** ⇒ 显示**「当前」**那一行：此刻真实在服务的那一档。
+ *   · **没走过这一家** ⇒ 显示**「配置」**的那几行：你映射表里写的每一档，
+ *     外加一句**带下一步**的提示（未知态不带下一步就是死胡同）。
+ *
+ * ⚠ 「配的」与「正在服务的」**不是一回事**，不许混成一个说法：
+ *   配的 = `cfg[渠道].mapping`（用户写的意图）；
+ *   正在服务的 = `/api/status` 的 `recent.served`（真实发生过的）。
+ *
  * ## 为什么它要自己一个测试文件
  *
- * 这一块的口径全是**判定**：倍率怎么归一、免费怎么判、「当前档位」对应哪个模型、
- * 目录读不到时该显示什么。每一处都会改掉用户看到的数：
+ * 这一块的口径全是**判定**：倍率怎么归一、免费怎么判、「当前」对应哪个模型、
+ * 「配的档位」怎么摆、目录读不到时该显示什么。每一处都会改掉用户看到的数：
  *
  *   · 把「x0.00」判成收费 → 用户以为要花钱，换错档位；
  *   · 把「倍率未知」显示成 0 → 0 会被读成「这款模型不扣积分」（其实免费档恰恰是 x0.00）；
- *   · 倍率取成了目录里**另一个**模型 → 显示一个看着很真的假数。
+ *   · 倍率取成了目录里**另一个**模型 → 显示一个看着很真的假数；
+ *   · 没走过时只说「不知道」不给下一步 → 死胡同，用户不知道该做什么。
  *
  * 没有测试的判定迟早被改坏，而改坏之后面板上仍然「有模有样」——
  * 那比 plainly 坏掉更坏。
@@ -44,7 +55,7 @@ const CARD_SRC = readFileSync(CARD, "utf8");
 const K1 = "alpha";
 const K2 = "beta";
 
-const TIER_ZH = { "claude-sonnet-5": "Sonnet", "claude-opus-5": "Opus" };
+const TIER_ZH = { "claude-sonnet-5": "Sonnet", "claude-opus-5": "Opus", "claude-fable-5": "Fable" };
 
 /* ====================================================================== *
  * 工具
@@ -105,13 +116,20 @@ function tdOf(html, n) {
   return tds[n] == null ? "" : tds[n];
 }
 
-/** 某张表的一组表头（按源码里的出现次序取第一个匹配的标记之后的那一段）。 */
-function headersAfter(src, marker, span) {
-  const at = src.indexOf(marker);
-  if (at < 0) return [];
-  const seg = src.slice(at, at + (span || 900));
+/** 所有 <tr> 的 <td> 内容（一行一组）。 */
+function rowsOf(html) {
   const out = [];
-  for (const m of seg.matchAll(/<th[^>]*>([^<]+)<\/th>/g)) out.push(m[1].trim());
+  const tb = html.indexOf("<tbody>");
+  let at = tb;
+  for (;;) {
+    const tr = html.indexOf("<tr>", at);
+    if (tr < 0) break;
+    const end = html.indexOf("</tr>", tr);
+    if (end < 0) break;
+    const row = html.slice(tr, end);
+    out.push(row.split("<td").slice(1).map((s) => s.split("</td>")[0]));
+    at = end + 5;
+  }
   return out;
 }
 
@@ -145,7 +163,14 @@ function poolSlice(over) {
   return Object.assign(base, over || {});
 }
 
-/* ⚠ 目录里**第一条不是**这一行要的模型 —— 这样「取错模型」这件事才有分辨力。 */
+/** 走过这一家、但**只走了一档**（其余档位是配好的、没在用）。 */
+function noTrafficSlice() {
+  const s = poolSlice();
+  s.recent = { tier: null };
+  return s;
+}
+
+/* ⚠ 目录里**第一条不是**要查的那个模型 —— 这样「取错模型」这件事才有分辨力。 */
 const CATALOG = {
   ok: true, source: "live", catalogAt: "2026-10-23T00:00:00.000Z",
   /* ⚠ 目录是**某一个账号**的权限事实：多账号时各号可见的倍率可能不同。 */
@@ -154,6 +179,15 @@ const CATALOG = {
     { key: "hy3", name: "HY3", credits: "x0.00", free: true },
     { key: "hy4-preview-f", name: "Hy4-Preview-F", credits: "x0.29", free: false },
   ],
+};
+
+/** 一份映射表（用户配的「每档指向哪个模型」）。 */
+const CFG_FIX = {
+  mapping: {
+    "claude-fable-5": { target: "hy3", label: "HY3" },
+    "claude-sonnet-5": { target: "hy4-preview-f", label: "Hy4-Preview-F" },
+    "claude-opus-5": { target: "hy3", label: "HY3" },
+  },
 };
 
 const ESC = (s) => String(s == null ? "" : s);
@@ -190,46 +224,94 @@ function checkCredits(card) {
 }
 
 /* ====================================================================== *
- * ② 「当前档位」对应哪个模型
+ * ② 走过这一家 —— 显示「当前」那一行
  * ====================================================================== */
 
-function checkTierModel(card) {
-  const row = card.modelQuotaRow({
+function checkCurrent(card) {
+  const g = card.modelQuotaRows({
     key: K1, name: "假渠道一", tierZh: TIER_ZH,
-    slice: poolSlice(),
+    slice: poolSlice(), cfg: CFG_FIX,
     catalog: { loading: false, err: "", data: CATALOG },
   });
-  assert.equal(row.tier, "claude-sonnet-5", "当前档位取服务端 recent.tier");
-  assert.equal(row.tierLabel, "Sonnet", "档位显示名走 TIER_ZH");
-  assert.equal(row.model, "hy4-preview-f", "档位模型 = 正在服务的那个模型");
-  assert.equal(row.credits, "x0.29", "★ 倍率取**这个模型**的，不是目录里第一条");
-  assert.equal(row.creditsKnown, true);
-  assert.equal(row.free, false);
-  assert.equal(row.noTraffic, false);
-  assert.equal(row.usable, true, "池里有一个可用账号就算可用");
-  assert.equal(row.modelName, "Hy4-Preview-F", "★ 模型显示名要写清");
+  assert.equal(g.hasCurrent, true, "走过这一家 ⇒ 有「当前」那一档");
+  assert.equal(g.rows.length, 1, "★ 走过这一家只显示当前那一行（不是把配的档位也铺开）");
+  const r = g.rows[0];
+  assert.equal(r.kind, "current", "★ 这一行的口径是「当前」（正在服务的）");
+  assert.equal(r.tier, "claude-sonnet-5", "当前档位取服务端 recent.tier");
+  assert.equal(r.tierLabel, "Sonnet", "档位显示名走 TIER_ZH");
+  assert.equal(r.model, "hy4-preview-f", "档位模型 = 正在服务的那个模型");
+  assert.equal(r.credits, "x0.29", "★ 倍率取**这个模型**的，不是目录里第一条");
+  assert.equal(r.creditsKnown, true);
+  assert.equal(r.free, false);
+  assert.equal(r.usable, true, "池里有一个可用账号就算可用");
+  assert.equal(r.modelName, "Hy4-Preview-F", "★ 模型显示名要写清");
+  assert.equal(g.summary, "", "有当前档位时不需要那句提示");
 
   /* 服务过的与打算路由的不一致 ⇒ 两个都要报出来。 */
   const mism = poolSlice();
   mism.recent = Object.assign({}, mism.recent, { served: "hy3", target: "hy4-preview-f", mismatch: true });
-  const mm = card.modelQuotaRow({
-    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: mism,
+  const mm = card.modelQuotaRows({
+    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: mism, cfg: CFG_FIX,
     catalog: { loading: false, err: "", data: CATALOG },
   });
-  assert.equal(mm.model, "hy3", "★ 真实服务的那个模型才是正在消耗额度的那个");
-  assert.equal(mm.credits, "x0.00", "倍率跟着**真正在用**的那个模型走");
-  assert.equal(mm.mismatch, true, "不一致要报出来（以为在用 A 其实在用 B）");
+  assert.equal(mm.rows[0].model, "hy3", "★ 真实服务的那个模型才是正在消耗额度的那个");
+  assert.equal(mm.rows[0].credits, "x0.00", "倍率跟着**真正在用**的那个模型走");
+  assert.equal(mm.rows[0].mismatch, true, "不一致要报出来（以为在用 A 其实在用 B）");
+}
 
-  /* 没走过这一家 ⇒ 不知道当前档位。 */
-  const none = card.modelQuotaRow({
+/* ====================================================================== *
+ * ②b 没走过这一家 —— 显示「配的档位」+ 带下一步的提示
+ * ====================================================================== */
+
+function checkConfigured(card) {
+  const g = card.modelQuotaRows({
     key: K1, name: "假渠道一", tierZh: TIER_ZH,
-    slice: { pool: poolSlice().pool },
+    slice: noTrafficSlice(), cfg: CFG_FIX,
     catalog: { loading: false, err: "", data: CATALOG },
   });
-  assert.equal(none.tier, null, "没走过 ⇒ 没有当前档位");
-  assert.equal(none.noTraffic, true, "★ 「没走过」要单独标出来");
-  assert.equal(none.model, null, "没走过 ⇒ 没有档位模型");
-  assert.equal(none.creditsKnown, false, "★ 没有模型 ⇒ 倍率不知道（不是 0）");
+  assert.equal(g.hasCurrent, false, "没走过 ⇒ 没有「当前」那一档");
+  assert.equal(g.noTraffic, true);
+  /* ★ **提示必须带下一步**：只说「不知道」是死胡同。 */
+  assert.ok(g.summary.indexOf("没有正在服务的模型") >= 0,
+    "★ 提示要说清「此刻没有正在服务的模型」");
+  assert.ok(g.summary.indexOf("走过这一家") >= 0,
+    "★ 提示必须给下一步（走过这一家 / 点「测试连通」）");
+  assert.ok(g.summary.indexOf("测试连通") >= 0, "下一步要具体到能执行的动作");
+
+  assert.equal(g.rows.length, 3, "★ 配了几档就摆几行");
+  for (const r of g.rows) {
+    assert.equal(r.kind, "configured", "★ 配的档位这一行的口径是「配置」");
+  }
+  const fable = g.rows[0];
+  assert.equal(fable.tier, "claude-fable-5", "配的档位逐个摆出来");
+  assert.equal(fable.tierLabel, "Fable");
+  assert.equal(fable.model, "hy3", "配的档位指向哪个模型");
+  assert.equal(fable.credits, "x0.00", "★ 配的档位也要带那个模型的倍率");
+  assert.equal(fable.free, true, "免费档要认出来");
+  const opus = g.rows[2];
+  assert.equal(opus.tier, "claude-opus-5");
+  assert.equal(opus.model, "hy3");
+  assert.equal(opus.credits, "x0.00");
+
+  /* 连映射表都没配 ⇒ 提示换一句（还是要有下一步）。 */
+  const bare = card.modelQuotaRows({
+    key: K1, name: "假渠道一", tierZh: TIER_ZH,
+    slice: noTrafficSlice(), cfg: {},
+    catalog: { loading: false, err: "", data: CATALOG },
+  });
+  assert.equal(bare.rows.length, 0, "没配映射表 ⇒ 没有配置档位那几行");
+  assert.ok(bare.summary.indexOf("映射表") >= 0, "要说清缺的是映射表");
+  assert.ok(bare.summary.indexOf("渠道") >= 0, "下一步要指到能配的地方");
+
+  /* 目录退化成兜底（名字就是 id）⇒ 用用户在映射表里起的那个名字。 */
+  const flat = { ok: true, source: "builtin", all: [{ key: "hy3", name: "hy3", credits: null, free: false }] };
+  const g2 = card.modelQuotaRows({
+    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: noTrafficSlice(), cfg: CFG_FIX,
+    catalog: { loading: false, err: "", data: flat },
+  });
+  assert.equal(g2.rows[0].modelName, "HY3",
+    "★ 兜底目录（名字就是 id）时用映射表里起的名字，别把 id 显示两遍");
+  assert.equal(g2.rows[0].creditsKnown, false, "兜底目录没有倍率 ⇒ 说「不知道」，不是 0");
 }
 
 /* ====================================================================== *
@@ -239,13 +321,13 @@ function checkTierModel(card) {
 function checkCooling(card) {
   const slice = poolSlice();
   slice.pool.accounts[1].coolingModels = ["hy4-preview-f"];
-  const row = card.modelQuotaRow({
-    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice,
+  const g = card.modelQuotaRows({
+    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice, cfg: CFG_FIX,
     catalog: { loading: false, err: "", data: CATALOG },
   });
-  assert.equal(row.cooling, true, "★ 这个模型在某个账号上冷却 ⇒ 模型级冷却");
-  assert.equal(row.coolingAccounts.length, 1, "要说清是哪个号");
-  assert.equal(row.usable, true, "★ 整号仍可用 —— 模型级冷却不等于这家不可用");
+  assert.equal(g.rows[0].cooling, true, "★ 这个模型在某个账号上冷却 ⇒ 模型级冷却");
+  assert.equal(g.rows[0].coolingAccounts.length, 1, "要说清是哪个号");
+  assert.equal(g.rows[0].usable, true, "★ 整号仍可用 —— 模型级冷却不等于这家不可用");
 
   const other = card.modelCooling({ accounts: [{ id: "a1", coolingModels: ["别的模型"] }] }, "hy4-preview-f");
   assert.equal(other.cooling, false, "别的模型在冷却不算这个模型在冷却");
@@ -254,43 +336,56 @@ function checkCooling(card) {
 }
 
 /* ====================================================================== *
- * ④ 渲染：模型级那一块与渠道级**分开摆**
+ * ④ 渲染 —— 两种状态各长什么样
  * ====================================================================== */
 
 function checkRender(card) {
-  const rows = [card.modelQuotaRow({
-    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: poolSlice(),
+  /* ── 走过这一家 ── */
+  const cur = card.renderModelQuota([card.modelQuotaRows({
+    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: poolSlice(), cfg: CFG_FIX,
     catalog: { loading: false, err: "", data: CATALOG },
-  })];
-  const html = card.renderModelQuota(rows, ESC, null);
-  assert.ok(html.indexOf("模型级额度") >= 0, "这一块有自己的标题（不是混在渠道级那张表里）");
-  assert.ok(html.indexOf("当前档位") >= 0, "列名说清是档位");
-  assert.ok(html.indexOf("档位模型") >= 0, "★ 模型名要写清");
-  assert.ok(html.indexOf("积分倍率") >= 0, "列名说清是倍率（不是余额）");
-  assert.ok(html.indexOf("该模型此刻") >= 0, "模型级状态单独一格");
-  assert.ok(html.indexOf("x0.29") >= 0, "倍率要显示出来");
-  assert.ok(html.indexOf("Sonnet") >= 0, "档位显示名要显示出来");
-  assert.ok(html.indexOf("Hy4-Preview-F") >= 0, "★ 模型显示名要显示出来");
+  })], ESC, null);
+  assert.ok(cur.indexOf("模型级额度") >= 0, "这一块有自己的标题（不是混在渠道级那张表里）");
+  assert.ok(thOf(cur).includes("档位"), "第二列说清是档位");
+  assert.ok(thOf(cur).includes("指向的模型"), "★ 模型名那一列写清");
+  assert.ok(thOf(cur).includes("积分倍率"), "列名说清是倍率（不是余额）");
+  assert.ok(cur.indexOf("Sonnet") >= 0, "档位显示名要显示出来");
+  assert.ok(cur.indexOf("Hy4-Preview-F") >= 0, "★ 模型显示名要显示出来");
+  assert.ok(cur.indexOf("x0.29") >= 0, "倍率要显示出来");
+  assert.ok(cur.indexOf("当前") >= 0, "★ 这一行的口径标成「当前」");
+  assert.ok(cur.indexOf(">配置<") < 0, "走过这一家时不该出现「配置」那几行");
   /* ⚠ 判据落在**表头**上，不是整段 HTML：说明文字里提到「上游余额」是为了
    *   说清两张表的区别，那是对的；混进**列**里才是错配。 */
-  assert.ok(!thOf(html).includes("上游余额"), "★ 这一块的表头里不许有「上游余额」——那是渠道级的列");
-  assert.ok(thOf(html).includes("积分倍率"), "这一块有自己的表头");
-  assert.ok(html.indexOf("渠道级") >= 0, "要说清与上面那张表的区别");
-  /* ⚠ 倍率的**出处**要能说清是哪个账号的目录：多账号时各号可见的倍率可能不同，
-   *   不说清就是一个「不知道该信几分」的数（放 title 里，不占版面）。 */
-  assert.ok(html.indexOf("号一") >= 0, "★ 倍率的出处要能说清是哪个账号的目录");
-  assert.ok(html.indexOf("实时抓的") >= 0, "出处还要说清是不是实时抓的");
-  /* ⚠ 说明文字是**纯文本**：里面写 markdown 的 ** 只会原样印出来（不会变粗体）。
-   *   这条曾经真的发生过一次 —— 屏幕上出现「那**不是**这家没额度」。 */
-  assert.ok(html.indexOf("**") < 0, "★ 说明文字里不许漏出 markdown 的 **（纯文本不会渲染它）");
+  assert.ok(!thOf(cur).includes("上游余额"), "★ 这一块的表头里不许有「上游余额」——那是渠道级的列");
+  assert.ok(cur.indexOf("渠道级") >= 0, "要说清与上面那张表的区别");
+  /* ⚠ 说明文字是**纯文本**：里面写 markdown 的 ** 只会原样印出来（不会变粗体）。 */
+  assert.ok(cur.indexOf("**") < 0, "★ 说明文字里不许漏出 markdown 的 **（纯文本不会渲染它）");
+  /* 倍率的出处要能说清是哪个账号的目录。 */
+  assert.ok(cur.indexOf("号一") >= 0, "★ 倍率的出处要能说清是哪个账号的目录");
+  assert.ok(cur.indexOf("实时抓的") >= 0, "出处还要说清是不是实时抓的");
 
-  /* 没有行 ⇒ 整块不画（画一条空条会被读成「它在跑」）。 */
+  /* ── 没走过这一家 ── */
+  const cfgd = card.renderModelQuota([card.modelQuotaRows({
+    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: noTrafficSlice(), cfg: CFG_FIX,
+    catalog: { loading: false, err: "", data: CATALOG },
+  })], ESC, null);
+  assert.ok(cfgd.indexOf("没有正在服务的模型") >= 0, "★ 提示行说清此刻没有正在服务的模型");
+  assert.ok(cfgd.indexOf("走过这一家") >= 0, "★ 提示行给了下一步");
+  assert.ok(cfgd.indexOf("配置") >= 0, "配的档位那几行的口径标成「配置」");
+  assert.ok(cfgd.indexOf("HY3") >= 0, "★ 配的档位指向的模型要摆出来");
+  assert.ok(cfgd.indexOf("x0.00") >= 0, "★ 配的档位那个模型的倍率也要摆出来");
+  assert.ok(cfgd.indexOf("免费") >= 0, "免费档要写出来");
+  assert.ok(cfgd.indexOf(">当前<") < 0, "没走过这一家时不该出现「当前」那一行");
+  assert.ok(cfgd.indexOf("这一档还没在用") >= 0, "配的档位那几行说清「还没在用」");
+  assert.ok(cfgd.indexOf("可用") < 0, "★ 配的档位那几行不许说「可用」（它压根没在用）");
+
+  /* 没有组 ⇒ 整块不画（画一条空条会被读成「它在跑」）。 */
   assert.equal(card.renderModelQuota([], ESC, null), "", "没有带账号池的渠道 ⇒ 整块不画");
   assert.equal(card.renderModelQuota(null, ESC, null), "", "同上");
 
   /* 目录读不到 ⇒ 「倍率未知」，绝不能显示成 0。 */
-  const unknown = card.renderModelQuota([card.modelQuotaRow({
-    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: poolSlice(),
+  const unknown = card.renderModelQuota([card.modelQuotaRows({
+    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: poolSlice(), cfg: CFG_FIX,
     catalog: { loading: false, err: "读不到目录", data: null },
   })], ESC, null);
   const ucell = tdOf(unknown, 3);
@@ -299,24 +394,15 @@ function checkRender(card) {
   assert.ok(ucell.indexOf("读目录中") < 0, "读完了就不该还说「读目录中」");
 
   /* 目录还在读 ⇒ 说「读目录中…」。 */
-  const loading = card.renderModelQuota([card.modelQuotaRow({
-    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: poolSlice(),
+  const loading = card.renderModelQuota([card.modelQuotaRows({
+    key: K1, name: "假渠道一", tierZh: TIER_ZH, slice: poolSlice(), cfg: CFG_FIX,
     catalog: { loading: true, err: "", data: null },
   })], ESC, null);
   assert.ok(tdOf(loading, 3).indexOf("读目录中") >= 0, "目录还在读要说「读目录中…」");
-
-  /* 免费那一档显示成「免费」，不是一串倍率。 */
-  const freeRow = card.modelQuotaRow({
-    key: K1, name: "假渠道一", tierZh: TIER_ZH,
-    slice: (() => { const s = poolSlice(); s.recent = Object.assign({}, s.recent, { served: "hy3", target: "hy3" }); return s; })(),
-    catalog: { loading: false, err: "", data: CATALOG },
-  });
-  assert.ok(tdOf(card.renderModelQuota([freeRow], ESC, null), 3).indexOf("免费") >= 0,
-    "★ 免费那一档要说「免费」");
 }
 
 /* ====================================================================== *
- * ⑤ 挂载：那一块真的画出来，且目录**只取一次**
+ * ⑤ 挂载 —— 真的画出来，且目录**只取一次**
  * ====================================================================== */
 
 /**
@@ -354,6 +440,7 @@ async function mountCard(apiMock, status, src) {
     channels: [K1, K2],
     nameOf: (k) => "假渠道" + k,
     stOf: (k) => (status && status[k]) || {},
+    cfgOf: (k) => (k === K1 ? CFG_FIX : {}),
     TIER_ZH,
     channelState: () => ({ s: "ok", txt: "可用" }),
     CATALOG_TIMEOUT_MS: 60000,
@@ -413,7 +500,7 @@ async function checkMounted(src) {
 
   /* ★ 分开摆：渠道级那张表里不许出现模型级的列，反之亦然。 */
   assert.ok(body.innerHTML.indexOf("积分倍率") < 0, "★ 渠道级那张表里不许混进模型级的列");
-  assert.ok(body.innerHTML.indexOf("档位模型") < 0, "★ 渠道级那张表里不许混进模型级的列");
+  assert.ok(body.innerHTML.indexOf("指向的模型") < 0, "★ 渠道级那张表里不许混进模型级的列");
   assert.ok(!thOf(model.innerHTML).includes("上游余额"), "★ 模型级那一块里不许混进渠道级的列");
 
   /* 目录只取一次：轮询几轮也不该多打上游。 */
@@ -435,14 +522,28 @@ async function checkMounted(src) {
 
 function checkSeparation(src) {
   const s = src === undefined ? CARD_SRC : src;
-  const chan = headersAfter(s, '<th style="width:16%">渠道</th>', 700);
-  const model = headersAfter(s, '<th style="width:18%">渠道</th>', 700);
+  const chan = tableHeaders(s, "预算上限");
+  const model = tableHeaders(s, "积分倍率");
   assert.ok(chan.length >= 6, "渠道级那张表要有六列");
   assert.ok(model.length >= 5, "模型级那一块要有五列");
   for (const h of model) {
     if (h === "渠道") continue;               /* 「渠道」这一列两边都该有 */
     assert.ok(!chan.includes(h), `★ 「${h}」不能同时出现在两张表里 —— 含义不同的两个数不能共用一格`);
   }
+}
+
+/**
+ * 某张表的表头。**按表头文字认表**，不按位置 ——
+ * 按位置认的话，改一处列宽就会认错表，这道判据就成了空话。
+ */
+function tableHeaders(src, mustContain) {
+  for (const m of String(src).matchAll(/<thead>([\s\S]*?)<\/thead>/g)) {
+    if (m[1].indexOf(mustContain) < 0) continue;
+    const out = [];
+    for (const h of m[1].matchAll(/<th[^>]*>([^<]+)<\/th>/g)) out.push(h[1].trim());
+    return out;
+  }
+  return [];
 }
 
 /* ====================================================================== *
@@ -455,9 +556,15 @@ describe("① 倍率口径 —— 归一与免费判定", () => {
   });
 });
 
-describe("② 「当前档位」对应哪个模型", () => {
-  test("② 档位取服务端 recent、模型取正在服务的那一个、倍率跟着它走", () => {
-    checkTierModel(loadCard());
+describe("② 走过这一家 —— 「当前」那一行", () => {
+  test("② 当前档位取服务端 recent、模型取正在服务的那一个、倍率跟着它走", () => {
+    checkCurrent(loadCard());
+  });
+});
+
+describe("②b 没走过这一家 —— 「配的档位」+ 带下一步的提示", () => {
+  test("②b 配的档位逐个摆出来，各带那个模型的倍率；提示必须给下一步", () => {
+    checkConfigured(loadCard());
   });
 });
 
@@ -467,12 +574,9 @@ describe("③ 模型级冷却", () => {
   });
 });
 
-describe("④ 渲染 —— 与渠道级分开摆", () => {
-  test("④ 模型级那一块：列名、模型名、倍率、未知与在读三种「没有」", () => {
+describe("④ 渲染 —— 两种状态各长什么样", () => {
+  test("④ 走过：当前那一行；没走过：提示行 + 配置那几行", () => {
     checkRender(loadCard());
-  });
-  test("④b 两张表的表头不许共用同一列（源码级）", () => {
-    checkSeparation(CARD_SRC);
   });
 });
 
@@ -535,23 +639,23 @@ describe("⑦ 反向对照 —— 改坏实现，对应断言必须真的会红"
   });
 
   test("⑦c 把「正在服务的那个模型」改成「打算路由的那个」⇒ ② 会红", async () => {
-    const card = mutant([["const model = served || target;", "const model = target || served;"]]);
-    await assertRed(card, checkTierModel, "取错模型后 ② 必须红");
+    const card = mutant([["const live = served || target;", "const live = target || served;"]]);
+    await assertRed(card, checkCurrent, "取错模型后 ② 必须红");
   });
 
   test("⑦d 把「取这个模型的倍率」改成「取目录第一条」⇒ ② 会红", async () => {
     const card = mutant([
       [
-        'const entry = model ? (all.find((m) => m && String(m.key) === model) || null) : null;',
-        "const entry = model ? (all[0] || null) : null;",
+        'const entry = id ? (all.find((m) => m && String(m.key) === id) || null) : null;',
+        "const entry = id ? (all[0] || null) : null;",
       ],
     ]);
-    await assertRed(card, checkTierModel, "取错倍率后 ② 必须红");
+    await assertRed(card, checkCurrent, "取错倍率后 ② 必须红");
   });
 
-  test("⑦e 把「没走过这一家」判成「走过」⇒ ② 会红", async () => {
+  test("⑦e 把「没走过这一家」判成「走过」⇒ ②b 会红", async () => {
     const card = mutant([["noTraffic: !tier,", "noTraffic: false,"]]);
-    await assertRed(card, checkTierModel, "「没走过」判坏后 ② 必须红");
+    await assertRed(card, checkConfigured, "「没走过」判坏后 ②b 必须红");
   });
 
   test("⑦f 把模型级冷却判坏（谁在冷却都不算）⇒ ③ 会红", async () => {
@@ -568,14 +672,14 @@ describe("⑦ 反向对照 —— 改坏实现，对应断言必须真的会红"
 
   test("⑦h 把模型级那一块的表头改成渠道级的列名 ⇒ ④b 会红", async () => {
     const src = mutantSrc([
-      ['<th style="width:14%">积分倍率</th>', '<th style="width:14%">上游余额</th>'],
+      ['<th style="width:24%">档位</th>', '<th style="width:24%">上游余额</th>'],
     ]);
     await assertRed(src, checkSeparation, "两张表共用一列后 ④b 必须红");
   });
 
   test("⑦i 不画模型级那一块 ⇒ ⑤ 会红", async () => {
     const src = mutantSrc([
-      ["host.innerHTML = self.renderModelQuota(modelRows(), esc, kit);", 'host.innerHTML = "";'],
+      ["host.innerHTML = self.renderModelQuota(modelGroups(), esc, kit);", 'host.innerHTML = "";'],
     ]);
     await assertRed(src, checkMounted, "不画那一块后 ⑤ 必须红");
   });
@@ -589,7 +693,7 @@ describe("⑦ 反向对照 —— 改坏实现，对应断言必须真的会红"
 
   test("⑦k 把倍率那一列混进渠道级那张表 ⇒ ⑤ 会红", async () => {
     const src = mutantSrc([
-      ["<th style=\"width:16%\">渠道</th>", "<th style=\"width:16%\">积分倍率</th>"],
+      ["<th style=\"width:22%\">预算上限</th>", "<th style=\"width:22%\">积分倍率</th>"],
     ]);
     await assertRed(src, checkMounted, "列名混了之后 ⑤ 必须红");
   });
@@ -611,5 +715,55 @@ describe("⑦ 反向对照 —— 改坏实现，对应断言必须真的会红"
       ['r.catalogAccount ? "账号「" + r.catalogAccount + "」的目录" : "",', '"" ,'],
     ]);
     await assertRed(card, checkRender, "出处去掉后 ④ 必须红");
+  });
+
+  test("⑦o 没走过时**不摆**配的档位 ⇒ ②b 会红", async () => {
+    const card = mutant([
+      [
+        'for (const t of Object.keys(mapping)) {',
+        'for (const t of []) {',
+      ],
+    ]);
+    await assertRed(card, checkConfigured, "不摆配的档位后 ②b 必须红");
+  });
+
+  test("⑦p 提示行**不给**下一步 ⇒ ②b 会红", async () => {
+    const card = mutant([
+      [
+        "· 走过这一家（或点「测试连通」）之后，这里会显示当前档位那个模型的倍率。",
+        "。",
+      ],
+    ]);
+    await assertRed(card, checkConfigured, "提示不给下一步后 ②b 必须红");
+  });
+
+  test("⑦q 把配的档位那一行说成「可用」⇒ ④ 会红", async () => {
+    const card = mutant([
+      [
+        "'<span class=\"led idle\"></span> 这一档还没在用'",
+        "'<span class=\"led ok\"></span> 可用'",
+      ],
+    ]);
+    await assertRed(card, checkRender, "说成「可用」后 ④ 必须红");
+  });
+
+  test("⑦r 把「当前」与「配置」两个口径混成一个 ⇒ ④ 会红", async () => {
+    const card = mutant([
+      [
+        '\'<span class="pill idle" style="font-size:10px">配置</span>\'',
+        '\'<span class="pill ok" style="font-size:10px">当前</span>\'',
+      ],
+    ]);
+    await assertRed(card, checkRender, "两个口径混成一个后 ④ 必须红");
+  });
+
+  test("⑦s 兜底目录时不用映射表里的名字 ⇒ ②b 会红", async () => {
+    const card = mutant([
+      [
+        "const name = (catName && catName !== id) ? catName : (fallbackName || catName || id);",
+        "const name = catName || (fallbackName || id);",
+      ],
+    ]);
+    await assertRed(card, checkConfigured, "兜底目录的名字改坏后 ②b 必须红");
   });
 });

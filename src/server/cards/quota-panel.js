@@ -68,142 +68,202 @@ window.BAI_CARDS["quota-panel"] = {
   },
 
   /**
-   * 组装「模型级额度」的一行。
+   * 组装「模型级额度」的那些行。
+   *
+   * ── 三种行，**口径不能混** ──
+   *   · "current"    此刻正在服务的那一档（服务端记的最近一次真实调用）。
+   *   · "configured" 用户在映射表里**配**的档位 ——「你打算用哪个」。
+   *   · 另有一行**提示行**（summary）：没走过这一家时说明「此刻没有正在服务的模型」
+   *     **并说清下一步** —— 未知态不带下一步就是死胡同（P5 的规矩）。
+   *
+   * ⚠ **「配的」与「正在服务的」是两件事，不能共用一个说法**：
+   *   配的       = `cfg[渠道].mapping`（用户写的意图）；
+   *   正在服务的 = `/api/status` 的 `recent.served`（真实发生过的）。
+   *   两者不一致时**两个都报** ——「以为在用 A 其实在用 B」正是这个差异本身。
    *
    * @param {object} o
-   *   · key       渠道 key
-   *   · name      显示名（ctx.nameOf）
-   *   · tierZh    档位短名表（ctx.TIER_ZH）
-   *   · slice     /api/status 里这一家的那一块（要 recent 与 pool）
-   *   · catalog   {loading, err, data} —— /api/models 那一家的目录状态
-   * @returns {object} 一行的全部事实（渲染层只照着显示，不自己判）
+   *   · key/name   渠道 key 与显示名（ctx.nameOf）
+   *   · tierZh     档位短名表（ctx.TIER_ZH）
+   *   · slice      /api/status 里这一家的那一块（要 recent 与 pool）
+   *   · catalog    {loading, err, data} —— /api/models 那一家的目录状态
+   *   · cfg        这一家的配置块（要 mapping）
+   * @returns {{channel:string, rows:Array, hasCurrent:boolean, summary:string}}
    */
-  modelQuotaRow(o) {
+  modelQuotaRows(o) {
     const self = this;
     const opt = o && typeof o === "object" ? o : {};
     const slice = opt.slice && typeof opt.slice === "object" ? opt.slice : {};
     const pool = slice.pool && typeof slice.pool === "object" ? slice.pool : null;
     const recent = slice.recent && typeof slice.recent === "object" ? slice.recent : {};
-    const tier = recent.tier ? String(recent.tier) : null;
-    const target = recent.target ? String(recent.target) : null;
-    const served = recent.served ? String(recent.served) : null;
-    /* ★ 真实**服务**的那个模型才是正在消耗额度的那个；没服务过就看打算路由到哪。
-     *   两者不一致时两个都报：「以为在用 A 其实在用 B」正是这个差异本身。 */
-    const model = served || target;
+    const cfg = opt.cfg && typeof opt.cfg === "object" ? opt.cfg : {};
     const cat = opt.catalog && typeof opt.catalog === "object" ? opt.catalog : null;
     const data = cat && cat.data && typeof cat.data === "object" ? cat.data : null;
     const all = data && Array.isArray(data.all) ? data.all : [];
-    const entry = model ? (all.find((m) => m && String(m.key) === model) || null) : null;
-    const cr = self.modelCredits(entry);
-    const cool = self.modelCooling(pool, model);
     const tierZh = opt.tierZh && typeof opt.tierZh === "object" ? opt.tierZh : {};
     const accounts = pool && Array.isArray(pool.accounts) ? pool.accounts : [];
-    return {
-      key: String(opt.key == null ? "" : opt.key),
-      name: String(opt.name == null ? (opt.key == null ? "" : opt.key) : opt.name),
-      tier,
-      tierLabel: tier ? String(tierZh[tier] || tier) : null,
-      model,
-      modelName: entry && entry.name ? String(entry.name) : model,
-      planned: target,
-      served,
-      mismatch: !!(served && target && served !== target),
-      credits: cr.credits,
-      free: cr.free,
-      /* ⚠ **没读到目录不等于倍率是 0** —— 那是两件事（口径①）。
-       *   目录读不到就标「不知道」，不拿 0 顶替。 */
-      creditsKnown: cr.known,
-      catalogLoading: !!(cat && cat.loading),
-      catalogError: cat && cat.err ? String(cat.err) : "",
-      catalogSource: data ? String(data.source || "") : "",
-      catalogAt: data && data.catalogAt ? String(data.catalogAt) : "",
-      /* ⚠ 目录是**某一个账号**的权限事实（多账号时各号可见的倍率可能不同）——
-       *   所以出处要能说清是哪个号的（只给用户自己起的标签，绝不给凭据）。 */
-      catalogAccount: data && data.sourceAccount && data.sourceAccount.label
-        ? String(data.sourceAccount.label) : "",
-      cooling: cool.cooling,
-      coolingAccounts: cool.accounts,
-      usable: accounts.some((a) => a && a.available === true),
-      observedAt: recent.observedAt ? String(recent.observedAt) : "",
-      /* 没走过这一家 ⇒ 不知道当前档位。这与「档位已知但模型不可用」是两件事。 */
-      noTraffic: !tier,
+    const usable = accounts.some((a) => a && a.available === true);
+    const channel = String(opt.name == null ? (opt.key == null ? "" : opt.key) : opt.name);
+
+    const tier = recent.tier ? String(recent.tier) : null;
+    const target = recent.target ? String(recent.target) : null;
+    const served = recent.served ? String(recent.served) : null;
+    /* ★ 真实**服务**的那个模型才是正在消耗额度的那个；没服务过就看打算路由到哪。 */
+    const live = served || target;
+
+    /* 一行的全部事实：某个模型 + 它的倍率 + 它此刻的状态。 */
+    const factsOf = (modelId, kind, tierKey, planned, fallbackName) => {
+      const id = modelId ? String(modelId) : null;
+      const entry = id ? (all.find((m) => m && String(m.key) === id) || null) : null;
+      const cr = self.modelCredits(entry);
+      const cool = self.modelCooling(pool, id);
+      /* 模型显示名：目录里**有正经名字**就用它；目录退化成兜底（名字就是 id）时，
+       *   用用户在映射表里起的那个名字 —— 兜底目录不该把「DeepSeek-V4.1-Flash」
+       *   显示成两遍 id。 */
+      const catName = entry && entry.name ? String(entry.name) : "";
+      const name = (catName && catName !== id) ? catName : (fallbackName || catName || id);
+      return {
+        kind,
+        tier: tierKey || null,
+        tierLabel: tierKey ? String(tierZh[tierKey] || tierKey) : null,
+        model: id,
+        modelName: name,
+        planned: planned || null,
+        mismatch: !!(id && planned && id !== planned),
+        credits: cr.credits,
+        free: cr.free,
+        /* ⚠ **没读到目录不等于倍率是 0** —— 那是两件事（口径①）。
+         *   目录读不到就标「不知道」，不拿 0 顶替。 */
+        creditsKnown: cr.known,
+        cooling: cool.cooling,
+        coolingAccounts: cool.accounts,
+        usable,
+        catalogLoading: !!(cat && cat.loading),
+        catalogError: cat && cat.err ? String(cat.err) : "",
+        catalogSource: data ? String(data.source || "") : "",
+        catalogAt: data && data.catalogAt ? String(data.catalogAt) : "",
+        /* ⚠ 目录是**某一个账号**的权限事实（多账号时各号可见的倍率可能不同）——
+         *   所以出处要能说清是哪个号的（只给用户自己起的标签，绝不给凭据）。 */
+        catalogAccount: data && data.sourceAccount && data.sourceAccount.label
+          ? String(data.sourceAccount.label) : "",
+      };
     };
+
+    const rows = [];
+    let summary = "";
+    if (tier) {
+      rows.push(factsOf(live, "current", tier, target, null));
+    } else {
+      /* 没走过这一家 ⇒ 把「你配的档位」摆出来（**配置的口径**，不是正在服务的）。 */
+      const mapping = cfg.mapping && typeof cfg.mapping === "object" ? cfg.mapping : {};
+      for (const t of Object.keys(mapping)) {
+        const m = mapping[t] || {};
+        rows.push(factsOf(m.target ? String(m.target) : "", "configured", String(t), null,
+          m.label ? String(m.label) : null));
+      }
+      /* ⚠ **未知态必须带下一步**：只说「不知道」是死胡同，用户不知道该做什么。 */
+      summary = rows.length
+        ? "此刻没有正在服务的模型 · 走过这一家（或点「测试连通」）之后，这里会显示当前档位那个模型的倍率。"
+        : "这一家还没配映射表：到「渠道」页把每个档位指向你想用的模型。";
+    }
+    return { channel, rows, hasCurrent: !!tier, noTraffic: !tier, summary };
   },
 
   /**
-   * 画「模型级额度」那一块。**纯函数**：只认传进来的行，不读全局、不碰 DOM。
+   * 画「模型级额度」那一块。**纯函数**：只认传进来的组，不读全局、不碰 DOM。
    *
-   * @param {Array} rows modelQuotaRow 的产物
+   * @param {Array} groups modelQuotaRows 的产物（一个渠道一组）
    * @param {Function} [esc]
    * @param {object} [kit] 共享组件库（window.BAI_KIT）
-   * @returns {string} HTML；没有行时返回空串（整块不画）
+   * @returns {string} HTML；没有组时返回空串（整块不画）
    */
-  renderModelQuota(rows, esc, kit) {
+  renderModelQuota(groups, esc, kit) {
     const e = esc || ((s) => String(s == null ? "" : s));
-    const list = Array.isArray(rows) ? rows : [];
+    const list = Array.isArray(groups) ? groups : [];
     /* 没有带账号池的渠道 ⇒ 整块不画。
        「没配置的渠道干脆不画条」——画一条空条会被读成「它在跑」。 */
     if (!list.length) return "";
 
-    const trs = list.map((r) => {
-      const tierCell = r.tier
-        ? `<span class="mono">${e(r.tierLabel)}</span> <span class="dim">（${e(r.tier)}）</span>`
-        : '<span class="dim">最近没走过这一家</span>';
-      const modelCell = r.model
-        ? `<span>${e(r.modelName)}</span> <span class="dim mono">${e(r.model)}</span>`
-          + (r.mismatch ? `<span class="dim">（与计划的 ${e(r.planned)} 不一致）</span>` : "")
-        : '<span class="dim">—</span>';
-      /* 倍率的**出处**：哪个账号的那份目录、什么时候抓的、是不是降级来的。
-         放 title 里（不占版面）—— 但它得在：多账号时「x0.29」是**某一个号**的数，
-         不说清是哪个号的，用户看到的是一个不知道该信几分的数。 */
-      const prov = [
-        r.catalogAccount ? "账号「" + r.catalogAccount + "」的目录" : "",
-        r.catalogSource === "live" ? "实时抓的" : (r.catalogSource ? "降级来源（不是实时抓的）" : ""),
-        r.catalogAt ? ("抓于 " + r.catalogAt) : "",
-      ].filter(Boolean).join(" · ");
-      const titleAttr = prov ? ` title="${e(prov)}"` : "";
-      /* ⚠ 三种「没有」要分开：目录还在读 / 目录读到了但这个模型没有倍率 /
-       *   目录根本没读到。混成一句「倍率未知」，用户分不出该不该刷新。
-       *   ⚠ **「倍率未知」绝不能显示成 0** —— 那是两件事（口径①）：
-       *   0 会被读成「这款模型不扣积分」（其实免费档恰恰是 x0.00）。
-       *   ⚠ **已经知道的数优先于「在读」**：后台换新目录时那一格不该闪一下
-       *   「读目录中…」—— 那会让用户以为刚才是没有倍率。 */
-      const creditsCell = r.free
-        ? `<span class="mono"${titleAttr}>免费</span>` + (r.creditsKnown ? ' <span class="dim">（x0.00）</span>' : "")
-        : (r.creditsKnown
-          ? `<span class="mono"${titleAttr}>${e(r.credits)}</span>`
-          : (r.catalogLoading
-            ? '<span class="dim">读目录中…</span>'
-            : `<span class="dim" title="${e([r.catalogError || "这份目录里没有这个模型的倍率", prov].filter(Boolean).join(" · "))}">倍率未知</span>`));
-      /* 「该模型此刻」只说这个模型，不替整号下结论（口径④）。 */
-      const stateCell = r.noTraffic
-        ? '<span class="led idle"></span> 不知道'
-        : (r.cooling
+    /* 这一块里有没有「配置」档位的行？（有的话才需要解释两个口径的差别） */
+    const hasConfigured = list.some((g) => (Array.isArray(g.rows) ? g.rows : [])
+      .some((r) => r && r.kind === "configured"));
+
+    const trs = list.map((g) => {
+      const rows = Array.isArray(g.rows) ? g.rows : [];
+      /* ⚠ **没走过这一家 ⇒ 先给一句带下一步的话**（提示行）。
+       *   渠道名在这一行上，下面几行（配的档位）留空，看起来是一组。 */
+      const head = (!g.hasCurrent && g.summary)
+        ? `<tr><td>${e(g.channel)}</td><td colspan="4" class="dim">${e(g.summary)}</td></tr>`
+        : "";
+      const body = rows.map((r, i) => {
+        /* 口径徽章：**「当前」= 此刻真实在服务的那一档**，
+           **「配置」= 你在映射表里写的档位**。两个说法不许混成一个。 */
+        const badge = g.hasCurrent
+          ? '<span class="pill ok" style="font-size:10px">当前</span>'
+          : '<span class="pill idle" style="font-size:10px">配置</span>';
+        const tierCell = r.tier
+          ? `${badge} <span class="mono">${e(r.tierLabel)}</span> <span class="dim">（${e(r.tier)}）</span>`
+          : badge;
+        const modelCell = r.model
+          ? `<span>${e(r.modelName)}</span> <span class="dim mono">${e(r.model)}</span>`
+            + (r.mismatch ? `<span class="dim">（与计划的 ${e(r.planned)} 不一致）</span>` : "")
+          : '<span class="dim">—</span>';
+        /* 倍率的**出处**：哪个账号的那份目录、什么时候抓的、是不是降级来的。
+           放 title 里（不占版面）—— 但它得在：多账号时「x0.29」是**某一个号**的数，
+           不说清是哪个号的，用户看到的是一个不知道该信几分的数。 */
+        const prov = [
+          r.catalogAccount ? "账号「" + r.catalogAccount + "」的目录" : "",
+          r.catalogSource === "live" ? "实时抓的" : (r.catalogSource ? "降级来源（不是实时抓的）" : ""),
+          r.catalogAt ? ("抓于 " + r.catalogAt) : "",
+        ].filter(Boolean).join(" · ");
+        const titleAttr = prov ? ` title="${e(prov)}"` : "";
+        /* ⚠ 三种「没有」要分开：目录还在读 / 目录读到了但这个模型没有倍率 /
+         *   目录根本没读到。混成一句「倍率未知」，用户分不出该不该刷新。
+         *   ⚠ **「倍率未知」绝不能显示成 0** —— 那是两件事（口径①）：
+         *   0 会被读成「这款模型不扣积分」（其实免费档恰恰是 x0.00）。
+         *   ⚠ **已经知道的数优先于「在读」**：后台换新目录时那一格不该闪一下
+         *   「读目录中…」—— 那会让用户以为刚才是没有倍率。 */
+        const creditsCell = r.free
+          ? `<span class="mono"${titleAttr}>免费</span>` + (r.creditsKnown ? ' <span class="dim">（x0.00）</span>' : "")
+          : (r.creditsKnown
+            ? `<span class="mono"${titleAttr}>${e(r.credits)}</span>`
+            : (r.catalogLoading
+              ? '<span class="dim">读目录中…</span>'
+              : `<span class="dim" title="${e([r.catalogError || "这份目录里没有这个模型的倍率", prov].filter(Boolean).join(" · "))}">倍率未知</span>`));
+        /* 「该模型此刻」只说这个模型，不替整号下结论（口径④）。
+           ⚠ **配了但此刻没在用的档位**说「这一档还没在用」——
+           说「可用」会让人以为它正在跑；说「不知道」又是个死胡同。 */
+        const stateCell = r.cooling
           ? `<span class="led warn"></span> 该模型在限流${r.coolingAccounts.length ? "（" + e(r.coolingAccounts.join("、")) + "）" : ""}`
-          : (r.usable
-            ? '<span class="led ok"></span> 可用'
-            : '<span class="led idle"></span> 池里没有可用账号'));
-      return `<tr>
-          <td>${e(r.name)}</td>
+          : (g.hasCurrent
+            ? (r.usable
+              ? '<span class="led ok"></span> 可用'
+              : '<span class="led idle"></span> 池里没有可用账号')
+            : '<span class="led idle"></span> 这一档还没在用');
+        /* 渠道名：没走过这一家时由上面那行提示行说（配置档位那几行留空，像一组）。 */
+        const chanCell = g.hasCurrent ? `<td>${e(g.channel)}</td>` : "<td></td>";
+        return `<tr>
+          ${chanCell}
           <td>${tierCell}</td>
           <td>${modelCell}</td>
           <td>${creditsCell}</td>
           <td>${stateCell}</td>
         </tr>`;
+      }).join("");
+      return head + body;
     }).join("");
 
     return `
         <div class="pb-head" style="margin-top:16px">
           <h3>模型级额度</h3>
-          <span class="sub">这一家当前档位那个模型 · 积分倍率 · 此刻能不能用</span>
+          <span class="sub">这一家在用哪一档 · 那个模型的积分倍率 · 此刻能不能用</span>
         </div>
         <table class="route" style="table-layout:fixed">
           <thead><tr>
-            <th style="width:18%">渠道</th>
-            <th style="width:22%">当前档位</th>
-            <th style="width:28%">档位模型</th>
+            <th style="width:16%">渠道</th>
+            <th style="width:24%">档位</th>
+            <th style="width:24%">指向的模型</th>
             <th style="width:14%">积分倍率</th>
-            <th style="width:18%">该模型此刻</th>
+            <th style="width:22%">该模型此刻</th>
           </tr></thead>
           <tbody>${trs}</tbody>
         </table>
@@ -219,7 +279,12 @@ window.BAI_CARDS["quota-panel"] = {
         <div class="hint" style="margin-top:7px">
           <b>「还剩多少积分、还能用几次」拿不到</b>：上游没有给这个查询接口（两个候选地址实测都 404），
           所以这里<b>不编一个数</b>——想知道余额只能去上游控制台看。
-        </div>`;
+        </div>
+        ${hasConfigured ? `<div class="hint" style="margin-top:7px">
+          <b>「当前」与「配置」是两个口径</b>：「当前」= 此刻真实在服务的那一档，
+          「配置」= 你在映射表里写的档位。<b>没走过这一家时只有「配置」</b>——
+          那是你打算怎么用，不是此刻在用；两者指向的模型不一样时那一行会写明。
+        </div>` : ""}`;
   },
 
   mount(ctx) {
@@ -327,15 +392,18 @@ window.BAI_CARDS["quota-panel"] = {
       }
     }
 
-    /** 模型级那几行（纯函数算出来的数据，渲染层只照着显示）。 */
-    function modelRows() {
+    /** 模型级那些组（纯函数算出来的数据，渲染层只照着显示）。 */
+    function modelGroups() {
       const tierZh = ctx.TIER_ZH || {};
-      return poolKeys().map((k) => self.modelQuotaRow({
+      return poolKeys().map((k) => self.modelQuotaRows({
         key: k,
         name: typeof ctx.nameOf === "function" ? ctx.nameOf(k) : k,
         tierZh,
         slice: (typeof ctx.stOf === "function" ? ctx.stOf(k) : null) || {},
-        /* 目录还没开始读 ⇒ 这一格显示「读目录中…」，不是「倍率未知」：
+        /* 配置块：映射表（每档指向哪个模型）在里面 ——
+           「没走过这一家」时那一块要摆出的是**配的**档位。 */
+        cfg: (typeof ctx.cfgOf === "function" ? ctx.cfgOf(k) : null) || {},
+        /* 目录还没开始读 ⇒ 那一格显示「读目录中…」，不是「倍率未知」：
            「还没问」与「问了、拿不到」是两件事，混起来用户会以为倍率真 0。 */
         catalog: catState.get(k) || { loading: true, err: "", data: null },
       }));
@@ -345,7 +413,7 @@ window.BAI_CARDS["quota-panel"] = {
     function renderModelSection() {
       const host = q('[data-role="qov-model"]');
       if (!host) return;
-      host.innerHTML = self.renderModelQuota(modelRows(), esc, kit);
+      host.innerHTML = self.renderModelQuota(modelGroups(), esc, kit);
     }
 
     const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -476,16 +544,16 @@ window.BAI_CARDS["quota-panel"] = {
 
     function signature() {
       const rows = Array.isArray(data && data.providers) ? data.providers : [];
-      /* ⚠ 模型级那几行也要进签名：当前档位变了（recent 变）就得重画，
+      /* ⚠ 模型级那些行也要进签名：当前档位变了（recent 变）就得重画，
          否则那一块会停在旧档位上 —— 用户看到的是「还在用上一个模型」。 */
-      const mrows = modelRows();
+      const mgroups = modelGroups();
       return JSON.stringify(rows.map((r) => [
         r.key, r.budget ? r.budget.used : 0, r.budget ? r.budget.limit : 0,
         r.resting, r.restUntil, r.cooling,
         r.probe ? r.probe.known : null, r.cost ? r.cost.total : null,
-      ])) + "|" + JSON.stringify(mrows.map((r) => [
-        r.key, r.tier, r.model, r.credits, r.creditsKnown, r.cooling, r.usable,
-        r.catalogLoading, r.catalogError,
+      ])) + "|" + JSON.stringify(mgroups.map((g) => [
+        g.channel, g.hasCurrent, g.summary,
+        (g.rows || []).map((r) => [r.kind, r.tier, r.model, r.credits, r.creditsKnown, r.cooling, r.usable]),
       ])) + "|" + (loaded ? "1" : "0") + "|" + lasterr;
     }
 
