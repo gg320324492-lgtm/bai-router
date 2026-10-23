@@ -51,6 +51,16 @@ window.BAI_CARDS["clients"] = {
             <span class="k">统一网关地址</span>
             <span class="v mono" data-role="c-base">—</span>
           </div>
+          <div class="fpline" style="align-items:flex-start;margin-top:6px">
+            <span class="k">接哪一家</span>
+            <span class="v">
+              <span data-role="c-providers" style="display:flex;gap:6px;flex-wrap:wrap"></span>
+              <div class="hint" style="margin-top:4px">
+                多数客户端自己挑模型，走网关就行（模型 id 形如 <span class="mono">provider/档位</span>）；
+                <b>Claude Code 挑不了模型</b>，要在这儿定一家，它才会写对模型 id。
+              </div>
+            </span>
+          </div>
           <div style="margin-top:8px">
             <button type="button" class="btn sm" data-role="c-reload">重新扫描</button>
             <span class="v dim" style="margin-left:8px" data-role="c-count"></span>
@@ -68,6 +78,9 @@ window.BAI_CARDS["clients"] = {
     let inflight = false;
     let loaded = false;
     let sig = "";
+    /* ⚠「接哪一家」是**这张卡自己的**选择，不改面板的当前渠道
+     *   （面板是按渠道分页的，切它会把用户带走）。 */
+    let target = (ctx.channel || "bai");
 
     function setResult(text, ok) {
       const el = q('[data-role="c-result"]');
@@ -93,6 +106,29 @@ window.BAI_CARDS["clients"] = {
       if (st.notConfigured) return "装了，还没生成过配置";
       if (st.configured) return "配置里有，但不是本机接的";
       return "没接";
+    }
+
+    /** 渠道按钮组：把「接哪一家」摆在明面上（Claude Code 挑不了模型，得人定）。 */
+    function renderProviders() {
+      const box2 = q('[data-role="c-providers"]');
+      if (!box2) return;
+      const keys = Array.isArray(ctx.channels) ? ctx.channels : [];
+      if (!keys.length) { box2.innerHTML = ""; return; }
+      box2.innerHTML = keys.map((k) => {
+        const on = k === target;
+        const label = ctx.nameOf ? ctx.nameOf(k) : k;
+        return `<button type="button" class="btn sm${on ? " primary" : ""}" data-role="c-prov-${esc(k)}">${esc(label)}</button>`;
+      }).join("");
+      for (const k of keys) {
+        const b = box2.querySelector(`[data-role="c-prov-${esc(k)}"]`);
+        if (!b) continue;
+        b.addEventListener("click", () => {
+          if (target === k) return;
+          target = k;
+          renderProviders();
+          setResult("接到「" + (ctx.nameOf ? ctx.nameOf(k) : k) + "」");
+        });
+      }
     }
 
     function renderBody() {
@@ -184,7 +220,7 @@ window.BAI_CARDS["clients"] = {
             try {
               const r = await ctx.api("/api/clients/apply", {
                 method: "POST", headers: { "content-type": "application/json" },
-                body: JSON.stringify({ id }),
+                body: JSON.stringify({ id, provider: target }),
                 timeoutMs: 30000,
               });
               if (r && r.ok === false) throw new Error(r.error || r.detail || "接不上");
@@ -247,6 +283,7 @@ window.BAI_CARDS["clients"] = {
     }
 
     /* 首屏先画「在读」并把第一次读发出去。 */
+    renderProviders();
     renderBody();
     load();
 
