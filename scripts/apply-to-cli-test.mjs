@@ -20,6 +20,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseJsonc, applyEdits } from "../src/server/edit-json.mjs";
+/* ⚠ applyToCli 里真正调的那个（早前从 server.mjs 里抽成了独立模块）——
+ *   注入**真的那份**，别在测试里另抄一份（抄了就跟源码漂移了）。 */
+import { claudeCodeEdits } from "../src/server/clients/claude-code-edits.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = fs.readFileSync(path.join(ROOT, "src/server/server.mjs"), "utf8");
@@ -45,12 +48,50 @@ function sliceBetween(src, startAnchor, endAnchor) {
   return src.slice(i, j);
 }
 
+/**
+ * sliceFnBody —— 抠出一个**参数列表里有默认值**的函数。
+ *
+ * ⚠ 为什么不能直接用 sliceFn：`applyToCli(S, opts = {})` 的**第一个 `{` 是参数
+ *   默认值**，不是函数体 ⇒ sliceFn 会切出 `function applyToCli(S, opts = {}`
+ *   这样的碎片 ⇒ 注入 `new Function` 时语法错误 ⇒ 整份测试在**加载阶段**就炸，
+ *   报错还看不出是「抠源码抠坏了」。
+ *   ⇒ 配平**圆括号**找到参数列表的结束位置，再找它后面的 `{`。
+ */
+function sliceFnBody(src, anchor) {
+  const i = src.indexOf(anchor);
+  assert.ok(i >= 0, `源码里找不到锚点：${anchor}`);
+  const lp = src.indexOf("(", i);
+  assert.ok(lp > i, `锚点后面没有左括号：${anchor}`);
+  let depth = 0;
+  let close = -1;
+  for (let k = lp; k < src.length; k++) {
+    const ch = src[k];
+    if (ch === "(") depth++;
+    else if (ch === ")") { depth--; if (depth === 0) { close = k; break; } }
+  }
+  assert.ok(close > 0, `锚点 ${anchor} 的参数列表没配平`);
+  const open = src.indexOf("{", close);
+  assert.ok(open > close, `锚点 ${anchor} 后面没有函数体`);
+  let d = 0;
+  for (let k = open; k < src.length; k++) {
+    const ch = src[k];
+    if (ch === "{") d++;
+    else if (ch === "}") { d--; if (d === 0) return src.slice(i, k + 1); }
+  }
+  throw new Error(`锚点 ${anchor} 的大括号没配平`);
+}
+
 const SRC_GUIDANCE = sliceFn(SRC, "function unreadableSettingsGuidance");
 const SRC_ACTION = sliceFn(SRC, "function unreadableSettingsAction");
-const SRC_APPLY = sliceFn(SRC, "async function applyToCli");
+/* ⚠ `applyToCli` 现在是**同步**的（早前为了让它能被 applyClient 同步地调用），
+ *   锚点里那个 `async` 已经不在源码里了 ⇒ 照旧抠会「找不到锚点」。 */
+const SRC_APPLY = sliceFnBody(SRC, "function applyToCli");
 /* TIERS 也用真的那份，别在测试里另抄一份（抄了就跟源码漂移了）。
  * sliceBetween 的右锚点**不含**在结果里，所以要自己把 `];` 补回去。 */
 const SRC_TIERS = sliceBetween(SRC, "const TIERS = [", "];") + "];";
+/* 占位符令牌的值同理 —— 源码里那个字面量就是「写进 settings.json 的那个」，
+ * 抄一份到测试里的话，源码改了测试还在断言旧值。 */
+const SRC_PROXY_TOKEN = sliceBetween(SRC, "const PROXY_MANAGED_TOKEN = ", ";") + ";";
 
 /** 组装一份可跑的 applyToCli：依赖全部从外面注进去。 */
 function makeApplyToCli(file, opts = {}) {
@@ -59,8 +100,11 @@ function makeApplyToCli(file, opts = {}) {
   const factory = new Function(
     "SETTINGS", "readFileSync", "writeAtomic", "copyFileSync", "recordCliApply",
     "cliViaRelay", "cliBaseUrlFor", "loadCfg", "parseJsonc", "applyEdits",
-    "gatewayOn", "gatewayBaseUrl",
-    `${SRC_TIERS}\n${SRC_GUIDANCE}\n${SRC_ACTION}\n${SRC_APPLY}\n`
+    "gatewayOn", "gatewayBaseUrl", "claudeCodeEdits",
+    /* ⚠ PROXY_MANAGED_TOKEN **不走参数注入** —— 它是源码里的 `const`，
+     *   放进这段源码里就行（同一个作用域，applyToCli 直接引用）。
+     *   同时又当参数名 ⇒ 重复声明 ⇒ new Function 直接 SyntaxError。 */
+    `${SRC_TIERS}\n${SRC_PROXY_TOKEN}\n${SRC_GUIDANCE}\n${SRC_ACTION}\n${SRC_APPLY}\n`
     + "return { applyToCli, unreadableSettingsAction, unreadableSettingsGuidance };",
   );
   const api = factory(
@@ -79,6 +123,7 @@ function makeApplyToCli(file, opts = {}) {
      * 而这个测试的沙箱里没有 config.json 这回事。 */
     () => Boolean(opts.gateway),
     () => "http://127.0.0.1:15799",
+    claudeCodeEdits,
   );
   return { ...api, writes, recorded };
 }
@@ -158,7 +203,11 @@ describe("applyToCli —— 接线写 ~/.claude/settings.json", () => {
     const file = tmpSettings(broken);
     const api = makeApplyToCli(file);
 
-    await assert.rejects(() => api.applyToCli(S), (e) => {
+    /* ⚠ 用 throws 而不是 rejects：**applyToCli 现在是同步的**（早前为了让它能被
+     *   clients/ 层的同步 `writes` 调用）。同步函数**同步抛错**时，
+     *   `assert.rejects` 抓不到 —— 它只认「返回的 promise 的 rejection」，
+     *   同步抛出发生在 promiseFn() 调用那一刻，会直接冒泡出去。 */
+    assert.throws(() => api.applyToCli(S), (e) => {
       assert.match(String(e.message), /无法解析/, "报错要说清是解析失败");
       return true;
     });
@@ -170,7 +219,7 @@ describe("applyToCli —— 接线写 ~/.claude/settings.json", () => {
     const broken = '{\n  "env": {\n    "A": "b"\n';
     const file = tmpSettings(broken);
     const api = makeApplyToCli(file);
-    await assert.rejects(() => api.applyToCli(S));
+    assert.throws(() => api.applyToCli(S));   // 同上：同步函数用 throws
     const bak = fs.readdirSync(path.dirname(file)).find((n) => n.startsWith("settings.json.unreadable-"));
     assert.ok(bak, "没有另存备份");
     assert.equal(fs.readFileSync(path.join(path.dirname(file), bak), "utf8"), broken, "备份内容不对");
