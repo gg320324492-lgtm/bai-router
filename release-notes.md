@@ -37,12 +37,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://github.com/g
 
 ### 二、面板多了一屏「客户端」：装好的 CLI 一键接上
 
-「客户端」页列出能接 B.AI 的客户端 —— **25 个**（Cline、CodeBuddy Code、Codex、
-Cursor CLI、Droid、Empryo、Gemini CLI、Goose、Grok Build、Hermes Agent、jcode、
-Kimi Code、MiniMax Code、Mister Morph、Muse Code、omp (oh-my-pi)、Pi、Qoder、
-Qoder CN、Qwen Code、Reasonix Studio、StepCode、WorkBuddy、WorkBuddy AI、ZCode），
+「客户端」页列出能接 B.AI 的客户端 —— **27 个**（Claude Code、Claude 桌面版、
+Cline、CodeBuddy Code、Codex、Cursor CLI、Droid、Empryo、Gemini CLI、Goose、
+Grok Build、Hermes Agent、jcode、Kimi Code、MiniMax Code、Mister Morph、
+Muse Code、OpenCode、omp (oh-my-pi)、Pi、Qoder、Qoder CN、Qwen Code、
+Reasonix Studio、StepCode、WorkBuddy、WorkBuddy AI、ZCode），
 每个写清它的配置文件在哪、说哪种方言、现在接上了没有。
 点「接上」替你写好，点「断开」把它摘掉。
+
+- **Claude Code / Claude 桌面版 / OpenCode 也在里面** —— 这三个是最常用的。
+  ⚠ **Claude Code 挑不了模型**（它的配置里写死一个），所以那一屏多一行
+  「接哪一家」：选哪家，它的模型 id 就写 `哪一家/档位`，网关才分流得了。
+- **「没装」与「装了但还没生成过配置」分开说** —— 客户端装了但还没运行过时，
+  它的配置文件还没生成（ZCode 就是这样），这时说的是「装了，先运行一次它」，
+  不是「你没装」。
 
 - **断开只还原我们写过的那几处** —— 你文件里其它内容一个字不动。
 - **读不懂就不写**：配置文件在但解析失败 ⇒ 报错、中止，**绝不**把它当空配置覆盖掉。

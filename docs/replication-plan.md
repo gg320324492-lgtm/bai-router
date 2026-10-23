@@ -196,22 +196,27 @@ provider 跳。模型寻址靠本地四档映射表（`TIERS` + `resolveModelTar
 地址与模型清单写进去。上下文窗口、输出上限、reasoning 档位这些**先不管** ——
 客户端自己会用默认值。
 
-### T15-c 接线层 · 深度定制（📋 后续规划，**未做**）
+### T15-c 接线层 · 深度定制（📋 后续规划，**设计已完成，未实现**）
 
 magpie 的每个客户端是**深度定制**的 —— `internal/agent/zcode.go` 就 600 多行：
 两个配置文件（`config.json` 的 provider 形状 + 3.14 起的 `provider_config.json`
 的 rules 形状）、模型的上下文窗口与输出上限、reasoning 档位与变体、原生联网
 开关（还要一个 stash 记「我们开过哪些」）、**用户在客户端里手改过的值要保留**。
 
-本仓的薄适配器**做不到**这些。后续要做的是：
+**设计已经写完**：**[docs/client-wiring-deep-plan.md](client-wiring-deep-plan.md)**
+（2026-10-23，229 行）。两个推荐：
 
-1. **模型元数据下发**：把 B.AI 已有的上下文窗口 / 输出上限 / reasoning 档位写进
-   客户端的模型表（magpie 的 `magpieModels()` → 各客户端的模型条目）。
-2. **保留用户手改的值**：magpie 有 `mergeKept` / `keptEffort` 那套「用户在客户端里
-   改过的东西我们不动」。本仓的 `base.mjs` 目前是**整块替换** provider 块
-   （只保住了键路径级别的原值，不保 provider 块内部的细分字段）。
-3. **每个客户端的第二份文件**：ZCode 的 `provider_config.json`、Qwen Code 的
-   `MAGPIE_QWEN_API_KEY` 环境变量、MothX 的 `providers` 对象…
+- **模型元数据的数据来源**：**内置表为主 + 渠道自己的目录接口为辅**；
+  models.dev **不进关键路径**（只作可选的后台补充）——
+  理由：我们只有八家 × 四个档位，比 magpie 那 232 个 provider 小得多，
+  内置表最省，而运行时拉一个 6MB 的 JSON 进关键路径最不省。
+- **保留用户手改过的值**：**逐值比对**（magpie 的 `openCodeKept` 做法），
+  **不引入「上次写了什么」的新状态** —— 多一个状态源就多一处会漂移的地方。
+
+分阶段落地顺序与「明确不做的」都在那份文档里。
+
+另有三件 magpie 做了、我们还没做的：ZCode 的 `provider_config.json`（第二份文件）、
+Qwen Code 的 `MAGPIE_QWEN_API_KEY` 环境变量、MothX 的 `providers` 对象。
 
 **取舍**：T15-c 是几十个客户端 × 每个 100–600 行 = 数月的量。
 先按 T15-b 铺完（几十个客户端一次能铺完），再挑用户真在用的那几个做深。
