@@ -338,6 +338,42 @@ describe("④c 键里带点：写进去的是一个键，还原得逐字相同",
 });
 
 /* ====================================================================== *
+ * ④d 护栏：只许写 home 之下的文件
+ * ====================================================================== */
+describe("④d 护栏：写 home 之外的路径 ⇒ 拒绝", () => {
+  test("④d-1 声明里的路径不在 ctx.home 之下 ⇒ 拒绝，并说清是哪个路径", () => {
+    /* 接线是**改用户环境**的动作。声明里一个写错的绝对路径（少拼一层、
+     * 路径写反了）就会写到用户没打算改的地方去，而那种改动用户往往要过
+     * 很久才发现（2026-10-23 真发生过：起测试实例时忘了隔离
+     * BAI_CLIENT_HOME，把 ~/.claude/settings.json 真改了）。 */
+    const home = tmpDir();
+    /* ⚠ 越界路径必须在**三个根之外**（home / %APPDATA% / %LOCALAPPDATA%）——
+     *   护栏放行这三个（Windows 上客户端的配置常在 APPDATA 下：goose、reasonix）。
+     *   所以不能用 tmpdir 下的路径（它在 APPDATA 之下）⇒ 用盘根下的一个目录。 */
+    const outside = path.join(path.parse(home).root, "bai-outside-home-test", "evil.json");
+    const def = {
+      id: "outside", name: "跑偏的", protocol: "chat",
+      files: () => [{
+        path: outside, format: "json",
+        writes: () => [{ path: "a", value: 1 }],
+        wired: () => false,
+      }],
+    };
+    const r = applyClient(def, { ...CTX, home }, { dataDir: home });
+    assert.equal(r.ok, false, "★ 写到 home 之外竟然成功了");
+    assert.match(String(r.detail || ""), /拒绝写/, "错误要说清是「拒绝写」");
+    assert.match(String(r.detail || ""), /bai-outside-home-test/, "错误要点名那个路径");
+    assert.equal(fs.existsSync(outside), false, "★ 那个文件真的被写出来了");
+  });
+
+  test("④d-2 home 之下的路径照常能写（护栏没把正事也挡了）", () => {
+    const home = tmpDir();
+    const r = applyClient(fakeClient(home), { ...CTX, home }, { dataDir: home });
+    assert.equal(r.ok, true, `home 之下应该能写：${r.detail}`);
+  });
+});
+
+/* ====================================================================== *
  * ⑤ 格式注册表
  * ====================================================================== */
 describe("⑤ 格式注册表", () => {

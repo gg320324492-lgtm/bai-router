@@ -203,6 +203,35 @@ export function applyClient(def, ctx, opts = {}) {
   const list = fileListOf(def, ctx);
   if (!list.length) return { ok: false, detail: "这个客户端没有声明要改哪些文件" };
 
+  /* ⚠⚠ **护栏：只许写「客户端配置该在的地方」。**
+   *   接线是**改用户环境**的动作 —— 声明里一个写错的绝对路径（少拼一层、
+   *   路径写反了）就会写到用户**没打算改**的地方去，而那种改动用户往往
+   *   要过很久才发现（2026-10-23 就真发生过：起测试实例时忘了隔离
+   *   BAI_CLIENT_HOME，把 ~/.claude/settings.json 真改了）。
+   *
+   *   ⚠ **放行三个根**，不只是 home —— Windows 上客户端的配置常在 APPDATA 下
+   *   （实测：goose 在 `%APPDATA%\Block\goose\config\config.yaml`、
+   *   reasonix 在 `%APPDATA%\reasonix\config.toml`）⇒ 只许 home 之下会把
+   *   这些正经客户端挡掉。
+   *   ⚠ 这条护栏挡不住「home 本身就是真的」—— 那靠 `BAI_CLIENT_HOME`
+   *   在测试里指到临时目录（见 docs 与 memory）。 */
+  const roots = [String(ctx.home || "")];
+  for (const k of ["APPDATA", "LOCALAPPDATA"]) {
+    const v = String(process.env[k] || "").trim();
+    if (v) roots.push(v);
+  }
+  const rootsAbs = roots.filter(Boolean).map((r) => path.resolve(r));
+  for (const f of list) {
+    const abs = path.resolve(String(f.path || ""));
+    const ok = rootsAbs.some((r) => abs === r || abs.startsWith(r + path.sep));
+    if (!ok) {
+      return {
+        ok: false,
+        detail: `拒绝写 ${abs}：它不在 ${rootsAbs.join(" / ")} 之下（客户端的配置只许改这几个地方）`,
+      };
+    }
+  }
+
   /* ① 先把每个文件要改的键的原值全读出来（读不出来 ⇒ 中止，一个字都不写） */
   const plan = [];
   for (const f of list) {
