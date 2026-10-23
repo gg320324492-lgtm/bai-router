@@ -221,11 +221,11 @@ window.BAI_CARDS["traffic-page"] = {
           `花费 ${fmtCost(x.cost)}`,
         ].filter(Boolean).join(" · ");
         return `<tr>
-            <td><span class="mono">${esc(x.day)}</span></td>
+            <td><span class="num">${esc(x.day)}</span></td>
             <td>${bar(maxTok ? num(x.tokens) / maxTok : null, tone, tip)}</td>
-            <td class="dim">${esc(int(x.calls))}</td>
+            <td class="dim num">${esc(int(x.calls))}</td>
             <td>${num(x.failed) ? `<span class="led err"></span> ${esc(int(x.failed))}` : '<span class="dim">0</span>'}</td>
-            <td class="dim">${esc(`${int(x.tokensIn)} / ${int(x.tokensOut)}`)}</td>
+            <td class="dim num">${esc(`${int(x.tokensIn)} / ${int(x.tokensOut)}`)}</td>
             <td>${esc(fmtCost(x.cost))}</td>
           </tr>`;
       }).join("");
@@ -249,7 +249,7 @@ window.BAI_CARDS["traffic-page"] = {
         return `<tr>
             <td>${esc(nameOfKey(x.key))}</td>
             <td>${bar(maxChTok ? num(x.tokens) / maxChTok : null, tone, tip)}</td>
-            <td class="dim">${esc(int(x.calls))}</td>
+            <td class="dim num">${esc(int(x.calls))}</td>
             <td>${num(x.failed) ? `<span class="led err"></span> ${esc(int(x.failed))}` : '<span class="dim">0</span>'}</td>
             <td class="dim">${esc(avg)}</td>
             <td>${esc(fmtCost(x.cost))}</td>
@@ -297,7 +297,7 @@ window.BAI_CARDS["traffic-page"] = {
 
       body.innerHTML = `
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">按天</h2>
+          <h2 style="font-size:13px">按天</h2>
           <span class="note">最近 ${esc(days.length)} 天${days.length > DAY_ROWS ? `（表里只列最近 ${DAY_ROWS} 天）` : ""} · 条长是 token 用量，颜色是那天的健康度</span>
         </div>
         <table class="route" style="table-layout:fixed">
@@ -313,7 +313,7 @@ window.BAI_CARDS["traffic-page"] = {
         </table>
 
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">每家流量</h2>
+          <h2 style="font-size:13px">每家流量</h2>
           <span class="note">谁扛了请求、扛得怎么样、花了多少${channels.length > CH_ROWS ? `（只列前 ${CH_ROWS} 家，共 ${channels.length} 家）` : ""}</span>
         </div>
         <table class="route" style="table-layout:fixed">
@@ -329,7 +329,7 @@ window.BAI_CARDS["traffic-page"] = {
         </table>
 
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">会话亲和</h2>
+          <h2 style="font-size:13px">会话亲和</h2>
           <span class="note">这段对话粘在哪一家、粘在哪个号上 · 共 ${esc(int(aTot.sessions || 0))} 个会话 / ${esc(int(aTot.sticks || 0))} 次粘住${sessions.length > SESSION_ROWS ? `（只列最近 ${SESSION_ROWS} 个）` : ""}</span>
         </div>
         <table class="route" style="table-layout:fixed">

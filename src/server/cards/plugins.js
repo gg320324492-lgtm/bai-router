@@ -91,7 +91,7 @@ window.BAI_CARDS["plugins"] = {
 
       const errHtml = errors.length ? `
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">装不上的声明</h2>
+          <h2 style="font-size:13px">装不上的声明</h2>
           <span class="note">${errors.length} 份</span>
         </div>
         ${errors.map((e) => `<div class="hint" style="margin-top:6px;padding:10px 12px;border:1px solid var(--line);border-radius:9px">
@@ -189,7 +189,7 @@ window.BAI_CARDS["plugins"] = {
       if (!list.length && !errors.length) { box.innerHTML = ""; return; }
       box.innerHTML = `
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">middleware 插件</h2>
+          <h2 style="font-size:13px">middleware 插件</h2>
           <span class="note">声明式的请求改写 · 装在 <span class="mono">${esc(String(mw.dir || ""))}</span></span>
         </div>
         <div class="fpline">
@@ -249,7 +249,7 @@ window.BAI_CARDS["plugins"] = {
       const dir = String(cp.dir || "");
       box.innerHTML = `
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">代码插件</h2>
+          <h2 style="font-size:13px">代码插件</h2>
           <span class="note">真代码 · 跑在<b>子进程</b>里（有权限模型与超时封顶）· 装在 <span class="mono">${esc(dir)}</span></span>
         </div>
         ${list.length ? "" : `<div class="hint" style="margin:2px 0 8px">
@@ -260,7 +260,7 @@ window.BAI_CARDS["plugins"] = {
         ${list.map((p) => {
           const perms = Array.isArray(p.permissions) ? p.permissions : [];
           return `<div class="fpline" style="align-items:flex-start">
-            <span class="k">${esc(String(p.name || p.id))}<br><span class="mono dim" style="font-size:10.5px">${esc(String(p.id || ""))}</span></span>
+            <span class="k">${esc(String(p.name || p.id))}<br><span class="mono dim" style="font-size: 11px">${esc(String(p.id || ""))}</span></span>
             <span class="v">${esc(stateOf(p.status))} · 单次超时 ${num(p.timeoutMs)}ms
               ${perms.length ? `<div class="hint" style="margin-top:4px">${perms.map((x) => esc(String(x.label || x.kind || ""))).join("<br>")}</div>` : ""}
             </span>

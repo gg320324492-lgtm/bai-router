@@ -56,7 +56,7 @@ window.BAI_CARDS["gateway-switch"] = {
           <div class="fpline"><span class="k">网关端口</span><span class="v" data-role="gw-port">—</span></div>
           <div class="result" data-role="gw-result"></div>
           <div class="sechead" style="margin:16px 0 4px">
-            <h2 style="font-size:12px">可分流的渠道</h2>
+            <h2 style="font-size:13px">可分流的渠道</h2>
             <span class="note" data-role="gw-chcount"></span>
           </div>
           <div data-role="gw-chans"></div>

@@ -204,7 +204,7 @@ window.BAI_CARDS["price-table"] = {
       el.innerHTML = `
         <div class="sechead" style="margin-top:6px">
           <h2>单价表</h2>
-          <span class="note">快照 <span class="mono">${esc(pricedAt || "—")}</span>${source ? " · 来源：" + esc(source) : ""}</span>
+          <span class="note">快照 <span class="num">${esc(pricedAt || "—")}</span>${source ? " · 来源：" + esc(source) : ""}</span>
           <span class="spacer"></span>
           ${refreshing ? '<span class="pill brand">正在更新…</span>' : ""}
           ${pill}
@@ -239,7 +239,7 @@ window.BAI_CARDS["price-table"] = {
           pickPrice(e, "cacheRead", "cache_read"),
           pickPrice(e, "cacheWrite", "cache_write"),
         ].map(fmtPrice);
-        const tds = cells.map((c) => `<td${c.title ? ` title="${esc(c.title)}"` : ""}>${c.txt === "—" ? '<span class="dim">—</span>' : '<span class="mono">' + esc(c.txt) + "</span>"}</td>`).join("");
+        const tds = cells.map((c) => `<td${c.title ? ` title="${esc(c.title)}"` : ""}>${c.txt === "—" ? '<span class="dim">—</span>' : '<span class="num">' + esc(c.txt) + "</span>"}</td>`).join("");
         return `<tr>
             <td>${esc(sp.vendor)}</td>
             <td><span class="mono">${esc(sp.model)}</span></td>

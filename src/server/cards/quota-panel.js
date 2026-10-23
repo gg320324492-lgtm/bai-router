@@ -201,7 +201,7 @@ window.BAI_CARDS["quota-panel"] = {
           ? '<span class="pill ok" style="font-size:10px">当前</span>'
           : '<span class="pill idle" style="font-size:10px">配置</span>';
         const tierCell = r.tier
-          ? `${badge} <span class="mono">${e(r.tierLabel)}</span> <span class="dim">（${e(r.tier)}）</span>`
+          ? `${badge} <span>${e(r.tierLabel)}</span> <span class="dim mono">（${e(r.tier)}）</span>`
           : badge;
         const modelCell = r.model
           ? `<span>${e(r.modelName)}</span> <span class="dim mono">${e(r.model)}</span>`
@@ -223,9 +223,9 @@ window.BAI_CARDS["quota-panel"] = {
          *   ⚠ **已经知道的数优先于「在读」**：后台换新目录时那一格不该闪一下
          *   「读目录中…」—— 那会让用户以为刚才是没有倍率。 */
         const creditsCell = r.free
-          ? `<span class="mono"${titleAttr}>免费</span>` + (r.creditsKnown ? ' <span class="dim">（x0.00）</span>' : "")
+          ? `<span${titleAttr}>免费</span>` + (r.creditsKnown ? ' <span class="dim">（<span class="num">x0.00</span>）</span>' : "")
           : (r.creditsKnown
-            ? `<span class="mono"${titleAttr}>${e(r.credits)}</span>`
+            ? `<span class="num"${titleAttr}>${e(r.credits)}</span>`
             : (r.catalogLoading
               ? '<span class="dim">读目录中…</span>'
               : `<span class="dim" title="${e([r.catalogError || "这份目录里没有这个模型的倍率", prov].filter(Boolean).join(" · "))}">倍率未知</span>`));
@@ -484,20 +484,20 @@ window.BAI_CARDS["quota-panel"] = {
               : '<span class="led idle"></span> —'));
         const budgetCell = !b
           ? '<span class="dim">未设预算</span>'
-          : `<span class="mono">${int(used)} / ${int(limit)}</span> <span class="dim">（${pct}%）</span>`;
+          : `<span class="num">${int(used)} / ${int(limit)}</span> <span class="dim">（<span class="num">${pct}%</span>）</span>`;
         const limitCell = !b
           ? "—"
-          : [b.hourly ? `每小时 ${int(b.hourly)}` : "", b.daily ? `每天 ${int(b.daily)}` : ""].filter(Boolean).join(" · ") || "—";
+          : [b.hourly ? `每小时 <span class="num">${int(b.hourly)}</span>` : "", b.daily ? `每天 <span class="num">${int(b.daily)}</span>` : ""].filter(Boolean).join(" · ") || "—";
         /* ⚠ 探不到时**只写「探不到」**，完整原因放进 title。
          *   原来把整句原因（一句能有两行）直接印在表里，八行一模一样地铺开 ——
          *   表格被一堵字墙占满，真正要看的「余额」那一列反而看不见了。 */
         const probe = r.probe
           ? (r.probe.known
-            ? `<span class="mono">${int(r.probe.used)} / ${r.probe.limit != null ? int(r.probe.limit) : "—"}</span> <span class="dim">（上游报）</span>`
+            ? `<span class="num">${int(r.probe.used)} / ${r.probe.limit != null ? int(r.probe.limit) : "—"}</span> <span class="dim">（上游报）</span>`
             : `<span class="dim" title="${esc(String(r.probe.error || "原因不明"))}">探不到</span>`)
           : '<span class="dim">未探测</span>';
         const cost = r.cost
-          ? (r.cost.known ? `<span class="mono">$${num(r.cost.total).toFixed(4)}</span>` : '<span class="dim">估不出</span>')
+          ? (r.cost.known ? `<span class="num">$${num(r.cost.total).toFixed(4)}</span>` : '<span class="dim">估不出</span>')
           : '<span class="dim">—</span>';
         return `<tr>
             <td>${esc(String(r.name || r.key || ""))}</td>
@@ -505,7 +505,7 @@ window.BAI_CARDS["quota-panel"] = {
             <td>${budgetCell}</td>
             <td>${probe}</td>
             <td>${cost}</td>
-            <td>${state}${r.restUntil ? ` <span class="dim">${esc(fmtLeft(r.restUntil))}</span>` : ""}</td>
+            <td>${state}${r.restUntil ? ` <span class="dim num">${esc(fmtLeft(r.restUntil))}</span>` : ""}</td>
           </tr>`;
       }).join("");
       body.innerHTML = `
@@ -520,7 +520,7 @@ window.BAI_CARDS["quota-panel"] = {
           </tr></thead>
           <tbody>${trs}</tbody>
         </table>
-        ${(data && data.pricedAt) ? `<div class="hint" style="margin-top:10px">单价表快照：<span class="mono">${esc(String(data.pricedAt))}</span>（价格会随厂商调价漂移；估不出的模型显示「—」，不拿别的价顶替）</div>` : ""}`;
+        ${(data && data.pricedAt) ? `<div class="hint" style="margin-top:10px">单价表快照：<span class="num">${esc(String(data.pricedAt))}</span>（价格会随厂商调价漂移；估不出的模型显示「—」，不拿别的价顶替）</div>` : ""}`;
     }
 
     async function load() {

@@ -136,7 +136,7 @@ window.BAI_CARDS["limits"] = {
       }).join("");
       body.innerHTML = `
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">当前占用</h2>
+          <h2 style="font-size:13px">当前占用</h2>
           <span class="note">在途 / 上限 · 排队 · 被拒 · 漏还</span>
         </div>
         <table class="route" style="table-layout:fixed">
@@ -175,7 +175,7 @@ window.BAI_CARDS["limits"] = {
       }).join("");
       box.innerHTML = `
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">额度预算</h2>
+          <h2 style="font-size:13px">额度预算</h2>
           <span class="note">单位是 token（不是钱）· 用完了这家会自己歇到窗口重置</span>
         </div>
         <table class="route" style="table-layout:fixed">

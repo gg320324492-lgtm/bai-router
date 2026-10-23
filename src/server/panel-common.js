@@ -1336,7 +1336,7 @@
         const t = (stOf(key).token) || {};
         const keys = Array.isArray(t.keys) ? t.keys : [];
         stBox.innerHTML = (keys.length
-          ? `<span class="fp mono">${keys.map((k) => esc(k.fp) + (k.active ? " ◂ 在用" : "")).join(" · ")}</span>`
+          ? `<span class="fp mono">${keys.map((k) => esc(k.fp) + (k.active ? ` <span class="ui-font">◂ 在用</span>` : "")).join(" · ")}</span>`
           : `<span class="fp">一把都没有</span>`);
         if (!q(".keybox", act)) {
           act.innerHTML = `<button class="btn sm" type="button" data-act="keys">编辑三把 key</button>`

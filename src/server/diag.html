@@ -7,18 +7,21 @@
   :root {
     --bg: #16171b; --panel: #1d1f25; --line: #2c2f39; --amber: #e8a33d;
     --err: #e05d5d; --ink: #e8e6df; --dim: #8b8e9a;
-    --mono: "Cascadia Mono", Consolas, monospace; --sans: "Segoe UI", "Microsoft YaHei", sans-serif;
+    --mono: "Cascadia Mono", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace;
+    --sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 14px; padding: 40px 24px; }
+  body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 13px; padding: 40px 24px; }
   .wrap { max-width: 640px; margin: 0 auto; }
-  h1 { font-size: 18px; display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  h1 { font-size: 16px; display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err); box-shadow: 0 0 8px rgba(224,93,93,.7); }
   .sub { color: var(--dim); margin-bottom: 24px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
   .row { display: flex; gap: 10px; padding: 5px 0; font-size: 13px; }
-  .k { color: var(--dim); width: 130px; flex: none; font-family: var(--mono); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; padding-top: 2px; }
-  .v { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+  /* .k 是**标签**（软件版本 / Windows / 服务运行时…），不是标识符 → UI 字体。
+     .v 与 #logBox 才是机器读的东西（版本号、端口、错误原文、日志）→ 等宽。 */
+  .k { color: var(--dim); width: 130px; flex: none; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; padding-top: 2px; }
+  .v { font-family: var(--mono); font-size: 13px; word-break: break-all; }
   .v.bad { color: #e8a7a7; }
   .btns { display: flex; gap: 12px; margin-top: 20px; flex-wrap: wrap; }
   button { font-family: var(--sans); cursor: pointer; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--ink); padding: 9px 18px; font-size: 13px; }

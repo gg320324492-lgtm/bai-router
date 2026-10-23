@@ -212,7 +212,7 @@ window.BAI_CARDS["usage-ledger"] = {
 
       body.innerHTML = `
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">按渠道</h2>
+          <h2 style="font-size:13px">按渠道</h2>
           <span class="note">请求数与 token（输入 + 输出）</span>
         </div>
         <table class="route" style="table-layout:fixed">
@@ -221,7 +221,7 @@ window.BAI_CARDS["usage-ledger"] = {
         </table>
 
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">按模型</h2>
+          <h2 style="font-size:13px">按模型</h2>
           <span class="note">${models.length > MODEL_MAX ? `只列前 ${MODEL_MAX} 个（共 ${models.length} 个）` : "按请求数排序"}</span>
         </div>
         <table class="route" style="table-layout:fixed">
@@ -230,7 +230,7 @@ window.BAI_CARDS["usage-ledger"] = {
         </table>
 
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">最近请求</h2>
+          <h2 style="font-size:13px">最近请求</h2>
           <span class="note">最新 ${Math.min(recent.length, RECENT_MAX)} 条${recs.length > RECENT_MAX ? "（后端只保留最近 200 条）" : ""}</span>
         </div>
         <table class="route" style="table-layout:fixed">

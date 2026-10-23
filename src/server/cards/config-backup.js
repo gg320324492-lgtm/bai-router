@@ -48,7 +48,7 @@ window.BAI_CARDS["config-backup"] = {
           <div class="fpline"><span class="k">备份目录</span><span class="v mono" data-role="b-dir">—</span></div>
           <div data-role="b-list"></div>
           <div class="sechead" style="margin:16px 0 4px">
-            <h2 style="font-size:12px">导出</h2>
+            <h2 style="font-size:13px">导出</h2>
             <span class="note">导出的文件里<b>有</b>你的真实凭据，所以必须加密</span>
           </div>
           <div class="fpline">

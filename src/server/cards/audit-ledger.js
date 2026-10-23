@@ -198,7 +198,7 @@ window.BAI_CARDS["audit-ledger"] = {
 
       body.innerHTML = `
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">按归类</h2>
+          <h2 style="font-size:13px">按归类</h2>
           <span class="note">失败被归成了什么 —— 这一栏最说明问题</span>
         </div>
         <table class="route" style="table-layout:fixed">
@@ -207,7 +207,7 @@ window.BAI_CARDS["audit-ledger"] = {
         </table>
 
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">按渠道</h2>
+          <h2 style="font-size:13px">按渠道</h2>
           <span class="note">谁在扛请求、谁在拖后腿</span>
         </div>
         <table class="route" style="table-layout:fixed">
@@ -216,7 +216,7 @@ window.BAI_CARDS["audit-ledger"] = {
         </table>
 
         <div class="sechead" style="margin:16px 0 4px">
-          <h2 style="font-size:12px">最近尝试</h2>
+          <h2 style="font-size:13px">最近尝试</h2>
           <span class="note">最新 ${Math.min(recent.length, RECENT_MAX)} 条</span>
         </div>
         <table class="route" style="table-layout:fixed">

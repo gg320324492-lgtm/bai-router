@@ -87,8 +87,8 @@ window.BAI_CARDS["model-catalog"] = {
         return;
       }
       bits.push(p.ready
-        ? `<span class="lvl ok" style="font-size:10px">补丁已装</span><span>${p.patched}/${p.found} 个 worker 副本</span>`
-        : `<span class="lvl warn" style="font-size:10px">补丁未装</span><span>发现 ${p.found} 个 worker 副本</span>`);
+        ? `<span class="lvl ok" style="font-size:10px">补丁已装</span><span><span class="num">${p.patched}/${p.found}</span> 个 worker 副本</span>`
+        : `<span class="lvl warn" style="font-size:10px">补丁未装</span><span>发现 <span class="num">${p.found}</span> 个 worker 副本</span>`);
       /* 令牌文件还没刷新 = **还没发生**（客户端没开或没发请求），不是出错。 */
       let stateBlock = "";
       if (p.tokenFresh) {

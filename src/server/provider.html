@@ -59,7 +59,7 @@
   <!-- ===================== 顶栏：品牌 + 视图分段导航 ===================== -->
   <header class="top">
     <span class="logo-dot"></span>
-    <h1 id="h1"><span id="h1Text">路由台</span><small id="h1Sub"></small></h1>
+    <h1 id="h1"><span id="h1Text">路由台</span></h1>
 
     <!-- 视图分段。data-view 必须与清单 window.BAI_VIEWS[].id 一一对应，
          也就是 URL hash 段（#/console · #/channels · #/fo · #/settings · #/quota · #/traffic）。C9 逐个核对。
@@ -218,7 +218,7 @@
           <div id="catSource" class="catsrc dim">模型目录：未拉取过，点「刷新模型列表」获取</div>
           <div class="editor" id="mapPanel">
             <div class="edhead">
-              <div class="mono-badge" id="mapBadge">—</div>
+              <div class="map-badge" id="mapBadge">—</div>
               <div>
                 <h3 id="mapTitle">路由表 · 模型映射</h3>
                 <div class="sub" id="mapSub">四档全部指向本渠道自己的模型名</div>
@@ -238,7 +238,7 @@
                 <h4>须知</h4>
                 <!-- 该渠道的接线后说明（清单 wireHint 已退役，这里留给渲染层按渠道生成） -->
                 <div class="note-b" id="patchHint"></div>
-                <div class="fpline"><span class="k">本渠道中转</span><span class="v"><span id="hintRelayPort"></span></span></div>
+                <div class="fpline"><span class="k">本渠道中转</span><span class="v num"><span id="hintRelayPort"></span></span></div>
               </aside>
             </div>
             <div class="edfoot">
@@ -364,7 +364,7 @@
 
   <footer>
     <span class="paths" id="footPaths"></span>
-    <span id="verTxt" class="mono"></span>
+    <span id="verTxt"></span>
   </footer>
 
   <!-- 插槽：cards/*.js 的默认落点（视图级归位由渲染层的 mountCards 决定） -->

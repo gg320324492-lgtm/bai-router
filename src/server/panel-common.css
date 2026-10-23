@@ -69,8 +69,19 @@
   --bad-text: #FFB3B0;
   --on-ok: #06210F;
 
-  --sans: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
-  --mono: "Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+  /* 界面文字。Windows 11 上 "Segoe UI Variable Text" 是可变字体的正文实例：
+     比 "Segoe UI" 更细一档、密一档，小字号下差别才看得出来；没有它（Win10）
+     再退回 "Segoe UI"。中文落到 "Microsoft YaHei UI"（YaHei 的**界面**字面），
+     不是正文用的 YaHei —— 两者字重不同，混用会让同一行里两半粗细不一致。 */
+  --sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  /* **机器读的东西**：模型 id / 路径 / 文件名 / 密钥值 / JSON / 日志 / diff。
+     等宽在告诉用户「这段是照抄得动、对得上的」—— **不是给开发者看的装饰**。
+     （判据看角色：这段字是机器读的还是人读的。不看它像不像代码。）
+     ⚠ 中文回退**不能少**：等宽字体没有中文字形时，浏览器会落到 generic
+       monospace —— 中文 Windows 上那是**宋体**：细、11px 下没 hinting，
+       跟同一行旁边的 YaHei UI 根本不是一套字（magpie 的 app.css 里记着
+       同一个坑，#690）。 */
+  --mono: "Cascadia Mono", "Cascadia Code", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace;
   color-scheme: dark;
 }
 
@@ -150,7 +161,28 @@ body {
   background: var(--bg);
   min-height: 100vh;
 }
-code, .mono, .zh.mono { font-family: var(--mono); }
+/* ── 字体只用两族，界线就一条 ────────────────────────────────────────────
+ *
+ * `.mono` = 这段字是一个**标识符**（模型 id、路径、文件名、密钥值、哈希、
+ *   会话 id）→ 等宽，因为用户要照着它抄、要比对它、要对齐它。
+ *
+ * 其余一律用 UI 字体：说明文字、状态词（就绪/免费/未配置）、标签、按钮、
+ * 纯数字。magpie 用的是同一条规矩 —— 它的 .key（密钥标签）基类是等宽，
+ * 但凡是变成状态词的（.key.free 免费、.key.none）就专门覆盖回 UI 字体。
+ *
+ * ⚠ 别把等宽当"显得技术"的装饰。字体种类越少，界面越安静。
+ */
+code, .mono { font-family: var(--mono); }
+
+/* 数字对齐：**等宽数字**就够，不必把整行换成等宽字体（magpie 用的就是这个
+   —— .kpi b / .chart .labels / .quota-balance b 等处都是
+   `font-variant-numeric: tabular-nums`，不是换字体）。 */
+.num { font-variant-numeric: tabular-nums; }
+
+/* 「这段字回到 UI 字体」——嵌在等宽块里的**状态词**用它。
+   magpie 的做法一模一样：.key（密钥标签）基类是等宽，但 .key.free（免费）
+   单独覆盖回 UI 字体。 */
+.ui-font { font-family: var(--sans); }
 
 .app { max-width: 1480px; margin: 0 auto; padding: 0 22px 80px; position: relative; z-index: 1; }
 /* 固定在视口上的品牌色柔光，铺在所有内容之下 */
@@ -185,7 +217,6 @@ body.no-frame .top { padding-right: 0; }
   background: var(--brand); box-shadow: 0 0 10px var(--brand-line);
 }
 h1 { display: flex; align-items: baseline; gap: 10px; font-size: 15px; font-weight: 700; letter-spacing: .3px; white-space: nowrap; }
-h1 small { font-family: var(--mono); font-size: 10.5px; color: var(--dim); letter-spacing: 2px; font-weight: 400; }
 
 /* 分段导航：一条 --panel 轨道，选中项是 --panel3 的小药丸 */
 .tabs {
@@ -195,7 +226,7 @@ h1 small { font-family: var(--mono); font-size: 10.5px; color: var(--dim); lette
 }
 .tabs button {
   padding: 6px 15px; border: 0; background: transparent;
-  border-radius: 7px; font-size: 12.5px; font-weight: 600; color: var(--dim);
+  border-radius: 7px; font-size: 13px; font-weight: 600; color: var(--dim);
   cursor: pointer; white-space: nowrap; transition: color .14s;
   font-family: inherit;
 }
@@ -210,7 +241,7 @@ html[data-theme="light"] .tabs button.on { box-shadow: 0 1px 2px rgba(16, 24, 40
 
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
-  font-size: 11.5px; color: var(--ink2);
+  font-size: 12px; color: var(--ink2);
   border: 1px solid var(--line); background: var(--panel);
   border-radius: 99px; padding: 4px 10px; white-space: nowrap;
 }
@@ -229,7 +260,7 @@ html[data-theme="light"] .tabs button.on { box-shadow: 0 1px 2px rgba(16, 24, 40
 
 .tgl {
   border: 1px solid var(--line); background: var(--panel); border-radius: 99px;
-  padding: 5px 12px; font-size: 11.5px; color: var(--ink2);
+  padding: 5px 12px; font-size: 12px; color: var(--ink2);
   cursor: pointer; box-shadow: var(--sh); transition: .14s;
   display: inline-flex; align-items: center; gap: 6px;
 }
@@ -266,8 +297,8 @@ body.no-frame .winCtrls { display: none; }
   font-size: 10px; letter-spacing: 1.1px; color: var(--dim);
   text-transform: uppercase; margin-bottom: 5px; display: block;
 }
-.gauge .val { font-size: 16px; font-weight: 650; display: flex; align-items: center; gap: 7px; letter-spacing: -.1px; }
-.gauge .sub { font-size: 11px; color: var(--dim); margin-top: 3px; font-family: var(--mono); }
+.gauge .val { font-size: 16px; font-weight: 650; display: flex; align-items: center; gap: 7px; letter-spacing: -.1px; font-variant-numeric: tabular-nums; }
+.gauge .sub { font-size: 11px; color: var(--dim); margin-top: 3px; }
 .gauge .sub:empty { display: none; }
 
 /* 状态灯：语义色的发光圆点。
@@ -293,10 +324,10 @@ body.no-frame .winCtrls { display: none; }
 
 /* 两端接线的单元：比别的单元多一行「谁在用」 */
 .gauge.patch .who { margin-bottom: 5px; }
-.gauge.patch .who .n { font-size: 10.5px; color: var(--dim); font-family: var(--mono); }
+.gauge.patch .who .n { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
 .gauge.patch .keyfp { display: block; font-size: 10px; color: var(--dim); margin-top: 2px; font-family: var(--mono); cursor: help; }
 .badge {
-  font-size: 10.5px; font-weight: 650; letter-spacing: .4px;
+  font-size: 11px; font-weight: 650; letter-spacing: .4px;
   padding: 2.5px 8px; border-radius: 6px; white-space: nowrap;
   border: 1px solid transparent; display: inline-flex; align-items: center; gap: 5px;
 }
@@ -309,13 +340,13 @@ body.no-frame .winCtrls { display: none; }
 .verdict {
   display: flex; align-items: center; gap: 12px;
   padding: 10px 16px; border-top: 1px solid var(--line);
-  background: var(--panel2); font-size: 12.5px; color: var(--ink2); flex-wrap: wrap;
+  background: var(--panel2); font-size: 13px; color: var(--ink2); flex-wrap: wrap;
 }
 .verdict .kicker {
   flex: none; font-size: 10px; letter-spacing: 1.1px; color: var(--dim);
   text-transform: uppercase; border-right: 1px solid var(--line2); padding-right: 12px;
 }
-.verdict .spacer { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--dim); }
+.verdict .spacer { margin-left: auto; font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
 
 .acts {
   display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
@@ -328,7 +359,7 @@ body.no-frame .winCtrls { display: none; }
    ========================================================================== */
 .sechead { display: flex; align-items: baseline; gap: 10px; margin: 0 2px 11px; flex-wrap: wrap; }
 .sechead h2 { font-size: 13px; font-weight: 700; letter-spacing: .2px; }
-.sechead .note { font-size: 11.5px; color: var(--dim); }
+.sechead .note { font-size: 12px; color: var(--dim); }
 .sechead .spacer { margin-left: auto; }
 /* 配色说明那一行：直接演示状态色的用法 */
 .sechead .sem-ok { color: var(--ok); }
@@ -337,7 +368,7 @@ body.no-frame .winCtrls { display: none; }
    它们不是"实时"，看起来和实时目录一样中立会让人误信（v1.0.71 实测踩过：
    同一渠道能拿到两份互相不一致的目录，没标出处就无法判断该信哪一份）。 */
 .catsrc {
-  font-size: 11.5px; color: var(--ink2);
+  font-size: 12px; color: var(--ink2);
   margin: -4px 2px 10px; line-height: 1.6;
 }
 .catsrc b { font-weight: 650; }
@@ -385,7 +416,7 @@ body.no-frame .winCtrls { display: none; }
   background: var(--panel);
   color: var(--ink);
   font: inherit;
-  font-size: 12.5px;
+  font-size: 13px;
   text-align: left;
   cursor: pointer;
   transition: border-color .14s, background .14s;
@@ -404,7 +435,7 @@ body.no-frame .winCtrls { display: none; }
   width: 26px; height: 26px; border-radius: 8px; flex: none;
   background: var(--panel3); border: 1px solid var(--line);
   display: grid; place-items: center;
-  font-family: var(--mono); font-size: 10px; font-weight: 700; color: var(--ink2);
+  font-size: 10px; font-weight: 700; color: var(--ink2);
 }
 .chan-row.sel .letter { background: var(--panel); border-color: var(--brand-line); color: var(--brand); }
 .chan-row .cr-name {
@@ -427,7 +458,7 @@ body.no-frame .winCtrls { display: none; }
 .cr-meter-fill.warn { background: var(--warn); }
 .cr-meter-fill.err { background: var(--err); }
 /* 探不到用量：显示「—」而不是一条空条（空条会被读成「用了 0%」）。 */
-.cr-meter-empty { font-size: 10.5px; color: var(--dim); font-family: var(--mono); }
+.cr-meter-empty { font-size: 11px; color: var(--dim); }
 
 .chan-row .cr-state { display: flex; justify-content: flex-end; }
 /* 药丸在窄栏里要小一号，否则一行放不下（名字 + 条 + 药丸 = 268px 的极限）。 */
@@ -449,11 +480,11 @@ body.no-frame .winCtrls { display: none; }
   width: 28px; height: 28px; border-radius: 8px; flex: none;
   background: var(--panel3); border: 1px solid var(--line);
   display: grid; place-items: center;
-  font-family: var(--mono); font-size: 10.5px; font-weight: 700; color: var(--ink2);
+  font-size: 11px; font-weight: 700; color: var(--ink2);
 }
 .chh-name { font-size: 15px; font-weight: 700; letter-spacing: .2px; }
 .chh-tier {
-  font-size: 10.5px; font-weight: 650; letter-spacing: .2px;
+  font-size: 11px; font-weight: 650; letter-spacing: .2px;
   padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor;
 }
 .chh-tier.ok { color: var(--ok); }
@@ -461,10 +492,10 @@ body.no-frame .winCtrls { display: none; }
 .chh-tier.err { color: var(--err); background: var(--err-soft); }
 .chh-caveat { font-size: 11px; color: var(--warn); }
 .chh-relay {
-  font-family: var(--mono); font-size: 10.5px; color: var(--dim);
+  font-family: var(--mono); font-size: 11px; color: var(--dim);
   padding: 2px 8px; border: 1px solid var(--line); border-radius: 7px;
 }
-.chh-sub { font-size: 11.5px; color: var(--dim); margin-top: 4px; padding-left: 37px; }
+.chh-sub { font-size: 12px; color: var(--dim); margin-top: 4px; padding-left: 37px; }
 /* 「接通这家」按钮：抬头右端。禁用态由按钮自己带（未配置时不可接通）。 */
 .chh-apply { margin-left: auto; }
 .chh-apply:disabled { opacity: .5; cursor: not-allowed; }
@@ -480,10 +511,10 @@ body.no-frame .winCtrls { display: none; }
   display: flex; align-items: center; gap: 12px;
   padding: 13px 16px; border-bottom: 1px solid var(--line); background: var(--panel2);
 }
-.edhead .mono-badge {
+.edhead .map-badge {
   width: 27px; height: 27px; border-radius: 8px; flex: none;
   background: var(--brand-soft); border: 1px solid var(--brand-line); color: var(--brand);
-  display: grid; place-items: center; font-family: var(--mono); font-size: 10px; font-weight: 700;
+  display: grid; place-items: center; font-size: 10px; font-weight: 700;
 }
 .edhead h3 { font-size: 13px; font-weight: 700; }
 .edhead .sub { font-size: 11px; color: var(--dim); }
@@ -493,7 +524,7 @@ body.no-frame .winCtrls { display: none; }
 .edmain { padding: 6px 16px 16px; border-right: 1px solid var(--line); min-width: 0; }
 .edaside { padding: 13px 16px 16px; background: var(--panel2); display: flex; flex-direction: column; gap: 11px; }
 .edaside h4 { font-size: 11px; letter-spacing: 1px; color: var(--dim); text-transform: uppercase; font-weight: 700; }
-.note-b { font-size: 11.5px; color: var(--ink2); line-height: 1.85; }
+.note-b { font-size: 12px; color: var(--ink2); line-height: 1.85; }
 
 .edfoot {
   display: flex; align-items: center; gap: 10px;
@@ -501,14 +532,14 @@ body.no-frame .winCtrls { display: none; }
 }
 .edfoot .spacer { margin-left: auto; }
 
-.fpline { display: flex; gap: 9px; align-items: center; font-size: 11.5px; color: var(--ink2); padding: 2.5px 0; }
-.fpline .k { color: var(--dim); flex: none; font-size: 10.5px; }
-.fpline .v { font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
-.fpline .v.zh { font-family: inherit; font-size: 11.5px; }
-/* 状态词（已安装 / 未安装 / 检测失败）：不是路径，所以不吃 .v 的等宽与截断。 */
-.fpline .v.ok { font-family: inherit; font-size: 11.5px; color: var(--ok); }
-.fpline .v.err { font-family: inherit; font-size: 11.5px; color: var(--err); }
-.fpline .v.warn { font-family: inherit; font-size: 11.5px; color: var(--warn); }
+.fpline { display: flex; gap: 9px; align-items: center; font-size: 12px; color: var(--ink2); padding: 2.5px 0; }
+.fpline .k { color: var(--dim); flex: none; font-size: 11px; }
+.fpline .v { font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+.fpline .v.zh { font-size: 12px; }
+/* 状态词（已安装 / 未安装 / 检测失败）：颜色说话，不用再靠字体强调。 */
+.fpline .v.ok { font-size: 12px; color: var(--ok); }
+.fpline .v.err { font-size: 12px; color: var(--err); }
+.fpline .v.warn { font-size: 12px; color: var(--warn); }
 
 /* 传输方式开关（v1.0.75 · cards/oc-transport.js）：两个可选项各一行，
    前置条件逐条写死——「能不能打开」和「打开要什么」必须摆在同一个视野里，
@@ -523,11 +554,11 @@ body.no-frame .winCtrls { display: none; }
 .ocopt .checks { padding-top: 2px; }
 .ocopt .body { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
 .ocopt .t { font-size: 12px; font-weight: 650; color: var(--ink); }
-.ocopt .d { font-size: 11.5px; color: var(--ink2); line-height: 1.7; }
-.ocopt .n { font-size: 11.5px; color: var(--dim); line-height: 1.7; }
+.ocopt .d { font-size: 12px; color: var(--ink2); line-height: 1.7; }
+.ocopt .n { font-size: 12px; color: var(--dim); line-height: 1.7; }
 .ocopt .lvl:empty { display: none; }
 
-.checks { display: flex; gap: 8px; font-size: 11.5px; color: var(--dim); user-select: none; align-items: center; }
+.checks { display: flex; gap: 8px; font-size: 12px; color: var(--dim); user-select: none; align-items: center; }
 .checks label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .checks input { accent-color: var(--brand); }
 
@@ -541,9 +572,9 @@ table.route th {
 }
 table.route td { padding: 9px 8px; border-bottom: 1px dashed var(--line); vertical-align: middle; font-size: 12px; }
 table.route tr:last-child td { border-bottom: none; }
-table.route td .tier { font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+table.route td .tier { font-family: var(--mono); font-size: 13px; color: var(--ink); }
 table.route td .zh { font-size: 11px; color: var(--dim); }
-table.route td .arrow { color: var(--brand); font-family: var(--mono); }
+table.route td .arrow { color: var(--brand); }
 table.route td:nth-child(1) { width: 34%; }
 table.route td:nth-child(2) { width: 38%; }
 table.route td.dim, .dim { color: var(--dim); }
@@ -552,7 +583,6 @@ select, input[type=text], input[type=password] {
   background: var(--panel2); color: var(--ink);
   border: 1px solid var(--line); border-radius: 8px;
   padding: 7px 10px; font-size: 12px; outline: none; transition: .14s;
-  font-family: var(--mono);
 }
 select:hover, input[type=text]:hover, input[type=password]:hover { border-color: var(--line2); }
 select:focus, input[type=text]:focus, input[type=password]:focus {
@@ -578,14 +608,14 @@ input.custom { width: 100%; margin-top: 4px; }
 .dbar:hover { background: var(--panel2); }
 .dbar .chev { transition: transform .2s; color: var(--dim); font-size: 10px; }
 .diagdrawer.open .dbar .chev { transform: rotate(180deg); }
-.dbar .t { font-size: 12.5px; font-weight: 700; letter-spacing: .2px; }
+.dbar .t { font-size: 13px; font-weight: 700; letter-spacing: .2px; }
 .dbar .mini { display: flex; gap: 5px; }
-.dbar .sum { font-size: 11.5px; color: var(--dim); margin-left: auto; }
+.dbar .sum { font-size: 12px; color: var(--dim); margin-left: auto; }
 .dbody { display: none; padding: 0 16px 16px; }
 .diagdrawer.open .dbody { display: block; }
 .diagdrawer.open .dbar { border-bottom: 1px solid var(--line); }
 .dhead { display: flex; align-items: center; gap: 10px; padding: 14px 0 12px; }
-.dhead .ttl { font-size: 12.5px; font-weight: 700; }
+.dhead .ttl { font-size: 13px; font-weight: 700; }
 .dhead .hint { font-size: 11px; color: var(--dim); }
 
 .stream { border: 1px solid var(--line); border-radius: 11px; overflow: hidden; background: var(--panel2); }
@@ -600,8 +630,8 @@ input.custom { width: 100%; margin-top: 4px; }
 .ditem .dot.warn { background: var(--warn); box-shadow: 0 0 8px rgba(240, 179, 65, .6); }
 .ditem .dot.err { background: var(--err); box-shadow: 0 0 8px rgba(255, 107, 102, .6); }
 .ditem .dx { min-width: 0; }
-.ditem .dt { font-size: 11.5px; color: var(--ink); font-weight: 650; line-height: 1.6; }
-.ditem .dm { font-size: 11.5px; color: var(--ink2); line-height: 1.7; white-space: pre-wrap; margin-top: 2px; }
+.ditem .dt { font-size: 12px; color: var(--ink); font-weight: 650; line-height: 1.6; }
+.ditem .dm { font-size: 12px; color: var(--ink2); line-height: 1.7; white-space: pre-wrap; margin-top: 2px; }
 
 /* ============================================================================
    10. 面板盒（凭据 / 故障转移 / 设置的容器）
@@ -614,14 +644,14 @@ input.custom { width: 100%; margin-top: 4px; }
   display: flex; align-items: center; gap: 11px;
   padding: 13px 16px; border-bottom: 1px solid var(--line); background: var(--panel2);
 }
-.pb-head h3 { font-size: 12.5px; font-weight: 700; }
+.pb-head h3 { font-size: 13px; font-weight: 700; }
 .pb-head .sub { font-size: 11px; color: var(--dim); }
 .pb-head .spacer { margin-left: auto; }
 
 .fieldset { padding: 6px 16px 15px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; }
 .fld { display: flex; flex-direction: column; gap: 4px; }
-.fld > label { font-size: 10.5px; letter-spacing: .9px; color: var(--dim); text-transform: uppercase; }
+.fld > label { font-size: 11px; letter-spacing: .9px; color: var(--dim); text-transform: uppercase; }
 .fld input { width: 100%; }
 .saverow { display: flex; gap: 10px; margin-top: 12px; align-items: center; flex-wrap: wrap; }
 .chntable { padding: 0 4px 4px; }
@@ -660,11 +690,11 @@ input.custom { width: 100%; margin-top: 4px; }
 .credhead .cl { display: flex; gap: 9px; align-items: center; flex: none; min-width: 0; }
 .credhead .cl .letter { width: 25px; height: 25px; border-radius: 8px; font-size: 10px; cursor: pointer; }
 .credhead .clname {
-  font-size: 12.5px; font-weight: 650; min-width: 0;
+  font-size: 13px; font-weight: 650; min-width: 0;
   max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .credhead .kindbadge {
-  font-size: 10.5px; font-weight: 650; color: var(--ink2);
+  font-size: 11px; font-weight: 650; color: var(--ink2);
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   padding: 2.5px 7px; flex: none; white-space: nowrap;
 }
@@ -688,7 +718,7 @@ input.custom { width: 100%; margin-top: 4px; }
 .credbody { display: none; flex-wrap: wrap; align-items: flex-start; gap: 9px 14px; padding: 0 16px 13px 50px; }
 .credrow.open .credbody { display: flex; }
 .credbody .ck { flex: 1 1 240px; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.credbody .cpath { font-family: var(--mono); font-size: 10.5px; color: var(--dim); font-weight: 400; }
+.credbody .cpath { font-family: var(--mono); font-size: 11px; color: var(--dim); font-weight: 400; }
 .credbody .cpath:empty { display: none; }
 .credbody .chint { font-size: 11px; color: var(--dim); line-height: 1.6; }
 /* 证据那一块左对齐：它是一段话，右对齐的折行很难读。
@@ -702,7 +732,7 @@ input.custom { width: 100%; margin-top: 4px; }
 
 .keybox { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 .keybox .kn {
-  font-family: var(--mono); font-size: 10.5px; color: var(--dim);
+  font-size: 11px; color: var(--dim);
   width: 16px; flex: none; text-align: right;
 }
 .keybox input { flex: 1; min-width: 0; }
@@ -716,13 +746,13 @@ input.custom { width: 100%; margin-top: 4px; }
   font-family: var(--mono); color: var(--ink2); padding: 2px 0;
 }
 .keyrow-inline .n { color: var(--dim); width: 34px; flex: none; }
-.keyrow-inline input { flex: 1; min-width: 0; font-size: 11.5px; }
+.keyrow-inline input { flex: 1; min-width: 0; font-size: 12px; }
 .keyrow-inline .live { color: var(--ok); font-family: inherit; white-space: nowrap; }
 
 /* 卡片挂进凭据行里的内容 */
 .cardbody { border-top: 1px dashed var(--line); padding-top: 11px; }
 .tcap { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 9px; }
-.tcap .k { font-size: 11.5px; font-weight: 650; color: var(--ink); }
+.tcap .k { font-size: 12px; font-weight: 650; color: var(--ink); }
 .tcap .v { font-size: 11px; color: var(--dim); flex: 1; min-width: 160px; }
 
 /* ============================================================================
@@ -741,19 +771,19 @@ input.custom { width: 100%; margin-top: 4px; }
 .jumpalarm[hidden] { display: none; }
 .jumpalarm.warn { border-color: var(--warn); background: var(--warn-soft); }
 .jumpalarm .jhead { display: flex; align-items: center; gap: 9px; }
-.jumpalarm .jhead b { font-size: 13.5px; font-weight: 750; color: var(--bad-text, var(--ink)); line-height: 1.5; }
+.jumpalarm .jhead b { font-size: 13px; font-weight: 750; color: var(--bad-text, var(--ink)); line-height: 1.5; }
 .jumpalarm .jico {
   flex: none; width: 19px; height: 19px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
-  background: var(--err); color: #fff; font-size: 12.5px; font-weight: 800; line-height: 1;
+  background: var(--err); color: #fff; font-size: 13px; font-weight: 800; line-height: 1;
 }
 .jumpalarm.warn .jico { background: var(--warn); color: var(--brand-ink, #0A0C11); }
-.jumpalarm .jlines { font-size: 11.5px; color: var(--ink2); line-height: 1.75; }
-.jumpalarm .jadvice { font-size: 11.5px; color: var(--ink); line-height: 1.7; }
+.jumpalarm .jlines { font-size: 12px; color: var(--ink2); line-height: 1.75; }
+.jumpalarm .jadvice { font-size: 12px; color: var(--ink); line-height: 1.7; }
 
 .fohead { display: flex; align-items: center; gap: 12px; padding: 14px 16px 10px; flex-wrap: wrap; }
 .foheadtxt b { font-size: 13px; font-weight: 700; display: block; }
-.foheadtxt span { font-size: 11.5px; color: var(--dim); }
+.foheadtxt span { font-size: 12px; color: var(--dim); }
 .fohead .spacer { margin-left: auto; }
 .monote { font-size: 11px; color: var(--dim); white-space: nowrap; }
 
@@ -775,16 +805,16 @@ input.custom { width: 100%; margin-top: 4px; }
   border: 1px solid var(--line); background: var(--panel2); border-radius: 10px; padding: 8px 11px;
 }
 .node.first { border-color: var(--brand-line); background: var(--brand-soft); }
-.node .no { font-family: var(--mono); font-size: 10px; color: var(--dim); }
+.node .no { font-size: 10px; color: var(--dim); font-variant-numeric: tabular-nums; }
 .node .nm { font-size: 12px; font-weight: 600; white-space: nowrap; }
 .node .cool {
-  font-family: var(--mono); font-size: 10px; color: var(--warn);
+  font-size: 10px; color: var(--warn); font-variant-numeric: tabular-nums;
   background: var(--warn-soft); border-radius: 4px; padding: 1px 5px;
 }
 .node .ops { display: flex; gap: 3px; }
 .node .ops button {
   width: 20px; height: 20px; border-radius: 6px; border: 1px solid var(--line);
-  background: transparent; color: var(--dim); font-size: 9px; line-height: 1;
+  background: transparent; color: var(--dim); font-size: 10px; line-height: 1;
   display: grid; place-items: center; cursor: pointer; padding: 0;
 }
 .node .ops button:hover:not([disabled]) { color: var(--ink); border-color: var(--line2); background: var(--panel3); }
@@ -822,7 +852,7 @@ button[disabled] { opacity: .42; cursor: not-allowed; transform: none; }
 
 .btn {
   display: inline-flex; align-items: center; gap: 7px;
-  border-radius: 9px; padding: 8px 15px; font-size: 12.5px; font-weight: 600;
+  border-radius: 9px; padding: 8px 15px; font-size: 13px; font-weight: 600;
   border: 1px solid var(--line); background: var(--panel3); color: var(--ink);
   box-shadow: var(--sh);
 }
@@ -832,7 +862,7 @@ button[disabled] { opacity: .42; cursor: not-allowed; transform: none; }
 .btn.primary:hover:not([disabled]) { filter: brightness(1.08); }
 .btn.ghost { background: transparent; color: var(--ink2); box-shadow: none; }
 .btn.ghost:hover:not([disabled]) { color: var(--ink); background: var(--panel2); }
-.btn.sm { padding: 5px 11px; font-size: 11.5px; border-radius: 8px; }
+.btn.sm { padding: 5px 11px; font-size: 12px; border-radius: 8px; }
 .btn-main {
   background: var(--brand); color: var(--brand-ink); font-weight: 700;
   font-size: 13px; padding: 8px 18px; border-radius: 9px; border: 1px solid transparent;
@@ -840,7 +870,7 @@ button[disabled] { opacity: .42; cursor: not-allowed; transform: none; }
 .btn-main:hover:not([disabled]) { filter: brightness(1.08); }
 .btn-sm {
   background: transparent; color: var(--ink2); border-color: var(--line);
-  padding: 5px 11px; font-size: 11.5px; border-radius: 8px;
+  padding: 5px 11px; font-size: 12px; border-radius: 8px;
 }
 .btn-sm:hover:not([disabled]) { color: var(--ink); border-color: var(--line2); background: var(--panel2); }
 #stopBtn { color: var(--err); }
@@ -850,7 +880,7 @@ button[disabled] { opacity: .42; cursor: not-allowed; transform: none; }
    ========================================================================== */
 .result {
   display: none; margin-top: 12px; padding: 10px 14px; border-radius: 9px;
-  font-family: var(--mono); font-size: 11.5px; line-height: 1.7;
+  font-family: var(--mono); font-size: 12px; line-height: 1.7;
   border: 1px solid var(--line); background: var(--panel2);
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
@@ -858,10 +888,10 @@ button[disabled] { opacity: .42; cursor: not-allowed; transform: none; }
 .result.good { border-color: var(--err-soft); color: var(--good-text); background: var(--ok-soft); }
 .result.bad { border-color: var(--err-soft); color: var(--bad-text); background: var(--err-soft); }
 
-.hint { font-size: 11.5px; color: var(--dim); line-height: 1.75; }
+.hint { font-size: 12px; color: var(--dim); line-height: 1.75; }
 .hint b { color: var(--ink2); }
 
-.tokstat { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--dim); }
+.tokstat { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--dim); }
 .tokstat b { color: var(--ink); font-weight: 650; }
 .tokstat b.warn { color: var(--warn); }
 .tokstat .warn { color: var(--warn); }
@@ -882,8 +912,8 @@ button[disabled] { opacity: .42; cursor: not-allowed; transform: none; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .progress .spin { animation: none; } }
-.progress .pTitle { font-size: 12.5px; font-weight: 600; }
-.progress .pDesc { font-size: 11.5px; color: var(--dim); margin-top: 3px; }
+.progress .pTitle { font-size: 13px; font-weight: 600; }
+.progress .pDesc { font-size: 12px; color: var(--dim); margin-top: 3px; }
 
 /* ============================================================================
    15. 视图切换
@@ -899,12 +929,19 @@ main { position: relative; z-index: 1; }
    ========================================================================== */
 footer {
   display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
-  font-family: var(--mono); font-size: 10.5px; color: var(--dim);
+  font-family: var(--mono); font-size: 11px; color: var(--dim);
   position: sticky; bottom: 0; z-index: 10;
   padding: 12px 0 4px; margin-top: 18px; background: var(--bg);
   box-shadow: 0 -1px 0 var(--line), 0 -12px 20px -14px rgba(0, 0, 0, .45);
 }
 footer .paths { flex: 1; min-width: 200px; }
+/* 页脚里两样东西性质不同：路径是标识符（等宽），版本号不是
+   （magpie 的 .ag-ver 就是 UI 字体 + 等宽数字）。 */
+footer #verTxt { font-family: var(--sans); font-variant-numeric: tabular-nums; }
+/* ⚠ 页脚里那三个按钮（检查更新 / 备用升级 / 停止服务）也得单独拎出来：
+   全局 `button { font-family: inherit }`，而页脚是等宽的 —— 于是
+   **按钮文字被顺带拖成等宽**。按钮上的字是人读的话，不是标识符。 */
+footer button { font-family: var(--sans); }
 
 #slot-extra { display: none; }
 
@@ -926,15 +963,15 @@ footer .paths { flex: 1; min-width: 200px; }
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
 @media (prefers-reduced-motion: reduce) { .banner { animation: none; } }
 .banner .t { font-weight: 650; margin-bottom: 4px; }
-.banner-msg { color: var(--ink2); font-size: 11.5px; line-height: 1.65; white-space: pre-wrap; }
+.banner-msg { color: var(--ink2); font-size: 12px; line-height: 1.65; white-space: pre-wrap; }
 .banner .x {
   position: absolute; right: 8px; top: 6px; background: none; border: none;
-  color: var(--dim); cursor: pointer; font-size: 14px; padding: 0;
+  color: var(--dim); cursor: pointer; font-size: 15px; padding: 0;
 }
 .banner .bar { height: 4px; background: var(--line); border-radius: 99px; margin: 8px 0 6px; overflow: hidden; }
 .banner .bar i { display: block; height: 100%; background: var(--brand); width: 0%; transition: width .4s ease; }
 .banner .row { display: flex; gap: 8px; margin-top: 8px; }
-.banner button { font-size: 11.5px; padding: 5px 12px; border-radius: 7px; }
+.banner button { font-size: 12px; padding: 5px 12px; border-radius: 7px; }
 .banner .notes {
   margin: 6px 0 0; padding: 8px 10px; max-height: 34vh; overflow-y: auto;
   background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
@@ -954,7 +991,7 @@ footer .paths { flex: 1; min-width: 200px; }
 .msync-row.openable { cursor: pointer; }
 .msync-row.openable:hover { border-color: var(--line2); background: var(--panel2); }
 .msync-row.open { border-color: var(--brand); }
-.msync-delta { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--dim); white-space: nowrap; }
+.msync-delta { margin-left: auto; font-size: 11px; color: var(--dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .msync-add { color: var(--ok); font-weight: 600; }
 .msync-del { color: var(--err); font-weight: 600; }
 .msync-note { margin-top: 10px; font-size: 11px; color: var(--dim); line-height: 1.6; }
@@ -972,7 +1009,7 @@ footer .paths { flex: 1; min-width: 200px; }
 }
 @media (prefers-reduced-motion: reduce) { .updModalCard { animation: none; } }
 .updModalCard .t { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
-.updModalCard .sub { font-size: 12.5px; color: var(--dim); margin-bottom: 10px; }
+.updModalCard .sub { font-size: 13px; color: var(--dim); margin-bottom: 10px; }
 .updModalCard .bar { height: 4px; background: var(--line); border-radius: 99px; margin: 4px 0 10px; overflow: hidden; flex: none; }
 .updModalCard .bar i { display: block; height: 100%; background: var(--brand); width: 0%; transition: width .4s ease; }
 .updModalCard .notesWrap { display: flex; flex-direction: column; min-height: 0; margin-bottom: 14px; }
@@ -989,6 +1026,31 @@ footer .paths { flex: 1; min-width: 200px; }
 /* ============================================================================
    18. 响应式
    ========================================================================== */
+
+/* 顶栏在窄窗口会撑破视口（2026-10-23 字体轮实测）。
+ *
+ *   顶栏 = logo + 品牌 + 七个分段 + 服务胶囊 + 主题钮，自然宽度约 805px；
+ *   而应用的**最小宽度是 720px**（src/main.js 的 minWidth）。720~810px
+ *   这一段里 .topright 被硬顶到视口右边之外 —— 用户看不见主题钮，
+ *   也看不见「服务还在不在跑」。
+ *
+ *   ⚠ 下面 @media (max-width: 700px) 里那条 .top 折行规则**够不着这段**：
+ *     窗口最小 720px，那条规则在真机上从来不生效（只有 480px 的
+ *     a11y 自测会撞上它）。所以这里单独给一段 ≥720px 能命中的断点。
+ *
+ *   做法是让它折行，而不是让右边那几样被推出屏幕 —— 折行时七个分段
+ *   仍在第一行，右边的胶囊与主题钮落到第二行右对齐，一样都看得见。 */
+@media (max-width: 820px) {
+  .top { height: auto; flex-wrap: wrap; padding-bottom: 10px; gap: 12px; }
+}
+
+/* 极窄窗口（手机宽度那种，a11y 自测会撞上 480px）：七个分段按钮的**内边距**
+   收一收，七个都要看得见 —— 宁可挤一点也不让最后一个被推出屏幕。
+   （.tabs 是 flex:none，不会自己缩；字号收档后它比原来宽了约 10px。） */
+@media (max-width: 560px) {
+  .tabs button { padding: 6px 10px; }
+}
+
 @media (max-width: 1300px) {
   .edgrid { grid-template-columns: 1fr; }
   .edmain { border-right: none; border-bottom: 1px solid var(--line); }
@@ -1037,7 +1099,7 @@ footer .paths { flex: 1; min-width: 200px; }
    而"这条路有坑"正是 warn 的语义。 */
 .ccaveat {
   margin: 0 14px 8px; padding: 5px 9px;
-  font-size: 10.5px; line-height: 1.6;
+  font-size: 11px; line-height: 1.6;
   color: var(--warn); background: var(--warn-soft);
   border-radius: 7px; cursor: help;
 }
@@ -1054,7 +1116,7 @@ footer .paths { flex: 1; min-width: 200px; }
 
 /* 量条：一条细轨 + 一段填充 + 一个百分比 */
 .bkit-meter { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
-.bkit-meter-label { font-size: 10.5px; color: var(--dim); white-space: nowrap; }
+.bkit-meter-label { font-size: 11px; color: var(--dim); white-space: nowrap; }
 .bkit-meter-track {
   flex: 1 1 60px; min-width: 40px; height: 5px; border-radius: 99px;
   background: var(--panel3); overflow: hidden; display: inline-block; vertical-align: middle;
@@ -1065,8 +1127,9 @@ footer .paths { flex: 1; min-width: 200px; }
 .bkit-meter-fill.err { background: var(--err); }
 .bkit-meter-fill.idle { background: var(--idle); }
 .bkit-meter-pct {
-  font-size: 10.5px; color: var(--dim); font-family: var(--mono);
+  font-size: 11px; color: var(--dim);
   min-width: 34px; text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 /* 顶部横条：五格（服务 / 当前接的 / 流量 / 用量 / 额度） */
@@ -1080,8 +1143,8 @@ footer .paths { flex: 1; min-width: 200px; }
   display: block; font-size: 10px; letter-spacing: 1.1px; color: var(--dim);
   text-transform: uppercase; margin-bottom: 4px;
 }
-.bkit-strip-val { display: flex; align-items: center; gap: 7px; font-size: 14.5px; font-weight: 640; color: var(--ink); }
-.bkit-strip-sub { display: block; font-size: 11px; color: var(--dim); margin-top: 2px; font-family: var(--mono); }
+.bkit-strip-val { display: flex; align-items: center; gap: 7px; font-size: 15px; font-weight: 640; color: var(--ink); font-variant-numeric: tabular-nums; }
+.bkit-strip-sub { display: block; font-size: 11px; color: var(--dim); margin-top: 2px; }
 .bkit-strip-sub:empty { display: none; }
 
 /* 渠道热力图：一家一格 */
@@ -1095,11 +1158,11 @@ footer .paths { flex: 1; min-width: 200px; }
 .bkit-heat-cell:hover { border-color: var(--line2); background: var(--panel3); }
 .bkit-heat-top { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .bkit-heat-name {
-  font-size: 12.5px; font-weight: 620; color: var(--ink);
+  font-size: 13px; font-weight: 620; color: var(--ink);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .bkit-heat-meter { display: block; margin-top: 8px; }
-.bkit-heat-meta { font-size: 10.5px; color: var(--dim); margin-top: 6px; font-family: var(--mono); }
+.bkit-heat-meta { font-size: 11px; color: var(--dim); margin-top: 6px; }
 .bkit-heat-empty { color: var(--dim); font-size: 12px; padding: 10px 0; }
 
 /* ── 三态：空 / 错 / 加载 ──────────────────────────────────────────────
@@ -1128,8 +1191,8 @@ footer .paths { flex: 1; min-width: 200px; }
 }
 @media (prefers-reduced-motion: reduce) { .bkit-state-spin { animation: none; } }
 .bkit-state-main { min-width: 0; }
-.bkit-state-text { font-size: 12.5px; color: var(--ink); line-height: 1.55; }
-.bkit-state-hint { font-size: 11.5px; color: var(--ink2); margin-top: 4px; line-height: 1.6; }
+.bkit-state-text { font-size: 13px; color: var(--ink); line-height: 1.55; }
+.bkit-state-hint { font-size: 12px; color: var(--ink2); margin-top: 4px; line-height: 1.6; }
 .bkit-state-detail { font-size: 11px; color: var(--dim); margin-top: 4px; line-height: 1.6; word-break: break-word; }
 .bkit-state-empty .bkit-state-icon { background: var(--idle-soft); color: var(--idle); }
 .bkit-state-error .bkit-state-icon { background: var(--err-soft); color: var(--err); }
@@ -1147,7 +1210,7 @@ footer .paths { flex: 1; min-width: 200px; }
   position: absolute; left: 8px; top: -60px; z-index: 999;
   padding: 9px 14px; border-radius: 9px;
   background: var(--brand); color: var(--brand-ink);
-  font-size: 12.5px; font-weight: 600; text-decoration: none;
+  font-size: 13px; font-weight: 600; text-decoration: none;
   transition: top .12s;
 }
 .skiplink:focus, .skiplink:focus-visible { top: 8px; outline: 2px solid var(--ink); outline-offset: 2px; }
