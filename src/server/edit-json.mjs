@@ -554,13 +554,19 @@ export function delPath(text, path) {
 }
 
 /* 一次改多处：edits 是 [{path, value}] 或 [{path, delete: true}]，按顺序应用。
- * 任一处出错就整体失败（不产出半改的文件）。 */
+ * 任一处出错就整体失败（不产出半改的文件）。
+ * ⚠ 另有 [{path, value, onlyIfAbsent: true}]：**原来就有就跳过**
+ *   （用户自己设的值我们不动）—— Claude Code 的 API_TIMEOUT_MS 走这条。 */
 export function applyEdits(text, edits) {
   const { bom, body } = splitBom(text);
   let cur = body.trim() === "" ? "{}\n" : body;
   let changed = false;
   for (const e of edits || []) {
     if (!e || typeof e.path !== "string") return { ok: false, error: "这条编辑没有键路径" };
+    if (e.onlyIfAbsent) {
+      const hit = getPath(cur, e.path);
+      if (hit.ok && hit.found) continue;
+    }
     const r = e.delete ? delIn(cur, e.path) : setIn(cur, e.path, e.value);
     if (!r.ok) return r;
     if (r.changed) changed = true;

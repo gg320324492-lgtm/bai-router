@@ -123,6 +123,10 @@ import { chatModelsPayload } from "./chat-protocol.mjs";
  * 加一个客户端不用改表）。 */
 import { applyClient, revertClient, clientStatus } from "./clients/base.mjs";
 import { allClients, clientById } from "./clients/registry.mjs";
+/* Claude Code 的 env 键怎么算（纯函数）：server.mjs 的 applyToCli 与 clients/ 层
+ * 共用同一份逻辑 —— 那段里有不少有历史教训的讲究（占位符、档位 vs 最终模型名），
+ * 重写一遍等于把教训重新踩一遍。 */
+import { claudeCodeEdits } from "./clients/claude-code-edits.mjs";
 /* Muse Code 的模型清单（clients/muse-models.mjs）：Muse 从 `<base_url 主机>/muse-code/models`
  * 拉清单，不是从 /v1/models ⇒ 没有这个端点，它的清单里就没有我们的模型。 */
 import { buildMuseModels } from "./clients/muse-models.mjs";
@@ -7828,15 +7832,49 @@ function gatewayModelEntries(cfg) {
  *   「写文件」这件事必须能被测试隔离开，否则测试就会动用户的真配置。
  *   生产环境不设这个变量，就是真实的用户目录。
  */
-function clientCtx(cfg) {
+/**
+ * clientCtx —— 接线时给客户端声明的那份上下文。
+ *
+ * ⚠ `provider` = **接哪一家**。客户端不能自己挑模型（Claude Code 的 env 里
+ *   写死一个模型 id），而模型 id 必须是 `provider/档位` ⇒ 得有人指定这一家。
+ *   面板上「接到 X」是按渠道调的，所以这里也跟着按渠道。
+ */
+function clientCtx(cfg, provider) {
   const c = cfg || loadCfg();
+  const P = provider ? resolveChannelKey(provider) : "bai";
   return {
     home: process.env.BAI_CLIENT_HOME || os.homedir(),
     baseUrl: gatewayBaseUrl(c),
     apiKey: "bai-local",
     models: gatewayModelEntries(c).map((e) => ({ id: e.id, label: e.displayName })),
-    providerId: "bai",
+    providerId: P,
     providerName: "B.AI",
+    /* 该渠道的切片（upstream / key / mapping / relayPort）—— 声明里偶尔要用。 */
+    channel: sliceOf(c, P),
+    /* ⚠ **复用现有接线逻辑**的入口：Claude Code 那条线有**很多有历史教训的讲究**
+     *   （走本地中转的渠道写占位符不写真凭据、模型 id 必须是档位而不是最终
+     *   模型名 —— 那条写反过一次）。重写一遍等于把教训重新踩一遍；这里把它
+     *   以「只算要改哪几处、不写盘」的方式交出去，由底座统一备份与还原
+     *   （底座能还原，applyToCli 自己只留指纹、还原不了）。
+     * ⚠ 走**纯函数** claudeCodeEdits（不读文件 —— 底座自己会读，而且读两次
+     *   之间文件可能变，算出来的 edits 就会对不上）。 */
+    cli: {
+      editsFor: (opts = {}) => claudeCodeEdits({
+        tiers: TIERS,
+        gw: true,
+        gatewayBaseUrl: gatewayBaseUrl(c),
+        cliBaseUrl: `http://127.0.0.1:${sliceOf(c, P).relayPort}`,
+        viaLocalRelay: cliViaRelay(sliceOf(c, P)),
+        proxyManagedToken: PROXY_MANAGED_TOKEN,
+        providerId: P,
+        channelId: P,
+        key: sliceOf(c, P).key,
+        mapping: sliceOf(c, P).mapping,
+        defaultModel: sliceOf(c, P).defaultModel,
+        proxy: c.proxy,
+        ...opts,
+      }),
+    },
   };
 }
 
@@ -8527,7 +8565,22 @@ function unreadableSettingsGuidance(bak, detail) {
 }
 
 // 通用：把一个提供方的映射写进 CLI settings.json
-async function applyToCli(S) {
+/**
+ * applyToCli —— 把 Claude Code 接上。
+ *
+ * ⚠ `opts.editsOnly`：**只算要改哪几处、不写盘**，把 edits 交回给调用方。
+ * 这是给 clients/ 层（src/server/clients/claude-code.mjs）用的：它要写的是
+ * **同一批 env 键**，但走底座那套「路径级备份 + 可还原」的流程。
+ * ⚠ 这样做的原因：这段逻辑里有很多**有历史教训的讲究**（读失败不当空、
+ *   走本地中转的渠道写占位符不写真凭据、网关模式模型 id 必须是**档位**而不是
+ *   最终模型名 —— 那条写反过一次，代价是「用户点 opus、跑的是 fable 的模型」）。
+ *   重写一遍等于把那些教训重新踩一遍；复用则一行都不用改。
+ *
+ * ⚠ 它是**同步**的（里面没有 await）：clients/ 层的 `writes` 是同步的。
+ *   现有调用点写的是 `await applyToCli(...)` —— await 一个普通值是合法的，
+ *   行为不变。
+ */
+function applyToCli(S, opts = {}) {
   /* ★ 读原文，不反序列化（v1.0.93 起）。
    *
    * 旧写法：`try { s = readJson(SETTINGS); } catch { s = {} }` + `JSON.stringify(s, null, 2)` 整份写回。
@@ -8547,7 +8600,10 @@ async function applyToCli(S) {
   } catch { /* 文件不存在：从空开始建，这是合法状态 */ }
 
   let env = {};
-  if (existed && text.trim() !== "") {
+  /* ⚠ `editsOnly`：**不读文件**。底座自己会读、而且会检查「读不懂就中止」
+   *   —— 这里再读一遍不但多余，两次读之间文件还可能变了（算出来的 edits
+   *   就会对不上文件里当时的样子）。 */
+  if (!opts.editsOnly && existed && text.trim() !== "") {
     const parsed = parseJsonc(text);
     const root = parsed.ok ? parsed.value : null;
     /* 根不是对象（数组/标量）同样算「读不懂」——Claude Code 那边也不认，
@@ -8584,7 +8640,7 @@ async function applyToCli(S) {
    * ⚠ 网关模式下**一律**写占位符令牌：请求先到网关，网关再用自己的凭据去调上游，
    * 客户端送来的那个 token 对网关没有意义（真写上去反而在用户主目录留了一份明文副本）。
    */
-  const gw = gatewayOn();
+  const gw = opts.forceGateway === true ? true : gatewayOn();
   /* 网关模式：模型 id 写 `provider/档位`（如 `sn/claude-opus-5`），**不是** `provider/最终模型`。
    *
    * ⚠⚠ 为什么是档位而不是最终模型名 —— 这一条曾经写反过，代价是「用户点 opus，
@@ -8602,49 +8658,30 @@ async function applyToCli(S) {
    * 老路（不走网关）保持原样：写最终模型名 —— 那一路客户端送来的就是模型名，
    * 中转按「模型名 → 可用清单」认它，不需要档位。
    */
-  const modelId = (tier, target) => (gw ? `${S.p}/${tier}` : String(target));
-  const edits = [];
-  const setEnv = (k, v) => edits.push({ path: "env." + k, value: v });
-  const delEnv = (k) => edits.push({ path: "env." + k, delete: true });
+  /* ⚠ 网关模式下模型 id 带 **provider 前缀**。Claude Code **不能自己挑模型**
+   *   （env 里写死一个），所以得知道接的是哪一家。
+   *   `opts.provider` 优先 —— clients/ 层知道用户选了谁；没有就用渠道自己的。 */
+  const gwProviderId = String(opts.provider || S.p || "");
+  const edits = claudeCodeEdits({
+    tiers: TIERS,
+    gw,
+    gatewayBaseUrl: gatewayBaseUrl(),
+    cliBaseUrl: cliBaseUrlFor(S),
+    viaLocalRelay,
+    proxyManagedToken: PROXY_MANAGED_TOKEN,
+    providerId: gwProviderId,
+    channelId: S.p,
+    key: S.key,
+    mapping: S.mapping,
+    defaultModel: S.defaultModel,
+    proxy: loadCfg().proxy,
+  });
 
-  setEnv("ANTHROPIC_BASE_URL", gw ? gatewayBaseUrl() : cliBaseUrlFor(S));
-  /* ⚠ 网关模式**不**改令牌：bai/sn 是直连渠道，它们的 handler 会把客户端带来的
-   * authorization 头**透传给上游**——写成占位符就等于把假令牌发给上游了。
-   * 协议桥渠道（wb/qd/or/zen/mm）自己用凭据，不看客户端送来的 token，照旧写占位符。 */
-  setEnv("ANTHROPIC_AUTH_TOKEN", viaLocalRelay ? PROXY_MANAGED_TOKEN : (S.key || "wb-local"));
-  setEnv("ANTHROPIC_MODEL", modelId("claude-haiku-4-5", S.mapping["claude-haiku-4-5"]?.target || S.defaultModel));
-  /* 显示名：只写用户手填的 label，不掺倍率（v1.0.65 撤掉）。
-   *
-   * 仍然不 `delete`：以前是 `delete e[t.envKey + "_NAME"]` —— 我们自己把 Claude Code
-   * 的显示名通道删掉了，于是 /model 里只能看到模型 id。契约 §1.6 实测：
-   * ANTHROPIC_DEFAULT_*_MODEL_NAME 的 label 可塞任意文本，且与模型名是两个独立字段。
-   * 曾经在这里拼过「label · x0.79」（路径 A），实测还有个更麻烦的问题：
-   * 目录里 hy4-preview-f 是 x0.00 而 hy4-preview 是 x0.29，靠前缀回退很容易配错行，
-   * 与其显示一个可能对不上的数字，不如不显示 —— 真实倍率在面板「刷新模型列表」里看。
-   * 模型名（e[t.envKey]）保持上游真名不变，解析链零改动。
-   */
-  for (const t of TIERS) {
-    const m = S.mapping[t.key] || {};
-    const target = m.target || S.defaultModel;
-    setEnv(t.envKey, modelId(t.key, target));
-    // 用户没填 label 就不写这条（留空反而会让 Claude Code 回退显示模型 id，与旧行为一致）
-    if (m.label) setEnv(t.envKey + "_NAME", m.label);
-  }
-  /* 用户自己设过 API_TIMEOUT_MS 就留着（旧写法 `e.API_TIMEOUT_MS = e.API_TIMEOUT_MS || "3000000"`）。 */
-  if (!env.API_TIMEOUT_MS) setEnv("API_TIMEOUT_MS", "3000000");
-  setEnv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
-  setEnv("NODE_USE_ENV_PROXY", "1");
-  if (S.p === "bai" || S.p === "or") {
-    // 出海渠道（B.AI / OpenRouter）：CLI 直连上游时靠 proxy env 出海。
-    // OpenRouter 走的是本地桥（127.0.0.1），但桥自己出海仍要代理——env 留着没坏处。
-    const px = loadCfg().proxy;
-    setEnv("HTTPS_PROXY", px);
-    setEnv("HTTP_PROXY", px);
-  } else {
-    // 境内提供方（SenseNova/WorkBuddy）直连、清空代理（WorkBuddy 桥在本机，NO_PROXY 已覆盖）
-    delEnv("HTTPS_PROXY"); delEnv("HTTP_PROXY");
-  }
-  setEnv("NO_PROXY", "127.0.0.1,localhost");
+  /* ⚠ `editsOnly`：只交回「要改哪几处」，**不写盘**。
+   *   clients/claude-code.mjs 拿它走底座那套「路径级备份 + 可还原」的流程 ——
+   *   好处是**能断开**（applyToCli 自己只留指纹，没有还原）。
+   *   逻辑一行没重写：那些有历史教训的讲究（占位符、档位 vs 最终模型名）都在。 */
+  if (opts.editsOnly) return edits;
 
   const out = applyEdits(text, edits);
   if (!out.ok) throw new Error("改写 " + SETTINGS + " 失败：" + out.error);
@@ -10628,7 +10665,9 @@ async function unknownMappingTargets(p, mapping, cfg) {
       const b = await readBody(req);
       const def = await clientById(b.id);
       if (!def) return json(res, 404, { error: `没有这个客户端：${String(b.id || "")}` });
-      const r = applyClient(def, clientCtx(), { dataDir: DATA_DIR });
+      /* ⚠ `provider` = 接哪一家。Claude Code 这类**不能自己挑模型**的客户端
+       *   需要它（模型 id 必须是 `provider/档位`）。 */
+      const r = applyClient(def, clientCtx(null, b.provider), { dataDir: DATA_DIR });
       return json(res, r.ok ? 200 : 400, r);
     }
     if (req.method === "POST" && u.pathname === "/api/clients/revert") {

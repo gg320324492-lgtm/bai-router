@@ -58,6 +58,7 @@ import path from "node:path";
 
 import { applyClient, revertClient, clientStatus, formatOf } from "../src/server/clients/base.mjs";
 import { allClients } from "../src/server/clients/registry.mjs";
+import { claudeCodeEdits } from "../src/server/clients/claude-code-edits.mjs";
 
 /* ------------------------------------------------------------------ *
  * 统一网关答哪些路径
@@ -83,6 +84,7 @@ const SERVED_PREFIX = ["/v1beta/"];
  *     文件里**不许**冒出网关地址。
  */
 const APPENDS = {
+  "claude-code": "/v1/messages",
   cline: "/chat/completions",
   codebuddy: { complete: true },
   codex: "/responses",
@@ -99,6 +101,7 @@ const APPENDS = {
   morph: "/responses",
   muse: "/responses",
   omp: "/chat/completions",
+  opencode: "/chat/completions",
   pi: "/chat/completions",
   qoder: "/chat/completions",
   "qoder-cn": "/chat/completions",
@@ -191,6 +194,31 @@ const CTX_BASE = {
   models: MODELS,
   providerId: "bai",
   providerName: "B.AI",
+  /* ⚠ Claude Code 那条线**复用**既有的接线逻辑（纯函数 claudeCodeEdits）——
+   *   这里传**真的**那个函数、给假的事实 ⇒ 测的是真的逻辑，不是抄一份。
+   *   （原来那段逻辑住在 server.mjs 里，而 server.mjs 一 import 就起服务 ⇒
+   *   测试没法用；已抽成纯函数，见 clients/claude-code-edits.mjs。） */
+  cli: {
+    editsFor: () => claudeCodeEdits({
+      tiers: [
+        { key: "claude-fable-5", envKey: "ANTHROPIC_DEFAULT_FABLE_MODEL" },
+        { key: "claude-sonnet-5", envKey: "ANTHROPIC_DEFAULT_SONNET_MODEL" },
+        { key: "claude-opus-5", envKey: "ANTHROPIC_DEFAULT_OPUS_MODEL" },
+        { key: "claude-haiku-4-5", envKey: "ANTHROPIC_DEFAULT_HAIKU_MODEL" },
+      ],
+      gw: true,
+      gatewayBaseUrl: BASE_URL,
+      cliBaseUrl: BASE_URL,
+      viaLocalRelay: false,
+      proxyManagedToken: "test-placeholder-proxy",
+      providerId: "bai",
+      channelId: "bai",
+      key: API_KEY,
+      mapping: { "claude-opus-5": { target: "test-target-opus", label: "档·Opus" } },
+      defaultModel: "test-target-default",
+      proxy: "http://127.0.0.1:7897",
+    }),
+  },
 };
 
 /* ------------------------------------------------------------------ *
@@ -356,13 +384,16 @@ describe("客户端接线：每一个都接上 → 读回 → 断开", () => {
           assert.match(s, /^[a-z0-9]+\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/,
             `${def.id}：${fx.f.path} 里有个不像 provider/档位 的模型 id：「${s}」`);
         }
-        /* · 档位不许单独出现（拿档位当模型 id 写出去，网关会静默落到默认模型） */
+        /* · 档位不许单独出现（拿档位当模型 id 写出去，网关会静默落到默认模型）
+         *   ⚠ 前缀**不必是 MODELS 里那一个**：Claude Code 这类**不能自己挑模型**
+         *   的客户端接的是「用户当前选中的渠道」，前缀是那一家（可能是 bai/sn/wb…）。
+         *   判据是「前面有**某个** provider 前缀」，不是「有**那个** provider 前缀」。 */
         for (const m of MODELS) {
           const tier = m.id.slice(m.id.indexOf("/") + 1);
           let at = text.indexOf(tier);
           while (at >= 0) {
             const before = text.slice(Math.max(0, at - 60), at);
-            assert.ok(before.endsWith(`${m.id.slice(0, m.id.indexOf("/"))}/`),
+            assert.ok(/[a-z0-9]+\/$/.test(before),
               `${def.id}：${fx.f.path} 里档位「${tier}」单独出现了（前面没有 provider 前缀）`);
             at = text.indexOf(tier, at + 1);
           }

@@ -229,7 +229,7 @@ export function applyClient(def, ctx, opts = {}) {
       if (before.error) {
         return { ok: false, detail: `读不懂 ${f.path}（${before.error}）—— 宁可不接，也不能把用户写坏` };
       }
-      edits.push({ path: p, before, value: w.value });
+      edits.push({ path: p, before, value: w.value, del: !!w.delete, onlyIfAbsent: !!w.onlyIfAbsent });
       /* ⚠ **父路径的原值也要记**：我们删掉 `providers.bai` 之后，`providers`
        *   会剩下一个**空壳**（edit-json.mjs 的 delPath 只删那个键，不删空父级）。
        *   那个空壳是我们留下的痕迹 —— 断开时必须连它一起收掉，否则用户的文件
@@ -282,7 +282,14 @@ export function applyClient(def, ctx, opts = {}) {
   for (const p of plan) {
     let text = p.text;
     for (const e of p.edits) {
-      const r = p.fmt.setPath(text, e.path, e.value);
+      /* ⚠ `{ path, delete: true }` = **删掉这个键**（与 edit-json.mjs 的
+       *   applyEdits 同一形状）。Claude Code 的接线要靠它清掉
+       *   `HTTPS_PROXY` / `HTTP_PROXY` 这类「不该留」的键。
+       * ⚠ `{ path, value, onlyIfAbsent: true }` = **原来没有才写**
+       *   （原来有就留着用户的值）—— Claude Code 的 `API_TIMEOUT_MS` 走这条：
+       *   用户自己设过就不动它。 */
+      if (e.onlyIfAbsent && e.before.existed) continue;
+      const r = e.del ? p.fmt.delPath(text, e.path) : p.fmt.setPath(text, e.path, e.value);
       if (!r.ok) {
         return { ok: false, detail: `写 ${p.file.path} 的 ${e.path} 失败：${r.error}` };
       }
