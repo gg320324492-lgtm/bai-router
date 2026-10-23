@@ -47,6 +47,16 @@
 //     （只有模型清单那一串是整串写），用户加的那些键我们压根不碰。
 //   · 没做：jcode 自己的 provider（它的登录档）列进 /model 选择器。
 //
+// ## 保留用户手改（通用合并层）
+//
+// | 字段 | 归谁 | 为什么 |
+// | --- | --- | --- |
+// | `providers.bai.models[].context_window` | **用户的** | 窗口是「用户可能手改」的字段（设计稿 §2.2(a)）—— 我们那个值是兜底不是真值 |
+// | `providers.bai.models[].id` / `.input` | 我们的 | 模型 id 集合机器该管（§2.2(a)）；`input` 是「至少收文本」的下限断言 |
+// | `providers.bai.type` / `base_url` / `api_key` / `requires_api_key` | 我们的 | 方言、地址与令牌是机器该管的（§2.2(a)）—— 照写、不比对 |
+// | `provider.default_provider` / `default_model` | 我们的 | 用哪一家、哪一档是机器该管的（与地址是一对） |
+// | 用户自己加的模型条目 | **保留用户的** | 数组合并那一层（我们逐条认 id，认不出的原样留着） |
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
@@ -104,7 +114,18 @@ export const jcodeClient = {
             { path: "providers.bai.base_url", value: gwV1(ctx) },
             { path: "providers.bai.api_key", value: ctx.apiKey || "" },
             { path: "providers.bai.requires_api_key", value: true },
-            { path: "providers.bai.models", value: modelList(ctx) },
+            /* ⚠ **模型清单逐条合并**（通用合并层）：用户自己加的模型留着、位置
+             *   不变，我们那几条**就地**合并。识别键是模型 id（`id`）—— 逐条唯一。
+             *   归属：`context_window`（窗口）**归用户** —— 我们那个 128000 是兜底
+             *   不是真值，拿它盖掉用户自己调的会让 jcode **提前截断**上下文
+             *   （设计稿 §2.2(a)「窗口是用户可能手改的字段」；代价见 §2.2(d)）。
+             *   `id` 与 `input` 是我们的（模型 id 集合机器该管；`input` 是
+             *   「至少收文本」这个下限断言）。 */
+            {
+              path: "providers.bai.models",
+              value: modelList(ctx),
+              merge: { mode: "array", key: "id", theirs: ["context_window"] },
+            },
             { path: "provider.default_provider", value: "bai" },
             { path: "provider.default_model", value: pick.id },
           ];

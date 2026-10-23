@@ -24,6 +24,9 @@
 //
 //   · 做了：models.json 的 providers.<我们的 id>（含模型清单）+ settings.json 的
 //     defaultProvider / defaultModel。
+//   · 做了**保留用户手改**：用户在 Pi 里改过的 **provider 显示名**与**模型显示名**
+//     留着；用户自己加的模型条目原样留着、位置不变；用户自己在 provider 里加的
+//     键（compat 之类）也留着。归属表见下面 writes 那几处的注释。
 //   · 做了 magpie 的 enabledModels 处理：**用户自己有那份清单时**，把我们的模型
 //     加进去（Pi 的 Ctrl+P 循环与 /scoped-models 只认清单里的东西 —— 不加，
 //     选中的模型永远轮不到）；**用户没有那份清单时，不新建**（magpie：
@@ -72,19 +75,35 @@ export const piClient = {
         path: models,
         writes: () => {
           pickModel(ctx);
-          const provider = {
-            name: ctx.providerName || "B.AI",
+          /* ⚠ **逐键写，不整块写**（magpie theirsKept 的那一层）：
+           *   用户在 `providers.<我们>` 里自己加的键（pi-cache-optimizer 加的
+           *   `compat.sendSessionAffinityHeaders` 之类，magpie agents.go:435
+           *   记着这一条）**留着** —— 整块写会把它们盖掉。
+           *   ⚠ 模型清单**单独一条写**：它是个**数组**，通用合并层的数组合并只作用
+           *   在「这条 write 的值根」上 ⇒ 数组必须自己是根，才谈得上「逐条合并」。 */
+          return [
+            /* provider 的**显示名**归用户（设计稿 §2.2(a)）—— 根模式：
+             *   标量没法用子路径表达归属 ⇒ 整个值逐值比对，一样就不动，
+             *   不一样**用户的赢**。 */
+            {
+              path: `providers.${pid}.name`,
+              value: ctx.providerName || "B.AI",
+              merge: { theirs: [""] },
+            },
             /* Pi 按 baseUrl + /chat/completions 问 —— 统一网关答这个路径。 */
-            baseUrl: ctx.baseUrl,
+            { path: `providers.${pid}.baseUrl`, value: ctx.baseUrl },
             /* 说 Chat Completions 方言（Pi 的 api 字段就是这么写的） */
-            api: "openai-completions",
-            apiKey: ctx.apiKey || "",
-            models: (ctx.models || []).map((m) => ({
-              id: m.id,
-              name: m.label || m.id,
-            })),
-          };
-          return [{ path: `providers.${pid}`, value: provider }];
+            { path: `providers.${pid}.api`, value: "openai-completions" },
+            { path: `providers.${pid}.apiKey`, value: ctx.apiKey || "" },
+            /* ⚠ **模型清单逐条合并**：用户自己加的模型留着、位置不变，我们那几条
+             *   **就地**合并（用户改过的显示名留着；模型 id 换回我们的）。
+             *   识别键是模型 id（`id`）—— 逐条唯一。 */
+            {
+              path: `providers.${pid}.models`,
+              value: (ctx.models || []).map((m) => ({ id: m.id, name: m.label || m.id })),
+              merge: { mode: "array", key: "id", theirs: ["name"] },
+            },
+          ];
         },
         wired: (text, fmt) => {
           const r = fmt.getPath(text, `providers.${pid}`);

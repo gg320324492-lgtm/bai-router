@@ -37,6 +37,17 @@
 //   · 没做：magpie 对 **Cline 桌面版**那一层（它在 web view 的 localStorage 里
 //     挑 provider 与模型，根本不读这两个文件）。
 //
+// ## 保留用户手改（通用合并层）
+//
+// | 字段 | 归谁 | 为什么 |
+// | --- | --- | --- |
+// | models.json 的 `providers.openai-compatible.provider.name` | **用户的** | 用户在 Cline 里改过的 provider 显示名留着（设计稿 §2.2(a)） |
+// | models.json 的 `providers.openai-compatible.models.<模型 id>.name` | **用户的** | 用户改过的模型显示名留着（同上） |
+// | models.json 的模型 id（表名与 `.id`） | 我们的 | 模型 id 集合是机器该管的（§2.2(a)） |
+// | providers.json 里我们没写的键（`settings.reasoning` 思考档…） | **保留用户的** | 弱保留那一层（我们没写 ⇒ 留着；magpie cline.go:409-429 同款） |
+// | `settings.apiKey` / `baseUrl` / `model` / `headers.User-Agent`、`provider.baseUrl` / `defaultModelId` | 我们的 | 地址、令牌、方言与「用哪一档」是机器该管的（§2.2(a)）—— 照写、不比对 |
+// | `lastUsedProvider` | 我们的 | 机器该管的：我们接的就是那个槽位 |
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
@@ -92,7 +103,15 @@ export const clineClient = {
           if (!curValue(files.providers, "json", "version").existed) {
             writes.push({ path: "version", value: 1 });
           }
-          writes.push({ path: `providers.${SLOT}`, value: entry });
+          /* ⚠ **保留用户手改**：这一条整块写下去会把用户在 Cline 里设的
+           *   **思考档**（`settings.reasoning`）、自己加的 headers 一起盖掉。
+           *   ⇒ 挂一份「弱保留」的合并声明：`theirs: []` = **没有哪个键显式
+           *   归用户**，但**我们没写的键保留用户的**（合并层的第三层，
+           *   magpie 的 theirsKept 同款）。
+           *   而我们写的那几个键（`settings.apiKey` / `baseUrl` / `model`、
+           *   `headers.User-Agent`）仍然是机器该管的 ⇒ 照写、不比对
+           *   （设计稿 §2.2(a)）。 */
+          writes.push({ path: `providers.${SLOT}`, value: entry, merge: { theirs: [] } });
           writes.push({ path: "lastUsedProvider", value: SLOT });
           return writes;
         },
@@ -127,6 +146,17 @@ export const clineClient = {
               },
               models,
             },
+            /* ⚠ **保留用户手改**（通用合并层）：
+             *   · `provider.name` —— 用户在 Cline 里改过的 provider 显示名留着
+             *     （设计稿 §2.2(a)）。
+             *   · `models.<模型 id>.name` —— 用户改过的模型显示名留着（同上）。
+             *     ⚠ 通配写 `models.*.name`：路径是**相对 value 根**的，而这条
+             *       write 的 value 根**就是** `providers.openai-compatible` 那个
+             *       对象 ⇒ `models` 下面才是模型表 ⇒ `models.*.name` 匹配得上。
+             *   · 模型 id（`models` 的表名与 `models.<id>.id`）是机器该管的 ⇒
+             *     换回我们的；用户自己加的模型条目原样留着（弱保留那一层）。
+             *   · `provider.baseUrl` / `defaultModelId` 是机器该管的 ⇒ 照写。 */
+            merge: { theirs: ["provider.name", "models.*.name"] },
           });
           return writes;
         },

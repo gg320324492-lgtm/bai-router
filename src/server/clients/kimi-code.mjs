@@ -52,6 +52,15 @@
 //     support_efforts / default_effort ——那些是「模型支持什么」的细账，
 //     我们这层只知道模型 id 与显示名。
 //
+// ## 保留用户手改（通用合并层）
+//
+// | 字段 | 归谁 | 为什么 |
+// | --- | --- | --- |
+// | `models."<provider/模型>".display_name` | **用户的** | 用户在 Kimi 的 /model 里改过的显示名留着（设计稿 §2.2(a)）—— 根模式 |
+// | `models."<provider/模型>".max_context_size` | **用户的** | 窗口是「用户可能手改」的字段（§2.2(a)）—— 我们那个值是兜底不是真值 |
+// | `models."<provider/模型>".provider` / `.model`、`providers.bai.*` | 我们的 | 模型 id、地址、令牌与方言是机器该管的（§2.2(a)）—— 照写、不比对 |
+// | `default_model` | 我们的 | 用哪一档是机器该管的（与地址是一对） |
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
@@ -74,11 +83,18 @@ function modelTables(ctx) {
     const t = `models."${modelRef(ctx, m)}"`;
     out.push({ path: `${t}.provider`, value: "bai" });
     out.push({ path: `${t}.model`, value: m.id });
-    out.push({ path: `${t}.display_name`, value: labelOf(m) });
+    /* ⚠ **显示名归用户**（设计稿 §2.2(a)：模型名是「用户可能手改」的字段）——
+     *   用户在 Kimi 的 /model 里改过的名字留着。根模式（`theirs: [""]`）：
+     *   标量没法用子路径表达归属 ⇒ 整个值逐值比对，一样就不动，
+     *   不一样**用户的赢**。 */
+    out.push({ path: `${t}.display_name`, value: labelOf(m), merge: { theirs: [""] } });
     /* Kimi 要一个上下文窗口才肯压缩；128000 是 magpie 同款的**兜底约定**
        （不是实测值）：有真值用真的（m.context），真实上限一旦有来源
-       （渠道目录的 max_input_tokens 之类）就用那个顶掉。 */
-    out.push({ path: `${t}.max_context_size`, value: m.context || 128000 });
+       （渠道目录的 max_input_tokens 之类）就用那个顶掉。
+       ⚠ **窗口归用户**（设计稿 §2.2(a)）—— 那个兜底值不是真值，拿它盖掉用户
+       *   自己调的窗口会让 Kimi **提前压缩**上下文（宁可报大不要报小）。
+       *   代价见 §2.2(d)：真值到位后这个值不会自动更新。 */
+    out.push({ path: `${t}.max_context_size`, value: m.context || 128000, merge: { theirs: [""] } });
   }
   return out;
 }

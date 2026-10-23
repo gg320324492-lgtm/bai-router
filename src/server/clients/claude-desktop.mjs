@@ -43,6 +43,17 @@
 // 那个 token 对网关没有意义。真写上去反而在用户主目录留了一份明文副本
 // （与 claude-code.mjs 同一口径）。
 //
+// ## 保留用户手改（通用合并层）
+//
+// | 字段 | 归谁 | 为什么 |
+// | --- | --- | --- |
+// | `inferenceModels[].labelOverride` | **用户的** | 用户在桌面版里改过的模型显示名留着（设计稿 §2.2(a)） |
+// | `inferenceModels[].name`（模型 id） | 我们的 | 模型 id 集合是机器该管的（§2.2(a)）—— 桌面版把它原样当模型发出去 |
+// | `_meta.json` 的 `entries[].name`（我们那一档的显示名） | **用户的** | 用户给这一档改过的名字留着（§2.2(a)） |
+// | `entries[].id`、`appliedId` | 我们的 | 配置档 id 是机器该管的（底座按文件路径备份与还原，路径得是确定的） |
+// | `inferenceProvider` / `inferenceGatewayBaseUrl` / `inferenceGatewayApiKey` / `inferenceGatewayAuthScheme` | 我们的 | 地址、令牌与鉴权是机器该管的（§2.2(a)）—— 照写、不比对 |
+// | `disableDeploymentModeChooser` / `coworkEgressAllowedHosts` | **保留用户的** | 本来就是「缺了才种」（政策类设置，替用户做主不对） |
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
@@ -121,20 +132,31 @@ function profileWrites(ctx) {
   if (!has("coworkEgressAllowedHosts")) {
     writes.push({ path: "coworkEgressAllowedHosts", value: ["*"] });
   }
-  writes.push({ path: "inferenceModels", value: desktopModels(ctx) });
+  /* ⚠ **模型清单逐条合并**（通用合并层）：用户在桌面版里改过的模型显示名
+   *   （`labelOverride`）留着；模型 id（`name`）是机器该管的 ⇒ 换回我们的。
+   *   识别键是模型 id（`name`）—— 逐条唯一 ⇒ 认得出「我们那一条」。
+   *   用户自己加的模型条目原样留着、位置不变。 */
+  writes.push({
+    path: "inferenceModels",
+    value: desktopModels(ctx),
+    merge: { mode: "array", key: "name", theirs: ["labelOverride"] },
+  });
   return writes;
 }
 
 /** _meta.json：appliedId 指到我们这一档，外加一条我们自己那条 entries。 */
 function metaWrites(ctx) {
   const file = path.join(desktopLibraryDir(ctx), "_meta.json");
-  const cur = curValue(file, "json", "entries");
-  const kept = cur.existed && Array.isArray(cur.value)
-    ? cur.value.filter((e) => !(e && String(e.id || "") === DESKTOP_PROFILE_ID))
-    : [];
   return [
     { path: "appliedId", value: DESKTOP_PROFILE_ID },
-    { path: "entries", value: [...kept, { id: DESKTOP_PROFILE_ID, name: ctx.providerName || "B.AI" }] },
+    /* ⚠ **entries 逐条合并**：用户在桌面版里给**我们这一档**改过的名字留着
+     *   （设计稿 §2.2(a)）；用户自己那一档的条目原样留着、位置不变。
+     *   识别键是配置档 id（`id`）—— 逐条唯一。 */
+    {
+      path: "entries",
+      value: [{ id: DESKTOP_PROFILE_ID, name: ctx.providerName || "B.AI" }],
+      merge: { mode: "array", key: "id", theirs: ["name"] },
+    },
   ];
 }
 

@@ -44,11 +44,12 @@
 //   · 做了：config.toml 的两处 + models.json 的 providers.bai。
 //   · 做了 magpie 用 stash 做的那件事的**等价物**：那几处的原值由底座备份，
 //     断开时只还原那几处。
+//   · 做了**保留用户手改**：用户在 StepCode 里改过的**模型显示名**留着；用户
+//     自己加的模型条目原样留着、位置不变；用户在 `providers.bai` 里自己加的键
+//     也留着 —— 我们**逐键写**，不整块覆盖。
 //   · 没做：enabledModels（一个「哪些模型可用」的范围表）—— magpie 会把我们的
 //     模型追加进去，并在断开时只撤掉自己追加的那几条。我们不碰它（用户自己
 //     那份原样保留）。
-//   · 没做：「用户自己在 models.json 的 providers.magpie 里加的键保留」——
-//     magpie 逐键合并；我们整块写 providers.bai，断开时靠备份原样还原。
 //   · 没做：项目本地的 .stepcode/config.toml 盖在全局之上（那是用户的事）。
 //   · 没做：auth.json（StepCode 自己的登录）—— 不碰。
 //
@@ -76,6 +77,7 @@ function providerEntry(ctx) {
     apiKey: ctx.apiKey || "",
     models: (ctx.models || []).map((m) => ({
       id: m.id,
+      /* ⚠ **显示名归用户**（设计稿 §2.2(a)：模型名是「用户可能手改」的字段） */
       name: labelOf(m),
       /* ⚠ **能力项我们不知道 ⇒ 不写那个键**（不是写 false、也不是写 true）：
        我们的模型 id 是**档位**（provider 无关），而能力由**映射到哪家上游**决定
@@ -116,9 +118,27 @@ export const stepcodeClient = {
       {
         path: path.join(dir, "models.json"),
         format: "json",
-        writes: () => [
-          { path: "providers.bai", value: providerEntry(ctx) },
-        ],
+        writes: () => {
+          const p = providerEntry(ctx);
+          return [
+            /* ⚠ **逐键写，不整块写**（magpie theirsKept 的那一层）：用户在
+               `providers.bai` 里自己加的键留着 —— 整块写会把它们盖掉。
+               ⚠ 模型清单**单独一条写**：它是个**数组**，通用合并层的数组合并只
+               作用在「这条 write 的值根」上 ⇒ 数组必须自己是根。 */
+            { path: "providers.bai.name", value: p.name },
+            { path: "providers.bai.baseUrl", value: p.baseUrl },
+            { path: "providers.bai.api", value: p.api },
+            { path: "providers.bai.apiKey", value: p.apiKey },
+            /* ⚠ **模型清单逐条合并**：用户自己加的模型留着、位置不变，我们那几条
+             *   **就地**合并（用户改过的显示名留着；模型 id 换回我们的）。
+             *   识别键是模型 id（`id`）—— 逐条唯一。 */
+            {
+              path: "providers.bai.models",
+              value: p.models,
+              merge: { mode: "array", key: "id", theirs: ["name"] },
+            },
+          ];
+        },
         wired: (text, fmt) => {
           const r = fmt.getPath(text, "providers.bai");
           return !!(r && r.ok && r.found);

@@ -48,6 +48,15 @@
 //     default_reasoning_effort ——我们这层不知道模型的档位，只写模型本身。
 //   · 没做：「Grok 自己登录账号的模型」也列进 /model（models_cache.json）。
 //
+// ## 保留用户手改（通用合并层）
+//
+// | 字段 | 归谁 | 为什么 |
+// | --- | --- | --- |
+// | `model."<provider/模型>".name` | **用户的** | 用户在 Grok 的 /model 里改过的显示名留着（设计稿 §2.2(a)）—— 根模式 |
+// | `model."<provider/模型>".context_window` | **用户的** | 窗口是「用户可能手改」的字段（§2.2(a)）—— 我们那个值是兜底不是真值，拿它盖用户的会**提前截断**上下文 |
+// | `model."<provider/模型>".model` / `base_url` / `api_key` / `api_backend` | 我们的 | 模型 id、地址、令牌与方言是机器该管的（§2.2(a)）—— 照写、不比对 |
+// | `models.default` / `features.campaigns` | 我们的 | 机器该管的（默认用哪一档、关战役补丁） |
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
@@ -69,13 +78,21 @@ function modelTables(ctx) {
   for (const m of ctx.models || []) {
     const t = `model."${modelRef(ctx, m)}"`;
     out.push({ path: `${t}.model`, value: m.id });
-    out.push({ path: `${t}.name`, value: labelOf(m) });
+    /* ⚠ **显示名归用户**（设计稿 §2.2(a)：模型名是「用户可能手改」的字段）——
+     *   用户在 Grok 的 /model 里改过的名字留着。根模式（`theirs: [""]`）：
+     *   标量没法用子路径表达归属 ⇒ 整个值逐值比对，一样就不动，
+     *   不一样**用户的赢**。 */
+    out.push({ path: `${t}.name`, value: labelOf(m), merge: { theirs: [""] } });
     out.push({ path: `${t}.base_url`, value: gwV1(ctx) });
     out.push({ path: `${t}.api_key`, value: ctx.apiKey || "" });
     out.push({ path: `${t}.api_backend`, value: "chat_completions" });
     /* ⚠ 128000 是**兜底约定**不是实测值：有真值用真的（m.context），真实上限
-       一旦有来源（渠道目录的 max_input_tokens 之类）就用那个顶掉。 */
-    out.push({ path: `${t}.context_window`, value: m.context || 128000 });
+       一旦有来源（渠道目录的 max_input_tokens 之类）就用那个顶掉。
+       ⚠ **窗口归用户**（设计稿 §2.2(a)：窗口是「用户可能手改」的字段）——
+       *   用户手调过的窗口留着：我们那个兜底值只是「不知道真值时的保守值」，
+       *   拿它盖掉用户自己调的窗口，会让 Grok **提前截断**上下文
+       *   （宁可报大不要报小）。代价见 §2.2(d)：真值到位后这个值不会自动更新。 */
+    out.push({ path: `${t}.context_window`, value: m.context || 128000, merge: { theirs: [""] } });
   }
   return out;
 }

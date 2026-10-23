@@ -24,13 +24,14 @@
 // ## 我们这层做了什么 / 没做什么
 //
 //   · 做了：providers 里我们那一条（含模型清单）+ model.name（当前用哪个）。
+//   · 做了**保留用户手改**：用户在 Qoder 里改过的 **provider 显示名**与**模型
+//     显示名**留着；用户自己加的模型条目原样留着、位置不变；用户在这个 provider
+//     上自己设的路由（压缩/摘要/子代理各用哪个模型、首包超时…）也留着 ——
+//     我们**逐键写**，不整块覆盖（magpie 专门为这个写了 qoderKept）。
 //   · 没做：**effort**。magpie 把「这个模型用多大力思考」写进 model.preferences
 //     （1.1.6x 之后）或 model.reasoningEffort（更早的 Qoder）。我们的接线上下文
 //     里没有「这个档位支持哪些 effort」这一项 —— **不猜**：宁可先不给，
 //     也别写一个客户端不认的 effort 值。
-//   · 没做：magpie 的 qoderKept（用户在那个 provider 上自己设的路由 —— 压缩/
-//     摘要/子代理各用哪个模型、首包超时等 —— 保留着）。我们写 provider 那一条时
-//     是**整条覆盖**的；用户改过的那些字段会在断开时由底座原样还回去。
 //   · 没做：magpie 的 Sync（目录变了刷新模型清单）。
 //
 // ## 纪律
@@ -74,20 +75,35 @@ export function qoderDecl({ id, name, note, env, dirName }) {
                  自己的默认（保守），将来有了真值（T15-c 的「模型元数据下发」）再加。 */
               capabilities: { tools: true },
             }));
-            const provider = {
-              displayName: ctx.providerName || "B.AI",
-              /* openai = 说 Chat Completions 方言 ⇒ 统一网关的 /chat/completions */
-              protocol: "openai",
-              baseUrl: ctx.baseUrl,
-              apiKey: ctx.apiKey || "",
-              /* 这个 provider 起在哪个模型上（裸的模型 id，不带 provider 前缀） */
-              model: pick.id,
-              models,
-            };
             return [
-              /* providers.<我们的 id> —— 叶子：我们只占这一个格子，
-                 用户自己的 provider 一个都不动。 */
-              { path: `providers.${pid}`, value: provider },
+              /* ⚠ **逐键写，不整块写**（magpie theirsKept 的那一层）：用户在这个
+                 provider 上自己设的路由（压缩/摘要/子代理各用哪个模型、
+                 firstPayloadTimeoutMs、streamIdleTimeoutMs、type、authType…，
+                 magpie qoder.go:273-284 记着这一堆）**留着** —— 整块写会把它们
+                 盖掉（magpie 专门为这个写了 qoderKept）。
+                 ⚠ 模型清单**单独一条写**：它是个**数组**，通用合并层的数组合并只
+                 作用在「这条 write 的值根」上 ⇒ 数组必须自己是根。 */
+              /* provider 的**显示名**归用户（设计稿 §2.2(a)；magpie qoderKept 同：
+                 用户给这个 provider 起的名字非空就留着）—— 根模式。 */
+              {
+                path: `providers.${pid}.displayName`,
+                value: ctx.providerName || "B.AI",
+                merge: { theirs: [""] },
+              },
+              /* openai = 说 Chat Completions 方言 ⇒ 统一网关的 /chat/completions */
+              { path: `providers.${pid}.protocol`, value: "openai" },
+              { path: `providers.${pid}.baseUrl`, value: ctx.baseUrl },
+              { path: `providers.${pid}.apiKey`, value: ctx.apiKey || "" },
+              /* 这个 provider 起在哪个模型上（裸的模型 id，不带 provider 前缀） */
+              { path: `providers.${pid}.model`, value: pick.id },
+              /* ⚠ **模型清单逐条合并**：用户自己加的模型留着、位置不变，我们那几条
+                 **就地**合并（用户改过的显示名留着；模型 id 换回我们的）。
+                 识别键是模型 id（`model`）—— 逐条唯一。 */
+              {
+                path: `providers.${pid}.models`,
+                value: models,
+                merge: { mode: "array", key: "model", theirs: ["displayName"] },
+              },
               /* 当前用哪个模型 —— "<provider>/<模型 id>"（Qoder 认这个写法）。
                  写叶子：用户 model 里的 reasoningEffort / preferences 保留。 */
               { path: "model.name", value: `${pid}/${pick.id}` },

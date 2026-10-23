@@ -42,6 +42,17 @@
 //   · `capabilities`、后台压缩那套（magpie 写的时候会把用户自己那份保留下来）
 //   · magpie 那个「Codex 自己的 multi_agent_v2 开着会抢多智能体」的通知
 //
+// ## 保留用户手改（通用合并层）
+//
+// | 字段 | 归谁 | 为什么 |
+// | --- | --- | --- |
+// | `model_providers.bai.name` | **用户的** | 用户在 Codex 里改过的 provider 显示名留着（设计稿 §2.2(a)）—— 根模式（标量没法用子路径表达归属） |
+// | `model_providers.bai.base_url` / `wire_api` / `experimental_bearer_token` | 我们的 | 地址、方言与令牌是机器该管的（§2.2(a)）—— 不比对、照写 |
+// | `model` / `model_provider` | 我们的 | 用哪一家、哪一档是机器该管的 |
+//
+// ⚠ **令牌不归用户**（magpie 的 `keptBearerToken` 会把用户自己那把网关 key 留着，
+//   那是合并层没有的能力 —— 我们的合并层只会逐值比对，没有「keyHolds」那一层）。
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
@@ -91,7 +102,13 @@ export const codexClient = {
           { path: "model", value: (ctx.models && ctx.models[0] && ctx.models[0].id) || "" },
         ];
         for (const [k, v] of Object.entries(t)) {
-          out.push({ path: `model_providers.${PID}.${k}`, value: v });
+          const w = { path: `model_providers.${PID}.${k}`, value: v };
+          /* ⚠ **provider 的显示名归用户**（设计稿 §2.2(a)：「模型名」那类
+             *   「用户可能手改」的字段）。根模式（`theirs: [""]`）—— 标量没法
+             *   用子路径表达归属：整个值逐值比对，一样就不动，不一样用户的赢。
+             *   地址 / 方言 / 令牌是机器该管的（§2.2(a)）⇒ 不比对、照写。 */
+          if (k === "name") w.merge = { theirs: [""] };
+          out.push(w);
         }
         return out;
       },

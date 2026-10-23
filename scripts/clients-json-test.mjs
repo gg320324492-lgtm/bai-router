@@ -179,7 +179,11 @@ const CASES = [
       ["providers.my-own.displayName", (v) => v === "我的"],
     ],
     list: {
-      write: "providers.bai",
+      /* ⚠ 2026-10-23：写模型清单的那一处从「整块写 providers.bai」改成了
+         **单独一条写 providers.bai.models**（通用合并层的数组合并只作用在
+         「这条 write 的值根」上 ⇒ 数组必须自己是根；拆开之后用户在这个
+         provider 上自己设的那些键才留得住）。断臂的目标要跟着改。 */
+      write: "providers.bai.models",
       check: [".qoder/settings.json", "providers.bai.models",
         (v) => Array.isArray(v) && v.length === 2 && v[0].model === "sn/claude-opus-5"],
     },
@@ -202,7 +206,8 @@ const CASES = [
       ["providers.my-own.displayName", (v) => v === "我的"],
     ],
     list: {
-      write: "providers.bai",
+      /* 同 qoder：写模型清单的那一处现在是单独一条写（见上面那条注释）。 */
+      write: "providers.bai.models",
       check: [".qoder-cn/settings.json", "providers.bai.models",
         (v) => Array.isArray(v) && v.length === 2],
     },

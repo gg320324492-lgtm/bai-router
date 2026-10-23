@@ -368,18 +368,27 @@ export function applyClient(def, ctx, opts = {}) {
     written.push(p.file.path);
   }
 
-  /* 「保留了你手改」的清单 —— 设计稿 §2.2(b)：**用户赢 + 说一句**，
+  /* 「保留了什么」的清单 —— 设计稿 §2.2(b)：**用户赢 + 说一句**，
    * 不静默、不弹窗（接线是后台动作，弹窗会打断）。
-   * 面板那一格要显示什么，由 server.mjs 那边取 `kept`（这里只负责算出来）。 */
+   * 面板那一格要显示什么，由 server.mjs 那边取 `kept`（这里只负责算出来）。
+   *
+   * ⚠ **`kept` 里有两类，面板要分开说**（2026-10-23 定，见 merge-policy.mjs）：
+   *   · 缺省 `kind` = **theirs** —— 那个键我们本来就会写、但用户改过 ⇒ 让给他
+   *     ⇒ 这才是「你手改的 N 处」。
+   *   · `kind: "unmanaged"` —— **我们压根没写**的键、用户自己有的 ⇒ 弱保留层
+   *     留下的 ⇒ 面板单独列「还留着你自己的 N 个键」。
+   * ⇒ 这一句里的「N 处」**只数 theirs 那组**：把用户压根没改过的东西算进
+   *   「你手改的 N 处」里，那个数就不准了。 */
   const kept = [];
   for (const p of plan) {
     for (const e of p.edits) {
       for (const k of e.kept || []) kept.push(k);
     }
   }
-  const shown = kept.slice(0, 5).map((k) => k.path).join("、");
-  const keptNote = kept.length
-    ? `；保留了你手改的 ${kept.length} 处${shown ? `（${shown}${kept.length > 5 ? " 等" : ""}）` : ""}`
+  const keptTheirs = kept.filter((k) => k.kind !== "unmanaged");
+  const shown = keptTheirs.slice(0, 5).map((k) => k.path).join("、");
+  const keptNote = keptTheirs.length
+    ? `；保留了你手改的 ${keptTheirs.length} 处${shown ? `（${shown}${keptTheirs.length > 5 ? " 等" : ""}）` : ""}`
     : "";
 
   return {

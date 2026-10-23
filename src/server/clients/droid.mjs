@@ -27,6 +27,9 @@
 //   · 做了：customModels 里我们的那几条 + sessionDefaultSettings.model。
 //   · 做了 magpie 的**合并**：用户自己的 customModels 条目留在前面（magpie：
 //     「用户的条目原地不动，在前面」，这样他们自己的 id 不挪位）。
+//   · 做了**保留用户手改**：用户在 Droid 里改过的**模型显示名**留着；改过的 id
+//     换回我们的（模型 id 集合是机器该管的）；用户自己加的条目原样留着、位置
+//     不变。归属表见 DROID_MERGE。
 //   · 没做：每个模型按**它自己那家**的原生协议接（magpie 会看目录里这个模型
 //     是 Anthropic 就写 anthropic + 网关根地址、是 Responses 就写 openai）。
 //     我们统一写 generic-chat-completion-api —— 统一网关把客户端的话翻成
@@ -43,7 +46,7 @@
 //   · 读不懂就不写：文件在但解析失败 ⇒ 底座报错、中止，用户的文件不动。
 
 import path from "node:path";
-import { curValue, pickModel, envDir } from "./json-util.mjs";
+import { pickModel, envDir } from "./json-util.mjs";
 
 /** 配置文件在哪儿。 */
 function droidFile(ctx) {
@@ -73,6 +76,29 @@ function entry(ctx, m, pid) {
   };
 }
 
+/**
+ * DROID_MERGE —— customModels 里**我们那几条**的字段归属（合并层的 spec）。
+ *
+ * 通用合并层（merge-policy.mjs，底座 base.mjs 调用）在写盘前把「我们要写的值」
+ * 与「用户文件里的现值」合并。这个 spec 就是 Droid 的**归属表**：
+ *
+ * | 字段 | 归谁 | 为什么 |
+ * | --- | --- | --- |
+ * | `displayName` | **用户的** | 用户在 Droid 里改过的模型显示名留着（设计稿 §2.2(a)：模型名是「用户可能手改」的字段） |
+ * | `model` / `id` | 我们的 | 模型 id 集合是机器该管的（§2.2(a)）—— 用户改过的 id 会被换回来 |
+ * | `baseUrl` / `apiKey` / `provider` | 我们的 | 地址、令牌与方言是机器该管的（§2.2(a)） |
+ * | 我们没写的键（maxContextLimit…） | **保留用户的** | 弱保留那一层（magpie 的 theirsKept） |
+ *
+ * ⚠ **识别键是 `id`**（`custom:<provider>/<模型 id>`）—— 它**逐条唯一**
+ *   ⇒ 不像 WorkBuddy 那样还要把我们的清单按用户文件里的顺序排好
+ *   （alignOurs 那一套）：合并层直接按 id 认出「我们那一条」。
+ */
+const DROID_MERGE = {
+  mode: "array",
+  key: "id",
+  theirs: ["displayName"],
+};
+
 export const droidClient = {
   id: "droid",
   name: "Droid",
@@ -88,13 +114,12 @@ export const droidClient = {
         writes: () => {
           const pick = pickModel(ctx);
           const ours = (ctx.models || []).map((m) => entry(ctx, m, pid));
-          /* 用户自己的条目留在前面。认「是不是我们的」靠 id 前缀 custom:<pid>/。 */
-          const list = curValue(file, "json", "customModels");
-          const kept = (list.existed && Array.isArray(list.value))
-            ? list.value.filter((e) => !(e && typeof e.id === "string" && e.id.startsWith(`custom:${pid}/`)))
-            : [];
           return [
-            { path: "customModels", value: [...kept, ...ours] },
+            /* ⚠ 合并层在写盘前把它与文件里的现值合并：
+               用户自己的条目原样留着、**位置不变**，我们那几条**就地**合并
+               （用户改过的 displayName 留着；地址/key/模型 id 换成我们的）。
+               归属见 DROID_MERGE。 */
+            { path: "customModels", value: ours, merge: DROID_MERGE },
             /* 当前用哪个模型（叶子：用户 sessionDefaultSettings 里的别的设置留着） */
             { path: "sessionDefaultSettings.model", value: `custom:${pid}/${pick.id}` },
           ];

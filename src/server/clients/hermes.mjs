@@ -72,6 +72,15 @@
 //   · 没做：api_key 写成环境变量引用（${VAR}）与 .env 的那套处理 —— 我们直接写值。
 //   · 没做：agent.reasoning_effort（思考档）—— 我们这层不知道模型的档位。
 //
+// ## 保留用户手改（通用合并层）
+//
+// | 字段 | 归谁 | 为什么 |
+// | --- | --- | --- |
+// | `providers.bai.name`（**映射形状**） | **用户的** | 用户给这个 provider 起的名字留着（magpie hermes.go:307-310 同）—— 根模式 |
+// | `custom_providers[name=bai].name`（**数组形状**） | 我们的 | ⚠ 它是**判别键**（数组元素靠 name 认）—— 它归用户的话，下次接线就认不出那个元素 ⇒ 会多出一个重复条目 |
+// | `base_url` / `api_key` / `api_mode` / `model` / `models` | 我们的 | 地址、令牌、方言与模型 id 集合是机器该管的（设计稿 §2.2(a)）—— 照写、不比对 |
+// | provider 条目里我们没写的键（key_env / key_cmd / enabled / ssl_*…） | **保留用户的** | 我们逐键写，本来就不碰它们（magpie hermes.go:300-304 记着这一堆键） |
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
@@ -165,7 +174,11 @@ export const hermesClient = {
             out.push({ path: `custom_providers[name=${OUR_NAME}].name`, value: fields.name });
           } else {
             /* 映射形状（magpie 的） */
-            out.push({ path: `providers.${OUR_NAME}.name`, value: fields.name });
+            /* ⚠ **provider 的显示名归用户**（magpie hermes.go:307-310 同：
+             *   用户给这个名字起的（providers.magpie.name）非空就留着）。
+             *   根模式（`theirs: [""]`）：标量没法用子路径表达归属 ⇒ 整个值
+             *   逐值比对，一样就不动，不一样**用户的赢**。 */
+            out.push({ path: `providers.${OUR_NAME}.name`, value: fields.name, merge: { theirs: [""] } });
             out.push({ path: `providers.${OUR_NAME}.base_url`, value: fields.base_url });
             out.push({ path: `providers.${OUR_NAME}.api_key`, value: fields.api_key });
             out.push({ path: `providers.${OUR_NAME}.api_mode`, value: fields.api_mode });

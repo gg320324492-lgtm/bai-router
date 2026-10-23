@@ -56,9 +56,18 @@
 //   · 做了：config.yaml 的四处 + custom_providers 那个 JSON。
 //   · 做了 magpie 用 stash 做的那件事的**等价物**：那几处键路径的原值由底座
 //     备份，断开时只还原那几处。
-//   · 没做：用户自己在 custom_providers 里加的 display_name、header 保留
-//     （magpie 逐键合并；我们逐个根键写，display_name 与 header 这两处
-//     我们写自己的值 —— 用户改的那份不会自动跟着回来）。
+//   · 做了**保留用户手改**：
+//     · `providers.bai.enabled`（开关）归用户 —— 用户在 Goose 里关掉的 provider
+//       保持关（设计稿 §2.2(a)；ZCode 同）。
+//     · `custom_providers/bai.json` 的 `display_name`（显示名）归用户。
+//     · 模型清单里的 `context_limit`（窗口）归用户 —— 我们那个 128000 是兜底
+//       不是真值，拿它盖掉用户自己调的会**提前截断**上下文。
+//     · 用户自己在 custom_providers 里加的键保留 —— 我们逐个根键写，本来就不碰
+//       它们（magpie 逐键合并，见 goose.go:161-178）。
+//   · 没做：magpie 那套 `headers` 的**逐键**合并（magpie goose.go:176 把用户的
+//     头并进我们的头里）—— 我们只逐键写 `headers.Authorization`，
+//     用户自己加的别的头键留着，但同一个头键上用户改的值会被我们盖掉
+//     （那是令牌，机器该管的）。
 //   · 没做：老式的扁平键（GOOSE_PROVIDER / GOOSE_MODEL）—— magpie 会在新式的
 //     providers 映射存在时把它们删掉；我们只写新式的那一套。
 //   · 没做：每个模型「会不会思考」的判断（goose 的 `reasoning` 那个键）——
@@ -131,7 +140,10 @@ export const gooseClient = {
           const pick = pickModel(ctx);
           return [
             { path: "active_provider", value: "bai" },
-            { path: "providers.bai.enabled", value: true },
+            /* ⚠ **开关归用户**（设计稿 §2.2(a)：「关掉的开关」是用户手改的东西；
+             *   ZCode 那边的 `enabled` 也是这么归的）。根模式（`theirs: [""]`）：
+             *   用户在 Goose 里把这个 provider 关掉了就让它关着。 */
+            { path: "providers.bai.enabled", value: true, merge: { theirs: [""] } },
             { path: "providers.bai.model", value: pick.id },
             { path: "providers.bai.configured", value: true },
           ];
@@ -151,7 +163,26 @@ export const gooseClient = {
           const out = [];
           for (const [k, v] of Object.entries(p)) {
             if (v === undefined) continue;
-            out.push({ path: k, value: v });
+            /* ⚠ **头逐键写**（不是整块写）：用户自己在 headers 里加的头留着
+             *   （magpie goose.go:176 是逐键合并的）—— 我们只写自己那一个
+             *   Authorization，它本来就是机器该管的（令牌）。
+             *   ⚠ 整块写会把用户加的头整个盖掉。 */
+            if (k === "headers" && v && typeof v === "object") {
+              for (const [hk, hv] of Object.entries(v)) {
+                out.push({ path: `headers.${hk}`, value: hv });
+              }
+              continue;
+            }
+            const w = { path: k, value: v };
+            /* ⚠ **provider 的显示名归用户**（设计稿 §2.2(a)）—— 根模式：
+             *   标量没法用子路径表达归属 ⇒ 整个值逐值比对，一样就不动，
+             *   不一样**用户的赢**。 */
+            if (k === "display_name") w.merge = { theirs: [""] };
+            /* ⚠ **模型清单逐条合并**：用户自己加的模型留着、位置不变，
+             *   我们那几条**就地**合并（用户改过的窗口留着）。识别键是模型 id
+             *   （`name`）—— 逐条唯一 ⇒ 不用像 WorkBuddy 那样再排一次顺序。 */
+            if (k === "models") w.merge = { mode: "array", key: "name", theirs: ["context_limit"] };
+            out.push(w);
           }
           return out;
         },

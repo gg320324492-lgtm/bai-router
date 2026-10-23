@@ -32,12 +32,40 @@
 // 底座按**键路径**备份（`env.ANTHROPIC_BASE_URL` 这样的粒度）⇒ 断开时只把
 // 我们写过的那几个键还原/删掉，用户自己在 `env` 里的其它键一个字不动。
 //
+// ## 保留用户手改（通用合并层）
+//
+// 归属声明见上面 `withKeptNames` 的表：只有 `ANTHROPIC_DEFAULT_*_MODEL_NAME`
+// （/model 里显示给人看的那一格）归用户，其余 env 键是机器该管的。
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
 //   · 读不懂就不写：文件在但解析失败 ⇒ 底座报错、中止，用户的文件不动。
 
 import path from "node:path";
+
+/**
+ * withKeptNames —— 给「显示名」那几条 env 键挂上**保留用户手改**的归属声明。
+ *
+ * ⚠ **只动归属声明，不动键路径与取值** —— 那两样由 `claudeCodeEdits`
+ *   （server.mjs 那边共用的一份纯函数）决定，见文件头「为什么不复写这一段逻辑」。
+ *
+ * ## 哪些键归用户
+ *
+ * | env 键 | 归谁 | 为什么 |
+ * | --- | --- | --- |
+ * | `ANTHROPIC_DEFAULT_*_MODEL_NAME` | **用户的** | 那是 /model 选择器上**显示给人看**的那一格 —— 用户在 Claude Code 里改过就留着（设计稿 §2.2(a)：「模型名」是「用户可能手改」的字段） |
+ * | `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` / 代理 env | 我们的 | 地址、令牌、模型 id 是机器该管的（§2.2(a)）—— 照写、不比对 |
+ * | `API_TIMEOUT_MS` | **保留用户的** | 本来就是 `onlyIfAbsent`（用户自己设过就留着） |
+ *
+ * ⚠ 根模式（`theirs: [""]`）：标量没法用子路径表达归属 ⇒ 整个值逐值比对，
+ *   一样就不动，不一样**用户的赢**。
+ */
+function withKeptNames(e) {
+  const p = String((e && e.path) || "");
+  if (!/_NAME$/.test(p)) return e;
+  return { ...e, merge: { theirs: [""] } };
+}
 
 export const claudeCodeClient = {
   id: "claude-code",
@@ -51,7 +79,7 @@ export const claudeCodeClient = {
       format: "json",
       /* ⚠ edits 来自 `applyToCli` 本身（`ctx.cli.editsFor()`）——
        *   那些键路径与取值规则**一处都不重写**，见文件头。 */
-      writes: (c) => c.cli.editsFor(),
+      writes: (c) => c.cli.editsFor().map(withKeptNames),
       /* 「接上了」怎么判：base URL 指向我们的网关。
        * ⚠ 用 env 块里那个键判，而不是「文件里有没有 base url」——
        *   用户自己配过 base url（没接我们）时，那条会误判成接上了。 */

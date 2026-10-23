@@ -55,6 +55,17 @@
 //     我们这层不知道模型的这些细账。
 //   · 没做：compat.promptCacheSessionHeader（会话头）。
 //
+// ## 保留用户手改（通用合并层）
+//
+// | 字段 | 归谁 | 为什么 |
+// | --- | --- | --- |
+// | `providers.bai.models[].name` | **用户的** | 用户在 omp 里改过的模型显示名留着（设计稿 §2.2(a)） |
+// | `providers.bai.models[].contextWindow` | **用户的** | 窗口是「用户可能手改」的字段（§2.2(a)）—— 我们那个值是兜底不是真值 |
+// | `providers.bai.models[].id` / `.input` | 我们的 | 模型 id 集合机器该管；`input` 是「至少收文本」的下限断言 |
+// | `providers.bai.baseUrl` / `api` / `auth` / `headers.User-Agent` | 我们的 | 方言、地址与鉴权是机器该管的（§2.2(a)）—— 照写、不比对 |
+// | `modelRoles.default` | 我们的 | 用哪一档是机器该管的（与地址是一对） |
+// | 用户自己加的模型条目 | **保留用户的** | 数组合并那一层（我们逐条认 id，认不出的原样留着） |
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
@@ -85,6 +96,7 @@ function providerEntry(ctx) {
       path: "providers.bai.models",
       value: (ctx.models || []).map((m) => ({
         id: m.id,
+        /* ⚠ **显示名归用户**（设计稿 §2.2(a)：模型名是「用户可能手改」的字段） */
         name: labelOf(m),
         /* ⚠ **能力项我们不知道 ⇒ 不写那个键**（不是写 false、也不是写 true）：
        我们的模型 id 是**档位**（provider 无关），而能力由**映射到哪家上游**决定
@@ -95,12 +107,20 @@ function providerEntry(ctx) {
        ⚠ **更不能写 true** —— 那会让用户真去发一个上游不认的思考参数，当场报错。
        真值随 T15-c 的「模型元数据下发」到位。 */
         /* ⚠ 128000 是**兜底约定**不是实测值：有真值用真的（m.context），真实上限
-           一旦有来源（渠道目录的 max_input_tokens 之类）就用那个顶掉。 */
+           一旦有来源（渠道目录的 max_input_tokens 之类）就用那个顶掉。
+           ⚠ **窗口归用户**（设计稿 §2.2(a)）—— 那个兜底值不是真值，拿它盖掉
+           *   用户自己调的窗口会让 omp **提前截断**上下文（宁可报大不要报小）。
+           *   代价见 §2.2(d)：真值到位后这个值不会自动更新。 */
         contextWindow: m.context || 128000,
         /* ⚠ `input` 写的是**下限**（文本是所有模型都收的），**不是**「只收文本」
            的断言 —— 能收图片的档位我们不知道（能力逐家不同），所以不写 image。 */
         input: ["text"],
       })),
+      /* ⚠ **模型清单逐条合并**（通用合并层）：用户自己加的模型留着、位置不变，
+       *   我们那几条**就地**合并。识别键是模型 id（`id`）—— 逐条唯一。
+       *   归属：`name`（显示名）与 `contextWindow`（窗口）**归用户**
+       *   （设计稿 §2.2(a)）；`id` 与 `input` 是我们的。 */
+      merge: { mode: "array", key: "id", theirs: ["name", "contextWindow"] },
     },
   ];
   return out;

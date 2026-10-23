@@ -134,7 +134,10 @@ describe("① 逐值比对：用户改过的赢，机器该管的照写", () => 
     assert.equal(r.ok, true, r.detail);
     assert.match(String(r.detail || ""), /保留了你手改/, "★ 用户改的东西被保留却一个字没说");
     assert.equal((r.kept || []).length, 1);
-    assert.equal(r.kept[0].path, "providers.bai.name", "要说清是哪个字段");
+    /* ⚠ 2026-10-23：路径前面带上了**文件名**（`base.mjs` 里的改动）——
+     *   多文件的客户端里同一个点分路径会出现好几次（Cline 的 providers.json 与
+     *   models.json 都写 `providers.openai-compatible`）⇒ 不带文件名分不清是哪一份。 */
+    assert.equal(r.kept[0].path, "cfg.json:providers.bai.name", "要说清是哪个字段（连哪个文件）");
     assert.equal(r.kept[0].theirs, "我改的");
     assert.equal(r.kept[0].ours, "B.AI");
   });

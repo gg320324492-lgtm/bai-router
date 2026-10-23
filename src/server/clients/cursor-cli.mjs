@@ -18,6 +18,9 @@
 //   · 做了：上面那四处（modelId / displayModelId / displayName +
 //     hasChangedDefaultModel）。displayName 我们填模型的友好名，magpie 填的是
 //     那个 id —— 显示给人看的那个格子，填个能看懂的更好。
+//   · 做了**保留用户手改**：`model.displayName` 归用户（用户在 Cursor CLI 里
+//     改过的显示名留着）。模型 id（modelId / displayModelId）与
+//     hasChangedDefaultModel 是机器该管的 —— 照写、不比对。
 //   · ⚠ **没做（也做不了）：把 Cursor CLI 指到 B.AI 的网关**。magpie 在这一行
 //     **也没有**改 base URL（它 magpie 那一行的 Cursor CLI 走的是 Cursor 自己
 //     的后端 —— magpie 的网关对 cursor-agent 是「它只跟 Cursor 的后端说话」）。
@@ -51,7 +54,11 @@ export const cursorCliClient = {
           return [
             { path: "model.modelId", value: pick.id },
             { path: "model.displayModelId", value: pick.id },
-            { path: "model.displayName", value: pick.label || pick.id },
+            /* ⚠ **显示名归用户**（设计稿 §2.2(a)：模型名是「用户可能手改」的字段）。
+             *   根模式（`theirs: [""]`）—— 这是「一个 write 只写一个字段」的标量
+             *   声明，没法用子路径表达归属：整个值逐值比对，一样就不动，
+             *   不一样**用户的赢**（magpie 的 openCodeKept 是同一层意思）。 */
+            { path: "model.displayName", value: pick.label || pick.id, merge: { theirs: [""] } },
             /* Cursor 靠这个标记知道「模型被改过」，否则它会按自己的默认走。 */
             { path: "hasChangedDefaultModel", value: true },
           ];

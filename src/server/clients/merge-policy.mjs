@@ -132,9 +132,19 @@ export function sameValue(a, b) {
  * @param {*} have  用户文件里该键路径上的**现值**（`undefined` = 用户压根没这个键）
  * @param {*} ours  我们要写的值
  * @param {object} spec 归属声明（见文件头的说明）
- * @returns {{ value: *, kept: Array<{ path: string, theirs: *, ours: *> } }}
+ * @returns {{ value: *, kept: Array<{ path: string, theirs?: *, ours?: *, kind?: string }> } }}
  *   `value` = 真正该写进文件的值；
- *   `kept`  = 「保留了你手改」的清单（`path` 是相对 `ours` 根的路径）。
+ *   `kept`  = 「保留了什么」的清单（`path` 是相对 `ours` 根的路径）。
+ *
+ * ⚠ **`kept` 里有两类东西，面板要分开说**（2026-10-23 定）：
+ *   · **没写 `kind`**（缺省）= `theirs` —— 那个键**我们本来就会写**、但用户改过
+ *     ⇒ 让给他 ⇒ 带 `theirs`（用户的值）与 `ours`（我们记的值）⇒ 面板显示
+ *     「路径 · 你的值 · 我们记的值」。
+ *   · **`kind: "unmanaged"`** —— **我们压根没写**的键、用户自己有的 ⇒ 弱保留层
+ *     留下的 ⇒ **只报键名、不报值** ⇒ 面板显示「还留着你自己的 N 个键」。
+ *   ⚠ 两者是**两回事**：一个是「我们本来要写、让你改了」，一个是「压根没碰、
+ *     你的东西还在」—— 混在一句「我改的 N 处」里会让人以为他没改过的东西
+ *     也在里头。
  *
  * ⚠ `have` 是 `undefined` ⇒ 用户没这个键 ⇒ 直接用我们的（没什么可比）。
  */
@@ -220,6 +230,13 @@ function mergeObj(have, ours, path, s, kept, prefix) {
   for (const [k, hv] of Object.entries(have)) {
     if (!Object.prototype.hasOwnProperty.call(ours, k)) {
       out[k] = hv;                    /* 我们没写 ⇒ 用户的留下 */
+      /* ⚠ **也要报出来**（2026-10-23）：这一条是「**我们压根没写**、用户自己
+       *   有的键」⇒ 与「显式归用户」那组是**两回事**（设计稿 §2.2(b)：
+       *   「用户赢 + **说一句**」—— 留住却一个字不说，等于没留住）。
+       *   ⇒ `kind: "unmanaged"`；**不报值**（那些值是「用户自己的一堆东西」，
+       *     一个个列出来太长 —— 面板上只列**键名**）。
+       *   ⚠ 值不报 ⇒ 也就不用脱敏（没有值会流出去）。 */
+      kept.push({ path: joinPath(prefix, k), kind: "unmanaged" });
       continue;
     }
     out[k] = mergeNode(hv, ours[k], path.concat(k), s, kept, joinPath(prefix, k));
@@ -258,6 +275,9 @@ function mergeArray(have, ours, s, kept, prefix) {
         continue;
       }
       out.push(el);
+      /* ⚠ **也要报出来**（2026-10-23）：「我们清单里没有的那一条」也是
+       *   「我们压根没写」⇒ 面板上归到「还留着你自己的 N 个键」那组。 */
+      kept.push({ path: `${prefix}${elemLabel(el, s.key)}`, kind: "unmanaged" });
     }
     if (!merged) out.push(ours);
     return out;
@@ -273,12 +293,32 @@ function mergeArray(have, ours, s, kept, prefix) {
       if (used.has(i)) continue;
       if (!s.key || keyOf(ours[i], s.key) === k) { idx = i; break; }
     }
-    if (idx < 0) { out.push(el); continue; }      /* 用户的条目原样留着 */
+    if (idx < 0) {
+      out.push(el);                                /* 用户的条目原样留着 */
+      /* ⚠ **也要报出来**（2026-10-23）—— 见上面那条注释。 */
+      kept.push({ path: `${prefix}${elemLabel(el, s.key)}`, kind: "unmanaged" });
+      continue;
+    }
     used.add(idx);
     out.push(mergeNode(el, ours[idx], [], s, kept, `${prefix}[${s.key}=${k}]`));
   }
   for (let i = 0; i < ours.length; i++) if (!used.has(i)) out.push(ours[i]);
   return out;
+}
+
+/**
+ * elemLabel —— 数组合并里「这个元素是谁」的那一段标签（报告用）。
+ *
+ * 认得出识别键 ⇒ `[键=值]`（与合并时用的路径段同一形状）；
+ * 认不出（元素不是对象 / 没有那个键）⇒ `[值]`（标量元素就是它自己）。
+ */
+function elemLabel(el, key) {
+  const k = keyOf(el, key);
+  if (k !== undefined && k !== null) return `[${key}=${k}]`;
+  if (typeof el === "string" || typeof el === "number" || typeof el === "boolean") {
+    return `[${String(el)}]`;
+  }
+  return "[?]";
 }
 
 /* ------------------------------------------------------------------ *
