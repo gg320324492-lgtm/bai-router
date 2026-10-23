@@ -8565,15 +8565,15 @@ function unreadableSettingsAction(file, detail) {
  *   message       —— 面板上显示的那段话
  *   offerRestore  —— 要不要给一个「用备份恢复并重新接线」的一键入口
  *
- * TODO(human): 这段的措辞与 offerRestore 取 true/false，是一个产品判断：
- *   · 用户的 settings.json 读不懂，多数是手滑多一个逗号，或别的工具写了注释。
- *   · 备份一定在（unreadableSettingsAction 已经另存好了），所以「一键用备份恢复」
- *     技术上随时能做 —— 但恢复等于**用备份覆盖用户当前文件**，若用户后来手工改好过，
- *     覆盖会把那次修改也抹掉。所以 offerRestore 该默认关掉还是开，由你定。
- *   · 下面这版是**保守默认**：说清下一步，不提供一键覆盖。
+ * ⚠ **2026-10-23 负责人拍板：不提供一键恢复（offerRestore 恒为 false）** ——
+ *   这不是「还没定」，是**定了**：
+ *   · 用户的 settings.json 读不懂，多数是手滑多一个逗号，或别的工具写了注释；
+ *   · 备份一定在（unreadableSettingsAction 已经另存好了）⇒ 一键恢复**技术上随时能做**；
+ *   · 但恢复等于**用备份覆盖用户当前文件** —— 若用户后来手工改好过，那次修改
+ *     也会被抹掉 ⇒ **不静默替用户做这个决定**，只把文件在哪、怎么修说清楚。
+ *   ⇒ 保守默认：说清下一步（另存路径 + 常见的错法），不提供一键覆盖。
  */
 function unreadableSettingsGuidance(bak, detail) {
-  // TODO(human): 按你的判断实现这个函数（下面这版是保守默认，可以直接改成你的方案）
   return {
     message: detail
       + "\n原文件未被改动"
