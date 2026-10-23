@@ -119,6 +119,16 @@ export function buildMuseModels(entries, opts) {
           name,
           family: provider,
           is_hidden: false,
+          /* ⚠⚠ **这三个是「我们不知道」，不是「不支持」** ——
+           *   我们的模型 id 是**档位**（provider 无关），而**能力由映射到哪家
+           *   上游决定**：`claude-opus-5` 在 sn 映射到 glm-5.2、在 wb 映射到 hy3，
+           *   图片与思考的支持**逐家不同** ⇒ 写 true 是撒谎；写 false 是**保守**
+           *   （Muse 于是不给图片入口 —— 能力被藏起来，但不会让用户去发一张
+           *   上游收不下的图）。
+           *   magpie 能写真值是因为它有一份 catalog（`e.Images`、`len(e.Efforts)>0`）；
+           *   我们没有 ⇒ 这三项目前是保守占位。
+           *   ⚠ 真值随 T15-c 的「模型元数据下发」到位（docs/client-wiring-deep-plan.md）。
+           *   ⚠ Muse 少这几个字段与写 false 等价（缺省即 falsy）⇒ 留着占位更清楚。 */
           attachment: false,
           reasoning: false,
           temperature: false,

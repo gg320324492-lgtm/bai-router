@@ -65,6 +65,11 @@ window.BAI_CARDS["clients"] = {
             <button type="button" class="btn sm" data-role="c-reload">重新扫描</button>
             <span class="v dim" style="margin-left:8px" data-role="c-count"></span>
           </div>
+          <div class="hint" style="margin-top:6px">
+            客户端里那几个能力项（图片 / 思考）目前是<b>保守值</b> —— 我们知道的是「档位」，
+            不知道它映射到哪家上游（同一档位逐家能力不同），所以宁可先不给。
+            真值随「模型元数据下发」到位。
+          </div>
           <div class="result" data-role="c-result"></div>
           <div data-role="c-body"></div>
         </div>`;
