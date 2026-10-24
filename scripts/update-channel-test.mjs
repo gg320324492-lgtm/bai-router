@@ -11,9 +11,14 @@
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 import {
   CHANNELS, DEFAULT_CHANNEL, readChannel, updaterChannel, allowPrereleaseFor,
-  isPrereleaseVersion, channelForVersion,
+  allowDowngradeFor, isPrereleaseVersion, channelForVersion,
 } from "../src/update-channel.js";
 
 describe("更新通道判据", () => {
@@ -98,5 +103,38 @@ describe("更新通道判据", () => {
     assert.equal(isPrereleaseVersion("1.0.93-alpha"), true, "真实现认得出 alpha");
     assert.notEqual(broken("1.0.93-alpha"), isPrereleaseVersion("1.0.93-alpha"),
       "两种判据必须在这个输入上不同，否则 ④ 的断言没咬住实现");
+  });
+});
+
+/* ====================================================================== *
+ * 降级（2026-10-25 真实事故）
+ * ====================================================================== *
+ *
+ * electron-updater 的 `channel` setter 会**顺手把 allowDowngrade 打开**
+ * ⇒ 「远端版本比本机旧」也被当成「有新版本」⇒ 悄悄降级。
+ *
+ * 踩到的那一次：本机装的是 v1.0.105-beta.1、通道是稳定版（最新 v1.0.92）⇒
+ * 它把 v1.0.92 下好躺在待装目录里，而 `autoInstallOnAppQuit = true` ⇒
+ * **一退出软件就被降级装回去**（旧安装包还装回默认的 C 盘位置）。
+ */
+describe("降级判据", () => {
+  test("① 平时一律不许降级（同一条通道上，远端比本机旧 = 没有更新）", () => {
+    assert.equal(allowDowngradeFor(CHANNELS.stable), false);
+    assert.equal(allowDowngradeFor(CHANNELS.beta), false);
+  });
+
+  test("② 用户**显式**从测试版切回稳定版 ⇒ 允许这一次降级（那正是「往回退」）", () => {
+    assert.equal(allowDowngradeFor(CHANNELS.stable, { explicitSwitch: true }), true);
+    assert.equal(allowDowngradeFor(CHANNELS.beta, { explicitSwitch: true }), false,
+      "★ 切到测试版不该允许降级");
+  });
+
+  test("③ 反向对照：electron-updater 的 channel setter 会把 allowDowngrade 打开", () => {
+    /* 读源码得到的坑：`set channel(value) { …; this.allowDowngrade = true; }`
+     * ⇒ 我们**必须**在设完 channel 之后自己盖回去，否则判据形同虚设。 */
+    const setter = fs.readFileSync(
+      path.join(REPO, "node_modules", "electron-updater", "out", "AppUpdater.js"), "utf8");
+    assert.match(setter, /set channel\(value\)[\s\S]{0,600}?this\.allowDowngrade = true/,
+      "★ electron-updater 的 setter 改了写法 ⇒ 这条判据的前提变了，得重新核一遍");
   });
 });

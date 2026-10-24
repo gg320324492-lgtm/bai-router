@@ -109,12 +109,42 @@ function channelForVersion(version) {
   return isPrereleaseVersion(version) ? CHANNELS.beta : CHANNELS.stable;
 }
 
+/**
+ * allowDowngradeFor —— 这条通道**允不允许降级**（装比本机更旧的版本）。
+ *
+ * ⚠⚠ **为什么必须有这个开关**（2026-10-25 真实事故，2026-10-25 修）：
+ *
+ *   electron-updater 的 `channel` setter 会**顺手把 allowDowngrade 打开**
+ *   （`AppUpdater.js` 的 `set channel`：`this.allowDowngrade = true`）⇒
+ *   于是「远端版本比本机旧」也被 `isUpdateAvailable` 当成「有新版本」
+ *   （`return this.allowDowngrade && isLatestVersionOlder`）⇒ **悄悄降级**。
+ *
+ *   实测踩到的那一次：本机装的是 **v1.0.105-beta.1**、通道是**稳定版**
+ *   （稳定通道最新是 v1.0.92）⇒ 它把 **v1.0.92 下下来躺在待装目录里**，
+ *   而 `autoInstallOnAppQuit = true` ⇒ **一退出软件就被降级装回去**
+ *   （而且那个旧安装包会装回**默认的 C 盘位置** ⇒ 前面搬走的整个布局全白做）。
+ *
+ * 规矩（两条，别自己改）：
+ *   · **平时一律不许降级** —— 同一条通道上，「远端比本机旧」= 没有更新，
+ *     不是「有更新的反面」。
+ *   · 只有用户**显式切通道**时才临时允许 —— 那正是「降级」的本意
+ *     （测试版 → 稳定版 = 往回退到稳定版）。切完仍由本函数说了算。
+ *
+ * @param {string} channel 目标通道
+ * @param {{explicitSwitch?: boolean}} [opts] `explicitSwitch=true` = 用户刚点了切换
+ */
+function allowDowngradeFor(channel, opts = {}) {
+  if (opts && opts.explicitSwitch) return channel === CHANNELS.stable;
+  return false;
+}
+
 module.exports = {
   CHANNELS,
   DEFAULT_CHANNEL,
   readChannel,
   updaterChannel,
   allowPrereleaseFor,
+  allowDowngradeFor,
   isPrereleaseVersion,
   channelForVersion,
 };

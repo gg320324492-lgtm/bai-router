@@ -6,7 +6,7 @@ const instCheck = require("./install-consistency");
 /* 更新通道（稳定版 / 测试版）——纯逻辑，无 Electron 依赖，测试直接 import 它。
  * 放在 CommonJS 里是因为 main.js 是 CommonJS：Electron 里 require() 一个 ESM
  * 并不可靠，两边格式一致最省事。 */
-const { CHANNELS, readChannel, updaterChannel, allowPrereleaseFor } = require("./update-channel");
+const { CHANNELS, readChannel, updaterChannel, allowPrereleaseFor, allowDowngradeFor } = require("./update-channel");
 
 // ---------- 兼容性：老机器/核显/远程桌面下 Electron 窗口黑屏的根治开关 ----------
 // 路由台界面极轻，软件渲染没有任何可感知性能损失
@@ -734,6 +734,11 @@ async function setUpdateChannel(ch) {
        * 只改一个就会落到那两种错误组合之一（详见 setupUpdater 里的四种组合表）。 */
       autoUpdater.allowPrerelease = allowPrereleaseFor(want);
       autoUpdater.channel = updaterChannel(want);
+      /* ⚠ 顺序要紧：**在 channel 之后**设。channel 的 setter 会把 allowDowngrade
+       *   打开 ⇒ 我们必须按自己的规矩盖回去。
+       *   显式切通道 = 允许这一次降级（测试版 → 稳定版就是「往回退」）；
+       *   切到测试版则不许（beta 通道里版本号本来就乱）。 */
+      autoUpdater.allowDowngrade = allowDowngradeFor(want, { explicitSwitch: true });
     } catch (e) { logMain("切更新通道失败: " + (e && e.message)); }
   }
   refreshTrayMenu();
@@ -887,6 +892,15 @@ function setupUpdater() {
       const ch = readChannel(readCfgSafe());
       au.allowPrerelease = allowPrereleaseFor(ch);
       au.channel = updaterChannel(ch);
+      /* ⚠⚠ **必须显式关掉降级**（2026-10-25 修）：electron-updater 的 `channel`
+       *   setter 会**顺手把 allowDowngrade 打开**（AppUpdater.js 的 set channel）
+       *   ⇒ 于是「远端版本比本机旧」也被当成「有新版本」⇒ **悄悄降级**。
+       *   实测踩到的那一次：本机装的是 v1.0.105-beta.1、通道是稳定版
+       *   （稳定通道最新 v1.0.92）⇒ 它把 v1.0.92 下好躺在待装目录里，而
+       *   `autoInstallOnAppQuit = true` ⇒ **一退出软件就被降级装回去**
+       *   （旧安装包还会装回默认的 C 盘位置 ⇒ 搬走的整个布局全白做）。
+       *   ⇒ 平时一律不许降级（判据见 update-channel.js 的 allowDowngradeFor）。 */
+      au.allowDowngrade = allowDowngradeFor(ch);
     } catch (e) {
       logMain("设置更新通道失败: " + (e && e.message));
     }
