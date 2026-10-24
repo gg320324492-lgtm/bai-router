@@ -330,7 +330,13 @@ describe("e2e：/api/test 真跑一遍，工具确实发到了上游", () => {
       ...cfg.zen, apiKey: DUMMY_KEY, transport: "direct",
       upstream: `http://127.0.0.1:${upstream}/zen/v1`,   // **免费档**（没有 /zen/go）
     };
-    cfg.qd = { ...cfg.qd, upstream: `http://127.0.0.1:${upstream}/qd/v1` };
+    /* ⚠ **qd 必须给一个令牌**（2026-10-24 补）：qd 的探测在**发请求之前**先
+     *   要令牌（server.mjs 的 qdEnsureToken ⇒ 没有令牌就直接判「不可用」，
+     *   **一个请求都不发**）⇒ 假上游自然「一个 qd 请求都没收到」。
+     *   ⚠ 这个失败是**环境相关**的：机器上装了 Qoder、令牌文件在时，它能过；
+     *   令牌不在（没装 Qoder / 没登录）时就红 ⇒ 跟被测的那段逻辑无关。
+     *   ⇒ 这里给一个**假的**令牌（假的占位串，不是真凭据）⇒ 探测能走到假上游。 */
+    cfg.qd = { ...cfg.qd, token: DUMMY_KEY, upstream: `http://127.0.0.1:${upstream}/qd/v1` };
     writeFileSync(path.join(dataDir, "config.json"), JSON.stringify(cfg, null, 2));
 
     fake = http.createServer((req, res) => {
