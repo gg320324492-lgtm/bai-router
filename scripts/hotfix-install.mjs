@@ -44,7 +44,13 @@ const INSTALL_DIR = String(process.env.BAI_INSTALL_DIR
   || path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Programs", "B.AI Router"));
 const ASAR = path.join(INSTALL_DIR, "resources", "app.asar");
 const SERVER_DST = path.join(INSTALL_DIR, "resources", "server");
-const ASAR_TOOL = path.join(REPO, "node_modules", ".bin", process.platform === "win32" ? "asar.cmd" : "asar");
+/* ⚠ 用 **asar 的 js 入口**（不是 .bin/asar.cmd）：.cmd 是批处理 ⇒ 必须走 shell
+ *   ⇒ 参数会被拼成一行 ⇒ 「B.AI Router」里的空格就把路径截断了。
+ *   直接 `node …/asar.js` 才能把参数原样传过去。 */
+const ASAR_JS = path.join(REPO, "node_modules", "@electron", "asar", "bin", "asar.js");
+function asar(args) {
+  return spawnSync(process.execPath, [ASAR_JS, ...args], { stdio: "inherit" });
+}
 
 /** 壳里那几个文件（要覆盖进 asar 的）。 */
 const APP_FILES = ["src/main.js", "src/preload.js", "src/install-consistency.js", "src/update-channel.js"];
@@ -127,7 +133,7 @@ log(`服务端已覆盖 ${changed.length} 个文件（原件在 resources/.hotfi
 if (appChanged.length) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bai-asar-"));
   try {
-    const r = spawnSync(ASAR_TOOL, ["extract", ASAR, tmp], { stdio: "inherit", shell: true });
+    const r = asar(["extract", ASAR, tmp]);
     if (r.status !== 0) throw new Error(`解包失败（exit ${r.status}）`);
     for (const f of APP_FILES) {
       const src = path.join(REPO, f);
@@ -138,7 +144,7 @@ if (appChanged.length) {
     }
     const outAsar = ASAR + ".new";
     if (fs.existsSync(outAsar)) fs.rmSync(outAsar);
-    const r2 = spawnSync(ASAR_TOOL, ["pack", tmp, outAsar], { stdio: "inherit", shell: true });
+    const r2 = asar(["pack", tmp, outAsar]);
     if (r2.status !== 0) throw new Error(`重打包失败（exit ${r2.status}）`);
     /* ⚠ 换之前把旧的留一份（万一新包起不来，能退回去）。 */
     fs.copyFileSync(ASAR, ASAR + ".hotfix-bak");
