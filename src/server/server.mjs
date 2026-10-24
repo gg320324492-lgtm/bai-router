@@ -12,6 +12,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
 import os from "node:os";
+/* 「主动退出」标记（写与读共用同一个文件 ⇒ 形状不会漂）—— 见 restart-marker.cjs 的说明。 */
+import marker from "./restart-marker.cjs";
+/* 走哪条通道的判定（纯逻辑，可单测）—— 见 proxy-policy.mjs 的说明。 */
+import { chooseChannel, proxyPortAlive } from "./proxy-policy.mjs";
 import {
   CaptureRes, failoverCooldown, failoverClear, failoverAvailable, failoverSnapshot, failoverQuotaBlocked,
   shouldFailover, FAILOVER_COOLDOWN_MS, noteSilentJump, silentJumpSnapshot,
@@ -201,6 +205,30 @@ const APP_VERSION = process.env.APP_VERSION || "dev";
 /* 自己这个文件跑在哪 —— 面板与日志靠它回答"现在服务我的是哪一份代码"。 */
 const SERVER_SELF = fileURLToPath(import.meta.url);
 try { mkdirSync(DATA_DIR, { recursive: true }); } catch { }
+
+/**
+ * markIntentionalExit —— **主动退出前留标记**（2026-10-24 加）。
+ *
+ * ## 为什么
+ *
+ * 桌面壳的看门狗只看「子进程退出」这一件事 ⇒ 它分不清
+ *   ① **这个进程自己决定退出**（代理切换 / NO_PROXY 自检 / 用户点的重启与停止 /
+ *      升级安装把自己收掉）
+ *   ② **它崩了**
+ * ⇒ 于是 ① 被计成 ②：弹「服务已自动恢复运行」横幅、计入崩溃熔断计数、
+ *   甚至触发「系统 Node 不兼容」的运行时切换。
+ * 那台机器上 Clash 同时占着 7890 与 7897 两个端口，10 分钟一次的代理探测在两者
+ * 之间来回跳 ⇒ **每跳一次自杀一次** ⇒ 用户看到的现象就是「老是被杀掉」。
+ *
+ * ## 形状与纪律
+ *
+ * 标记的**写与读**都在 `src/server/restart-marker.cjs`（壳那边 require 同一个文件）
+ * ⇒ 形状不会漂。标记是**一次性**的：壳读完就删；超过 2 分钟就算过期
+ * ⇒ **不许拿它遮住真崩溃**。
+ */
+function markIntentionalExit(reason) {
+  marker.markIntentionalExit(DATA_DIR, reason);
+}
 // 首启：用户目录还没有 config → 从随包默认配置（或绿色模式旧 config）复制一份
 try {
   if (!existsSync(CONFIG_FILE)) {
@@ -1089,6 +1117,8 @@ if (needEnvRestart) {
   );
   child.unref();
   log(`代理环境自检：已以修正后的 NO_PROXY 重启自己 -> pid ${child.pid}（NO_PROXY=${wantNoProxy}）`);
+  /* ⚠ 同上：这是**主动**退出 ⇒ 留标记，壳读到就不当崩溃（见 markIntentionalExit）。 */
+  markIntentionalExit("no-proxy-selfcheck");
   process.exit(0);
 }
 log(`路由台启动 relay=:${cfg0.relayPort} panel=:${cfg0.panelPort} (pid ${process.pid}) 代理=${cfg0.proxy || "直连"}`);
@@ -1143,6 +1173,15 @@ function applyProxy(found, reason) {
       // 一个永久待命）。待命实例不服务但白耗资源，历史上还造成过配置多写竞态。
       if (process.env.BAI_ROUTER_EXE) {
         log("代理变更，退出交由桌面壳以新配置重拉");
+        /* ⚠ **主动退出前留个标记**（2026-10-24 加）：壳的看门狗只看「子进程退出」，
+         *   分不清「它自己决定重启」与「它崩了」⇒ 于是每次代理切换都被计成一次崩溃
+         *   ⇒ 弹「服务已自动恢复运行」横幅 + 端口互抢。
+         *   2026-10-24 那五次「老是被杀」就是这么来的（退出码 1、间隔 ≈ 10 分钟的
+         *   代理探测周期）—— 那台机器上 Clash 占了 7890 与 7897 两个端口，
+         *   探测在两者之间来回跳 ⇒ 每跳一次自杀一次。
+         *   ⇒ 写一个标记文件，壳读到它就知道这是**主动重启**，不弹崩溃横幅、不计崩溃。
+         *   标记是「一次性」的：壳读完就删（见 src/main.js 的 readRestartReason）。 */
+        markIntentionalExit("proxy-changed");
         process.exit(0);
       }
       const c = loadCfg();
@@ -1157,12 +1196,22 @@ function applyProxy(found, reason) {
   }
   return true;
 }
-async function detectWorkingProxy() {
+async function detectWorkingProxy(thorough = false) {
   const cfg = loadCfg();
-  const cands = [...new Set([cfg.proxy, process.env.HTTPS_PROXY, ...PROXY_CANDIDATES].filter(Boolean))];
-  cands.push("DIRECT"); // 兜底：TUN/全局模式无需本地端口
-  for (const c of cands) if (await probeVia(c)) return c;
-  return null;
+  /* ⚠ **判据分两级**（2026-10-24 加，根因修复）—— 详见 src/server/proxy-policy.mjs：
+   *   周期探测（thorough=false）只在「当前代理的**端口**死了」时才换；
+   *   端到端探上游只用来**挑候选**（换过去得真能用）。
+   *   原来只拿端到端探针判代理死活 ⇒ 上游一慢就误判「代理坏了」⇒ 换代理 ⇒
+   *   重启进程 ⇒ 新进程又探到另一个「能用」的 ⇒ **每 10 分钟自杀一次**
+   *   （2026-10-20/21 日志里 604s/1811s 的反复退出与「起来 4~5 秒又退」）。
+   *   手动检测（thorough=true）才做端到端深探 —— 用户明确要「找一条真能用的」。 */
+  return chooseChannel({
+    current: String(cfg.proxy || "").trim(),
+    thorough,
+    candidates: [...new Set([process.env.HTTPS_PROXY, ...PROXY_CANDIDATES].filter(Boolean))],
+    portAlive: (p) => proxyPortAlive(p),
+    probe: (p) => probeVia(p),
+  });
 }
 let proxyCheckTimer = null;
 function scheduleProxyCheck(delay = 3000, reason = "周期探测") {
@@ -9819,7 +9868,10 @@ const panel = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && u.pathname === "/api/proxy-detect") {
-      const found = await detectWorkingProxy();
+      /* ⚠ **手动检测用深探**（thorough=true）：用户明确点了「检测」⇒ 就是想找一条
+       *   **真能用的**路 ⇒ 每条候选都端到端探上游。
+       *   （周期探测只看本地代理的端口通不通 —— 那是修「老是被杀掉」的关键。） */
+      const found = await detectWorkingProxy(true);
       let applied = false;
       if (found) applied = applyProxy(found, "手动检测");
       return json(res, 200, {
@@ -11046,6 +11098,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
       json(res, 200, { ok: true, message: `即将退出并安装 ${st.version}，约 15 秒后自动重开` });
       log(`备用升级：启动安装 ${st.version}（本进程即将被 apply.cmd 收掉）`);
       launchApplyScript();
+      markIntentionalExit("selfupdate-install");
       setTimeout(() => process.exit(0), 400);
       return;
     }
@@ -11053,6 +11106,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
     if (req.method === "POST" && u.pathname === "/api/service/stop") {
       json(res, 200, { ok: true, message: "服务即将停止（B.AI / SenseNova / WorkBuddy / OpenCode Zen / Qoder 中转一并停止）" });
       log("收到停止指令，进程退出");
+      markIntentionalExit("user-stop");
       setTimeout(() => process.exit(0), 300);
       return;
     }
@@ -11064,6 +11118,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
       if (process.env.BAI_ROUTER_EXE) {
         json(res, 200, { ok: true, message: "服务正在重启（桌面壳托管：退出后由壳重拉）" });
         log("收到重启指令（Electron 托管），直接退出交由壳重拉");
+        markIntentionalExit("user-restart");
         setTimeout(() => process.exit(0), 300);
         return;
       }

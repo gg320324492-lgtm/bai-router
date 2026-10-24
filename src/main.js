@@ -30,6 +30,20 @@ const DATA_DIR = app.getPath("userData");
 const SERVER_JS = app.isPackaged
   ? path.join(process.resourcesPath, "server", "server.mjs")
   : path.join(APP_DIR, "server", "server.mjs");
+/* 「主动退出」标记的读写方是同一个文件（服务端写、壳读）⇒ 形状不会漂。
+   它放在 server 目录里：打包时 src/server 整份复制到 resources/server，
+   而壳在 resources/app ⇒ 只有放 server 那一侧，两边才都够得着。
+   ⚠ **拿不到也不能让软件起不来**（热修时可能只换了一半）⇒ 读不到就退回旧行为。 */
+let readRestartReasonRaw = null;
+try {
+  ({ readRestartReason: readRestartReasonRaw } = require(
+    app.isPackaged
+      ? path.join(process.resourcesPath, "server", "restart-marker.cjs")
+      : path.join(APP_DIR, "server", "restart-marker.cjs")
+  ));
+} catch (e) {
+  logMain("读不到 restart-marker.cjs（热修只换了一半？）：主动退出仍会被当成崩溃");
+}
 const iconPath = app.isPackaged
   ? path.join(process.resourcesPath, "icon.ico")
   : path.join(APP_DIR, "..", "build", "icon.ico");
@@ -308,8 +322,24 @@ function spawnServer() {
   });
   child.on("exit", (code, sig) => {
     child = null;
-    logMain(`服务子进程退出 code=${code} sig=${sig} 存活${Math.round((Date.now() - born) / 1000)}s 运行时=${runtimeSystem ? "system-node" : "electron-node"}`);
+    /* ⚠ **主动退出 ≠ 崩溃**（2026-10-24 加）—— 修「老是被杀掉」。
+     *
+     * server.mjs 在**自己决定退出**时（代理切换 / NO_PROXY 自检 / 用户点的重启与
+     * 停止 / 升级安装）会先写一个标记（见 server.mjs 的 markIntentionalExit）。
+     * 壳读到它 ⇒ 这次退出是「安排好的」⇒
+     *   · 不计入崩溃熔断（连续 5 次秒退 ⇒ 切诊断页）
+     *   · 不弹「服务已自动恢复运行」横幅（那条是给**真崩溃**看的）
+     *   · 不触发「系统 Node 不兼容」的运行时切换（recentExits 里也不塞它）
+     * **仍然要重拉** —— 服务得回来；代理变了本来就必须重启进程才能生效
+     * （Node 在启动时就把代理配置缓存进 env 了）。 */
+    const intentional = readRestartReason();
+    logMain(`服务子进程退出 code=${code} sig=${sig} 存活${Math.round((Date.now() - born) / 1000)}s 运行时=${runtimeSystem ? "system-node" : "electron-node"}`
+      + (intentional ? ` 【主动退出：${intentional}】` : ""));
     if (quitting) return;
+    if (intentional) {
+      setTimeout(() => { if (!quitting && !child) respawnWithNotice(true); }, 500);
+      return;
+    }
     // 快速崩溃计数：连续 5 次秒退 → 熔断重试，切诊断页（防止无限拉起循环）
     if (Date.now() - born < 5000) crashStreak++; else crashStreak = 0;
     if (crashStreak >= 5) {
@@ -333,6 +363,37 @@ function spawnServer() {
 
 let lastSpawnError = null;
 let lastRecoverNoticeAt = 0;
+
+/**
+ * readRestartReason —— 读「主动退出」标记（server.mjs 写、壳读）。
+ *
+ * 判定本身在 `src/server/restart-marker.cjs` 里（与服务端**共用同一个文件**
+ * ⇒ 形状不会漂）；这里只做壳这一侧的事：**把过期这件事记进日志**。
+ *
+ * ## 为什么要有这个标记
+ *
+ * 壳的看门狗只看「子进程退出」这一件事 ⇒ 它分不清
+ *   ① **它自己决定重启**（代理切换、NO_PROXY 自检、用户点的重启与停止、升级安装）
+ *   ② **它崩了**
+ * ⇒ 于是 ① 被计成 ②：弹「服务已自动恢复运行」横幅、计入崩溃熔断计数、
+ *   甚至触发「系统 Node 不兼容」的运行时切换。
+ * 那台机器上 Clash 同时占着 7890 与 7897 两个端口，10 分钟一次的代理探测在两者
+ * 之间来回跳 ⇒ **每跳一次自杀一次** ⇒ 用户看到的现象就是「老是被杀掉」。
+ *
+ * @returns {string|null} 原因标签（proxy-changed / no-proxy-selfcheck /
+ *                          user-restart / user-stop / selfupdate-install）；
+ *                          没有标记 / 标记坏了 / 标记过期 ⇒ null（按**真崩溃**处理）
+ */
+function readRestartReason() {
+  /* ⚠ 拿不到模块（热修只换了一半）⇒ 一律按**真崩溃**处理（退回旧行为）。 */
+  if (typeof readRestartReasonRaw !== "function") return null;
+  const m = readRestartReasonRaw(DATA_DIR);
+  if (m && m.why === "stale") {
+    logMain(`忽略过期的「主动退出」标记：${m.reason}（${Math.round(m.ageMs / 1000)} 秒前写的）`);
+  }
+  return m && m.intentional ? m.reason : null;
+}
+
 function logMain(msg) {
   try {
     /* 超过 1MB 就滚动，保留一份 .old（v1.0.73 起日志轮转只在这一层：
@@ -349,10 +410,12 @@ function logMain(msg) {
   } catch { }
 }
 
-async function respawnWithNotice() {
+async function respawnWithNotice(silent) {
   spawnServer();
   const ok = await waitReady(20000);
   if (ok) crashStreak = 0;
+  // ⚠ silent=true ⇒ **不弹横幅**（主动重启不该配一条「崩了又好了」的通知）。
+  if (silent) return;
   // 静默恢复：只通知面板横幅。限流 60s 一次——若真出现重启循环（NO_PROXY 漂移等），
   // 逐次弹出的横幅会盖住整个界面且关不掉，而根因在日志里，60s 一次足够定位。
   const now = Date.now();
