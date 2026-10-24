@@ -355,3 +355,69 @@ describe("⑥ 反向对照：改坏 ⇒ 判据必须红", () => {
     void rank;
   });
 });
+
+/* ====================================================================== *
+ * ⑦ 如实文案：半个接线不许说「已接上」
+ * ====================================================================== *
+ *
+ * · `partial` —— **声明层**的「半个接线」：Cursor CLI 那一格我们只改得了它选
+ *   哪个模型、改不了它的地址 ⇒ 它的请求仍然走 Cursor 自己的后端 ⇒
+ *   说「已接上」是**误导**（magpie 自己也只接管 model 一个字段）。
+ * · `halfWired` —— **多层客户端缺一层**：Cline 的认证门在 globalState.json +
+ *   secrets.json 里 ⇒ 只写 providers.json 它一个请求都发不出去。
+ */
+describe("⑦ 如实文案：半个接线不许说「已接上」", () => {
+  test("⑦a 半个接线（partial）⇒ 说「只接了一半」，不说「已接上」", () => {
+    const { box } = mountCard(() => Promise.resolve({
+      ok: true,
+      list: [{
+        id: "cursor-cli", name: "光标", protocol: "chat",
+        status: {
+          wired: true, configured: true, partial: true,
+          partialNote: "只设了模型（不走 B.AI）：它的请求不会经过 B.AI。",
+          detail: "只设了模型（不走 B.AI）：它的请求不会经过 B.AI。",
+          file: "C:/x/cli-config.json",
+        },
+      }],
+    }));
+    return new Promise((r) => setTimeout(r, 30)).then(() => {
+      const body = box.parts["c-body"] || "";
+      assert.doesNotMatch(body, /已接上/, "★ 半个接线不许说「已接上」");
+      assert.match(body, /只接了一半/, "★ 要说清是「只接了一半」");
+      assert.match(body, /不走 B\.AI/, "★ 那句说明要画出来（用户得知道它的请求不走 B.AI）");
+    });
+  });
+
+  test("⑦b 只接了一半（halfWired）⇒ 说「只接了一半」", () => {
+    const { box } = mountCard(() => Promise.resolve({
+      ok: true,
+      list: [{
+        id: "cline", name: "某客户端", protocol: "chat",
+        status: { wired: false, configured: false, halfWired: true, detail: "只接了一半：还差 state.json", file: "C:/x/p.json" },
+      }],
+    }));
+    return new Promise((r) => setTimeout(r, 30)).then(() => {
+      const body = box.parts["c-body"] || "";
+      assert.match(body, /只接了一半/);
+      assert.doesNotMatch(body, /已接上/);
+    });
+  });
+
+  test("⑦c 计数只算**真的**接到 B.AI 的，半个接线另算", () => {
+    const { box } = mountCard(() => Promise.resolve({
+      ok: true,
+      list: [
+        { id: "a", name: "真接上的", status: { wired: true, partial: false } },
+        { id: "b", name: "半个接线的", status: { wired: true, partial: true } },
+        { id: "c", name: "没接的", status: { wired: false } },
+      ],
+    }));
+    return new Promise((r) => setTimeout(r, 30)).then(() => {
+      /* ⚠ 计数那一格是 **textContent**（不是 innerHTML）⇒ 读元素本身，
+         *   读 box.parts 只会拿到空串。 */
+      const cnt = String((box.els["c-count"] && box.els["c-count"].textContent) || "");
+      assert.match(cnt, /1 \/ 3 已接上/, "★ 半个接线的不许算进「已接上」");
+      assert.match(cnt, /另有 1 个只接了一半/, "★ 半个接线的要另算、另说");
+    });
+  });
+});

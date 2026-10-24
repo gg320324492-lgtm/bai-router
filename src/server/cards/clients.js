@@ -148,22 +148,28 @@ window.BAI_CARDS["clients"] = {
       box.innerHTML = parts.join("");
     }
 
-    /* 一个客户端的**状态灯**：接上了是 ok，没接是 idle，装不上/读不懂是 err。 */
+    /* 一个客户端的**状态灯**：接上了是 ok，没接是 idle，装不上/读不懂是 err。
+     * ⚠ **半个接线用黄灯（warn）**：绿灯 + 「已接上」对 Cursor CLI 那一格是误导
+     *   （它的请求仍然走 Cursor 自己的后端，一个都没到 B.AI）。 */
     function ledOf(st) {
       if (!st) return "idle";
-      if (st.wired) return "ok";
+      if (st.halfWired) return "warn";
+      if (st.wired) return st.partial ? "warn" : "ok";
       if (st.missing) return "idle";
       if (st.configured) return "idle";
       return "idle";
     }
 
-    /* 状态的一句话。**说清是哪一种**：「没装」「装了但没配置」「没接」是三件事。 */
+    /* 状态的一句话。**说清是哪一种**：「没装」「装了但没配置」「没接」是三件事。
+     * ⚠ 「已接上」只有**真的**走到 B.AI 才许说 —— 「半个接线」（声明层的
+     *   partial）与「只接了一半」（多层客户端缺一层）都要另说。 */
     function statusText(st) {
       if (!st) return "—";
-      if (st.wired) return "已接上";
+      if (st.halfWired) return "只接了一半";
+      if (st.wired) return st.partial ? "只接了一半" : "已接上";
       if (st.missing) return "没装这个客户端";
       if (st.notConfigured) return "装了，还没生成过配置";
-      if (st.configured) return "配置里有，但不是本机接的";
+      if (st.configured) return st.partial ? "只接了一半" : "配置里有，但不是本机接的";
       return "没接";
     }
 
@@ -211,8 +217,14 @@ window.BAI_CARDS["clients"] = {
       }
       const cntEl = q('[data-role="c-count"]');
       if (cntEl) {
-        const wired0 = list0.filter((c) => c.status && c.status.wired).length;
-        cntEl.textContent = list0.length ? `${wired0} / ${list0.length} 已接上` : "";
+        /* ⚠ **只数真的走到 B.AI 的**：把「半个接线」（Cursor CLI 那一格：改了模型
+         *   但请求仍然走 Cursor 自己的后端）算进「已接上」⇒ 这个数字会骗人。
+         *   半个接线的另算、另说。 */
+        const wired0 = list0.filter((c) => c.status && c.status.wired && !c.status.partial).length;
+        const half0 = list0.filter((c) => c.status && (c.status.partial || c.status.halfWired)).length;
+        cntEl.textContent = list0.length
+          ? `${wired0} / ${list0.length} 已接上` + (half0 ? `（另有 ${half0} 个只接了一半）` : "")
+          : "";
       }
       if (!loaded && !lasterr) {
         body.innerHTML = S3("loadingState", "正在读客户端清单…", { hint: "读完就知道哪些客户端能接、哪些已经接上了。" });

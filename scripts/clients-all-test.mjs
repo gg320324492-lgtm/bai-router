@@ -287,6 +287,36 @@ function quotedIn(text) {
 }
 
 /**
+ * tableKeyWithId —— 这个「档位」是不是**模型表的表名**，且那一条带 `id`？
+ *
+ * 2026-10-24（OpenCode 1.19+）：它的模型表用**档位**当表名，条目里另有一个
+ * **`id`** —— 那是**发给 API 的模型 id**（我们的完整 id `sn/claude-opus-5`）。
+ * 它的寻址是 `providerId/modelId`（按第一个斜杠切）⇒ 表名里再带一遍 provider
+ * 前缀会变成 `bai/bai/…`，而用户从面板上抄来的 `sn/claude-opus-5` 会**选不了**。
+ *
+ * ⇒ 表名是档位**不算**「拿档位当模型 id 发出去」—— 真正发出去的是条目的 `id`
+ *   （实测：请求体里的 model = `sn/claude-opus-5` ⇒ 网关照样分得流）。
+ *
+ * ⚠ **只认这一种形状**：表名后面紧跟 `":`，且**同一个条目对象里**有
+ *   `"id": "<provider>/…"`。光有档位、没有 id ⇒ **仍然判失败**（那才是
+ *   「拿档位当模型 id 发出去」⇒ 网关会静默落到默认模型）。
+ */
+function tableKeyWithId(text, at, tier) {
+  const rest = text.slice(at + tier.length);
+  if (!/^\s*"\s*:/.test(rest)) return false;          // 不是键（是值）⇒ 不算例外
+  const open = rest.indexOf("{");
+  if (open < 0) return false;
+  /* 条目对象：按花括号配平找它结束（我们的条目里 id/name 都在最外层）。 */
+  let depth = 0, end = -1;
+  for (let i = open; i < rest.length && i < open + 600; i++) {
+    if (rest[i] === "{") depth++;
+    else if (rest[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+  }
+  const obj = rest.slice(open, end < 0 ? rest.length : end);
+  return /"id"\s*:\s*"[a-z0-9]+\/[^"]+"/.test(obj);
+}
+
+/**
  * 凭据形态的长串（纯字母数字 20 位以上 —— JWT 段、base64 段那种）。
  *
  * ⚠ **键名不算**：JSON 的 `"sessionDefaultSettings": {` 里的那个词是键名，
@@ -394,13 +424,17 @@ describe("客户端接线：每一个都接上 → 读回 → 断开", () => {
         /* · 档位不许单独出现（拿档位当模型 id 写出去，网关会静默落到默认模型）
          *   ⚠ 前缀**不必是 MODELS 里那一个**：Claude Code 这类**不能自己挑模型**
          *   的客户端接的是「用户当前选中的渠道」，前缀是那一家（可能是 bai/sn/wb…）。
-         *   判据是「前面有**某个** provider 前缀」，不是「有**那个** provider 前缀」。 */
+         *   判据是「前面有**某个** provider 前缀」，不是「有**那个** provider 前缀」。
+         *   ⚠ **例外**（2026-10-24）：档位可以当**模型表的表名**出现 ——
+         *   前提是那一条带一个**带 provider 前缀的 `id`**（见 tableKeyWithId）。
+         *   真正发出去的是条目的 `id`，表名只是客户端内部的寻址键。 */
         for (const m of MODELS) {
           const tier = m.id.slice(m.id.indexOf("/") + 1);
           let at = text.indexOf(tier);
           while (at >= 0) {
             const before = text.slice(Math.max(0, at - 60), at);
-            assert.ok(/[a-z0-9]+\/$/.test(before),
+            const prefixed = /[a-z0-9]+\/$/.test(before);
+            assert.ok(prefixed || tableKeyWithId(text, at, tier),
               `${def.id}：${fx.f.path} 里档位「${tier}」单独出现了（前面没有 provider 前缀）`);
             at = text.indexOf(tier, at + 1);
           }

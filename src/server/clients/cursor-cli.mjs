@@ -30,6 +30,24 @@
 //     想要 Cursor CLI 真的走到 B.AI，得等 Cursor CLI 自己认自定义端点，
 //     那时再有确切字段名再补这一层。断开随时可还原。
 //
+// ## ⚠⚠ 面板上**不能**说「已接上」
+//
+// 这一点特别要紧，因为面板那一格本来会说「已接上」（cards/clients.js 的
+// statusText）—— 对 Cursor CLI 来说**那是误导**：它的请求**仍然走 Cursor 自己的
+// 后端**，一个都没到 B.AI；我们只是替它把「用哪个模型」那个 id 改了。
+//
+// magpie 那边也一样（`docs/reference.md:107`：Cursor CLI **只接管 `model` 一个
+// 字段**）⇒ **这是 Cursor CLI 自己的上限，不是我们的缺口** —— 照抄就是正解。
+//
+// ⇒ 声明上带两个字段给面板用（cards/clients.js 读它们）：
+//   · `partial: true`      —— 「接了，但不是接通了」
+//   · `partialNote: "…"`   —— 一句话，说清「接到哪、没接到哪、用户该做什么」
+//
+// 面板上建议这么说（**不要**说「已接上」）：
+//
+//   只设了模型（不走 B.AI）：Cursor CLI 只跟它自己的后端说话，
+//   我们改不了它的地址 ⇒ 它的请求不会经过 B.AI。
+//
 // ## 纪律
 //
 //   · 凭据不进这个文件（声明是分发物）：key 由接线时 ctx 给。
@@ -42,7 +60,11 @@ export const cursorCliClient = {
   id: "cursor-cli",
   name: "Cursor CLI",
   protocol: "chat",
-  note: "Cursor 的 CLI（cursor-agent）—— 只改它选哪个模型",
+  note: "Cursor 的 CLI（cursor-agent）—— 只改它选哪个模型（请求仍走 Cursor 自己的后端）",
+  /* ⚠ **半个接线**：面板上别显示「已接上」（那会误导）——
+   *   详见文件头「面板上不能说『已接上』」那节。 */
+  partial: true,
+  partialNote: "只设了模型（不走 B.AI）：Cursor CLI 只跟它自己的后端说话，我们改不了它的地址 ⇒ 它的请求不会经过 B.AI。",
 
   files: (ctx) => {
     const file = path.join(ctx.home, ".cursor", "cli-config.json");

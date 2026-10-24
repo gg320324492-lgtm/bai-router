@@ -120,7 +120,7 @@ describe("① 接线：说好的键路径真的写进去了", () => {
     const st = clientStatus(fakeClient(home), { ...CTX, home }, { dataDir: home });
     assert.equal(st.wired, false, "没接就是没接");
     assert.equal(st.configured, false, "里面没有我们那块");
-    assert.equal(st.missing, undefined, "★ 说成了「没装」—— 用户会以为要去下载客户端");
+    assert.equal(st.missing, false, "★ 说成了「没装」—— 用户会以为要去下载客户端");
     assert.match(String(st.detail || ""), /还没接/, "要说清是「还没接」");
   });
 });
@@ -240,7 +240,7 @@ describe("④b 装没装：看目录，不只看那个配置文件在不在", ()
     const home = tmpDir();
     const st = clientStatus(fakeClient(home), { ...CTX, home }, { dataDir: home });
     assert.equal(st.missing, true, "连目录都不在 ⇒ 就是没装");
-    assert.equal(st.notConfigured, undefined, "不该同时说「没生成过配置」");
+    assert.equal(st.notConfigured, false, "不该同时说「没生成过配置」");
   });
 
   test("④b-2 配置文件不在、**父目录在** ⇒ 装了但没配置（不是「没装」）", () => {
@@ -251,7 +251,7 @@ describe("④b 装没装：看目录，不只看那个配置文件在不在", ()
     fs.mkdirSync(path.join(home, "app"), { recursive: true });
     const st = clientStatus(fakeClient(home), { ...CTX, home }, { dataDir: home });
     assert.equal(st.notConfigured, true, "父目录在 ⇒ 是「装了没配置」");
-    assert.equal(st.missing, undefined, "★ 说成了「没装」—— 用户会以为要去下载客户端");
+    assert.equal(st.missing, false, "★ 说成了「没装」—— 用户会以为要去下载客户端");
     assert.match(String(st.detail || ""), /还没生成|运行一次/, "要说清下一步：先运行一次客户端");
   });
 
@@ -279,7 +279,7 @@ describe("④b 装没装：看目录，不只看那个配置文件在不在", ()
     const home = tmpDir();
     fs.mkdirSync(path.join(home, "app"), { recursive: true });
     const st = mod.clientStatus(fakeClient(home), { ...CTX, home }, { dataDir: home });
-    assert.equal(st.notConfigured, undefined,
+    assert.notEqual(st.notConfigured, true,
       "★ 改坏之后仍判成「装了没配置」—— 那 ④b-2 的判据是恒真的，测了个寂寞");
   });
 });

@@ -156,6 +156,15 @@ export function mergeValue(have, ours, spec) {
     whole: toPatterns(spec.whole),
     key: spec.key ? String(spec.key) : "",
     mode: String(spec.mode || ""),
+    /* ⚠ `dropUnmanaged`：**我们自己要删掉的键**，别报进「还留着你自己的 N 个键」。
+     *   场景（OpenCode 迁移旧表名）：旧表名 `sn/claude-opus-5` 我们**删掉**，
+     *   但合并层先看见它「我们没写」⇒ 报成「unmanaged（还留着）」⇒
+     *   面板说「还留着你自己的 3 个键」，其实其中 2 个**已经被我们删了**。
+     *   ⇒ 说错了。**值仍然保留**（合并层照旧把它放进结果里），
+     *     只是**不报**——报不报由「我们删不删它」说了算。 */
+    dropUnmanaged: new Set(
+      Array.isArray(spec.dropUnmanaged) ? spec.dropUnmanaged.map((k) => String(k)) : []
+    ),
   };
   /* ⚠ `mode: "array"` 但没给 `key` ⇒ **认不出「我们那一条」** ⇒ 不做数组合并
    *   （瞎猜会把用户的某一条当我们的改掉 —— 那比不合并更坏）。 */
@@ -235,8 +244,12 @@ function mergeObj(have, ours, path, s, kept, prefix) {
        *   「用户赢 + **说一句**」—— 留住却一个字不说，等于没留住）。
        *   ⇒ `kind: "unmanaged"`；**不报值**（那些值是「用户自己的一堆东西」，
        *     一个个列出来太长 —— 面板上只列**键名**）。
-       *   ⚠ 值不报 ⇒ 也就不用脱敏（没有值会流出去）。 */
-      kept.push({ path: joinPath(prefix, k), kind: "unmanaged" });
+       *   ⚠ 值不报 ⇒ 也就不用脱敏（没有值会流出去）。
+       *   ⚠ **但我们要删掉的键不报**（`dropUnmanaged`）—— 报成「还留着」而
+       *     其实已经被我们删了 ⇒ 面板在骗人。 */
+      if (!(path.length === 0 && s.dropUnmanaged.has(k))) {
+        kept.push({ path: joinPath(prefix, k), kind: "unmanaged" });
+      }
       continue;
     }
     out[k] = mergeNode(hv, ours[k], path.concat(k), s, kept, joinPath(prefix, k));

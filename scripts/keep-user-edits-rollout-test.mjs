@@ -365,9 +365,19 @@ describe("③ OpenCode：opencode.json 的 provider.<pid>", () => {
     assert.equal(bai.options.baseURL, `${CTX.baseUrl}/v1`, "地址是机器该管的 ⇒ 必须换成我们的");
     assert.equal(bai.options.apiKey, CTX.apiKey, "key 是机器该管的 ⇒ 必须换成我们的");
     assert.equal(bai.npm, "@ai-sdk/openai-compatible", "方言/包名是机器该管的");
-    assert.equal(bai.models["sn/claude-opus-5"].name, "我改过的模型名", "★ 用户改过的模型名被改回去了");
-    assert.equal(bai.models["sn/glm-5.2"].name, "GLM 5.2", "★ 我们的模型名被改回去了");
+    /* ⚠ **表名是「档位」**（2026-10-24 定的契约）：OpenCode 的寻址是
+     *   `providerId/modelId`、**按第一个斜杠切** ⇒ 表名里再带一遍 provider
+     *   前缀会变成 `bai/bai/sn/claude-opus-5`，**用户从面板抄来的 id 选不了**。
+     *   ⇒ 表名 = 档位，条目里的 `id` = 发给网关的完整 id。 */
+    assert.equal(bai.models["claude-opus-5"].name, "我改过的模型名", "★ 用户改过的模型名被改回去了");
+    assert.equal(bai.models["claude-opus-5"].id, "sn/claude-opus-5", "★ 条目里发给网关的 id 丢了");
+    assert.equal(bai.models["glm-5.2"].name, "GLM 5.2", "★ 我们的模型名被改回去了");
+    assert.equal(bai.models["glm-5.2"].id, "sn/glm-5.2", "★ 带点的档位的 id 丢了");
     assert.equal(bai.models["我自己的/模型"].name, "我自己的模型", "★ 用户自己加的模型被抹了");
+    assert.ok(!bai.models["sn/claude-opus-5"], "★ 旧表名没删干净 ⇒ 清单里会多出一条选不了的");
+    assert.ok(!bai.models["sn/glm-5.2"], "★ 旧表名没删干净");
+    /* 顶层 `model` 是**引用**（按第一个斜杠切）⇒ `bai/<档位>`。 */
+    assert.equal(j.model, "bai/claude-opus-5", "★ 顶层 model 不对（客户端就不知道用哪个模型）");
     assert.equal(j.provider.other.name, "别人的", "★ 别人的 provider 被动了");
     assert.equal(j.theme, "dark", "★ 用户的其它配置被动");
   });
@@ -375,12 +385,15 @@ describe("③ OpenCode：opencode.json 的 provider.<pid>", () => {
   test("③b 模型 id 里带点（sn/glm-5.2）时，切路径不会切坏它", () => {
     const home = tmpDir();
     const file = ocFile(home);
+    /* 旧版留下的表名（带点）⇒ 迁移时不能切坏它。 */
     writeJson(file, { provider: { bai: { models: { "sn/glm-5.2": { name: "我改过的名字" } } } } });
     const r = applyClient(opencodeClient, { ...CTX, home }, { dataDir: home });
     assert.equal(r.ok, true, r.detail);
     const models = readJson(file).provider.bai.models;
-    assert.equal(models["sn/glm-5.2"].name, "我改过的名字", "★ 带点的键被切坏了");
-    assert.ok(models["sn/claude-opus-5"], "★ 我们的模型没写进去");
+    assert.equal(models["glm-5.2"].name, "我改过的名字", "★ 带点的键被切坏了");
+    assert.equal(models["glm-5.2"].id, "sn/glm-5.2", "★ 带点的档位，发给网关的 id 错了");
+    assert.ok(models["claude-opus-5"], "★ 我们的模型没写进去");
+    assert.ok(!models["sn/glm-5.2"], "★ 旧表名没删干净");
   });
 
   test("③c 断开后与接线前**逐字相同**", () => {
@@ -529,13 +542,16 @@ describe("④ 反向对照：改坏 ⇒ 判据必须红", () => {
     /* OpenCode */
     home = tmpDir();
     file = ocFile(home);
-    writeJson(file, { provider: { bai: { name: "我改过的 provider 名", models: { "sn/claude-opus-5": { name: "我改过的模型名" } } } } });
+    /* ⚠ 用**新**表名（档位）：这一条要验的是**合并层**（"名字归用户"），
+     *   而旧表名那条走的是**迁移**的路（把用户改过的名字搬过来）⇒
+     *   改坏合并层它照样搬 ⇒ 测不到合并层。（迁移那条由 ③a/③b 验。） */
+    writeJson(file, { provider: { bai: { name: "我改过的 provider 名", models: { "claude-opus-5": { name: "我改过的模型名" } } } } });
     const ocr = base.applyClient(oc.opencodeClient, { ...CTX, home }, { dataDir: home });
     assert.equal(ocr.ok, true, ocr.detail);
     const ocj = readJson(file);
     assert.notEqual(ocj.provider.bai.name, "我改过的 provider 名",
       "★ 改坏之后仍然保留用户的 provider 名 —— 那 ③a 的判据是恒真的，测了个寂寞");
-    assert.notEqual(ocj.provider.bai.models["sn/claude-opus-5"].name, "我改过的模型名",
+    assert.notEqual(ocj.provider.bai.models["claude-opus-5"].name, "我改过的模型名",
       "★ 改坏之后仍然保留用户的模型名 —— 那 ③a 的判据是恒真的，测了个寂寞");
   });
 
@@ -572,8 +588,11 @@ describe("④ 反向对照：改坏 ⇒ 判据必须红", () => {
     const before3 = JSON.stringify({ provider: { bai: { name: "我改过的 provider 名", models: { "sn/claude-opus-5": { name: "我改过的模型名" } } } } });
     writeText(file3, before3);
     base.applyClient(oc.opencodeClient, { ...CTX, home: home3 }, { dataDir: home3 });
-    base.revertClient(oc.opencodeClient, { dataDir: home3 });
-    assert.notEqual(fs.readFileSync(file3, "utf8"), before3,
+    /* ⚠ 改坏之后**可能直接炸**（备份里存的是新值 ⇒ 还原时父路径没了 ⇒
+     *   setIn 抛）—— 那也说明「没逐字还原」⇒ 判据照样成立。 */
+    let threw = false;
+    try { base.revertClient(oc.opencodeClient, { dataDir: home3 }); } catch { threw = true; }
+    assert.ok(threw || fs.readFileSync(file3, "utf8") !== before3,
       "★ 改坏之后仍然逐字还原 —— 那 ③c 的判据是恒真的，测了个寂寞");
   });
 
@@ -636,15 +655,17 @@ describe("④ 反向对照：改坏 ⇒ 判据必须红", () => {
     /* OpenCode：模型名的通配 */
     dir = copyTree("broken-spec-oc");
     patch(dir, "opencode.mjs",
-      "merge: { theirs: [\"*.name\"] }",
-      "merge: { theirs: [] }   /* SABOTAGE：模型名不归用户了 */");
+      "merge: { theirs: [\"*.name\"], dropUnmanaged: legacyKeys }",
+      "merge: { theirs: [], dropUnmanaged: legacyKeys }   /* SABOTAGE：模型名不归用户了 */");
     base = await importPatched(dir, "base.mjs");
     let oc = await importPatched(dir, "opencode.mjs");
     home = tmpDir();
     file = ocFile(home);
-    writeJson(file, { provider: { bai: { models: { "sn/claude-opus-5": { name: "我改过的模型名" } } } } });
+    /* ⚠ 用**新**表名（档位）—— 旧表名那条走**迁移**的路（改坏归属表它照样搬），
+     *   测不到归属表。 */
+    writeJson(file, { provider: { bai: { models: { "claude-opus-5": { name: "我改过的模型名" } } } } });
     base.applyClient(oc.opencodeClient, { ...CTX, home }, { dataDir: home });
-    assert.notEqual(readJson(file).provider.bai.models["sn/claude-opus-5"].name, "我改过的模型名",
+    assert.notEqual(readJson(file).provider.bai.models["claude-opus-5"].name, "我改过的模型名",
       "★ 改坏归属表之后仍然保留用户的模型名 —— 那 ③a 的判据是恒真的，测了个寂寞");
   });
 

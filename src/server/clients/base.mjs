@@ -465,25 +465,39 @@ export function revertClient(def, opts = {}) {
 /**
  * clientStatus —— 这个客户端现在接的是不是我们。
  *
- * 返回 `{ wired, detail, file, missing, notConfigured }`：
- *   · `wired` —— 备份文件在 **且** 配置里我们的那块在 ⇒ 是我们接的
+ * 返回 `{ wired, detail, file, missing, notConfigured, configured, halfWired,
+ *          partial, partialNote }`：
+ *   · `wired` —— **每一层**都到位 **且** 备份文件在 ⇒ 是我们接的
  *   · 只有配置在、没有备份 ⇒ 用户（或别的工具）自己写的，如实说明
  *   · `missing` —— **这个客户端压根没装**（它的目录都不在）
  *   · `notConfigured` —— **装了，但还没生成过那个配置文件**（第一次运行才有）
+ *   · `halfWired` —— **只接了一半**（多层客户端：有一层到位、另一层没到位）
+ *   · `partial` / `partialNote` —— **声明层**的「半个接线」：这一格我们**只改得了
+ *     一部分**（Cursor CLI：改得了它选哪个模型、改不了它的地址 ⇒ 它的请求仍然
+ *     走 Cursor 自己的后端）⇒ 面板上**不许**说「已接上」。
  *
- * ⚠ 这两件事必须分开说：早先一律按「配置文件不在」报「这个客户端可能没装」，
- *   而**用户明明装了、只是客户端还没运行过**（ZCode 就是这样：装好了，
- *   `~/.zcode/v2/config.json` 还没生成）—— 那句话会让人以为要去下载。
- *   判据用「配置文件的**父目录**在不在」：**通用**，不用每个客户端各写一套。
+ * ⚠ 「装没装」与「生成没生成」是两把尺子，必须分开说：早先一律按「配置文件不在」
+ *   报「这个客户端可能没装」，而**用户明明装了、只是客户端还没运行过**
+ *   （ZCode 就是这样：装好了，`~/.zcode/v2/config.json` 还没生成）——
+ *   那句话会让人以为要去下载。
+ *   判据：装没装看**客户端自己的目录**（声明里可以给 `installedDir`），
+ *   生成没生成看**配置文件在不在**。默认用配置文件的父目录。
+ *
+ * ⚠ **逐层看**（2026-10-24 加）：早先只看 `list[0]`（第一份文件）⇒
+ *   **Cline 的认证门在 globalState.json + secrets.json 里** —— 只写
+ *   providers.json 的话 CLI 一个请求都发不出去（实测：「Not authenticated」），
+ *   而面板上却说「已接上」⇒ **骗人**。现在每一层都要到位才算接上。
  */
 export function clientStatus(def, ctx, opts = {}) {
   const list = fileListOf(def, ctx);
+  const partial = !!def.partial;
+  const partialNote = String(def.partialNote || "");
   if (!list.length) return { wired: false, detail: "这个客户端没有声明配置文件", file: "" };
   const f = list[0];
   const r = readFileText(f.path);
   if (!r.ok) return { wired: false, detail: `读不了 ${f.path}：${r.error}`, file: f.path };
   if (!r.exists) {
-    const dir = path.dirname(f.path);
+    const dir = installedDirOf(def, ctx) || path.dirname(f.path);
     const installed = fs.existsSync(dir);
     if (installed) {
       return {
@@ -491,7 +505,10 @@ export function clientStatus(def, ctx, opts = {}) {
         detail: `装了，但还没生成过这个配置文件（${f.path}）—— 先把 ${def.name} 运行一次，它就会自己写出来`,
         file: f.path,
         notConfigured: true,
+        missing: false,
         dir,
+        partial,
+        partialNote,
       };
     }
     return {
@@ -499,23 +516,68 @@ export function clientStatus(def, ctx, opts = {}) {
       detail: `没装这个客户端（连 ${dir} 都不在）`,
       file: f.path,
       missing: true,
+      notConfigured: false,
       dir,
+      partial,
+      partialNote,
     };
   }
-  let on = false;
-  try {
-    const fmt = formatOf(f.format || "json");
-    on = typeof f.wired === "function" ? !!f.wired(r.text, fmt) : false;
-  } catch { on = false; }
+  /* ⚠ **逐层判定**：一个客户端可能有多份文件，而**每一份都得对**才算接上。 */
+  const layers = [];
+  for (const ff of list) {
+    const rr = readFileText(ff.path);
+    if (!rr.ok || !rr.exists) { layers.push({ path: ff.path, ok: false }); continue; }
+    let on = false;
+    try {
+      const fmt = formatOf(ff.format || "json");
+      on = typeof ff.wired === "function" ? !!ff.wired(rr.text, fmt) : false;
+    } catch { on = false; }
+    layers.push({ path: ff.path, ok: on });
+  }
+  const bad = layers.filter((l) => !l.ok);
+  const allOk = bad.length === 0;
+  /* 只接了一半 ⇒ 说清**还差哪几层**（只报文件名，不含任何值）。 */
+  const halfWired = !allOk && bad.length < layers.length;
   const hasBackup = fs.existsSync(backupFileOf(def.id, opts.dataDir));
   return {
-    wired: on && hasBackup,
-    configured: on,
-    detail: on
-      ? (hasBackup ? "已接到 B.AI" : "配置里有 B.AI，但不是本机接的（没有备份记录）")
-      : "还没接",
+    wired: allOk && hasBackup,
+    configured: allOk,
+    halfWired,
+    missing: false,
+    notConfigured: false,
+    detail: allOk
+      ? (partial
+        /* ⚠ 半个接线：说清「改好了」≠「走到 B.AI 了」。 */
+        ? (partialNote || "只改了我们改得了的那几处（这一格的请求仍然不走 B.AI）")
+        : (hasBackup ? "已接到 B.AI" : "配置里有 B.AI，但不是本机接的（没有备份记录）"))
+      : (halfWired
+        ? `只接了一半：还差 ${bad.map((l) => path.basename(l.path)).join("、")}`
+        : "还没接"),
     file: f.path,
+    partial,
+    partialNote,
   };
+}
+
+/**
+ * installedDirOf —— 「这个客户端装没装」看哪个目录。
+ *
+ * 声明里可以给 `installedDir: (ctx) => "<目录>"`；不给就用**第一份配置文件的父
+ * 目录**（早先的判据，对大多数客户端是对的）。
+ *
+ * ⚠ 谁需要它：**配置文件在更深的子目录里**的那些 —— 比如 Cline 的配置在
+ *   `~/.cline/data/settings/providers.json`，而 `~/.cline/data/settings` 是
+ *   **客户端第一次运行才建**的 ⇒ 刚装上、还没跑过的 Cline 会被误判成「没装」。
+ *   （ZCode 当年也是这个坑。）
+ */
+function installedDirOf(def, ctx) {
+  try {
+    if (typeof def.installedDir === "function") {
+      const d = String(def.installedDir(ctx) || "").trim();
+      return d || null;
+    }
+  } catch { /* 声明写错了 ⇒ 退回默认判据 */ }
+  return null;
 }
 
 /* ------------------------------------------------------------------ *
