@@ -1227,7 +1227,18 @@ function scheduleProxyCheck(delay = 3000, reason = "周期探测") {
   proxyCheckTimer = setTimeout(async () => {
     if (!serverActivated) return; // 待命/未激活实例不探测（也就绝不触发写配置与自重启）
     const found = await detectWorkingProxy();
-    if (found) applyProxy(found, reason);
+    if (!found) {
+      /* ⚠ 一条都没探通 ⇒ **不动**（宁可保持现状，也别换成一个更不能用的）。
+       *   ⚠ 原来这里是「什么都不做」⇒ 日志里看不出「探过」⇒ 下次有人问
+       *   「它到底探没探」无从查证 ⇒ 现在说清楚。 */
+      log("代理探测：没找到可用通道 ⇒ 保持现状（不换代理、不重启）");
+      return;
+    }
+    if (!applyProxy(found, reason)) {
+      /* 同样要说清楚「决定了不换」—— 这是修「老是被杀掉」的关键判定，
+       *   日志里留一笔，下次有人怀疑「它是不是又在自杀」时能直接看到。 */
+      log(`代理探测：当前通道 ${(loadCfg().proxy || "直连")} 仍可用 ⇒ 不换（不重启）`);
+    }
   }, delay);
 }
 // ---------- "激活"门控：只有真正绑上端口、在对外服务的实例才允许写配置/跑探测 ----------
