@@ -1036,6 +1036,19 @@ async function downloadLatestInstaller() {
 function launchApplyScript() {
   // apply.cmd 由 cmd.exe detached 起：不在服务进程树里，能安全杀掉 node+Electron 主进程。
   // 路径全部用引号包裹；安装器 /S 为 electron-builder NSIS 静默模式，原地升级保留 %APPDATA% 配置。
+  //
+  // ⚠ **必须带上当前安装目录**（2026-10-25 加）：不带 /D= 时安装器会装回**默认
+  //   目录**（%LOCALAPPDATA%\Programs\…）⇒ 装在自定义目录的用户（2026-10-25
+  //   这台机器装在 G:\bai-router\app）**升级一次就被搬回 C 盘**。
+  //   NSIS 的 /D= 必须是**最后一个参数且不能带引号** ⇒ 路径里有空格就传不了
+  //   （那种情况靠注册表的 InstallLocation —— 安装器自己会写、也会读）。
+  const installDirArg = (() => {
+    const exe = String(process.env.BAI_ROUTER_EXE || "");
+    if (!exe) return "";                       // 绿色/开发模式：没有安装目录这回事
+    const dir = path.dirname(exe);
+    if (!dir || /\s/.test(dir)) return "";     // 有空格 ⇒ NSIS 的 /D= 传不了（交给注册表）
+    return ` /D=${dir}`;
+  })();
   const pids = path.join(SU_DIR, "pids.txt");
   try { writeFileSync(pids, `${process.pid} ${process.ppid || 0}\n`); } catch { }
   const appExe = process.env.BAI_ROUTER_EXE || "";
@@ -1052,7 +1065,7 @@ function launchApplyScript() {
     // 按命令行精确匹配本应用的 server.mjs，不误伤其他 node 程序。
     'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq \'node.exe\' -and $_.CommandLine -match \'bai-router.+server[\\\\/]+server[.]mjs\' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1',
     "ping -n 3 127.0.0.1 >nul",
-    `"${SU_EXE}" /S`,
+    `"${SU_EXE}" /S${installDirArg}`,
     "ping -n 2 127.0.0.1 >nul",
   ];
   if (appExe) lines.push(`start "" "${appExe}" --min`);
