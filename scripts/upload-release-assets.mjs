@@ -24,9 +24,12 @@ const TAG = process.argv[2] || "v1.0.108-beta.1";
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..");
 const DIST = path.join(ROOT, "dist");
 
+/* ⚠ 文件名**按 tag 推导**（别写死版本号）：写死过一次 ⇒ 把 108 的安装包传到了
+ *   109 的 release 里（远端看着有资产、其实版本不对）。 */
+const VER = TAG.replace(/^v/, "");
 const ASSETS = [
-  "BARRouter-Setup-1.0.108-beta.1.exe",
-  "BARRouter-Setup-1.0.108-beta.1.exe.blockmap",
+  `BARRouter-Setup-${VER}.exe`,
+  `BARRouter-Setup-${VER}.exe.blockmap`,
   "beta.yml",
   "upgrade.ps1",
   "rollback.ps1",
@@ -71,16 +74,22 @@ function listAssets() {
 const rel = spawnSync("gh", ["api", `repos/${REPO}/releases/tags/${TAG}`, "--jq", ".id"], {
   encoding: "utf8", env: { ...process.env, ...ROUTES[0].env },
 });
-let releaseId = String(rel.stdout || "").trim();
+/* ⚠ **看退出码，不看 stdout**：查不到时 `gh api` 会把**错误 JSON 打到 stdout**
+ *   （`{"message":"Not Found",…}`）⇒ 只判 stdout 非空会把那段错误当成 id
+ *   ⇒ 于是「release 不存在 ⇒ 先建」那段永远不跑 ⇒ 上传一律 404。 */
+let releaseId = rel.status === 0 ? String(rel.stdout || "").trim() : "";
 if (!releaseId) {
   /* ⚠ release 不存在 ⇒ **先用 REST 建一个**（不带资产 ⇒ 快，也不会碰到
    *   「上传被截断却报成功」那个坑）⇒ 再逐个传资产、逐个验大小。 */
   console.log(`release ${TAG} 不存在 ⇒ 先建一个（prerelease，不带资产）`);
+  /* ⚠ **body 用短文本**：整份 release-notes.md（含中文、反引号、换行）塞进
+   *   `--data-binary` 的 JSON 里 ⇒ 引号/编码很容易把它弄坏 ⇒ 建出来是坏的正文。
+   *   ⇒ 这里只写标题，**正文另用 `gh release edit --notes-file` 补**（那个读文件、
+   *   不过 shell 的引号地狱）。 */
   const body = JSON.stringify({
     tag_name: TAG,
     name: TAG,
-    body: fs.existsSync(path.join(ROOT, "release-notes.md"))
-      ? fs.readFileSync(path.join(ROOT, "release-notes.md"), "utf8") : TAG,
+    body: TAG,
     prerelease: true,
     draft: false,
     target_commitish: process.argv[3] || "main",
@@ -106,6 +115,16 @@ if (!releaseId) {
   console.log("  已建，id=" + releaseId);
 }
 console.log("release id:", releaseId);
+
+/* 正文用 `gh release edit --notes-file` 补（读文件 ⇒ 不过 shell 的引号地狱）。 */
+try {
+  const notesFile = path.join(ROOT, "release-notes.md");
+  if (fs.existsSync(notesFile)) {
+    spawnSync("gh", ["release", "edit", TAG, "-R", REPO, "--notes-file", notesFile],
+      { stdio: "ignore", env: { ...process.env, ...ROUTES[0].env } });
+    console.log("  已补正文（release-notes.md）");
+  }
+} catch { /* 正文补不上不挡着传资产 */ }
 
 for (const name of ASSETS) {
   const local = path.join(DIST, name);
