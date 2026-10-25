@@ -107,9 +107,17 @@ Get-ChildItem 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall' -
 `;
 spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", shell: true });
 
-/* ⑤ 从新位置启动 */
-say("⑤ 从新位置启动…");
-try { spawnSync(EXE, [], { detached: true, stdio: "ignore" }); } catch (e) { say(`  启动失败：${e.message}`); }
+/* ⑤ 从新位置启动（**已经在跑就别再起一个** —— hotfix 那步已经把它起好了 ⇒
+ *    再起一个只会撞单实例锁、白白多一个进程）。 */
+const already = String(spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+  "$p = (Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'B.AI Router.exe' -and $_.ExecutablePath -like '" + NEW_DIR.replace(/'/g, "''") + "*' } | Select-Object -First 1); if ($p) { $p.ExecutablePath } else { 'NOT RUNNING' }"],
+{ encoding: "utf8", shell: true }).stdout || "").trim();
+if (already && already !== "NOT RUNNING") {
+  say(`⑤ 新位置那份**已经在跑**（${already}）⇒ 不再起第二个`);
+} else {
+  say("⑤ 从新位置启动…");
+  try { spawnSync(EXE, [], { detached: true, stdio: "ignore" }); } catch (e) { say(`  启动失败：${e.message}`); }
+}
 
 await new Promise((r) => setTimeout(r, 12000));
 /* ⑥ 验证 */
