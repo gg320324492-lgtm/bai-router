@@ -253,8 +253,12 @@ describe("救砖脚本：安装位置读注册表，不写死路径", () => {
   test("② helper 读注册表的 InstallLocation，调用处用的是它，找不到要明说", () => {
     for (const rel of SCRIPTS) {
       const src = srcOf(rel);
-      assert.match(src, /InstallLocation/,
+      /* ⚠ 断言针对**代码**（读注册表那行），不是注释里的同一个词 ——
+       *   注释出现 InstallLocation 不算实现，反向对照也会被它骗过。 */
+      assert.match(src, /\$reg = Get-ChildItem "HKCU:[^"]*Uninstall"/,
         `★ ${rel} 不读注册表 ⇒ 装在自定义目录的机器找不到 exe`);
+      assert.match(src, /Join-Path \$r\.InstallLocation/,
+        `★ ${rel} 读到了注册表却不用 InstallLocation`);
       assert.match(src, /\$exe = Find-InstalledExe/,
         `★ ${rel} 的调用处仍写死路径`);
       assert.match(src, /找不到已安装的程序/,
@@ -262,14 +266,14 @@ describe("救砖脚本：安装位置读注册表，不写死路径", () => {
     }
   });
 
-  test("③ 反向对照：把注册表那段删掉 ⇒ ①② 必须红", () => {
+  test("③ 反向对照：把读注册表那行删掉 ⇒ ② 必须红", () => {
     const src = srcOf(SCRIPTS[0]);
     const broken = src.replace(
-      /try \{\s*\$reg = Get-ChildItem "HKCU:[\s\S]*?\} catch \{ \}/,
-      "",
+      /\$reg = Get-ChildItem "HKCU:[^"]*Uninstall" -ErrorAction SilentlyContinue \|/,
+      "$reg = @() |/",
     );
     assert.notEqual(broken, src, "改坏的副本没改成 —— 这条反向对照失效了（锚点与源码脱节）");
-    assert.ok(!/InstallLocation/.test(broken),
-      "★ 删掉注册表读取之后仍出现 InstallLocation ⇒ 断言没咬住实现");
+    assert.ok(!/\$reg = Get-ChildItem "HKCU:/.test(broken),
+      "★ 改坏之后仍读注册表 ⇒ ② 的判据是恒真的，测了个寂寞");
   });
 });
