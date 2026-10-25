@@ -71,8 +71,40 @@ function listAssets() {
 const rel = spawnSync("gh", ["api", `repos/${REPO}/releases/tags/${TAG}`, "--jq", ".id"], {
   encoding: "utf8", env: { ...process.env, ...ROUTES[0].env },
 });
-const releaseId = String(rel.stdout || "").trim();
-if (!releaseId) { console.error("找不到 release"); process.exit(1); }
+let releaseId = String(rel.stdout || "").trim();
+if (!releaseId) {
+  /* ⚠ release 不存在 ⇒ **先用 REST 建一个**（不带资产 ⇒ 快，也不会碰到
+   *   「上传被截断却报成功」那个坑）⇒ 再逐个传资产、逐个验大小。 */
+  console.log(`release ${TAG} 不存在 ⇒ 先建一个（prerelease，不带资产）`);
+  const body = JSON.stringify({
+    tag_name: TAG,
+    name: TAG,
+    body: fs.existsSync(path.join(ROOT, "release-notes.md"))
+      ? fs.readFileSync(path.join(ROOT, "release-notes.md"), "utf8") : TAG,
+    prerelease: true,
+    draft: false,
+    target_commitish: process.argv[3] || "main",
+  });
+  const mk = spawnSync("curl", [
+    "-sS", "--ssl-no-revoke", "-m", "120", "-X", "POST",
+    "-H", `Authorization: Bearer ${token}`,
+    "-H", "Accept: application/vnd.github+json",
+    "-H", "X-GitHub-Api-Version: 2022-11-28",
+    "-H", "Content-Type: application/json",
+    "--data-binary", body,
+    "https://api.github.com/repos/" + REPO + "/releases",
+    "-w", "\\n%{http_code}",
+  ], { encoding: "utf8", env: { ...process.env, ...ROUTES[0].env } });
+  const out = String(mk.stdout || "");
+  const code = (out.trim().split(/\r?\n/).pop() || "").trim();
+  if (code !== "201") {
+    console.error("★ 建 release 失败：HTTP " + code + " " + out.slice(0, 300));
+    process.exit(1);
+  }
+  const j = JSON.parse(out.slice(0, out.lastIndexOf("\n")));
+  releaseId = String(j.id || "");
+  console.log("  已建，id=" + releaseId);
+}
 console.log("release id:", releaseId);
 
 for (const name of ASSETS) {
