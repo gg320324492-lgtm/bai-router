@@ -245,9 +245,19 @@ provider 跳。模型寻址靠本地四档映射表（`TIERS` + `resolveModelTar
 - **阶段 3**（渠道目录作真源）—— `src/server/clients/facts-sources.mjs`：
   wb/wbai 的 `/v3/config`、qd 的 `qoder-models.json` 都**实测拉通**（模块做出来了）；
   本机 32 条档位里 14 条拿到真值（8 条本家实测 + 6 条两家一致），18 条仍兜底。
-  ⚠ **「后台刷表」那一步还没接进生产** —— 那要在启动时去拉渠道目录（发网络请求、
-  可能触发令牌刷新）⇒ 目前用的是**内置表里那 25 条**（含 2026-10-23 实测值）。
-  交接笔记在 `…/side-session-notes/…/model-facts-handoff.md` 第三节，代码现成。
+  ⚠ **「后台刷表」那一步还没接进生产**（2026-10-26 专项核实过 ⇒ 见下）。
+
+  **2026-10-26 专项核实的结论**（只读调研，没改代码）：
+  · **「代码现成」≠「接进生产」**。`model-facts.mjs` **已接**（server.mjs 的
+    导入与下发点），但**下发面只有 `/muse-code/models` 一个端点**；
+    `facts-sources.mjs` 与 `facts-refresh.mjs` **零生产调用、从未运行过**
+    （覆盖层文件与计划任务都不存在）。
+  · **最大阻碍不是代码，是「令牌来源」**：`facts-sources` 读 `cfg.wb.accessToken`
+    （本机是空串），而 server.mjs 生产抓取读的是**账号池选出的账号令牌**
+    ⇒ 两条路各走各的 ⇒ 直接把刷表接进启动流程会拿到空令牌。
+  · 推荐形态：**独立进程刷表 + server.mjs 只读内存里的覆盖层**
+    （别在启动路径上发网络请求）。
+  · ⚠ 文档里的「内置表 25 条」与**实际的 24 条**有漂移（以代码为准）。
 
 **还没做**：
 - **阶段 4**（models.dev 后台补充）—— 刻意不做（设计稿已定：id 不同源，映射错了
@@ -274,6 +284,13 @@ magpie 的每个客户端是**深度定制**的 —— `internal/agent/zcode.go`
 
 另有三件 magpie 做了、我们还没做的：ZCode 的 `provider_config.json`（第二份文件）、
 Qwen Code 的 `MAGPIE_QWEN_API_KEY` 环境变量、MothX 的 `providers` 对象。
+⚠ **2026-10-26 订正**：前两件其实**已经做了**——
+· ZCode 的 `provider_config.json`（rules 形状，3.14+ 真正读的那份）已在
+  `clients/zcode.mjs` 里；
+· Qwen Code 的 key 我们用的是 `BAI_QWEN_API_KEY`（**带客户端名**，与 magpie 的
+  `MAGPIE_QWEN_API_KEY` 同思路：名字具体一点、被盖掉的概率小）——是**有意的不同**，
+  不是没做。
+⇒ 真正还没做的只剩 **MothX 的 `providers` 对象**。
 
 **取舍**：T15-c 是几十个客户端 × 每个 100–600 行 = 数月的量。
 先按 T15-b 铺完（几十个客户端一次能铺完），再挑用户真在用的那几个做深。
@@ -456,12 +473,21 @@ export function connect({ gateway, model, models }) {
 · ⚠ **本机能无头实测的只有 5 个**（其余是 GUI/IDE 分支或没装）⇒ **验证覆盖有限**，
   别把「这 5 个过了」当成「28 个都过了」。
 
-**待办**：加一个「**环境变量遮蔽检查**」（接线成功后查用户系统里有没有同名 env 会盖掉
-我们写的）—— 优先级最高的是 **Gemini CLI**（`GOOGLE_GEMINI_BASE_URL` /
-`GEMINI_API_KEY` 是**行业标准名**，而我们写进 `~/.gemini/.env`；dotenv 默认**不覆盖**
-已有的进程环境变量 ⇒ 用户系统里有同名变量时**真环境变量赢**）。⚠ 本机没装 ⇒ 未验证。
-（Qwen Code / Reasonix 的 key 也走环境变量，shell 同名变量优先；我们已用
-`BAI_QWEN_API_KEY` / `BAI_REASONIX_API_KEY` 压低风险，与 magpie 同思路。）
+**✅ 已做（2026-10-26）**：**环境变量遮蔽检查** —— 接线后查用户系统里有没有同名 env
+会盖掉我们写的键，并把结果**摆到面板上**（`src/server/clients/env-shadow.mjs`：
+读注册表 User/Machine 两级 + 判据 + 脱敏文案；接线在 server.mjs 的 apply 与列表两个
+端点；面板 `cards/clients.js` 多一行提示）。
+判据核过上游源码，没拍脑袋：
+· **Gemini CLI**（`GOOGLE_GEMINI_BASE_URL` / `GEMINI_API_KEY`，写在 `~/.gemini/.env`）
+  ⇒ 它的 `loadEnvironment()` 只在 `!Object.hasOwn(process.env, key)` 时才填 ⇒
+  **真环境变量赢，.env 只填补空缺** ⇒ 一定被盖 ⇒ 报「已确定被盖住」；
+· **Qwen Code**（`BAI_QWEN_API_KEY`）、**Reasonix**（`BAI_REASONIX_API_KEY`）⇒ 同类风险；
+· **Claude Code**（`env.ANTHROPIC_*`）⇒ `Object.assign(process.env, settings.env)`
+  ⇒ **自己的配置赢** ⇒ 不算遮蔽（不打扰用户）。
+⚠ **明说的盲区**：注册表这一档抓不到「进程里临时设的」和「wrapper 注入的」变量
+（本机就有个例子：`ANTHROPIC_BASE_URL` 在进程环境里有、注册表里没有 ⇒ 它是某个进程
+注入的，不是用户在「系统属性」里设的）⇒ **不能拿进程环境当用户环境**。
+⚠ 本机没装 Gemini CLI ⇒ 未做端到端实测（依据是上游源码/文档）。
 
 ---
 
