@@ -21,6 +21,25 @@
 #   「回到能用的稳定版」，不是「回到上一个更旧的测试版」。
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# 找到「当前这份安装」的位置。
+# ⚠ **不能写死路径**：装在自定义目录（例如别的盘）的机器上，写死的两条都不存在
+#   ⇒ 脚本「装完了但不重启」——静默失败，用户以为回退没生效。
+#   安装器（NSIS）自己会写注册表的 InstallLocation ⇒ 读它最准。
+#   ⚠ **这份 helper 与 scripts/upgrade.ps1 里的必须逐字一致**（两份独立发布的
+#   .ps1 不能共享代码 ⇒ 只能靠测试钉住；见 scripts/ps-verify-test.mjs）。
+function Find-InstalledExe {
+  $cands = @()
+  try {
+    $reg = Get-ChildItem "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
+      ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+      Where-Object { $_.DisplayName -like "*B.AI Router*" -and $_.InstallLocation }
+    foreach ($r in $reg) { $cands += (Join-Path $r.InstallLocation "B.AI Router.exe") }
+  } catch { }
+  $cands += "$env:LOCALAPPDATA\Programs\B.AI Router\B.AI Router.exe"
+  $cands += "$env:LOCALAPPDATA\Programs\bai-router\B.AI Router\B.AI Router.exe"
+  return ($cands | Where-Object { Test-Path $_ } | Select-Object -First 1)
+}
 $repo = "gg320324492-lgtm/bai-router"
 
 # ── 下面这些函数只是定义；主流程放在文件末尾的 if 里 ──────────────────────
@@ -180,7 +199,8 @@ if (-not $env:BAI_ROUTER_PS_LIB) {
   Write-Host "安装旧版（静默，配置保留）..."
   Start-Process $tmp -ArgumentList "/S"
   Start-Sleep 4
-  $exe = @("$env:LOCALAPPDATA\Programs\bai-router\B.AI Router\B.AI Router.exe", "D:\Users\$env:USERNAME\AppData\Local\Programs\bai-router\B.AI Router\B.AI Router.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+  $exe = Find-InstalledExe
   if ($exe) { Start-Process $exe -ArgumentList "--min"; Write-Host "已用 v$ver 重新启动 ✓" }
+  else { Write-Host "⚠ 找不到已安装的程序 —— 回退已装上，但没能自动重启（从桌面图标或开始菜单打开即可）" }
   Write-Host "回退完成。"
 }

@@ -23,6 +23,25 @@
 #   这样下载失败/校验不过时，当前这份安装**一点都没被动过**。
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# 找到「当前这份安装」的位置。
+# ⚠ **不能写死路径**：装在自定义目录（例如别的盘）的机器上，写死的两条都不存在
+#   ⇒ 脚本「装完了但不重启」——静默失败，用户以为升级没生效。
+#   安装器（NSIS）自己会写注册表的 InstallLocation ⇒ 读它最准。
+#   兜底才是默认目录（electron-builder 的默认是 %LOCALAPPDATA%\Programs\B.AI Router，
+#   **不是** Programs\bai-router —— 旧写法那两条路径连默认都不对）。
+function Find-InstalledExe {
+  $cands = @()
+  try {
+    $reg = Get-ChildItem "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
+      ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+      Where-Object { $_.DisplayName -like "*B.AI Router*" -and $_.InstallLocation }
+    foreach ($r in $reg) { $cands += (Join-Path $r.InstallLocation "B.AI Router.exe") }
+  } catch { }
+  $cands += "$env:LOCALAPPDATA\Programs\B.AI Router\B.AI Router.exe"
+  $cands += "$env:LOCALAPPDATA\Programs\bai-router\B.AI Router\B.AI Router.exe"
+  return ($cands | Where-Object { Test-Path $_ } | Select-Object -First 1)
+}
 $repo = "gg320324492-lgtm/bai-router"
 
 # ── 下面这些函数只是定义；主流程放在文件末尾的 if 里 ──────────────────────
@@ -161,7 +180,8 @@ if (-not $env:BAI_ROUTER_PS_LIB) {
   Write-Host "启动安装（静默，原地升级，配置保留）..."
   Start-Process $tmp -ArgumentList "/S"
   Start-Sleep 3
-  $exe = @("$env:LOCALAPPDATA\Programs\bai-router\B.AI Router\B.AI Router.exe", "D:\Users\$env:USERNAME\AppData\Local\Programs\bai-router\B.AI Router\B.AI Router.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+  $exe = Find-InstalledExe
   if ($exe) { Start-Process $exe -ArgumentList "--min"; Write-Host "已用新版重新启动 ✓" }
+  else { Write-Host "⚠ 找不到已安装的程序 —— 升级已装上，但没能自动重启（从桌面图标或开始菜单打开即可）" }
   Write-Host "完成。"
 }

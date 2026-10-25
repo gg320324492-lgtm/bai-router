@@ -223,3 +223,53 @@ Write-Host ('HASH=' + (Get-InstallerSha512 $t '${EXE}'))
     assert.equal(outs[0], EXE_HASH);
   });
 });
+
+/* ====================================================================== *
+ * 安装位置：不能写死路径（2026-10-25）
+ * ====================================================================== *
+ *
+ * 起因：装在自定义目录（例如别的盘）的机器上，脚本写死的两条候选路径都不存在
+ *   ⇒ 「装完了但不重启」——静默失败，用户以为升级/回退没生效。
+ *   而且那两条连 electron-builder 的**默认**目录都不是（默认是
+ *   %LOCALAPPDATA%\Programs\B.AI Router，不是 Programs\bai-router\…）。
+ * ⇒ 读注册表的 InstallLocation（安装器自己写的）才准。
+ */
+describe("救砖脚本：安装位置读注册表，不写死路径", () => {
+  const srcOf = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
+  const helperBody = (src) => {
+    const m = /function Find-InstalledExe \{[\s\S]*?\n\}/.exec(src);
+    return m ? m[0] : null;
+  };
+
+  test("① 两份脚本的 Find-InstalledExe 逐字一致（不能共享代码 ⇒ 只能靠比对）", () => {
+    const bodies = SCRIPTS.map((rel) => helperBody(srcOf(rel)));
+    for (const [i, rel] of SCRIPTS.entries()) {
+      assert.ok(bodies[i], `★ ${rel} 里没有 Find-InstalledExe`);
+    }
+    assert.equal(bodies[0], bodies[1],
+      "★ 两份 helper 不一致 ⇒ 改一处忘另一处就会漂移（两份是独立发布的 .ps1）");
+  });
+
+  test("② helper 读注册表的 InstallLocation，调用处用的是它，找不到要明说", () => {
+    for (const rel of SCRIPTS) {
+      const src = srcOf(rel);
+      assert.match(src, /InstallLocation/,
+        `★ ${rel} 不读注册表 ⇒ 装在自定义目录的机器找不到 exe`);
+      assert.match(src, /\$exe = Find-InstalledExe/,
+        `★ ${rel} 的调用处仍写死路径`);
+      assert.match(src, /找不到已安装的程序/,
+        `★ ${rel} 找不到 exe 时一个字不说 ⇒ 用户以为升级没生效`);
+    }
+  });
+
+  test("③ 反向对照：把注册表那段删掉 ⇒ ①② 必须红", () => {
+    const src = srcOf(SCRIPTS[0]);
+    const broken = src.replace(
+      /try \{\s*\$reg = Get-ChildItem "HKCU:[\s\S]*?\} catch \{ \}/,
+      "",
+    );
+    assert.notEqual(broken, src, "改坏的副本没改成 —— 这条反向对照失效了（锚点与源码脱节）");
+    assert.ok(!/InstallLocation/.test(broken),
+      "★ 删掉注册表读取之后仍出现 InstallLocation ⇒ 断言没咬住实现");
+  });
+});

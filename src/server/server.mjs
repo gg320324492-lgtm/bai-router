@@ -14,6 +14,8 @@ import { execFile, spawn } from "node:child_process";
 import os from "node:os";
 /* 「主动退出」标记（写与读共用同一个文件 ⇒ 形状不会漂）—— 见 restart-marker.cjs 的说明。 */
 import marker from "./restart-marker.cjs";
+/* 静默安装时「装到哪儿」的参数判据（纯函数、可单测）—— 见 nsis-args.cjs。 */
+import { installDirArg } from "./nsis-args.cjs";
 /* 走哪条通道的判定（纯逻辑，可单测）—— 见 proxy-policy.mjs 的说明。 */
 import { chooseChannel, proxyPortAlive } from "./proxy-policy.mjs";
 import {
@@ -1039,16 +1041,17 @@ function launchApplyScript() {
   //
   // ⚠ **必须带上当前安装目录**（2026-10-25 加）：不带 /D= 时安装器会装回**默认
   //   目录**（%LOCALAPPDATA%\Programs\…）⇒ 装在自定义目录的用户（2026-10-25
-  //   这台机器装在 G:\bai-router\app）**升级一次就被搬回 C 盘**。
-  //   NSIS 的 /D= 必须是**最后一个参数且不能带引号** ⇒ 路径里有空格就传不了
-  //   （那种情况靠注册表的 InstallLocation —— 安装器自己会写、也会读）。
-  const installDirArg = (() => {
-    const exe = String(process.env.BAI_ROUTER_EXE || "");
-    if (!exe) return "";                       // 绿色/开发模式：没有安装目录这回事
-    const dir = path.dirname(exe);
-    if (!dir || /\s/.test(dir)) return "";     // 有空格 ⇒ NSIS 的 /D= 传不了（交给注册表）
-    return ` /D=${dir}`;
-  })();
+  //   这台机器装在 G:\bai-router\app\B.AI Router）**升级一次就被搬回 C 盘**。
+  //   NSIS 的 /D= 必须是**最后一个参数**；路径里有空格时把**整个参数**引起来
+  //   （`"/D=C:\My Dir"`）即可 —— 不是「不能带空格」。
+  //   ⚠ 另有一条 NSIS 的规矩：**目标目录名里不含产品名时，安装器会自动补一层**
+  //   （`instFilesPre`：`StrContains $0 "${APP_FILENAME}" $INSTDIR` 为空 ⇒
+  //   `$INSTDIR\B.AI Router`）⇒ 传 `G:\bai-router\app` 会变成
+  //   `G:\bai-router\app\B.AI Router`（多一层，2026-10-25 实测踩到 ⇒ 桌面图标
+  //   指到不存在的文件，「用不了」）。
+  //   ⇒ 传 dirname(exe) 正合适：它**已经含产品名** ⇒ 不会再补一层。
+  /* 判据本身在 nsis-args.cjs（纯函数、可单测）—— 这里只取当前 exe 的目录。 */
+  const dirArg = installDirArg(process.env.BAI_ROUTER_EXE || "");
   const pids = path.join(SU_DIR, "pids.txt");
   try { writeFileSync(pids, `${process.pid} ${process.ppid || 0}\n`); } catch { }
   const appExe = process.env.BAI_ROUTER_EXE || "";
@@ -1065,7 +1068,7 @@ function launchApplyScript() {
     // 按命令行精确匹配本应用的 server.mjs，不误伤其他 node 程序。
     'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq \'node.exe\' -and $_.CommandLine -match \'bai-router.+server[\\\\/]+server[.]mjs\' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1',
     "ping -n 3 127.0.0.1 >nul",
-    `"${SU_EXE}" /S${installDirArg}`,
+    `"${SU_EXE}" /S${dirArg}`,
     "ping -n 2 127.0.0.1 >nul",
   ];
   if (appExe) lines.push(`start "" "${appExe}" --min`);
