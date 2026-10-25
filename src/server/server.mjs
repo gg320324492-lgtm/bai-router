@@ -143,6 +143,8 @@ import { claudeDesktopClient } from "./clients/claude-desktop.mjs";
 /* Muse Code 的模型清单（clients/muse-models.mjs）：Muse 从 `<base_url 主机>/muse-code/models`
  * 拉清单，不是从 /v1/models ⇒ 没有这个端点，它的清单里就没有我们的模型。 */
 import { buildMuseModels } from "./clients/muse-models.mjs";
+/* 环境变量遮蔽检查（接线后：用户系统里的同名 env 会盖掉我们写的配置 ⇒ 必须能看见）。 */
+import { checkClientEnvShadow, envShadowNotice, readUserEnv } from "./clients/env-shadow.mjs";
 /* 网关的故障转移（gateway-failover.mjs）：把「档位」从最终模型名反查回来，
  * 转移时才能按**目标家**重解析（各家同一档位是不同模型）。 */
 import { tierOfModel, tierKeyFor } from "./gateway-failover.mjs";
@@ -8148,6 +8150,28 @@ function clientCtx(cfg, provider) {
   };
 }
 
+/* ------------------------------------------------------------------ *
+ * 环境变量遮蔽检查：用户系统里设置过的同名变量
+ * ------------------------------------------------------------------ *
+ *
+ * 「写进配置」≠「生效」：有的客户端读环境变量，而**真环境变量赢**
+ * （Gemini CLI 的 dotenv 只填补空缺；Claude Code 则是自己的配置赢）。
+ * ⇒ 接线后必须查一遍用户系统里有没有同名变量，并**说出来**。
+ *
+ * ⚠ 读注册表要起一个 PowerShell（几十毫秒到几秒）⇒ **缓存一分钟**：
+ *   面板每几秒刷一次列表 ⇒ 不缓存就是每刷一次起一个 PowerShell。
+ */
+let _userEnvCache = { at: 0, value: null };
+function cachedUserEnv(ttlMs = 60000) {
+  const now = Date.now();
+  if (_userEnvCache.value && now - _userEnvCache.at < ttlMs) return _userEnvCache.value;
+  let value = { ok: false, env: [], source: "none", error: "读用户环境变量时意外失败" };
+  try { value = readUserEnv(); }
+  catch (e) { value = { ok: false, env: [], source: "none", error: "读用户环境变量失败：" + String((e && e.message) || e) }; }
+  _userEnvCache = { at: now, value };
+  return value;
+}
+
 // ---------- 文件级操作 ----------
 function readJson(file) {
   return JSON.parse(readFileSync(file, "utf8"));
@@ -10899,12 +10923,21 @@ async function unknownMappingTargets(p, mapping, cfg) {
     if (req.method === "GET" && u.pathname === "/api/clients") {
       const ctx = clientCtx();
       const list = await allClients();
+      /* ⚠ 环境变量遮蔽检查要**读一次**注册表（读一次要起一个 PowerShell，
+       *   二十几个客户端各读一次就是十几秒）⇒ 这里读一次、缓存一分钟。 */
+      const userEnv = cachedUserEnv();
       const out = [];
       for (const c of list) {
         let st = { wired: false, detail: "", file: "" };
         /* ⚠ 判状态失败**如实报**，不让一个客户端的异常把整张列表变成空白。 */
         try { st = clientStatus(c, ctx, { dataDir: DATA_DIR }); }
         catch (e) { st = { wired: false, detail: "读状态时出错：" + String((e && e.message) || e) }; }
+        /* 遮蔽检查：用户系统里的同名 env 会盖掉我们写的键 ⇒ 面板上要看得见。 */
+        let envShadow = null;
+        try {
+          const sh = checkClientEnvShadow(c, ctx, { envRead: userEnv });
+          if (sh && sh.shadows && sh.shadows.length) envShadow = { shadows: sh.shadows, notice: envShadowNotice(sh) };
+        } catch (e) { /* 遮蔽检查失败不该让整张列表变空白 */ }
         out.push({
           id: c.id, name: c.name, protocol: c.protocol || "", note: c.note || "",
           status: st,
@@ -10915,6 +10948,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
           /* 插件声明的客户端（<数据目录>/agent-plugins/*.json）⇒ 面板上标出来，
            *   免得用户以为那是内置的。 */
           plugin: !!c.plugin,
+          envShadow,
         });
       }
       /* ⚠ 统一网关地址要一起给出去：用户要看得见「客户端会被指到哪儿」，
@@ -10946,8 +10980,21 @@ async function unknownMappingTargets(p, mapping, cfg) {
       if (!def) return json(res, 404, { error: `没有这个客户端：${String(b.id || "")}` });
       /* ⚠ `provider` = 接哪一家。Claude Code 这类**不能自己挑模型**的客户端
        *   需要它（模型 id 必须是 `provider/档位`）。 */
-      const r = applyClient(def, clientCtx(null, b.provider), { dataDir: DATA_DIR });
-      return json(res, r.ok ? 200 : 400, r);
+      const ctx = clientCtx(null, b.provider);
+      const r = applyClient(def, ctx, { dataDir: DATA_DIR });
+      /* ⚠ **遮蔽检查要拼进 detail**：面板只显示 detail（cards/clients.js 那行）⇒
+       *   只加结构化字段的话面板一个字都不改 ⇒ 用户**看不见** ⇒ 而
+       *   「写进配置但被同名 env 盖住」这件事**看得见**是本功能存在的唯一理由。 */
+      let shadow = null;
+      try {
+        const sh = checkClientEnvShadow(def, ctx, { envRead: cachedUserEnv() });
+        if (sh && sh.shadows && sh.shadows.length) shadow = { shadows: sh.shadows, notice: envShadowNotice(sh) };
+      } catch (e) { /* 遮蔽检查失败不该让接线失败 */ }
+      return json(res, r.ok ? 200 : 400, {
+        ...r,
+        detail: (shadow ? shadow.notice + "\n" : "") + r.detail,
+        envShadow: shadow,
+      });
     }
     if (req.method === "POST" && u.pathname === "/api/clients/revert") {
       const b = await readBody(req);

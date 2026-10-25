@@ -153,12 +153,27 @@ describe("客户端接线的面板接口", () => {
     const ids = Object.keys(j.provider.bai.models || {});
     assert.ok(ids.length > 0, "模型清单没写进去");
     for (const id of ids) assert.match(id, /^[a-z0-9]+\//, `模型 id 必须是 provider/档位：${id}`);
+    /* ⚠ 环境变量遮蔽检查**接上了**（字段在、失败也不炸）。
+     *   只验「接线通」：本机注册表里没有同名变量 ⇒ 造不出遮蔽场景
+     *   （要造就得改真实注册表 ⇒ 绝不做）。判据本身由 scripts/env-shadow-test.mjs 覆盖。 */
+    assert.ok("envShadow" in r.json,
+      "★ apply 的返回体里没有 envShadow 字段 ⇒ 遮蔽结果没法从接口拿出来");
+    assert.equal(typeof r.json.detail, "string", "detail 必须是字符串（面板只显示它）");
   });
 
   test("②b 状态变成「已接到 B.AI」", async () => {
     const r = await get("/api/clients");
     const z = r.list.find((x) => x.id === "zcode");
     assert.equal(z.status.wired, true, `状态不对：${JSON.stringify(z.status)}`);
+  });
+
+  test("②c 列表每一项都带 envShadow（面板那行渲染得出来）", async () => {
+    /* ⚠ **只读**：不要再 apply 一次（那会覆盖备份 ⇒ 把 ③ 的还原测坏）。 */
+    const list = await get("/api/clients");
+    for (const c of list.list) {
+      assert.ok("envShadow" in c,
+        `★ 列表项 ${c.id} 里没有 envShadow 字段 ⇒ 面板那行渲染不出来`);
+    }
   });
 
   test("③ POST /api/clients/revert → 把我们写的那一块收回去", async () => {

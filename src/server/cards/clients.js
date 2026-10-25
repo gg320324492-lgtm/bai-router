@@ -274,6 +274,7 @@ window.BAI_CARDS["clients"] = {
               ${c.protocol ? `<span class="dim"> · ${esc(String(c.protocol))}</span>` : ""}
               ${c.note ? `<div class="hint" style="margin-top:2px">${esc(String(c.note))}</div>` : ""}
               ${st.file ? `<div class="hint mono" style="margin-top:2px;word-break:break-all">${esc(String(st.file))}</div>` : ""}
+              ${c.envShadow ? `<div class="hint" style="margin-top:2px">${esc(String(c.envShadow.notice || ""))}</div>` : ""}
             </span>
           </div>
           ${broken ? "" : `<div style="margin-top:8px;display:flex;gap:7px;flex-wrap:wrap">
