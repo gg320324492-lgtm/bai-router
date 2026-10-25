@@ -50,9 +50,22 @@
 //     whole:  ["models"],                            // 整块用我们的（不做深合并）
 //     mode:   "array",                               // 可选：值是数组
 //     key:    "providerId",                          // mode=array 时：按这个键认出「我们那一条」
+//     aliasOf: "tier",                               // 可选：认出「同一条」时，还按这个别名比
 //   },
 // }
 // ```
+//
+// ⚠ **`aliasOf` 为什么需要**（2026-10-24 补）：数组里认「同一条」原本只看
+//   `key` 的**字面相等** ⇒ 而**键的含义变了、键本身也变了**时就认不出了
+//   （模型 id 从 `claude-fable-5` 变成 `mm/claude-fable-5` —— 加了 provider 前缀）。
+//   ⇒ 认不出 ⇒ 旧的当「用户自己加的条目」**原样留着** ⇒ **新旧两套并存**
+//   ⇒ 用户选到旧的那套 ⇒ 客户端原样发给统一网关 ⇒ **400「没有 provider 前缀」**
+//   （2026-10-25 用户实拍报错，根因就是桌面版的 `inferenceModels`）。
+//   ⇒ `aliasOf: "tier"` 的意思是「**除了 key 相等，还要看「按别名规约后」是否相等**」
+//   —— 别名规约 = 取 `provider/档位` 的**档位**部分（去掉前缀）。
+//   ⇒ 认出是同一条 ⇒ 合并它（用户的 `labelOverride` 留着）**并把 key 换成我们的**
+//   ⇒ 旧的裸档位那条**被替换掉**，不会两套并存。
+//   ⚠ 只影响**数组**的认人方式（`mode: "array"`），别的合并路径不受影响。
 //
 // 路径是**相对 value 根**的分段：`"config.models"` = `config` 下的 `models`；
 // 数组元素用 `*` 通配：`"models.*.name"` = 任意模型条目的 `name`。
@@ -165,6 +178,12 @@ export function mergeValue(have, ours, spec) {
     dropUnmanaged: new Set(
       Array.isArray(spec.dropUnmanaged) ? spec.dropUnmanaged.map((k) => String(k)) : []
     ),
+    /* ⚠ `aliasOf`：**认出「同一条」的第二个口径**（只对数组有效）。
+     *   键的含义变了、键本身也变了时（模型 id 加了 provider 前缀），
+     *   只按 key 字面相等就认不出 ⇒ 旧的被当「用户自己加的」留着 ⇒ 新旧并存。
+     *   这里给一个**别名规约**（目前只有 "tier"）：取 `provider/档位` 的档位部分。
+     *   ⇒ 认出是同一条 ⇒ 合并它并把 key 换成我们的 ⇒ 旧的被**替换掉**。 */
+    aliasOf: String(spec.aliasOf || ""),
   };
   /* ⚠ `mode: "array"` 但没给 `key` ⇒ **认不出「我们那一条」** ⇒ 不做数组合并
    *   （瞎猜会把用户的某一条当我们的改掉 —— 那比不合并更坏）。 */
@@ -306,6 +325,37 @@ function mergeArray(have, ours, s, kept, prefix) {
       if (used.has(i)) continue;
       if (!s.key || keyOf(ours[i], s.key) === k) { idx = i; break; }
     }
+    /* ⚠ **别名口径**（`aliasOf`，2026-10-24 补）：key 字面不相等，但**按别名规约后
+     *   相等** ⇒ 那是**同一条**（只是键的写法变了：模型 id 加了 provider 前缀）。
+     *   ⇒ 认出它 ⇒ 合并它（用户的 labelOverride 留着）**并把 key 换成我们的**
+     *   ⇒ 旧写法那条被**替换掉**，不会新旧两套并存。
+     *   ⚠ 不认出的代价很具体：两套并存 ⇒ 用户选到旧的那套 ⇒ 客户端原样发给
+     *     统一网关 ⇒ 400「没有 provider 前缀」（2026-10-25 用户实拍）。 */
+    if (idx < 0 && s.aliasOf) {
+      const ak = aliasKeyOf(el, s.key, s.aliasOf);
+      if (ak) {
+        for (let i = 0; i < ours.length; i++) {
+          const ok = aliasKeyOf(ours[i], s.key, s.aliasOf);
+          /* ⚠ **前缀必须对得上**：`sn/claude-fable-5` 与 `mm/claude-fable-5` 的
+           *   档位部分一样，但**它们是两家的不同模型** ⇒ 不能认成同一条。
+           *   ⇒ 只有「前缀相同」或「其中一边没有前缀」才算。 */
+          if (!ok || ok.tier !== ak.tier) continue;
+          if (!ak.prov || !ok.prov || ak.prov === ok.prov) {
+            if (used.has(i)) {
+              /* ⚠⚠ **同一条被认了两次**（2026-10-24 修）：用户清单里同时有
+               *   **旧写法**（裸档位）与**新写法**（带前缀）⇒ 别名口径下它们是
+               *   同一条 ⇒ 第二次认到的那条**已经合并过**⇒ 不能再合并一次
+               *   （否则同一条输出两遍 ⇒ 桌面版菜单里同一个模型出现两次）。
+               *   ⇒ 丢弃这条重复项，保留前面那条（已合并过的）。 */
+              idx = -2;   // 标记：重复项
+              break;
+            }
+            idx = i; break;
+          }
+        }
+      }
+    }
+    if (idx === -2) continue;   // 重复项：丢弃（前面那条已合并过）
     if (idx < 0) {
       out.push(el);                                /* 用户的条目原样留着 */
       /* ⚠ **也要报出来**（2026-10-23）—— 见上面那条注释。 */
@@ -317,6 +367,38 @@ function mergeArray(have, ours, s, kept, prefix) {
   }
   for (let i = 0; i < ours.length; i++) if (!used.has(i)) out.push(ours[i]);
   return out;
+}
+
+/**
+ * aliasKeyOf —— **别名口径**下的「这条是谁」（认不出 ⇒ null）。
+ *
+ * ⚠ 目前只支持 `"tier"`：**`provider/档位` 的档位部分**（去掉 provider 前缀）。
+ *   认「同一条」时用它 ⇒ 模型 id 从 `claude-fable-5` 变成 `mm/claude-fable-5`
+ *   （加前缀）之后仍认得出是同一条 ⇒ 旧的被替换而不是并存。
+ *
+ * ⚠ **前缀也要留着**（返回值是 `{prov, tier}`）—— 因为 `sn/claude-fable-5` 与
+ *   `mm/claude-fable-5` 的**档位部分一样**，但它们是两家的**不同模型** ⇒
+ *   认成同一条就等于把 A 家的模型显示成 B 家的。⇒ 比较时前缀必须对得上
+ *   （或其中一边没有前缀 —— 那才是「旧写法」）。
+ *
+ * @param {*} el 数组元素
+ * @param {string} key 识别键名
+ * @param {string} aliasOf 别名口径（目前只有 "tier"）
+ * @returns {{prov:string, tier:string}|null} 别名；认不出 ⇒ null
+ */
+function aliasKeyOf(el, key, aliasOf) {
+  const k = keyOf(el, key);
+  if (k === undefined || k === null) return null;
+  const s = String(k);
+  if (aliasOf === "tier") {
+    const at = s.indexOf("/");
+    if (at < 0) return { prov: "", tier: s.trim() };
+    const prov = s.slice(0, at).trim().toLowerCase();
+    const tier = s.slice(at + 1).trim();
+    if (!prov || !tier) return null;
+    return { prov, tier };
+  }
+  return null;
 }
 
 /**

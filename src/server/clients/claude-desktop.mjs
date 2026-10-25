@@ -135,11 +135,20 @@ function profileWrites(ctx) {
   /* ⚠ **模型清单逐条合并**（通用合并层）：用户在桌面版里改过的模型显示名
    *   （`labelOverride`）留着；模型 id（`name`）是机器该管的 ⇒ 换回我们的。
    *   识别键是模型 id（`name`）—— 逐条唯一 ⇒ 认得出「我们那一条」。
-   *   用户自己加的模型条目原样留着、位置不变。 */
+   *   用户自己加的模型条目原样留着、位置不变。
+   *
+   * ⚠⚠ **`aliasOf: "tier"`**（2026-10-24 补）：**旧版本写进去的模型 id 没有
+   *   provider 前缀**（`claude-fable-5`），新版本有（`mm/claude-fable-5`）
+   *   ⇒ 只按 key 字面相等就**认不出是同一条** ⇒ 旧的被当「用户自己加的条目」
+   *   **原样留着** ⇒ 清单里**新旧两套并存**（实测 8 条：4 裸 + 4 带前缀）。
+   *   ⇒ 桌面版里用户能选到**裸档位**那条 ⇒ 它原样发给统一网关
+   *   ⇒ **400「没有 provider 前缀」**（2026-10-25 用户实拍报错）。
+   *   ⇒ 用别名口径（按档位认人）⇒ 认出是同一条 ⇒ 合并它（用户的
+   *   `labelOverride` 留着）**并把 name 换成我们的** ⇒ 旧的被**替换掉**。 */
   writes.push({
     path: "inferenceModels",
     value: desktopModels(ctx),
-    merge: { mode: "array", key: "name", theirs: ["labelOverride"] },
+    merge: { mode: "array", key: "name", theirs: ["labelOverride"], aliasOf: "tier" },
   });
   return writes;
 }
