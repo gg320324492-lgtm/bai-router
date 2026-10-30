@@ -593,6 +593,22 @@ html[data-theme="dark"] select option { background: #191D25; color: #E9ECF2; }
 input.lbl { width: 100%; font-family: inherit; }
 input.custom { width: 100%; margin-top: 4px; }
 
+/* 「实际服务的是另一个模型」那条标注（2026-10-30）。
+ *
+ * 映射区那张表是**配置**（「这一档指向哪个模型」= 打算路由到哪），
+ * 而故障转移是**静默**的：实际服务的那家可能是别家、别的模型。
+ * 不把它标出来，用户看到的就与实际不符（那正是「模型显示对不上」）。
+ *
+ * 用 --warn（需留意）而不是 --err（故障）：转移往往是有意为之的兜底，
+ * 请求是成功的 —— 但它确实让人以为在用 A 而实际在用 B，所以必须显眼。
+ * 正常路径下这条根本不会出现（服务端 mismatch 为 false 时压根不渲染）。 */
+.serveddiff-wrap { display: block; margin-top: 4px; }
+i.serveddiff {
+  font-style: normal; font-size: 11px; line-height: 1.5;
+  color: var(--warn); background: var(--warn-soft);
+  border-radius: 5px; padding: 1px 6px; cursor: help;
+}
+
 /* ============================================================================
    9. 诊断抽屉（折叠在控制台视图内；设计稿把它做成全局页脚，
       契约 §2.3 明确放在 #viewConsole 里，故这里是块内折叠而不是固定底栏）

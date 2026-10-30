@@ -6950,6 +6950,36 @@ async function attemptWithFailover(fo, req, res, cfg, body, rewritten, isProbe, 
         t.forget(provider);
       } catch { /* 休息表坏了不该影响这次应答 */ }
       tries.push({ provider, ok: true });
+      /* ★ 转移成功 ⇒ 「实际在服务的那家/那个模型」必须如实记下来（2026-10-30 实测修的）。
+       *
+       * 改之前的毛病（探针实测，真 server + 假上游）：入口 bai 的上游回 500 → 转移到
+       * sn 成功（真正服务的是 sn 按**自己**的映射重解析出来的那个模型），可是
+       * /api/status 里入口渠道的 recent 是这样的：
+       *   { target: <bai 打算路由到的模型>, served: <同一个>, mismatch: false }
+       * ⇒ **面板显示的模型 ≠ 实际服务的模型，而它自己算出来的「不一致」还是 false**
+       *   —— 全链路没有一处说真话。目标渠道 sn 的 recent 则是 {tier: null}
+       *   （那次请求压根不是从 sn 的中转口进来的，sn 从来没记过这次调用）。
+       *
+       * 现在做三件事：
+       *   ① 入口渠道的观察改写成「实际服务的那家/那个模型」
+       *      ⇒ 面板**现有的** mismatch 机制（诊断抽屉 + 映射矩阵格）就能如实报出来，
+       *         不用另造一套显示逻辑。
+       *   ② 记下 servedProvider（实际服务的渠道键）⇒ 面板能说清「是谁在服务」。
+       *   ③ 真正在服务的那家也记一条观察 ⇒ 它的卡片显示「刚刚在服务这一档」，
+       *      而不是一片空白。
+       *
+       * ⚠ 只在**真的换了人**时改。没换人的时候 served 必须保持原样——正常流量里
+       *   served 与 target 相同，被误报成「以为在用 A 实际在用 B」的那种天天误报的
+       *   告警，比静默本身更坏（用户会学会无视它）。 */
+      if (fo.obs && provider !== fo.provider) {
+        const servedModel = String((sub.rewritten || {}).model || "");
+        if (servedModel) {
+          fo.obs.served = servedModel;
+          fo.obs.servedProvider = provider;
+          fo.obs.handoff = true;
+          noteHandoffObservation(provider, fo.obs.tier, servedModel);
+        }
+      }
       /* 审计：这一次尝试成功了 —— 谁、哪一家、哪个模型、多久。 */
       auditRecord({
         provider,
@@ -7190,6 +7220,47 @@ function noteFailoverEvent(from, tries, servedModel, cfg) {
      这一处是同一类错误的另一面：判据用错了渠道。 */
   const served = (tries || []).find((t) => t && t.ok === true && t.provider && t.provider !== from);
   noteSilentJump(from, tries, servedModel, served ? servedModelCostsMoney(served.provider, servedModel, cfg) : null);
+}
+
+/**
+ * 转移成功 ⇒ 给**真正在服务的那家**也记一条中转观察。
+ *
+ * ## 为什么要有它
+ *
+ * 转移这条路有个结构性特点：**请求是从入口渠道的中转口进来的**（客户端只连一个端口）。
+ * 于是目标渠道的 relay handler **压根没被调用过** —— 它自己的观察表里自然没有这次调用。
+ * 面板上表现为：目标渠道的卡片显示「最近没有真实会话」，而它其实刚刚在服务。
+ *
+ * 这不是「显示不全」，是**显示与事实相反**：用户去目标渠道那格排查「它怎么没动静」，
+ * 会被引到错误的方向上。
+ *
+ * ## 写什么
+ *
+ * 与入口渠道那套**逐字同形**：{tier, served, at} —— tier 是客户端发来的那个名字
+ * （不是档位 key），served 是这一家**自己**实际发出去的那个模型。
+ *
+ * ⚠ served 必须是**它自己**发出去的那个（转移时每家按自己的映射重解析过），
+ *   不是入口家打算路由的那个 —— 否则这一格就会显示别人的模型名，
+ *   与入口渠道那格显示同一个名字，又变成「两处各说一半」。
+ *
+ * ⚠ 写入规则与入口渠道一致（同一档位且 2 秒内就刷新那条，否则新开一条，上限 30 条）：
+ *   两处各写一套规则，观察表的口径就会分叉。
+ *
+ * 🔴 纯内存、有界（每家最多 30 条），不进 config、不落盘。
+ */
+function noteHandoffObservation(provider, tier, servedModel) {
+  const rp = RELAY_PARAMS[provider];
+  const store = rp && rp.store;
+  if (!Array.isArray(store) || !tier || !servedModel) return;
+  const now = Date.now();
+  if (store[0] && store[0].tier === tier && now - store[0].at < 2000) {
+    store[0].at = now;
+    store[0].served = servedModel;
+    store[0].servedProvider = provider;
+  } else {
+    store.unshift({ tier, served: servedModel, at: now, servedProvider: provider });
+    if (store.length > 30) store.pop();
+  }
 }
 
 // 与 noteFailoverEvent 的区别：这里**没有**发生渠道转移——命中不该转移的错误（如 400），
@@ -9225,8 +9296,21 @@ function providerStatus(cfg, p, store) {
        * 两者不一致时**两个都报**：「以为在用 A 其实在用 B」正是这条差异本身，报一个等于没报。 */
       const target = resolveModelQuiet(t, S);
       const served = (obs && obs.served) || null;
+      /* ★ 实际在服务的那家是谁（2026-10-30 补）。
+       *
+       * 转移成功时，入口渠道的观察会被改写成「实际服务的那家/那个模型」，
+       * servedProvider 就是那家的渠道键 ⇒ 面板能说清「是谁在服务」，
+       * 而不只是甩两个模型名让用户自己猜。
+       *
+       * ⚠ 没发生过转移时它是 null：此时「实际服务的」就是这一家自己，
+       *   说出来是废话，不如不报（面板也不显示它）。 */
+      const servedProvider = (obs && obs.servedProvider) || null;
       return {
         tier: t, label: m.label || t, target, served,
+        servedProvider,
+        /* handoff = 最近服务的那次**换了人**（入口渠道失败、转移到了别家）。
+           面板据此把这件事说成「这次换了人」，而不是泛泛的「模型不一致」。 */
+        handoff: !!(obs && obs.handoff),
         observedAt: obs ? obs.at : null,
         mismatch: !!(served && served !== target),
       };

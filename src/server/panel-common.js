@@ -1102,6 +1102,14 @@
 
     const C = cfgOf(selected);
     const list = Array.isArray(C.availableModels) && C.availableModels.length ? C.availableModels : (P.models || []);
+    /* ★ 服务端说的「此刻在服务哪一档」（含真实服务的模型）。
+     *
+     * 映射区那张表是**配置**（「这一档指向哪个模型」= 打算路由到哪），
+     * 而故障转移是**静默**的：实际服务的那家可能是别家、别的模型
+     * （2026-10-30 实测：入口渠道显示自己的模型，实际是另一家在答）。
+     * 不把这一行标出来，用户看到的就与实际不符。
+     * ⚠ bai 在 /api/status 里是**平铺**的（历史字段名），sliceOf 已经处理好。 */
+    const Rsel = (stOf(selected).recent) || null;
     tb.innerHTML = "";
     for (const t of TIERS) {
       const m = (C.mapping || {})[t.key] || {};
@@ -1144,6 +1152,18 @@
       });
       tr.children[1].append(sel, cus);
       tr.children[2].appendChild(lbl);
+      /* 正在用的那一档，旁边补一句「实际服务的是哪个模型、由哪家提供」。
+         只在两者确实不同（服务端标了 mismatch）时出声 —— 正常路径一个字都不加，
+         表格与改动前逐字一致。 */
+      if (Rsel && Rsel.tier === t.key) {
+        const noteHtml = servedNote(Rsel, Rsel.servedProvider ? nameOf(Rsel.servedProvider) : "");
+        if (noteHtml) {
+          const wrap = document.createElement("span");
+          wrap.className = "serveddiff-wrap";
+          wrap.innerHTML = noteHtml;   /* 内容由 servedNote 自己拼，值都过了 esc */
+          tr.children[2].appendChild(wrap);
+        }
+      }
       tb.appendChild(tr);
     }
     const hint = $("patchHint");
@@ -1566,26 +1586,49 @@
      * 面板就会打印「你以为在用 x，实际服务的是 x」——那正是本节要消灭的那类假话。 */
     if (R && R.tier && R.served && R.served !== R.target && R.mismatch === true) {
       const who = R.label && R.label !== R.tier ? `（界面显示名 ${R.label}）` : "";
+      /* ★ 「实际在服务的是哪一家」（2026-10-30 补）。
+       *
+       * 转移是**静默**的：光说「实际服务的是另一个模型」不够 —— 用户还得自己去猜
+       * 是哪一家接的活、额度扣在谁头上。servedProviderName 由**调用方**用 nameOf
+       * 算好塞进来（渲染层不许认识渠道名，C11）。
+       *
+       * ⚠ 只有 handoff===true（服务端确认这次**真的换了人**）才说「换了渠道」。
+       *   mismatch 还有另一个来源：同一渠道内部换模（WorkBuddy 额度用尽后换模型），
+       *   那种情况下说「换了渠道」是编造。
+       *
+       * ⚠ servedProviderName 缺失时（老格式 / 测试里直接构造的切片）措辞退回原样，
+       *   一字不多、一处不崩。 */
+      const spn = String((S && S.servedProviderName) || "");
+      const byWho = spn ? `（由「${spn}」提供）` : "";
+      const handoffLine = (R.handoff === true && spn)
+        ? `\n这次请求换了渠道：入口「${name}」没接住，由「${spn}」接上并服务。`
+        : "";
       items.push({
         s: "err",
-        t: `${name}：你以为在用「${R.target}」，实际服务的是「${R.served}」`,
+        t: `${name}：你以为在用「${R.target}」，实际服务的是「${R.served}」${byWho}`,
         m: `正在用的档位是 ${R.tier}${who}。我们打算路由到「${R.target}」（档位映射里配的那个），`
-          + `但真实服务的是「${R.served}」——两个都摆出来，是因为这正是要看见的那件事。\n`
+          + `但真实服务的是「${R.served}」——两个都摆出来，是因为这正是要看见的那件事。${handoffLine}\n`
           + `最后一次这样的请求：${when(R.observedAt)}。`,
       });
     }
     return items;
   }
 
-  /** 矩阵格「档位映射」里，正在用的那一档旁边补一句**真实服务的模型**。
-   *  只在 served 与 target 不一致时出现——正常路径一个字都不加（与改动前逐字一致）。 */
-  function servedNote(R) {
+  /** 映射区「档位 → 目标模型」那一行里，正在用的那一档旁边补一句**真实服务的模型**。
+   *  只在 served 与 target 不一致时出现——正常路径一个字都不加（与改动前逐字一致）。
+   *
+   *  ⚠ `servedName` 是**实际服务那家**的显示名，由调用方用 nameOf 算好传进来
+   *   （渲染层不许认识渠道名，C11）。不给就不显示渠道名，措辞退回原样。
+   *   转移是**静默**的：只说模型名的话，用户还得自己去猜是哪一家接的活。 */
+  function servedNote(R, servedName) {
     /* 判据与 modelIdentityItems 里那一条**完全相同**：服务端标了 mismatch，
        且两个名字确实不同。只信前者的话，一份自相矛盾的状态会让矩阵格显示
        「实际服务 x」而它旁边就是同一个 x。 */
     if (!R || !R.tier || R.mismatch !== true || !R.served || R.served === R.target) return "";
+    const spn = String(servedName || "");
+    const byWho = spn ? `；由「${esc(spn)}」提供` : "";
     return `<i class="serveddiff" title="我们打算路由到：${esc(R.target)}（档位映射里配的那个）；`
-      + `实际服务的是：${esc(R.served)}。两者不一致，所以两个都摆出来。">实际服务 ${esc(R.served)}</i>`;
+      + `实际服务的是：${esc(R.served)}${byWho}。两者不一致，所以两个都摆出来。">实际服务 ${esc(R.served)}</i>`;
   }
 
   /* ======================================================================
@@ -1683,7 +1726,13 @@
      * 而模型身份错配与凭据错配是**两件独立的事**，都成立时都得看得见。
      * 判定本身在 modelIdentityItems 里（纯函数，可测）。 */
     for (const key of chainOf().length ? chainOf() : CHAIN_KEYS) {
-      const items2 = modelIdentityItems(stOf(key), nameOf(key));
+      const S0 = stOf(key) || {};
+      /* ★「实际在服务的是哪一家」的**显示名**在这里算（nameOf），塞进切片里传下去。
+       * 服务端只报渠道键（recent.servedProvider）—— 渲染层不许认识渠道名（C11），
+       * 所以「键 → 名字」这一步必须由调用方做。没发生转移时没有这个键，
+       * 切片原样传下去（措辞退回原样，一个字都不多）。 */
+      const sp = (S0.recent && S0.recent.servedProvider) || "";
+      const items2 = modelIdentityItems(sp ? { ...S0, servedProviderName: nameOf(sp) } : S0, nameOf(key));
       for (const it of items2) items.push(it);
     }
 

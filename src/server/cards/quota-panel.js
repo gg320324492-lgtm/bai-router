@@ -109,6 +109,18 @@ window.BAI_CARDS["quota-panel"] = {
     const served = recent.served ? String(recent.served) : null;
     /* ★ 真实**服务**的那个模型才是正在消耗额度的那个；没服务过就看打算路由到哪。 */
     const live = served || target;
+    /* ★ 归属（2026-10-30）：转移成功时，这一格里的 served 是**别家**实际服务的模型 ——
+       那笔额度扣在**别家**头上，倍率也得查**别家**的目录（查这一家的必然查不到，
+       只会显示成「倍率未知」—— 那不是「未知」，是**问错了人**；而且归属会被读成
+       「这一家在消耗它的额度」）。
+       ⇒ 这一格不画「当前」行（它此刻没在服务任何东西），改说清「这次实际由谁服务的」。
+       ⚠ servedProvider 缺失（老服务端 / 没发生过转移）⇒ 行为与改动前逐字一致。 */
+    const sp = recent.servedProvider ? String(recent.servedProvider) : "";
+    const myKey = String(opt.key == null ? "" : opt.key);
+    const servedElsewhere = !!(sp && myKey && sp !== myKey);
+    /* 实际服务那家的**显示名**：调用方（modelGroups，在 mount 内，有 ctx.nameOf）算好传进来。
+       渲染层不许认识渠道名（C11）⇒ 这里只收显示名，不自己查。 */
+    const who = String(opt.servedProviderName || sp);
 
     /* 一行的全部事实：某个模型 + 它的倍率 + 它此刻的状态。 */
     const factsOf = (modelId, kind, tierKey, planned, fallbackName) => {
@@ -150,22 +162,30 @@ window.BAI_CARDS["quota-panel"] = {
 
     const rows = [];
     let summary = "";
-    if (tier) {
+    if (tier && !servedElsewhere) {
       rows.push(factsOf(live, "current", tier, target, null));
     } else {
-      /* 没走过这一家 ⇒ 把「你配的档位」摆出来（**配置的口径**，不是正在服务的）。 */
+      /* 没走过这一家（**或**实际由别家在服务）⇒ 把「你配的档位」摆出来
+         （**配置的口径**，不是正在服务的）。 */
       const mapping = cfg.mapping && typeof cfg.mapping === "object" ? cfg.mapping : {};
       for (const t of Object.keys(mapping)) {
         const m = mapping[t] || {};
         rows.push(factsOf(m.target ? String(m.target) : "", "configured", String(t), null,
           m.label ? String(m.label) : null));
       }
-      /* ⚠ **未知态必须带下一步**：只说「不知道」是死胡同，用户不知道该做什么。 */
-      summary = rows.length
-        ? "此刻没有正在服务的模型 · 走过这一家（或点「测试连通」）之后，这里会显示当前档位那个模型的倍率。"
-        : "这一家还没配映射表：到「渠道」页把每个档位指向你想用的模型。";
+      if (servedElsewhere) {
+        /* 服务端确认这次**真的换了人**：说清是谁在服务、额度记在谁那边。
+           ⚠ 未知态必须带下一步 —— 这里也有：下面摆的是配的档位，怎么改在渠道页。 */
+        summary = `这次实际由「${who}」服务（这一家没接住）—— 额度与倍率记在它那边；`
+          + `下面摆的是**你配的**档位，不是此刻在服务的。`;
+      } else {
+        /* ⚠ **未知态必须带下一步**：只说「不知道」是死胡同，用户不知道该做什么。 */
+        summary = rows.length
+          ? "此刻没有正在服务的模型 · 走过这一家（或点「测试连通」）之后，这里会显示当前档位那个模型的倍率。"
+          : "这一家还没配映射表：到「渠道」页把每个档位指向你想用的模型。";
+      }
     }
-    return { channel, rows, hasCurrent: !!tier, noTraffic: !tier, summary };
+    return { channel, rows, hasCurrent: !!(tier && !servedElsewhere), noTraffic: !tier, summary };
   },
 
   /**
@@ -395,18 +415,26 @@ window.BAI_CARDS["quota-panel"] = {
     /** 模型级那些组（纯函数算出来的数据，渲染层只照着显示）。 */
     function modelGroups() {
       const tierZh = ctx.TIER_ZH || {};
-      return poolKeys().map((k) => self.modelQuotaRows({
-        key: k,
-        name: typeof ctx.nameOf === "function" ? ctx.nameOf(k) : k,
-        tierZh,
-        slice: (typeof ctx.stOf === "function" ? ctx.stOf(k) : null) || {},
-        /* 配置块：映射表（每档指向哪个模型）在里面 ——
-           「没走过这一家」时那一块要摆出的是**配的**档位。 */
-        cfg: (typeof ctx.cfgOf === "function" ? ctx.cfgOf(k) : null) || {},
-        /* 目录还没开始读 ⇒ 那一格显示「读目录中…」，不是「倍率未知」：
-           「还没问」与「问了、拿不到」是两件事，混起来用户会以为倍率真 0。 */
-        catalog: catState.get(k) || { loading: true, err: "", data: null },
-      }));
+      return poolKeys().map((k) => {
+        const S = (typeof ctx.stOf === "function" ? ctx.stOf(k) : null) || {};
+        /* 「实际在服务的是别家」时那家的**显示名**：服务端只给渠道键
+           （recent.servedProvider），「键 → 名字」这一步归调用方（渲染层不许认识渠道名，C11）。 */
+        const sp = (S.recent && S.recent.servedProvider) || "";
+        return self.modelQuotaRows({
+          key: k,
+          name: typeof ctx.nameOf === "function" ? ctx.nameOf(k) : k,
+          tierZh,
+          slice: S,
+          /* 配置块：映射表（每档指向哪个模型）在里面 ——
+             「没走过这一家」时那一块要摆出的是**配的**档位。 */
+          cfg: (typeof ctx.cfgOf === "function" ? ctx.cfgOf(k) : null) || {},
+          /* 目录还没开始读 ⇒ 那一格显示「读目录中…」，不是「倍率未知」：
+             「还没问」与「问了、拿不到」是两件事，混起来用户会以为倍率真 0。 */
+          catalog: catState.get(k) || { loading: true, err: "", data: null },
+          /* 实际在服务的是别家时，那家的显示名（没有就不显示渠道名）。 */
+          servedProviderName: sp ? (typeof ctx.nameOf === "function" ? ctx.nameOf(sp) : sp) : "",
+        });
+      });
     }
 
     /** 画模型级那一块。 */
