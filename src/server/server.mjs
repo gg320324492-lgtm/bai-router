@@ -6219,6 +6219,49 @@ const middlewareRegistry = createMiddlewareRegistry();
 const middlewareErrors = [];
 /** req[MIDDLEWARE_CTX]：这次尝试要加/要删的头（应答那侧也要用）。 */
 const MIDDLEWARE_CTX = Symbol("bai.middleware.ctx");
+/** req[CLIENT_GONE]：这次请求「客户端真的走了」的 AbortSignal（见 clientGoneSignal）。 */
+const CLIENT_GONE = Symbol("bai.clientGone");
+
+/**
+ * 「客户端真的走了」的信号 —— 排队中的请求据此立刻离开队列（magpie 的 ctx.Done()）。
+ *
+ * ⚠⚠ **为什么不能直接用 `req.signal`**（这是本模块曾经的一个真 bug）：
+ *   Node 的 `http.IncomingMessage.signal` 是「**请求流被销毁**时 abort」的信号。
+ *   而请求流在**请求体读完之后**就会被 autoDestroy 掉 —— 于是**每一个**读完 body
+ *   的请求，`req.signal.aborted` 恒为 `true`，**哪怕客户端连接好好的、请求完整
+ *   收到、响应也照写**。
+ *   拿它当「客户端已断开」，等于把**每一个请求**都判成断线：并发闸门拿不到名额，
+ *   一律回 429「本地限流：客户端已断开」。
+ *   （实测对照：正常应答与客户端中途断开，`req.signal.aborted` **都是 true**，
+ *     两者根本区分不开 —— 它只说「请求流没了」，而请求流没了是常态。）
+ *
+ * ⚠ 判据（与 oc-wiring.mjs 的 clientGone 同一口径）：
+ *   · `res` 的 'close' 且 `writableFinished !== true` ⇒ 响应还没写完，连接就断了；
+ *   · `req` 的 'aborted' ⇒ 请求体还没收完，客户端就断了；
+ *   · **正常收尾（`writableFinished === true`）必须放过** —— 否则每个成功请求
+ *     都会在写完之后把自己 abort 掉。
+ *
+ * @param {object} req Node 的 IncomingMessage。
+ * @param {object} res ServerResponse（或包着它的影子 res —— 取 `.real`）。
+ * @returns {AbortSignal}
+ */
+function clientGoneSignal(req, res) {
+  const ctl = new AbortController();
+  const abort = () => { if (!ctl.signal.aborted) ctl.abort(); };
+  /* 影子 res（CaptureRes）只在自己 end() 时才发 close，监听它没用 —— 要听真的那个。 */
+  const realRes = (res && res.real) ? res.real : res;
+  if (req && typeof req.on === "function") {
+    req.on("aborted", abort);
+    if (req.aborted) abort();          // 进门时就已经断了
+  }
+  if (realRes && typeof realRes.on === "function") {
+    realRes.on("close", () => {
+      if (realRes.writableFinished === true) return;   // 正常收尾，不是断线
+      abort();
+    });
+  }
+  return ctl.signal;
+}
 
 function loadMiddleware() {
   middlewareRegistry.clear();
@@ -6625,7 +6668,13 @@ async function dispatchGated(provider, target, req, res, cfg, body, rewritten, i
   /* ⚠ **总是**取一次名额（哪怕上限是 0）：上限 0 时闸门不拦，但**在途数照样被记**
    *   ——「在途几个」是面板热力图要显示的数字，不设上限就不统计的话那一格永远是 0。 */
   slot = await concurrencyGate.acquire(provider, {
-    limit: lim.concurrency, waitMs: lim.waitMs, signal: req.signal,
+    limit: lim.concurrency, waitMs: lim.waitMs,
+    /* ⚠ 用 req[CLIENT_GONE]，**不是 req.signal**。
+     *   req.signal 是「请求流被销毁」的信号，而请求流在**body 读完**后就会被
+     *   autoDestroy ⇒ 每个请求的 req.signal.aborted 恒为 true ⇒ 闸门把
+     *   **每一个**请求都判成「客户端已断开」，一律回 429。
+     *   详见 clientGoneSignal 的注释与那组对照实测。 */
+    signal: req[CLIENT_GONE],
   });
   if (!slot.ok) {
     return { gated: true, reason: slot.reason === "aborted" ? "客户端已断开" : "并发已满", retryAfterSec: 1 };
@@ -7284,6 +7333,11 @@ function relaySpec(provider, cfg) {
  *   所以「端口一个实例、网关一个实例」行为完全一致。 */
 function makeRelayHandler(p, store, getSlice, useProxy, opts = {}) {
   return (req, res) => {
+    /* ⚠ **进门第一件事**就把「客户端真的走了」的信号挂上（见 clientGoneSignal）。
+     *   必须在**最早**的时刻挂：客户端若在请求还没读完时就断了，那个 'close'/
+     *   'aborted' 事件只发一次 —— 等到闸门前再挂就永远等不到了。
+     *   ⚠ 绝不能用 req.signal（那是「请求流被销毁」，body 读完就成立）。 */
+    req[CLIENT_GONE] = clientGoneSignal(req, res);
     const chunks = [];
     /* 「body 的接力」：统一网关已经**读完**了这个请求体（它要靠 body 里的 model 字段
      * 决定走哪一家），请求流因此早就 end 了。此时再挂 'data'/'end' 监听器，
