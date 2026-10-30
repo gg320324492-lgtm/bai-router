@@ -38,7 +38,7 @@
 //        ⚠ 实测 2026-10-23：UA 才是闸门，CLI 形态才拿得到完整目录。
 //        ⚠ 落盘缓存（`wb-catalog-*.json`）**把这两个字段丢了** —— 本仓的
 //          `wbMapModel` 用它们做过滤却没存 ⇒ 只有原始响应里才有。
-//      · qd —— `%TEMP%/qoder-models.json` 的 `app[]`，带 `max_input_tokens`
+//      · qd —— 补丁落盘的 `qoder-models.json` 的 `app[]`，带 `max_input_tokens`
 //        （蛇形），**没有**输出上限。
 //   ② **本表（人工核对）**：八家 × 四档只有三十来条，人工核对比机器映射更准
 //      （设计稿 §2.1 第 1 条：「映射错了会写错窗口 —— 那比不写更坏」）。
@@ -276,7 +276,7 @@ export const MODEL_FACTS = Object.freeze({
     at: "2026-10-23",
   },
 
-  /* ---- qd（Qoder —— 目录在 %TEMP%/qoder-models.json，不在本仓手上） ---- */
+  /* ---- qd（Qoder —— 目录在补丁落盘的 qoder-models.json，不在本仓手上） ---- */
   "qd/lite": {
     context: CONVENTION_CONTEXT, output: CONVENTION_OUTPUT,
     kind: "convention", source: "约定（Qoder 目录里没有这一条）", sourceId: "",

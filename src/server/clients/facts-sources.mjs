@@ -10,7 +10,7 @@
 //     ⚠ 实测 2026-10-23：UA 才是闸门（非 CLI 形态回 400 code=12403）；
 //     ⚠ **落盘缓存里没有这两个字段**（本仓 `wbMapModel` 用它们做过滤却没存）
 //       ⇒ 只能从**原始响应**拿。
-//   · **qd** —— `%TEMP%/qoder-models.json` 的 `app[]`，带 `max_input_tokens`
+//   · **qd** —— 补丁落盘的 `qoder-models.json` 的 `app[]`，带 `max_input_tokens`
 //     （**蛇形**），**没有**输出上限。
 //
 // 拉得到就**覆盖表里的值并更新日期戳**；拉不到就用表里的。
@@ -170,7 +170,7 @@ export async function fetchWbCatalog(o) {
 /**
  * readQdCatalog —— 读 Qoder 客户端写的模型目录（`qoder-models.json`）。
  *
- * ⚠ 这是**本地文件**，不是网络接口 —— Qoder 客户端把它写在 `%TEMP%` 下，
+ * ⚠ 这是**本地文件**，不是网络接口 —— Qoder 客户端把它写在**数据目录**下（补丁落点），
  *   本仓只是去读。文件不在 / 读不了 / 形状不对 ⇒ `{ ok: false }`（安静）。
  *
  * ⚠ 目录里**只有输入窗口**（`max_input_tokens`），没有输出上限 ⇒

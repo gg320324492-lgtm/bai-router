@@ -86,16 +86,27 @@ window.BAI_CARDS["model-catalog"] = {
         });
         return;
       }
-      bits.push(p.ready
-        ? `<span class="lvl ok" style="font-size:10px">补丁已装</span><span><span class="num">${p.patched}/${p.found}</span> 个 worker 副本</span>`
-        : `<span class="lvl warn" style="font-size:10px">补丁未装</span><span>发现 <span class="num">${p.found}</span> 个 worker 副本</span>`);
+      if (p.ready) {
+        bits.push(`<span class="lvl ok" style="font-size:10px">补丁已装</span><span><span class="num">${p.patched}/${p.found}</span> 个 worker 副本</span>`);
+        if (p.activeVer) bits.push(`<span>当前版本：<b>${esc(p.activeVer)}</b>（已打补丁）</span>`);
+      } else if (p.patched > 0 && p.activeVer) {
+        /* ⚠ **「有几份带补丁」不等于「现在跑的那份带补丁」**：客户端升级会新增版本
+         *   目录，补丁不会自动跟过去。只按份数报状态会把这种情况说成「补丁已装」
+         *   ⇒ 用户以为好了，令牌却永远抓不到（老版本那份白带补丁）。
+         *   所以这里点名说清「当前版本没打」，并给可执行的下一步。 */
+        bits.push(`<span class="lvl warn" style="font-size:10px">当前版本未打补丁</span>`
+          + `<span>当前版本 <b>${esc(p.activeVer)}</b> 没有补丁（<span class="num">${p.patched}/${p.found}</span> 份带补丁的是旧版本）—— 再点一次「一键装补丁」</span>`);
+      } else {
+        bits.push(`<span class="lvl warn" style="font-size:10px">补丁未装</span><span>发现 <span class="num">${p.found}</span> 个 worker 副本</span>`);
+      }
       /* 令牌文件还没刷新 = **还没发生**（客户端没开或没发请求），不是出错。 */
       let stateBlock = "";
       if (p.tokenFresh) {
         bits.push('<span class="lvl ok" style="font-size:10px">令牌文件新鲜</span><span>客户端正在刷新</span>');
       } else {
         stateBlock = S3("emptyState", "还没有令牌文件", {
-          hint: "客户端启动并发一次带鉴权的请求就会刷出来 —— 补丁装好后保持客户端运行即可。",
+          hint: "客户端启动并发一次带鉴权的请求就会刷出来 —— 补丁装好后保持客户端运行即可。"
+            + "客户端升级后会新增版本目录、补丁不跟过去，记得再点一次「一键装补丁」。",
         });
       }
       if (p.cn) bits.push(`<span>另有国内版 ${p.cn} 份，有意跳过</span>`);

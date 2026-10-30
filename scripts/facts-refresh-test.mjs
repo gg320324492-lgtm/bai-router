@@ -185,11 +185,13 @@ describe("② 读配置", () => {
     assert.equal(loaded.cfg.wb.upstream, "https://www.workbuddy.cn", "上游地址该由出厂值兜底");
   });
 
-  test("②d qd 的目录文件路径为空 ⇒ 用 server.mjs 的同一处兜底", async () => {
+  test("②d qd 的目录文件路径为空 ⇒ 用数据目录兜底（与补丁写的落点同一个目录）", async () => {
     const dataDir = tmpDir();
     fs.writeFileSync(path.join(dataDir, "config.json"), JSON.stringify({ qd: {} }), "utf8");
     const loaded = await loadRefreshCfg({ dataDir, serverDir: tmpDir(), env: {} });
-    assert.equal(loaded.cfg.qd.modelsFile, path.join(os.tmpdir(), "qoder-models.json"));
+    /* ⚠ 落点必须是**数据目录**，不是系统盘临时目录：补丁把模型目录写在数据目录里
+     *   （补丁的落点与中转读的落点是同一处），指向别处就永远读不到目录。 */
+    assert.equal(loaded.cfg.qd.modelsFile, path.join(dataDir, "qoder-models.json"));
   });
 });
 

@@ -23,7 +23,7 @@ import {
   shouldFailover, FAILOVER_COOLDOWN_MS, noteSilentJump, silentJumpSnapshot,
   restTable, failoverCooldownFor,
 } from "./failover.mjs";
-import { qpApply, qpRevert, qpStatus, QODER_PATCH_PATHS } from "./qoder-patch.mjs";
+import { qpApply, qpRevert, qpStatus, qdFilePath, QODER_PATCH_PATHS } from "./qoder-patch.mjs";
 /* 逐模型能力探测（v1.0.74 · T3+T6）：只探免费模型、只在用户显式点「检测可用性」时跑。
  * 纯逻辑（判定 / 并发 / 落盘）在 zen-probe.mjs 里，HTTP 由下面的 zenProbeSend 注入。 */
 import {
@@ -383,7 +383,7 @@ const DEFAULTS = {
   // Qoder（qoder.com 桌面端附带的 Free 套餐）—— 第五个可路由提供方。
   // 上游只讲 OpenAI 协议（/model/v1/chat/completions），复用通用协议桥。
   // 认证不是 sk- 密钥，而是 jt- 开头的 jobToken，且**每次 Qoder 启动都会轮换**——
-  // 所以不落 config，由 worker 补丁（qoder-patch/patch_worker.py）实时写入 tokenFile，
+  // 所以不落 config，由 worker 补丁（qoder-patch.mjs，Node 实现）实时写入 tokenFile，
   // 中转每次请求现读；token 字段只作手动粘贴兜底。
   // 服务端只认两个模型别名：普通用户走 lite，auto 为自动选路。
   qd: {
@@ -398,8 +398,12 @@ const DEFAULTS = {
     availableModels: ["lite", "auto", "performance", "ultimate", "qmodel", "kmodel", "dmodel", "mmodel", "gmodel"],
     mapping: defaultMapping("lite", "Qoder Lite"),
     token: "",
-    tokenFile: path.join(DATA_DIR, "qoder-token.json"),
-    modelsFile: path.join(DATA_DIR, "qoder-models.json"),
+    /* ⚠ 令牌/模型快照的落点**直接引用补丁模块的常量**，不在这儿另算一份 ——
+     *   补丁写在哪，中转就得读哪，两边各算一次早晚会分叉（分叉过一次：
+     *   补丁写 os.tmpdir()、中转读 DATA_DIR ⇒ 面板永远「未读到」）。
+     *   qoder-patch.mjs 与本文件同在 server/ 下 ⇒ 两边算出的 DATA_DIR 必然相同。 */
+    tokenFile: QODER_PATCH_PATHS.TOKFILE,
+    modelsFile: QODER_PATCH_PATHS.MODELFILE,
     useProxy: false,
   },
   // WorkBuddy 国内版（腾讯 WorkBuddy 客户端附带的免费模型）—— 第三个可路由提供方。
@@ -785,20 +789,12 @@ function loadCfg() {
     // 令牌/模型文件路径纠正（v1.0.57）：早期 config.defaults.json 把它写死成发布机的
     // 绝对路径（C:\Users\admin\…\Temp\qoder-token.json）。换一台电脑时这个路径既不属于
     // 该机的临时目录、也可能根本不存在，导致补丁写的文件与中转读的文件不是同一份，
-    // 面板永远显示「未读到」。这里：空值、或「盘符/用户目录明显不是本机」的路径，
-    // 一律改回**数据目录**（与补丁写入位置一致）。
-    // ⚠ 落点从 os.tmpdir() 挪到了 DATA_DIR（2026-10-23）：本项目不在系统盘的临时
-    //   目录里留文件（用户的要求）⇒ 临时目录会被系统清掉，那些快照活不过重启。
-    const fixQdFile = (v, name) => {
-      const def = path.join(DATA_DIR, name);
-      if (typeof v !== "string" || !v.trim()) return def;
-      const norm = path.normalize(v.trim());
-      // 已经是本机临时目录下的同名文件 → 尊重用户设置
-      if (norm.toLowerCase() === def.toLowerCase()) return v;
-      // 绝对路径但父目录在本机不存在 → 视为「从别的机器带过来的」，换回本机默认
-      if (path.isAbsolute(norm) && !existsSync(path.dirname(norm))) return def;
-      return v;
-    };
+    // 面板永远显示「未读到」。
+    // ⚠ **归位规则住在 qoder-patch.mjs 的 qdFilePath() 里** —— 落点逻辑只有一处出处。
+    //   这里曾自己抄过一份规则（抄出来的那份只认「异机路径」，漏了「旧落点」）
+    //   ⇒ 两边分叉过一次：补丁写临时目录、中转读数据目录 ⇒ 面板永远「未读到」。
+    //   ⇒ 现在只做一件事：把本机的数据目录告诉它，规则由它统一执行。
+    const fixQdFile = (v, name) => qdFilePath(v, name, DATA_DIR);
     merged.qd.tokenFile = fixQdFile(merged.qd.tokenFile, "qoder-token.json");
     merged.qd.modelsFile = fixQdFile(merged.qd.modelsFile, "qoder-models.json");
     // 版别自愈（v1.0.59）：按登录域名把 wb.upstream 拨到对应版别的默认端点
@@ -2577,7 +2573,7 @@ function wbCatPoolFingerprints(cfg, p) {
 // 所以下拉框只放外部真能调通的（QD_EXTERNAL_OK），其余照实列出并标注"仅客户端内可用"，
 // 免得用户选了必然 400 的模型。
 //
-// QD_EXTERNAL_OK 的依据（实测 2026-10-03，用 %TEMP%/qoder-token.json 的 jt- 令牌直连
+// QD_EXTERNAL_OK 的依据（实测 2026-10-03，用补丁落盘的 jt- 令牌直连
 // https://api2-v2.qoder.sh/model/v1/chat/completions，每个别名连测 3 次）：
 //   3/3 通过：lite(0×) / qmodel / mmodel / auto / dmodel / kmodel / gmodel / performance
 //   intermittent：ultimate(2×) 首次成功、第二次 All models failed —— 错误细节是
@@ -2598,7 +2594,7 @@ const QD_EXTERNAL_OK = new Set([
 // 实测会间歇失败的付费档（Qoder 服务端 Bedrock 权限问题，见上）。下拉里如实标注。
 const QD_FLAKY = new Set(["ultimate"]);
 // 读不到客户端目录（Qoder 没开 / 补丁没生效）时的兜底价格表，取自
-// %TEMP%/qoder-models.json 的 app 数组快照（实测 2026-10-03）。
+// 补丁落盘的 qoder-models.json 的 app 数组快照（实测 2026-10-03）。
 // 只有下拉标注用，不参与路由——绝不能让"标注"变成"默认走付费"。
 //
 // ⚠ qmodel / qmodel_38max 有**错峰折扣**（每晚 22:00-08:00 打到 4 折），
@@ -2735,9 +2731,12 @@ function qdReadCatalog(cfg) {
 
 // ---------- Qoder 令牌（v1.0.38）----------
 // Qoder 的 jt- jobToken **每次客户端启动都会轮换**，缓存到 config 里必然失效。
-// 取法：worker 补丁（qoder-patch/patch_worker.py）在每次带鉴权的出站请求上把最新令牌
+// 取法：worker 补丁（qoder-patch.mjs）在每次带鉴权的出站请求上把最新令牌
 // 覆盖写入 tokenFile，中转按 mtime 缓存几秒现读——Qoder 换令牌后无需重启中转即自动跟随。
 // 令牌失效时上游回 401，此时强制绕过缓存重读一次（Qoder 可能刚刷新过）。
+// ⚠ tokenFile 的落点只有**一处出处**：`QODER_PATCH_PATHS.TOKFILE`（补丁模块算的
+//   数据目录）⇒ 补丁写在哪、中转就读哪，不会分叉（分叉过一次：补丁写临时目录、
+//   中转读数据目录 ⇒ 面板永远「未读到」）。
 let qdTokCache = { token: "", mtimeMs: -1, at: 0 };
 function qdEnsureToken(cfg, force) {
   const manual = (cfg.qd && cfg.qd.token) || "";
@@ -2779,16 +2778,29 @@ function qdPatchInfo() {
   let val;
   try {
     const s = qpStatus();
+    /* ⚠ **就绪判据要问「现在跑的那份」，不是「有没有一份带补丁」**。
+     *   Qoder 升级会新增版本目录（.qoder-versions/<新版本>/…），补丁不会自动跟过去
+     *   ⇒ 老版本那份还带着补丁、实际在跑的新版本没有 ⇒ patchedCount>0 而令牌永远抓不到。
+     *   只按 patchedCount 报「补丁已装」是**误报**（实测：根 resources 那份带补丁，
+     *   而当天刚装的 0.5.1 那份没带）。
+     *   判据：版本号最大的那份（活跃版本）也得带补丁。 */
+    const active = s.latest || null;
+    const activePatched = !!active && active.patched === true;
     val = {
       found: s.found,
       patched: s.patchedCount,
-      ready: s.found > 0 && s.patchedCount > 0,
+      activeVer: active ? active.ver : null,
+      activePatched,
+      ready: s.found > 0 && s.patchedCount > 0 && activePatched,
       tokenFresh: s.tokenFresh,
       tokenAt: s.tokenAt,
       cn: s.cn,
     };
   } catch {
-    val = { found: 0, patched: 0, ready: false, tokenFresh: false, tokenAt: null, cn: 0 };
+    val = {
+      found: 0, patched: 0, activeVer: null, activePatched: false,
+      ready: false, tokenFresh: false, tokenAt: null, cn: 0,
+    };
   }
   qdPatchCache = { at: Date.now(), val };
   return val;
@@ -6029,7 +6041,7 @@ async function probeQuotaOf(provider, cfg, now) {
       try { mmToken = String((await mmTokens.ensure()) || ""); } catch { mmToken = ""; }
     }
     /* ⚠⚠ **qd 的凭据也是不在 cfg 里的**：它是 Qoder 桌面端写的令牌文件
-     *   （%TEMP%\qoder-token.json，裸串 `jt-…`，**不是 JWT**），由补丁读出来。
+     *   （补丁落盘的 qoder-token.json，裸串 `jt-…`，**不是 JWT**），由补丁读出来。
      *   实测（2026-10-23）：真端点是 `openapi.qoder.sh/api/v2/quota/usage`
      *   （另一个域，与推理基址不是一路），`Authorization: Bearer <jt-令牌>` 即可，
      *   `x-gw-user-id` 与 `Cosy-*` 头对它**不必要**。
@@ -11031,7 +11043,7 @@ async function unknownMappingTargets(p, mapping, cfg) {
       if (P === "qd") {
         try { qdEnsureToken(cfg, true); }
         catch {
-          return json(res, 400, { error: "未读到 Qoder 令牌——请先启动 Qoder 桌面端（补丁会把令牌写到 %TEMP%/qoder-token.json），无需手动填写" });
+          return json(res, 400, { error: "未读到 Qoder 令牌——请先启动 Qoder 桌面端（补丁会把令牌写到 " + QODER_PATCH_PATHS.TOKFILE + "），无需手动填写" });
         }
       }
       /* mm（MiniMax 会员）：凭据不在配置里（只在内存），所以「配没配好」只能问令牌仓库。

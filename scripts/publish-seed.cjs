@@ -205,9 +205,9 @@ function syncSeed(local, CUR) {
   if (typeof CUR.defaultModel === "string" && CUR.defaultModel) def.defaultModel = CUR.defaultModel;
 
   // qd（Qoder）块：token 是手动兜底用的 jt- jobToken，绝不进快照
-  // （正常路径下它恒为空——真实令牌由 worker 补丁写在 %TEMP%\qoder-token.json，不落 config）
-  // tokenFile/modelsFile 是发布机的 %TEMP% 绝对路径，原样进快照会被 C13 闸门拦下；
-  // 清空即可——运行期 fixQdFile() 会把空值/异机路径自愈回本机 os.tmpdir()。
+  // （正常路径下它恒为空——真实令牌由 worker 补丁写在**数据目录**里，不落 config）
+  // tokenFile/modelsFile 是发布机的绝对路径，原样进快照会被 C13 闸门拦下；
+  // 清空即可——运行期 fixQdFile() 会把空值/异机路径自愈回本机的数据目录。
   if (def.qd) { def.qd = { ...def.qd, token: "", tokenFile: "", modelsFile: "" }; }
   else if (CUR.qd) { def.qd = { ...CUR.qd, token: "", tokenFile: "", modelsFile: "" }; }
 

@@ -212,10 +212,12 @@ export async function loadRefreshCfg(opts) {
     wbai: pick("wbai", ["upstream", "accessToken"]),
     qd: pick("qd", ["modelsFile"]),
   };
-  /* ⚠ qd 的目录文件路径：出厂默认是空串 ⇒ 用 server.mjs 的同一处兜底
-   *   （`path.join(os.tmpdir(), "qoder-models.json")`）。 */
+  /* ⚠ qd 的目录文件路径：出厂默认是空串 ⇒ 用**数据目录**兜底。
+   *   这必须与「补丁写的地方」和 server.mjs 的 `DEFAULTS.qd.modelsFile` 是**同一个**
+   *   落点 —— 早先这里写的是 `os.tmpdir()`，而补丁那时也写临时目录，两边确实对得上；
+   *   补丁的落点挪到数据目录之后，这一处不改就变成「读一个没人写的文件」⇒ 刷不到目录。 */
   if (!String(cfg.qd.modelsFile || "").trim()) {
-    cfg.qd.modelsFile = path.join(os.tmpdir(), "qoder-models.json");
+    cfg.qd.modelsFile = path.join(dataDir, "qoder-models.json");
   }
 
   /* ⚠ **凭据清单**（只留够长的字符串，短的不算凭据，免得误判）。 */

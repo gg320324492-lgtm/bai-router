@@ -18,11 +18,35 @@
 
 ---
 
+## ⚠ 落点变更（2026-10-30）：令牌文件从 `%TEMP%` 挪到**数据目录**
+
+本文其余部分记的都是 2026-10-23 实测当时的情况 —— 令牌文件当时落在 `%TEMP%`。
+**现在落点变了**：`src/server/qoder-patch.mjs` 的 `QODER_PATCH_PATHS.TOKFILE`
+指向**数据目录**（`BAI_DATA_DIR`，没设时是 `%APPDATA%\bai-router`）下的
+`qoder-token.json`，不再是 `os.tmpdir()`。
+
+**为什么改**（这是一件真实的缺陷，不是一次整理）：
+
+- 2026-10-23 用户要求「本项目不在系统盘留文件」⇒ **中转侧**的落点先改到了数据目录，
+  **但补丁侧没跟着改** —— 而补丁才是**真正写文件的那一侧**。
+- ⇒ 两边分叉：**补丁写 `%TEMP%`、中转读数据目录** ⇒ 面板永远显示「未读到」，
+  令牌永远抓不到（**新机必现**；本机只是碰巧 config.json 里还留着旧的 `%TEMP%` 路径）。
+- 现在补丁侧也搬到数据目录，且**中转侧不再自己另算一份**：
+  `DEFAULTS.qd.tokenFile` 直接引用 `QODER_PATCH_PATHS.TOKFILE` ⇒ 落点只有一处出处。
+
+⚠ 改落点 = 改补丁**字节**（落点路径硬编码在补丁的 preamble 里）⇒ 已经打过旧补丁的
+副本要**先还原再重打**（`qpApply` 认得旧补丁态并自动从 `.orig` 还原）。
+
+**这份文档为什么值得留下**：分叉的那半年里，代码注释、面板文案、实测记录三处
+各说各话 —— 只有把「补丁写哪、中转读哪」钉成一处出处才不会再犯。
+
+---
+
 ## 一、令牌：形态、位置、拼法
 
 | 事实 | 值 | 出处 |
 | --- | --- | --- |
-| 令牌文件 | `%TEMP%\qoder-token.json` | `src/server/qoder-patch.mjs` 的 `QODER_PATCH_PATHS.TOKFILE`（= `os.tmpdir()/qoder-token.json`） |
+| 令牌文件 | **数据目录**下的 `qoder-token.json`（2026-10-23 实测时在 `%TEMP%`，见上面「落点变更」） | `src/server/qoder-patch.mjs` 的 `QODER_PATCH_PATHS.TOKFILE` |
 | 文件形状 | `{ token: string, userId: string, at: number }` | worker 补丁写的（`qoder-patch.mjs` 的 `zriReplacement`） |
 | 令牌形态 | **裸串**，`jt-` 开头、**27 字符**、**不是 JWT**（无点分段） | 实测读 `qoder-token.json` |
 | userId | UUID 形态（36 字符） | 同上 |
@@ -33,7 +57,7 @@
 
 ### 客户端请求头的真实形状
 
-抓包文件 `%TEMP%\qoder-hdr.jsonl` 里 `via:"zri"` 的行带请求头（`via:"fetch"` 的行只有 url/body）：
+抓包文件 `qoder-hdr.jsonl`（数据目录；2026-10-23 实测时在 `%TEMP%`）里 `via:"zri"` 的行带请求头（`via:"fetch"` 的行只有 url/body）：
 
 ```
 Authorization: Bearer <jt-令牌>      ← 客户端就是这么发的（"Bearer " 前缀 + 令牌）
@@ -172,14 +196,14 @@ app.asar.unpacked\node_modules\@qoder-ai\qoder-agent-sdk\dist\_worker\qoder-work
 
 ```bash
 # 1. 令牌：先让 Qoder 跑起来（令牌随客户端启动写入，3 秒内落盘）
-#    没跑的话 %TEMP%\qoder-token.json 里那把可能是过期的（回 401 TOKEN_EXPIRE）
+#    没跑的话 令牌文件里那把可能是过期的（回 401 TOKEN_EXPIRE）
 # 2. 端点（换成你自己的令牌，别把令牌写进任何文件）
 curl -s -H "Authorization: Bearer <jt-令牌>" \
      https://openapi.qoder.sh/api/v2/quota/usage
 # 3. 头够不够：去掉 x-gw-user-id 再打一次，应答应完全相同
 ```
 
-抓包文件 `%TEMP%\qoder-hdr.jsonl` 里有**真令牌**，别把它的内容抄进任何文件。
+抓包文件 `qoder-hdr.jsonl` 里有**真令牌**，别把它的内容抄进任何文件。
 本记录里所有值都是脱敏过的。
 
 ---

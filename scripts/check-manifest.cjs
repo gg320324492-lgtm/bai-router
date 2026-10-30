@@ -1043,7 +1043,7 @@ setCheck("C12");
  *
  *   实际踩过：qd.tokenFile 被写成 'C:\Users\admin\AppData\Local\Temp\qoder-token.json'
  *   （2026-10-06 实测发现）。幸而 server.mjs 的 fixQdFile() 读 config.json 时会自愈
- *   （父目录不存在就换回本机 os.tmpdir()），但那只是**运行期补丁、只覆盖 qd 两个字段**；
+ *   （父目录不存在就换回本机的数据目录），但那只是**运行期补丁、只覆盖 qd 两个字段**；
  *   别的字段（relayPort / upstream / wb.accessToken…）写脏了没人兜。
  *   所以这里在**构建期**拦一道。
  *

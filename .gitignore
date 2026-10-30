@@ -31,6 +31,12 @@ src/server/cli-apply.json
 src/server/agent-plugins/
 # 开发模式下模型真值表的运行时覆盖层（落盘在数据目录里）
 src/server/model-facts.json
+# Qoder worker 补丁的运行时产物（开发/绿色模式下 DATA_DIR 就是 src/server）
+# ⚠ qoder-token.json 里有**真令牌**，qoder-hdr.jsonl 是**抓到的请求头原文**
+#   （里面也有真令牌）——这两样绝不能进版本库。
+src/server/qoder-token.json
+src/server/qoder-models.json
+src/server/qoder-hdr.jsonl
 # 本项目的运行时数据目录（配置/日志/备份/凭据）—— 不进版本库
 .data/
 
